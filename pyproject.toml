@@ -2,7 +2,7 @@
 name = "xhs-agent"
 # 版本需与 src/xhs_agent/__init__.py 的 __version__ 保持一致
 version = "0.1.0"
-description = "蹭点 · 热点相关性 Agent：把热点拆成爆点要素，在本地素材库里找出能蹭上它的镜头"
+description = "小红书热点搭子 · 热点相关性 Agent：把热点拆成爆点要素，在本地素材库里找出能蹭上它的镜头"
 readme = "README.md"
 requires-python = ">=3.11"
 authors = [{ name = "tianshugui", email = "tianshugui95@gmail.com" }]
