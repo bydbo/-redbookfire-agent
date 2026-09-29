@@ -38,6 +38,26 @@
 
 ---
 
+## 技术栈
+
+已落地的选型（完整清单、依据与规划中的演进见 `docs/技术栈.md`）：
+
+| 层面 | 选型 |
+| --- | --- |
+| 语言 | Python ≥ 3.11 |
+| 包管理与构建 | uv + `pyproject.toml`（hatchling 后端，src 布局） |
+| 运行时依赖 | 无，仅标准库 |
+| 开发依赖 | pytest |
+| 文本模型接入 | OpenAI 兼容 `/chat/completions` 协议（默认 DeepSeek），标准库 `urllib` 直连，JSON mode 结构化输出 + 解析失败自修 |
+| 多模态接入 | 通义千问 VL（`qwen-vl-max`），关键帧 base64 内联 |
+| 音视频处理 | ffmpeg / ffprobe（可选，缺失自动降级） |
+| 检索算法 | 字符 bigram Jaccard + 要素类型加权；无 embedding、无向量库 |
+| 配置 | TOML + `.env` + 环境变量，三层覆盖 |
+| 数据落地 | JSON 索引 / JSONL 轨迹 / Markdown 与单文件 HTML 报告；无数据库 |
+| 测试 | pytest |
+
+**规划中（尚未引入，落地后才会写进简历）**：FastAPI 服务层、Pydantic 数据校验、embedding 与向量检索（pgvector）、PostgreSQL、Docker、GitHub Actions CI、结构化日志与调用可观测。引入规则见 `AGENTS.md` 第 6 节。
+
 ## 快速开始
 
 前置条件：Python ≥ 3.11，`uv`，可选 `ffmpeg` / `ffprobe`（缺失时跳过抽帧，链路不中断）。
@@ -57,7 +77,7 @@ uv run python -c "import xhs_agent; print(xhs_agent.__version__)"
 uv run python -c "from xhs_agent.config import load_config; print(load_config().describe())"
 ```
 
-网络受限时：`uv sync --no-dev` 只装运行时环境（当前运行时零第三方依赖，可直接用系统 Python 跑）。
+网络受限时：`uv sync --no-dev` 只装运行时环境——当前运行时依赖为空，只有标准库；不过 `import xhs_agent` 仍然需要安装或设置 `PYTHONPATH=src`（src 布局）。
 
 ---
 
@@ -103,7 +123,7 @@ project/
 | `XHS_LLM_MODEL` | 覆盖模型名 |
 | `XHS_LLM_API_KEY` | 覆盖密钥 |
 
-没有配置任何密钥时，系统自动降级到**离线规则引擎**接管全链路，保证零依赖也能跑通并复现结果。
+没有配置任何密钥时，系统自动降级到**离线规则引擎**接管全链路，保证**没有任何密钥也能跑通并复现结果**。
 
 ---
 
