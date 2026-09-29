@@ -26,7 +26,7 @@
 | 部分 | 状态 |
 | --- | --- |
 | 数据契约（要素／线索／素材／匹配／文案） | ✅ 已完成 |
-| 爆点要素词典与离线规则引擎 | ✅ 已完成 |
+| 爆点要素词典与离线规则引擎 | ✅ 已完成（离线规则引擎将在 P2 删除） |
 | 模型调用层（兼容接口 + 结构化输出自修重试） | ✅ 已完成 |
 | 素材扫描与索引（旁车文件／文件名／视觉打标，增量更新） | ✅ 已完成 |
 | 相关性打分与覆盖度计算 | ✅ 已完成 |
@@ -50,25 +50,46 @@
 | 开发依赖 | pytest |
 | 文本模型接入 | OpenAI 兼容 `/chat/completions` 协议（默认 DeepSeek），标准库 `urllib` 直连，JSON mode 结构化输出 + 解析失败自修 |
 | 多模态接入 | 通义千问 VL（`qwen-vl-max`），关键帧 base64 内联 |
-| 音视频处理 | ffmpeg / ffprobe（可选，缺失自动降级） |
+| 音视频处理 | ffmpeg / ffprobe（用于探测与抽帧；缺失时跳过抽帧，属能力裁剪） |
 | 检索算法 | 字符 bigram Jaccard + 要素类型加权；无 embedding、无向量库 |
 | 配置 | TOML + `.env` + 环境变量，三层覆盖 |
 | 数据落地 | JSON 索引 / JSONL 轨迹 / Markdown 与单文件 HTML 报告；无数据库 |
 | 测试 | pytest |
 
-**规划中（尚未引入，落地后才会写进简历）**：FastAPI 服务层、Pydantic 数据校验、embedding 与向量检索（pgvector）、PostgreSQL、Docker、GitHub Actions CI、结构化日志与调用可观测。引入规则见 `AGENTS.md` 第 6 节。
+### 最终技术栈（企业级，已确定待落地）
+
+| 层面 | 选型 |
+| --- | --- |
+| Web 服务 | FastAPI + Uvicorn |
+| 数据契约与配置 | Pydantic v2 + pydantic-settings |
+| HTTP 客户端 | httpx（异步、连接池、重试） |
+| Agent 编排 | LangGraph（状态图 + 检查点 + 失败重试） |
+| 数据库 | PostgreSQL 16 + pgvector（Docker Compose 提供） |
+| 数据访问 | SQLAlchemy 2.0 async + asyncpg + Alembic |
+| 检索 | 混合召回：pg_trgm 字面 + pgvector 语义，RRF 融合后套要素加权 |
+| Embedding | 默认通义 text-embedding-v3（API）；本地小模型为可选实现 |
+| 队列与缓存 | Redis + Celery |
+| 可观测 | Langfuse Cloud + structlog，run_id 贯穿全链路 |
+| 容器化 / CI | Docker Compose（api / worker / postgres / redis）；GitHub Actions |
+| 代码质量 / 测试 | ruff + mypy + pre-commit；pytest + pytest-asyncio + pytest-cov + testcontainers |
+
+以上组件**尚未落地**，落地顺序见 `docs/技术栈.md` 第四节。**简历只写已经落地的技术栈。**
+
+> **运行时降级已取消**：缺密钥、连不上数据库或队列时启动直接失败并明确报错，不再提供“无密钥也能跑”的离线模式。
 
 ## 快速开始
 
-前置条件：Python ≥ 3.11，`uv`，可选 `ffmpeg` / `ffprobe`（缺失时跳过抽帧，链路不中断）。
+前置条件：Python ≥ 3.11、`uv`、`ffmpeg` / `ffprobe`（用于抽帧）。
+
+> **注意**：下面是当前代码可运行的步骤。企业化改造（服务化、数据库、队列）尚未落地，改造后启动方式会变成 `docker compose up`。
 
 ```powershell
-# 1. 安装环境（首次需要网络，会下载 pytest 与构建后端）
+# 1. 安装环境（首次需要网络）
 uv sync
 
-# 2. 准备配置（可选：不配也能以离线规则引擎跑）
+# 2. 准备配置（必须填密钥：项目不做无密钥降级）
 Copy-Item config/.env.example config/.env
-#    然后编辑 config/.env 填入密钥；不填则为离线模式
+#    编辑 config/.env 填入 DEEPSEEK_API_KEY 与 DASHSCOPE_API_KEY
 
 # 3. 验证安装
 uv run python -c "import xhs_agent; print(xhs_agent.__version__)"
@@ -118,12 +139,14 @@ project/
 | --- | --- |
 | `DEEPSEEK_API_KEY` | 文本模型密钥（默认走 DeepSeek 兼容接口） |
 | `DASHSCOPE_API_KEY` | 多模态模型密钥（素材抽帧打标） |
-| `XHS_LLM_PROVIDER` | 覆盖模型供应方（`auto` / `openai_compatible` / `offline`） |
+| `XHS_LLM_PROVIDER` | 覆盖模型供应方（`openai_compatible`；`auto` / `offline` 的降级语义将在改造中移除） |
 | `XHS_LLM_BASE_URL` | 覆盖接口地址 |
 | `XHS_LLM_MODEL` | 覆盖模型名 |
 | `XHS_LLM_API_KEY` | 覆盖密钥 |
 
-没有配置任何密钥时，系统自动降级到**离线规则引擎**接管全链路，保证**没有任何密钥也能跑通并复现结果**。
+改造落地后，这里还会增加 `DATABASE_URL`、`REDIS_URL`、`LANGFUSE_PUBLIC_KEY`、`LANGFUSE_SECRET_KEY`、`LANGFUSE_HOST`——完整契约见 `docs/技术栈.md` 第三节。
+
+**运行时不降级**：缺密钥、连不上数据库或队列时直接启动失败并给出明确报错。这是刻意取舍——降级模式产出质量差一个档次，被当成正常模式使用反而会损害结果可信度。
 
 ---
 

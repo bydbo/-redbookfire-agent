@@ -1,9 +1,10 @@
 # 蹭点 · 默认配置
 # 本文件只放可公开的默认值，不存放任何密钥。
 # 真实密钥写在同一目录的 .env（已被 .gitignore 忽略），或用环境变量覆盖。
+# 【现状】本文件描述当前代码可读取的配置项。企业化改造后还会增加 database / redis / langfuse 段，届时同步更新（见 docs/技术栈.md）。
 
 [llm]
-# auto = 有密钥走在线模型，没有密钥自动降级到离线规则引擎
+# auto = 有密钥走在线模型；改造后将取消 auto / offline 的降级语义，缺密钥直接启动失败（见 docs/技术栈.md）
 provider = "auto"
 base_url = "https://api.deepseek.com/v1"
 model = "deepseek-chat"

@@ -6,10 +6,10 @@ description = "蹭点 · 热点相关性 Agent：把热点拆成爆点要素，�
 readme = "README.md"
 requires-python = ">=3.11"
 authors = [{ name = "tianshugui", email = "tianshugui95@gmail.com" }]
-# 运行时依赖当前为空（仅标准库）；引入依赖前先看 AGENTS.md 第 4、6 节与 docs/技术栈.md
+# 运行时依赖当前为空；最终技术栈（FastAPI / LangGraph / pgvector 等）见 docs/技术栈.md，引入时走 AGENTS.md 第 6 节
 dependencies = []
 
-# 开发依赖：仅测试工具
+# 开发依赖：测试与代码质量工具
 [dependency-groups]
 dev = ["pytest>=8.0"]
 
