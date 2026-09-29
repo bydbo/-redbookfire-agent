@@ -1,0 +1,40 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+
+# 测试与工具缓存
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# 运行产物：可重建，不入库
+runs/*
+!runs/.gitkeep
+
+# 本地素材库：体积大且含隐私，绝不入库
+data/materials/*
+!data/materials/.gitkeep
+
+# 密钥：绝不入库
+config/.env
+.env
+.env.local
+*.env
+!config/.env.example
+
+# IDE 与编辑器
+.idea/
+.vscode/
+*.swp
+
+# 操作系统
+Thumbs.db
+Desktop.ini
+.DS_Store

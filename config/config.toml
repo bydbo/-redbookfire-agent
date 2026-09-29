@@ -1,0 +1,40 @@
+# 蹭点 · 默认配置
+# 本文件只放可公开的默认值，不存放任何密钥。
+# 真实密钥写在同一目录的 .env（已被 .gitignore 忽略），或用环境变量覆盖。
+
+[llm]
+# auto = 有密钥走在线模型，没有密钥自动降级到离线规则引擎
+provider = "auto"
+base_url = "https://api.deepseek.com/v1"
+model = "deepseek-chat"
+api_key = ""                  # 留空，密钥请写进 config/.env
+api_key_env = "DEEPSEEK_API_KEY"
+temperature = 0.6
+max_tokens = 2000
+timeout_s = 60
+max_retries = 2
+price_in_per_m = 1.0          # 元/百万 token，仅用于成本估算
+price_out_per_m = 2.0
+
+[vision]
+enabled = true                # 关闭后素材打标退回文件名与人工说明
+base_url = "https://dashscope.aliyuncs.com/compatible-mode/v1"
+model = "qwen-vl-max"
+api_key = ""                  # 留空，密钥请写进 config/.env
+api_key_env = "DASHSCOPE_API_KEY"
+max_frames = 3
+max_width = 720
+
+[match]
+topk = 5
+min_score = 0.15
+
+# 覆盖默认要素权重：人物 IP 降到 0.4，体现"借势不直用"的产品规则
+[match.element_type_weights]
+ip = 0.4
+
+[paths]
+# 相对路径均以工程根（本仓库根目录）为基准
+materials_dir = "data/materials"
+runs_dir = "runs"
+index_dir = "runs/_index"
