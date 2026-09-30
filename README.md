@@ -25,7 +25,7 @@
 
 | 部分 | 状态 |
 | --- | --- |
-| 数据契约（要素／线索／素材／匹配／文案） | ✅ 已完成 |
+| 数据契约（要素／线索／素材／匹配／文案） | ✅ 已完成（S1.1 起为 Pydantic v2 模型） |
 | 爆点要素词典与离线规则引擎 | ✅ 已完成（离线规则引擎将在 P2 删除） |
 | 模型调用层（兼容接口 + 结构化输出自修重试） | ✅ 已完成 |
 | 素材扫描与索引（旁车文件／文件名／视觉打标，增量更新） | ✅ 已完成 |
@@ -47,7 +47,7 @@
 | --- | --- |
 | 语言 | Python ≥ 3.11 |
 | 包管理与构建 | uv + `pyproject.toml`（hatchling 后端，src 布局） |
-| 运行时依赖 | 无，仅标准库 |
+| 运行时依赖 | pydantic v2（S1.1 引入） |
 | 开发依赖 | pytest |
 | 文本模型接入 | OpenAI 兼容 `/chat/completions` 协议（默认 DeepSeek），标准库 `urllib` 直连，JSON mode 结构化输出 + 解析失败自修 |
 | 多模态接入 | 通义千问 VL（`qwen-vl-max`），关键帧 base64 内联 |
@@ -62,7 +62,7 @@
 | 层面 | 选型 |
 | --- | --- |
 | Web 服务 | FastAPI + Uvicorn |
-| 数据契约与配置 | Pydantic v2 + pydantic-settings |
+| 配置加载 | pydantic-settings（Pydantic v2 已落地） |
 | HTTP 客户端 | httpx（异步、连接池、重试） |
 | Agent 编排 | LangGraph（状态图 + 检查点 + 失败重试） |
 | 数据库 | PostgreSQL 16 + pgvector（Docker Compose 提供） |
@@ -102,7 +102,7 @@ uv run python -c "import xhs_agent; print(xhs_agent.__version__)"
 uv run python -c "from xhs_agent.config import load_config; print(load_config().describe())"
 ```
 
-网络受限时：`uv sync --no-dev` 只装运行时环境——当前运行时依赖为空，只有标准库；不过 `import xhs_agent` 仍然需要安装或设置 `PYTHONPATH=src`（src 布局）。
+网络受限时：`uv sync --no-dev` 只装运行时环境——当前运行时依赖只有 pydantic；不过 `import xhs_agent` 仍然需要安装或设置 `PYTHONPATH=src`（src 布局）。
 
 ---
 
@@ -151,7 +151,7 @@ project/
 uv run pytest
 ```
 
-当前 `tests/` 为空目录占位：`uv run pytest` 报"0 用例、退出码 5"属于预期状态。第一个功能落地前必须先补测试。
+当前 `tests/unit/` 已有 `schemas.py` 的契约测试，`uv run pytest` 应全绿；`tools/` 的行为回归见 `docs/backlog.md` 的 S1.4。
 
 开发前请先读 `AGENTS.md`（AI 开发规范，含目录约定、文件边界、测试要求、依赖策略、提交检查清单）：
 

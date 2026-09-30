@@ -2,12 +2,19 @@
 
 所有 LLM 的产出都必须先落成这里的结构，Workflow 才允许往下走。
 这样模型说人话、程序看结构，两边不会互相污染。
+
+实现说明（S1.1）：八个结构由 dataclass 升级为 Pydantic v2 模型，字段名、默认值、
+`to_dict()` / `from_dict()` 的输入输出与升级前逐键一致；唯一新增的硬约束是
+`MatchCandidate.reasons` 不允许为空（契约见 `docs/contracts/数据契约.md` 第七节与
+`docs/contracts/openapi.yaml` 的 `MatchCandidate.reasons`）。
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, ClassVar
+
+from pydantic import (BaseModel, ConfigDict, Field, ValidationError,
+                      ValidationInfo, field_validator, model_validator)
 
 from .util import clip01, now_iso, short_hash, slugify
 
@@ -84,24 +91,73 @@ def _as_str_list(value: Any) -> list:
     return out
 
 
-@dataclass
-class Element:
+def _clean_str(value: Any) -> str:
+    """宽松字符串归一：`None` / `False` / `0` 之类的假值一律视作空串。"""
+    return str(value or "").strip()
+
+
+def _as_float(value: Any, default: float = 0.0) -> float:
+    """宽松数值归一：解析不了或 NaN 时回落到默认值，不做上下界裁剪。"""
+    try:
+        num = float(value)
+    except (TypeError, ValueError):
+        return default
+    if num != num:
+        return default
+    return num
+
+
+def _as_int(value: Any, default: int = 0) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _invalid(ctx: str, exc: ValidationError) -> SchemaError:
+    """把 Pydantic 的校验失败折回本模块对外的统一异常。"""
+    details = "；".join(
+        f"{'.'.join(str(part) for part in err['loc']) or '<root>'}：{err['msg']}"
+        for err in exc.errors()
+    )
+    return SchemaError(f"{ctx} 不符合契约：{details}")
+
+
+class _Contract(BaseModel):
+    """内存契约模型的公共配置：忽略未声明字段，保持可变更。"""
+
+    model_config = ConfigDict(extra="ignore")
+
+
+class Element(_Contract):
     """一个爆点要素：类型 + 取值 + 权重 + 置信度。"""
 
-    type: str
+    type: str = "topic"
     value: str
     weight: float = 0.6
     confidence: float = 0.7
     evidence: str = ""
 
-    def __post_init__(self) -> None:
-        self.type = str(self.type or "topic").strip().lower()
-        if self.type not in ELEMENT_TYPES:
-            self.type = "topic"
-        self.value = str(self.value or "").strip()
-        self.weight = clip01(self.weight, 0.6)
-        self.confidence = clip01(self.confidence, 0.7)
-        self.evidence = str(self.evidence or "").strip()
+    @field_validator("type", mode="before")
+    @classmethod
+    def _norm_type(cls, value: Any) -> str:
+        text = _clean_str(value or "topic").lower()
+        return text if text in ELEMENT_TYPES else "topic"
+
+    @field_validator("value", "evidence", mode="before")
+    @classmethod
+    def _norm_text(cls, value: Any) -> str:
+        return _clean_str(value)
+
+    @field_validator("weight", mode="before")
+    @classmethod
+    def _norm_weight(cls, value: Any) -> float:
+        return clip01(value, 0.6)
+
+    @field_validator("confidence", mode="before")
+    @classmethod
+    def _norm_confidence(cls, value: Any) -> float:
+        return clip01(value, 0.7)
 
     @property
     def label(self) -> str:
@@ -127,21 +183,28 @@ class Element:
             data = {"type": "topic", "value": data}
         if not isinstance(data, dict):
             raise SchemaError(f"要素必须是对象或字符串，收到 {type(data).__name__}")
-        return cls(
-            type=data.get("type", "topic"),
-            value=_require(data, "value", "要素"),
-            weight=data.get("weight", 0.6),
-            confidence=data.get("confidence", 0.7),
-            evidence=data.get("evidence", ""),
-        )
+        try:
+            return cls(
+                type=data.get("type", "topic"),
+                value=_require(data, "value", "要素"),
+                weight=data.get("weight", 0.6),
+                confidence=data.get("confidence", 0.7),
+                evidence=data.get("evidence", ""),
+            )
+        except ValidationError as exc:
+            raise _invalid("要素", exc) from exc
 
 
-@dataclass
-class Mechanism:
+class Mechanism(_Contract):
     """为什么这个热点能火的一条机制，例如「反差」「参与门槛低」。"""
 
     name: str
     explain: str = ""
+
+    @field_validator("name", "explain", mode="before")
+    @classmethod
+    def _norm_text(cls, value: Any) -> str:
+        return _clean_str(value)
 
     def to_dict(self) -> dict:
         return {"name": self.name, "explain": self.explain}
@@ -155,30 +218,63 @@ class Mechanism:
         name = data.get("name") or data.get("type") or data.get("title")
         if not name:
             raise SchemaError("mechanism 缺少 name")
-        return cls(name=str(name).strip(), explain=str(data.get("explain") or data.get("why") or "").strip())
+        try:
+            return cls(name=str(name).strip(),
+                       explain=str(data.get("explain") or data.get("why") or "").strip())
+        except ValidationError as exc:
+            raise _invalid("mechanism", exc) from exc
 
 
-@dataclass
-class HotspotClue:
+class HotspotClue(_Contract):
     """热点线索：一条热点被拆解后的可迁移结论。"""
 
     hotspot_raw: str
-    why_it_works: list = field(default_factory=list)
-    mechanisms: list = field(default_factory=list)
-    elements: list = field(default_factory=list)
-    match_keywords: list = field(default_factory=list)
-    audience: dict = field(default_factory=dict)
-    borrow_angles: list = field(default_factory=list)
-    risk_notes: list = field(default_factory=list)
+    why_it_works: list[str] = Field(default_factory=list)
+    mechanisms: list[Mechanism] = Field(default_factory=list)
+    elements: list[Element] = Field(default_factory=list)
+    match_keywords: list[str] = Field(default_factory=list)
+    audience: dict = Field(default_factory=dict)
+    borrow_angles: list[str] = Field(default_factory=list)
+    risk_notes: list[str] = Field(default_factory=list)
     provider: str = ""
     model: str = ""
-    created_at: str = field(default_factory=now_iso)
+    created_at: str = Field(default_factory=now_iso)
     hotspot_key: str = ""
 
-    def __post_init__(self) -> None:
+    @field_validator("hotspot_raw", "provider", "model", "created_at", mode="before")
+    @classmethod
+    def _norm_text(cls, value: Any) -> str:
+        return _clean_str(value)
+
+    @field_validator("hotspot_key", mode="before")
+    @classmethod
+    def _norm_key(cls, value: Any) -> str:
+        return _clean_str(value)
+
+    @field_validator("why_it_works", "match_keywords", "borrow_angles", "risk_notes",
+                     mode="before")
+    @classmethod
+    def _norm_str_list(cls, value: Any) -> list:
+        return _as_str_list(value)
+
+    @field_validator("mechanisms", "elements", mode="before")
+    @classmethod
+    def _norm_model_list(cls, value: Any) -> list:
+        return _as_list(value)
+
+    @field_validator("audience", mode="before")
+    @classmethod
+    def _norm_audience(cls, value: Any) -> dict:
+        if isinstance(value, dict):
+            return value
+        text = _clean_str(value)
+        return {"core": text} if text else {}
+
+    @model_validator(mode="after")
+    def _fill_hotspot_key(self) -> "HotspotClue":
         if not self.hotspot_key:
             self.hotspot_key = slugify(self.hotspot_raw, max_len=20, fallback="hotspot")
-        self.match_keywords = [str(k).strip() for k in _as_str_list(self.match_keywords) if str(k).strip()]
+        return self
 
     @property
     def element_values(self) -> list:
@@ -239,23 +335,25 @@ class HotspotClue:
                 seen.add(key)
                 distinct.append(item)
 
-        return cls(
-            hotspot_raw=raw,
-            why_it_works=why,
-            mechanisms=mechanisms,
-            elements=elements,
-            match_keywords=distinct[:20],
-            audience=audience,
-            borrow_angles=_as_str_list(data.get("borrow_angles")),
-            risk_notes=_as_str_list(data.get("risk_notes")),
-            provider=provider,
-            model=model,
-            hotspot_key=slugify(str(data.get("hotspot_key") or raw), max_len=20, fallback="hotspot"),
-        )
+        try:
+            return cls(
+                hotspot_raw=raw,
+                why_it_works=why,
+                mechanisms=mechanisms,
+                elements=elements,
+                match_keywords=distinct[:20],
+                audience=audience,
+                borrow_angles=_as_str_list(data.get("borrow_angles")),
+                risk_notes=_as_str_list(data.get("risk_notes")),
+                provider=provider,
+                model=model,
+                hotspot_key=slugify(str(data.get("hotspot_key") or raw), max_len=20, fallback="hotspot"),
+            )
+        except ValidationError as exc:
+            raise _invalid("热点线索", exc) from exc
 
 
-@dataclass
-class Material:
+class Material(_Contract):
     """素材仓库里的一条素材。"""
 
     id: str
@@ -263,8 +361,8 @@ class Material:
     type: str = "video"          # video | image | text
     title: str = ""
     description: str = ""
-    tags: list = field(default_factory=list)
-    elements: list = field(default_factory=list)
+    tags: list[str] = Field(default_factory=list)
+    elements: list[Element] = Field(default_factory=list)
     duration_s: float = 0.0
     width: int = 0
     height: int = 0
@@ -272,9 +370,35 @@ class Material:
     size_bytes: int = 0
     mtime: float = 0.0
     source: str = "filename"     # sidecar | vision | filename | legacy
-    keyframes: list = field(default_factory=list)
-    indexed_at: str = field(default_factory=now_iso)
+    keyframes: list[str] = Field(default_factory=list)
+    indexed_at: str = Field(default_factory=now_iso)
     fingerprint: str = ""
+
+    @field_validator("id", "path", "type", "title", "description", "source",
+                     "indexed_at", "fingerprint", mode="before")
+    @classmethod
+    def _norm_text(cls, value: Any) -> str:
+        return _clean_str(value)
+
+    @field_validator("tags", "keyframes", mode="before")
+    @classmethod
+    def _norm_str_list(cls, value: Any) -> list:
+        return _as_str_list(value)
+
+    @field_validator("elements", mode="before")
+    @classmethod
+    def _norm_model_list(cls, value: Any) -> list:
+        return _as_list(value)
+
+    @field_validator("duration_s", "mtime", mode="before")
+    @classmethod
+    def _norm_float(cls, value: Any) -> float:
+        return _as_float(value)
+
+    @field_validator("width", "height", "size_bytes", mode="before")
+    @classmethod
+    def _norm_int(cls, value: Any) -> int:
+        return _as_int(value)
 
     @property
     def aspect_ratio(self) -> float:
@@ -323,24 +447,27 @@ class Material:
 
     @classmethod
     def from_dict(cls, data: dict) -> "Material":
-        material = cls(
-            id=str(data.get("id") or ""),
-            path=str(data.get("path") or ""),
-            type=str(data.get("type") or "video"),
-            title=str(data.get("title") or ""),
-            description=str(data.get("description") or ""),
-            tags=[str(t) for t in _as_str_list(data.get("tags"))],
-            duration_s=float(data.get("duration_s") or 0.0),
-            width=int(data.get("width") or 0),
-            height=int(data.get("height") or 0),
-            has_audio=bool(data.get("has_audio")),
-            size_bytes=int(data.get("size_bytes") or 0),
-            mtime=float(data.get("mtime") or 0.0),
-            source=str(data.get("source") or "filename"),
-            keyframes=[str(k) for k in _as_list(data.get("keyframes"))],
-            indexed_at=str(data.get("indexed_at") or now_iso()),
-            fingerprint=str(data.get("fingerprint") or ""),
-        )
+        try:
+            material = cls(
+                id=str(data.get("id") or ""),
+                path=str(data.get("path") or ""),
+                type=str(data.get("type") or "video"),
+                title=str(data.get("title") or ""),
+                description=str(data.get("description") or ""),
+                tags=[str(t) for t in _as_str_list(data.get("tags"))],
+                duration_s=float(data.get("duration_s") or 0.0),
+                width=int(data.get("width") or 0),
+                height=int(data.get("height") or 0),
+                has_audio=bool(data.get("has_audio")),
+                size_bytes=int(data.get("size_bytes") or 0),
+                mtime=float(data.get("mtime") or 0.0),
+                source=str(data.get("source") or "filename"),
+                keyframes=[str(k) for k in _as_list(data.get("keyframes"))],
+                indexed_at=str(data.get("indexed_at") or now_iso()),
+                fingerprint=str(data.get("fingerprint") or ""),
+            )
+        except ValidationError as exc:
+            raise _invalid("素材", exc) from exc
         material.elements = [Element.from_dict(item) for item in _as_list(data.get("elements"))]
         return material
 
@@ -349,8 +476,7 @@ class Material:
         return "m_" + short_hash(rel_path, 10)
 
 
-@dataclass
-class ElementHit:
+class ElementHit(_Contract):
     """一条匹配记录：线索要素被哪条素材信息命中。"""
 
     element_type: str
@@ -358,6 +484,16 @@ class ElementHit:
     hit_value: str = ""
     similarity: float = 0.0
     contribution: float = 0.0
+
+    @field_validator("element_type", "clue_value", "hit_value", mode="before")
+    @classmethod
+    def _norm_text(cls, value: Any) -> str:
+        return _clean_str(value)
+
+    @field_validator("similarity", "contribution", mode="before")
+    @classmethod
+    def _norm_float(cls, value: Any) -> float:
+        return _as_float(value)
 
     def to_dict(self) -> dict:
         return {
@@ -369,18 +505,63 @@ class ElementHit:
         }
 
 
-@dataclass
-class MatchCandidate:
-    """一条候选素材及其匹配解释。"""
+class MatchCandidate(_Contract):
+    """一条候选素材及其匹配解释。
+
+    `reasons` 是契约硬约束：不允许出现无理由候选。由于打分与解释是两步，
+    中间态必须走 `MatchCandidate.draft(...)` 构造，解释补齐后再 `finalize()`。
+    """
 
     material_id: str
     material: Material
     score: float = 0.0
-    hits: list = field(default_factory=list)
-    missing: list = field(default_factory=list)
-    reasons: list = field(default_factory=list)
+    hits: list[ElementHit] = Field(default_factory=list)
+    missing: list[Element] = Field(default_factory=list)
+    reasons: list[str] = Field(default_factory=list)
     usage: str = ""
     rank: int = 0
+
+    @field_validator("material_id", "usage", mode="before")
+    @classmethod
+    def _norm_text(cls, value: Any) -> str:
+        return _clean_str(value)
+
+    @field_validator("score", mode="before")
+    @classmethod
+    def _norm_score(cls, value: Any) -> float:
+        return _as_float(value)
+
+    @field_validator("rank", mode="before")
+    @classmethod
+    def _norm_rank(cls, value: Any) -> int:
+        return _as_int(value)
+
+    @field_validator("hits", "missing", mode="before")
+    @classmethod
+    def _norm_model_list(cls, value: Any) -> list:
+        return _as_list(value)
+
+    @field_validator("reasons", mode="before")
+    @classmethod
+    def _norm_reasons(cls, value: Any) -> list:
+        return _as_str_list(value)
+
+    @model_validator(mode="after")
+    def _require_reasons(self, info: ValidationInfo) -> "MatchCandidate":
+        if not self.reasons and not (info.context or {}).get("allow_empty_reasons"):
+            raise ValueError("候选素材缺少 reasons：契约不允许无理由候选")
+        return self
+
+    @classmethod
+    def draft(cls, **kwargs: Any) -> "MatchCandidate":
+        """中间态构造入口：此时 `reasons` 允许为空，等解释补齐后再 `finalize()`。"""
+        return cls.model_validate(kwargs, context={"allow_empty_reasons": True})
+
+    def finalize(self) -> "MatchCandidate":
+        """终态校验：理由为空即视为未完成，不能流向报告与落库。"""
+        if not self.reasons:
+            raise SchemaError(f"候选素材 {self.material_id or self.material.id} 缺少 reasons")
+        return self
 
     def to_dict(self) -> dict:
         return {
@@ -395,13 +576,22 @@ class MatchCandidate:
         }
 
 
-@dataclass
-class Coverage:
+class Coverage(_Contract):
     """线索覆盖度：哪些爆点要素有素材，哪些是缺口。"""
 
-    covered: list = field(default_factory=list)
-    gaps: list = field(default_factory=list)
+    covered: list[Element] = Field(default_factory=list)
+    gaps: list[Element] = Field(default_factory=list)
     ratio: float = 0.0
+
+    @field_validator("covered", "gaps", mode="before")
+    @classmethod
+    def _norm_model_list(cls, value: Any) -> list:
+        return _as_list(value)
+
+    @field_validator("ratio", mode="before")
+    @classmethod
+    def _norm_ratio(cls, value: Any) -> float:
+        return _as_float(value)
 
     def to_dict(self) -> dict:
         return {
@@ -411,24 +601,39 @@ class Coverage:
         }
 
 
-@dataclass
-class Draft:
+class Draft(_Contract):
     """一版初步文案。"""
 
     material_id: str = ""
     hotspot_key: str = ""
-    titles: list = field(default_factory=list)   # [{text, style}]
+    titles: list[dict] = Field(default_factory=list)   # [{text, style}]
     body: str = ""
-    tags: list = field(default_factory=list)
+    tags: list[str] = Field(default_factory=list)
     cover_text: str = ""
     first_3s: str = ""
-    shot_list: list = field(default_factory=list)
-    compliance_notes: list = field(default_factory=list)
+    shot_list: list[str] = Field(default_factory=list)
+    compliance_notes: list[str] = Field(default_factory=list)
     provider: str = ""
     model: str = ""
-    created_at: str = field(default_factory=now_iso)
+    created_at: str = Field(default_factory=now_iso)
 
-    XHS_TITLE_LIMIT = 20
+    XHS_TITLE_LIMIT: ClassVar[int] = 20
+
+    @field_validator("material_id", "hotspot_key", "body", "cover_text", "first_3s",
+                     "provider", "model", "created_at", mode="before")
+    @classmethod
+    def _norm_text(cls, value: Any) -> str:
+        return _clean_str(value)
+
+    @field_validator("tags", "shot_list", "compliance_notes", mode="before")
+    @classmethod
+    def _norm_str_list(cls, value: Any) -> list:
+        return _as_str_list(value)
+
+    @field_validator("titles", mode="before")
+    @classmethod
+    def _norm_titles(cls, value: Any) -> list:
+        return _as_list(value)
 
     def title_warnings(self) -> list:
         out = []
@@ -496,16 +701,19 @@ class Draft:
         for tag in _as_str_list(data.get("tags")):
             tag = tag if tag.startswith("#") else f"#{tag}"
             tags.append(tag)
-        return cls(
-            material_id=str(data.get("material_id") or material_id),
-            hotspot_key=str(data.get("hotspot_key") or hotspot_key),
-            titles=titles[:5],
-            body=body,
-            tags=tags[:12],
-            cover_text=str(data.get("cover_text") or "").strip(),
-            first_3s=str(data.get("first_3s") or "").strip(),
-            shot_list=_as_str_list(data.get("shot_list")),
-            compliance_notes=_as_str_list(data.get("compliance_notes")),
-            provider=provider,
-            model=model,
-        )
+        try:
+            return cls(
+                material_id=str(data.get("material_id") or material_id),
+                hotspot_key=str(data.get("hotspot_key") or hotspot_key),
+                titles=titles[:5],
+                body=body,
+                tags=tags[:12],
+                cover_text=str(data.get("cover_text") or "").strip(),
+                first_3s=str(data.get("first_3s") or "").strip(),
+                shot_list=_as_str_list(data.get("shot_list")),
+                compliance_notes=_as_str_list(data.get("compliance_notes")),
+                provider=provider,
+                model=model,
+            )
+        except ValidationError as exc:
+            raise _invalid("文案", exc) from exc

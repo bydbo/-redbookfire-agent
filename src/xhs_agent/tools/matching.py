@@ -110,7 +110,8 @@ def rank_materials(clue: HotspotClue, materials: list, topk: int = 5, min_score:
     for rank, (score, hits, missing, material) in enumerate(scored[:max(0, topk)], start=1):
         if score < min_score:
             break
-        candidates.append(MatchCandidate(
+        # 候选先以中间态产出（reasons 由 explain_candidates 补齐），再 finalize 成契约终态。
+        candidates.append(MatchCandidate.draft(
             material_id=material.id,
             material=material,
             score=score,
@@ -139,11 +140,13 @@ def explain_candidates(clue: HotspotClue, candidates: list) -> None:
 
     for candidate in candidates:
         if candidate.reasons:
+            candidate.finalize()
             continue
         payload = offline.material_explain(clue.to_dict(), candidate.material.to_dict(),
                                           [h.to_dict() for h in candidate.hits])
         candidate.reasons = payload["reasons"]
         candidate.usage = payload["usage"]
+        candidate.finalize()
 
 
 def dedupe_by_path(materials: list) -> list:
