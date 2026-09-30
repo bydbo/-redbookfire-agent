@@ -34,7 +34,7 @@
 
 **可以自由读**：`src/`、`tests/`、`docs/`、`config/config.toml`、`config/.env.example`、`pyproject.toml`、`README.md`、`AGENTS.md`。
 
-**改之前先说清楚**：`src/xhs_agent/schemas.py`（数据契约，改它会牵动多处）、`pyproject.toml`（依赖）、`AGENTS.md`（规范本身）。
+**改之前先说清楚**：`docs/contracts/`（数据与接口契约，改它会牵动多处）、`src/xhs_agent/models/`（P1 之前为 `schemas.py`，内存实现）、`pyproject.toml`（依赖）、`AGENTS.md`（规范本身）。
 
 **原则上不碰**：
 
@@ -62,7 +62,7 @@ Copy-Item config/.env.example config/.env
 
 # 2. 编辑 config/.env，填入真实密钥
 #    DEEPSEEK_API_KEY=xxx
-#    DASHSCOPE_API_KEY=xxx
+#    DASHSCOPE_API_KEY=xxx        # 仅在使用多模态打标或向量召回时需要，见 docs/contracts/配置契约.md
 
 # 3. 确认它确实被忽略了（应输出匹配到的忽略规则）
 git check-ignore -v config/.env

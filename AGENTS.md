@@ -33,7 +33,7 @@
 
 四条硬约定：
 
-1. `src/xhs_agent/schemas.py` 是**唯一数据契约来源**。新增字段或结构必须先改它，再改使用方。
+1. `docs/contracts/` 是**数据与接口契约的事实源**；`src/xhs_agent/schemas.py`（P1 之后迁至 `models/`）是内存实现，必须与契约逐字段一致。新增字段或结构必须先改契约文件，再改实现，最后改调用方。
 2. 工程根由 `src/xhs_agent/config.py` 上溯三层推导得出，因此 `src/`、`config/`、`data/`、`runs/` 必须保持同级。**不要单独移动其中任何一个**，否则配置与路径会集体失效。
 3. 新增顶层目录前，先在 `docs/项目结构.md` 登记，再更新本表。
 4. **显示名与代码标识分离**：项目显示名（小红书热点搭子）可以改，但 Python 包名 `xhs_agent`、分发名 `xhs-agent`、环境变量前缀 `XHS_` 保持不变；确需改名时按第 6 节流程单独处理，不要顺手替换。
@@ -42,7 +42,7 @@
 
 ## 2. 文件边界
 
-依赖方向只能单向：`workflows/` → `agents/` → `tools/` → `schemas.py`。
+依赖方向只能单向：`workflows/` → `agents/` → `tools/` → `models/`（P1 之前为 `schemas.py`）。
 
 - `tools/` 只放确定性能力，**不得反向调用 `agents/` 或 `workflows/`**。
 - `agents/` 与 `workflows/` 只做编排与判断，不重复实现 `tools/` 里已有的算法。
@@ -76,7 +76,7 @@
 | 运行时依赖 | 必须走第 6 节流程才能引入；引入后同步更新 `docs/技术栈.md` | 空（核心逻辑只用标准库） |
 | 开发依赖 | 允许测试与代码质量工具 | 仅 `pytest` |
 | 系统级依赖 | 仅指外部程序依赖；缺失时只影响对应能力 | `ffmpeg` / `ffprobe` |
-| 前端依赖 | 由 `frontend/package.json` 管理；直接依赖需在提交信息写明理由，禁止引入第二套组件库或状态管理方案 | pnpm + Node 20 LTS |
+| 前端依赖 | 由 `frontend/package.json` 管理；直接依赖需在提交信息写明理由，禁止引入第二套组件库或状态管理方案 | pnpm 11.25.0 + Node 25.3.0 |
 
 - 依赖统一由 `pyproject.toml` 声明、`uv` 管理；`uv.lock` 提交入库。前端依赖由 `frontend/package.json` 声明、pnpm 管理，`pnpm-lock.yaml` 提交入库；`node_modules/` 与 `frontend/dist/` 不入库。
 - Python 版本要求 `>= 3.11`（代码使用了 `tomllib`）。
@@ -133,7 +133,7 @@
 - 密钥模板是 `config/.env.example`（可以入库，只含变量名与占位符）。
 - 真实密钥写在 `config/.env`，该文件被 `.gitignore` 强制忽略，**永不提交**。
 - 代码读取顺序：`config/.env` → 环境变量覆盖。任何模块都不得硬编码密钥，也不得把密钥写进日志、报告或 `runs/` 产物。
-- 支持的环境变量：`DEEPSEEK_API_KEY`、`DASHSCOPE_API_KEY`，以及 `XHS_LLM_PROVIDER`、`XHS_LLM_BASE_URL`、`XHS_LLM_MODEL`、`XHS_LLM_API_KEY`。
+- 支持的环境变量：`DEEPSEEK_API_KEY`（P1 起必填）、`DASHSCOPE_API_KEY`（辅助服务，供多模态打标与向量化，按能力启用时必填）、`DATABASE_URL`（P2 起必填）、`REDIS_URL`（P3 起必填），以及 `XHS_LLM_PROVIDER`、`XHS_LLM_BASE_URL`、`XHS_LLM_MODEL`、`XHS_LLM_API_KEY` 覆盖项。**必填项按阶段分级生效**，完整口径见 `docs/contracts/配置契约.md`。
 - 配置与密钥分离：`config/config.toml` 只放可公开的默认值（模型名、路径、阈值），不放任何凭据。
 - 怀疑密钥已泄漏时：立即停止提交，轮换密钥，再检查 `git log` 与 `git ls-files` 是否已入库。
 

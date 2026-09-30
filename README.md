@@ -93,7 +93,7 @@ uv sync
 
 # 2. 准备配置（必须填密钥：项目不做无密钥降级）
 Copy-Item config/.env.example config/.env
-#    编辑 config/.env 填入 DEEPSEEK_API_KEY 与 DASHSCOPE_API_KEY
+#    编辑 config/.env 填入 DEEPSEEK_API_KEY（P1 必填）；DASHSCOPE_API_KEY 按能力启用时再填
 
 # 3. 验证安装
 uv run python -c "import xhs_agent; print(xhs_agent.__version__)"
