@@ -1,0 +1,749 @@
+openapi: 3.1.0
+
+info:
+  title: 小红书热点搭子 · 热点相关性 API
+  version: 0.1.0
+  summary: 输入热点，在本地素材库中检索可蹭素材并产出文案初稿
+  description: |
+    ## 本文件的地位
+
+    本文件是 API 的**唯一事实源**。代码向契约对齐；改接口必须先改本文件，
+    再改实现，并通过 CI 中的契约一致性校验（见 docs/backlog.md 的 S4.6）。
+
+    ## 设计前提
+
+    - **本地单人工具**：不提供鉴权、不区分用户、不做限流。此处写"不适用"而非留空，
+      是为了让面试追问时能给出明确答案，而不是"还没来得及做"。
+    - **不做运行时降级**：依赖不可用时返回错误码，不返回降级结果。
+    - **分析是异步任务**：`POST /analyze` 立即返回 `job_id`，进度与结果分开查询。
+
+    ## 通用约定
+
+    - 字段名一律 snake_case；时间戳为 RFC 3339（UTC）。
+    - 除报告接口外，响应体均为 `application/json`。
+    - 请求可携带 `X-Request-ID`，响应同值回写；未携带时由服务端生成，并贯穿日志与调用追踪。
+    - `topk` 默认 5，允许范围 1–20；`hotspots` 允许 1–10 条。
+
+    ## 错误码
+
+    | code | HTTP | 含义 |
+    | --- | --- | --- |
+    | `bad_request` | 400 | 请求格式或参数不合法 |
+    | `validation_error` | 422 | 字段级校验失败（如 topk 越界） |
+    | `not_found` | 404 | job_id 或 run_id 不存在 |
+    | `dependency_unavailable` | 503 | 数据库、Redis 或模型服务不可用 |
+    | `upstream_error` | 502 | 上游模型返回错误或连续重试失败 |
+    | `internal_error` | 500 | 未分类的内部错误 |
+  license:
+    name: Proprietary
+servers:
+  - url: http://localhost:8000
+    description: 本地开发环境
+security: []
+tags:
+  - name: 分析
+    description: 提交热点并跟踪任务
+  - name: 结果
+    description: 读取运行结果与报告
+  - name: 运维
+    description: 健康检查与演示页
+
+paths:
+  /:
+    get:
+      tags:
+        - 运维
+      summary: 零构建演示页
+      description: 返回静态 HTML 演示页，可直接提交热点并跳转到报告。
+      operationId: getDemoPage
+      responses:
+        '200':
+          description: 演示页
+          content:
+            text/html:
+              schema:
+                type: string
+
+  /health:
+    get:
+      tags:
+        - 运维
+      summary: 健康检查
+      description: 逐项返回数据库、Redis 与模型服务的可用性；任一不可用时整体状态为 down 并返回 503。
+      operationId: getHealth
+      responses:
+        '200':
+          description: 全部依赖可用
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Health'
+        '503':
+          description: 存在不可用依赖
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Health'
+
+  /analyze:
+    post:
+      tags:
+        - 分析
+      summary: 提交热点分析任务
+      description: |
+        接受一个或多个热点文本，落库生成 hotspot 与 run 记录，投递异步任务后立即返回。
+        同一请求内多个热点按顺序分别分析，互不影响。
+      operationId: createAnalysis
+      parameters:
+        - $ref: '#/components/parameters/RequestId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AnalyzeRequest'
+      responses:
+        '202':
+          description: 任务已接受
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/RequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AnalyzeAccepted'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '422':
+          $ref: '#/components/responses/ValidationError'
+        '502':
+          $ref: '#/components/responses/UpstreamError'
+        '503':
+          $ref: '#/components/responses/DependencyUnavailable'
+
+  /jobs/{job_id}:
+    get:
+      tags:
+        - 分析
+      summary: 查询任务状态
+      description: 轮询任务进度；succeeded 后可凭 run_id 取结果，failed 时 error 字段给出失败原因。
+      operationId: getJob
+      parameters:
+        - $ref: '#/components/parameters/RequestId'
+        - name: job_id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: 任务状态
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/JobStatus'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '503':
+          $ref: '#/components/responses/DependencyUnavailable'
+
+  /runs/{run_id}:
+    get:
+      tags:
+        - 结果
+      summary: 读取运行结果
+      description: 返回该次运行的结构化结果：线索、候选素材、覆盖缺口与文稿。
+      operationId: getRun
+      parameters:
+        - $ref: '#/components/parameters/RequestId'
+        - name: run_id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: 运行结果
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RunDetail'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          description: 运行尚未完成
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '503':
+          $ref: '#/components/responses/DependencyUnavailable'
+
+  /runs/{run_id}/report:
+    get:
+      tags:
+        - 结果
+      summary: 读取报告
+      description: 返回渲染好的报告；html 为自带样式的单文件，md 为可直接复制的文本。
+      operationId: getRunReport
+      parameters:
+        - $ref: '#/components/parameters/RequestId'
+        - name: run_id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+        - name: format
+          in: query
+          required: false
+          schema:
+            type: string
+            enum:
+              - html
+              - md
+            default: html
+      responses:
+        '200':
+          description: 报告内容
+          content:
+            text/html:
+              schema:
+                type: string
+            text/markdown:
+              schema:
+                type: string
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          description: 运行尚未完成
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+components:
+  parameters:
+    RequestId:
+      name: X-Request-ID
+      in: header
+      required: false
+      description: 客户端生成的请求标识；未提供时由服务端生成。用于贯穿日志、调用追踪与数据库记录。
+      schema:
+        type: string
+        maxLength: 128
+
+  headers:
+    RequestId:
+      description: 本次请求的标识
+      schema:
+        type: string
+
+  responses:
+    BadRequest:
+      description: 请求格式或参数不合法
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+    ValidationError:
+      description: 字段级校验失败
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+    NotFound:
+      description: 资源不存在
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+    DependencyUnavailable:
+      description: 依赖不可用（不做降级，直接返回错误）
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+    UpstreamError:
+      description: 上游服务错误
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+
+  schemas:
+    AnalyzeRequest:
+      type: object
+      additionalProperties: false
+      required:
+        - hotspots
+      properties:
+        hotspots:
+          type: array
+          minItems: 1
+          maxItems: 10
+          description: 热点文本列表（话题句或链接文本均可）
+          items:
+            type: string
+            minLength: 1
+            maxLength: 500
+        topk:
+          type: integer
+          minimum: 1
+          maximum: 20
+          default: 5
+          description: 每个热点返回的候选素材数量上限
+
+    AnalyzeAccepted:
+      type: object
+      required:
+        - job_id
+        - run_id
+      properties:
+        job_id:
+          type: string
+          description: 异步任务标识，用于轮询状态
+        run_id:
+          type: string
+          format: uuid
+          description: 运行记录标识，用于读取结果与报告
+
+    JobStatus:
+      type: object
+      required:
+        - job_id
+        - run_id
+        - status
+        - progress
+      properties:
+        job_id:
+          type: string
+        run_id:
+          type: string
+          format: uuid
+        status:
+          type: string
+          enum:
+            - queued
+            - running
+            - succeeded
+            - failed
+        progress:
+          type: number
+          minimum: 0
+          maximum: 1
+          description: 0–1 的完成比例
+        current_step:
+          type: string
+          description: 当前所处步骤（拆解 / 检索 / 缺口 / 撰稿 / 报告）
+        error:
+          oneOf:
+            - $ref: '#/components/schemas/ErrorResponse'
+            - type: 'null'
+
+    RunDetail:
+      type: object
+      required:
+        - run_id
+        - status
+        - created_at
+        - totals
+        - hotspots
+      properties:
+        run_id:
+          type: string
+          format: uuid
+        status:
+          type: string
+          enum:
+            - queued
+            - running
+            - succeeded
+            - failed
+        created_at:
+          type: string
+          format: date-time
+        finished_at:
+          oneOf:
+            - type: string
+              format: date-time
+            - type: 'null'
+        totals:
+          $ref: '#/components/schemas/RunTotals'
+        hotspots:
+          type: array
+          description: 本次运行中每个热点的分析结果
+          items:
+            $ref: '#/components/schemas/HotspotResult'
+
+    HotspotResult:
+      type: object
+      required:
+        - hotspot_id
+        - hotspot_raw
+        - clue
+        - coverage
+        - candidates
+      properties:
+        hotspot_id:
+          type: string
+          format: uuid
+        hotspot_raw:
+          type: string
+        clue:
+          $ref: '#/components/schemas/HotspotClue'
+        coverage:
+          $ref: '#/components/schemas/Coverage'
+        candidates:
+          type: array
+          items:
+            $ref: '#/components/schemas/MatchCandidate'
+        draft:
+          oneOf:
+            - $ref: '#/components/schemas/Draft'
+            - type: 'null'
+
+    HotspotClue:
+      type: object
+      required:
+        - why_it_works
+        - mechanisms
+        - elements
+      properties:
+        why_it_works:
+          type: array
+          items:
+            type: string
+        mechanisms:
+          type: array
+          items:
+            type: object
+            required:
+              - name
+            properties:
+              name:
+                type: string
+              explain:
+                type: string
+        elements:
+          type: array
+          items:
+            $ref: '#/components/schemas/Element'
+        match_keywords:
+          type: array
+          items:
+            type: string
+        audience:
+          type: object
+          additionalProperties: true
+        borrow_angles:
+          type: array
+          items:
+            type: string
+        risk_notes:
+          type: array
+          items:
+            type: string
+
+    Element:
+      type: object
+      required:
+        - type
+        - value
+      properties:
+        type:
+          type: string
+          description: 爆点要素类型，口径见 docs/产品方案.md 第六节
+          enum:
+            - ip
+            - topic
+            - scene
+            - visual
+            - emotion
+            - sound
+            - conflict
+            - format
+            - audience
+        value:
+          type: string
+        weight:
+          type: number
+          minimum: 0
+          maximum: 1
+          default: 0.6
+        confidence:
+          type: number
+          minimum: 0
+          maximum: 1
+          default: 0.7
+        evidence:
+          type: string
+
+    Coverage:
+      type: object
+      required:
+        - ratio
+        - covered
+        - gaps
+      properties:
+        ratio:
+          type: number
+          minimum: 0
+          maximum: 1
+          description: 被素材命中的线索要素权重占比
+        covered:
+          type: array
+          items:
+            $ref: '#/components/schemas/Element'
+        gaps:
+          type: array
+          items:
+            $ref: '#/components/schemas/Element'
+
+    MatchCandidate:
+      type: object
+      required:
+        - rank
+        - material_id
+        - score
+        - hits
+        - missing
+        - reasons
+        - usage
+        - material
+      properties:
+        rank:
+          type: integer
+          minimum: 1
+        material_id:
+          type: string
+          format: uuid
+        score:
+          type: number
+          minimum: 0
+          maximum: 1
+        recall_sources:
+          type: array
+          description: 该素材由哪些召回通道带回（literal / vector），用于解释排序来源
+          items:
+            type: string
+            enum:
+              - literal
+              - vector
+        hits:
+          type: array
+          items:
+            $ref: '#/components/schemas/MatchHit'
+        missing:
+          type: array
+          items:
+            $ref: '#/components/schemas/Element'
+        reasons:
+          type: array
+          description: 为什么相关；不允许为空，系统不允许出现无理由候选
+          minItems: 1
+          items:
+            type: string
+        usage:
+          type: string
+          description: 建议怎么用（放开头 3 秒 / 当过程画面等）
+        material:
+          $ref: '#/components/schemas/MaterialSummary'
+
+    MatchHit:
+      type: object
+      required:
+        - element_type
+        - clue_value
+      properties:
+        element_type:
+          type: string
+          enum:
+            - ip
+            - topic
+            - scene
+            - visual
+            - emotion
+            - sound
+            - conflict
+            - format
+            - audience
+        clue_value:
+          type: string
+        hit_value:
+          type: string
+        similarity:
+          type: number
+          minimum: 0
+          maximum: 1
+        contribution:
+          type: number
+          minimum: 0
+          maximum: 1
+
+    MaterialSummary:
+      type: object
+      required:
+        - id
+        - path
+        - type
+      properties:
+        id:
+          type: string
+          format: uuid
+        path:
+          type: string
+        type:
+          type: string
+          enum:
+            - video
+            - image
+        title:
+          type: string
+        description:
+          type: string
+        tags:
+          type: array
+          items:
+            type: string
+        duration_s:
+          type: number
+        width:
+          type: integer
+        height:
+          type: integer
+        has_audio:
+          type: boolean
+        keyframes:
+          type: array
+          items:
+            type: string
+
+    Draft:
+      type: object
+      required:
+        - titles
+        - body
+        - tags
+      properties:
+        titles:
+          type: array
+          description: 标题备选，小红书标题上限 20 字
+          maxItems: 5
+          items:
+            type: object
+            required:
+              - text
+            properties:
+              text:
+                type: string
+                maxLength: 20
+              style:
+                type: string
+        cover_text:
+          type: string
+        first_3s:
+          type: string
+        body:
+          type: string
+        tags:
+          type: array
+          maxItems: 12
+          items:
+            type: string
+        shot_list:
+          type: array
+          items:
+            type: string
+        compliance_notes:
+          type: array
+          items:
+            type: string
+
+    RunTotals:
+      type: object
+      required:
+        - llm_calls
+        - prompt_tokens
+        - completion_tokens
+        - cost_cny
+        - latency_ms
+      properties:
+        llm_calls:
+          type: integer
+          minimum: 0
+        prompt_tokens:
+          type: integer
+          minimum: 0
+        completion_tokens:
+          type: integer
+          minimum: 0
+        cost_cny:
+          type: number
+          minimum: 0
+        latency_ms:
+          type: integer
+          minimum: 0
+
+    Health:
+      type: object
+      required:
+        - status
+        - checks
+      properties:
+        status:
+          type: string
+          enum:
+            - ok
+            - down
+        checks:
+          type: object
+          required:
+            - db
+            - redis
+            - llm
+          properties:
+            db:
+              $ref: '#/components/schemas/ComponentHealth'
+            redis:
+              $ref: '#/components/schemas/ComponentHealth'
+            llm:
+              $ref: '#/components/schemas/ComponentHealth'
+
+    ComponentHealth:
+      type: object
+      required:
+        - status
+      properties:
+        status:
+          type: string
+          enum:
+            - ok
+            - down
+        detail:
+          type: string
+        latency_ms:
+          type: integer
+          minimum: 0
+
+    ErrorResponse:
+      type: object
+      required:
+        - code
+        - message
+      properties:
+        code:
+          type: string
+          enum:
+            - bad_request
+            - validation_error
+            - not_found
+            - dependency_unavailable
+            - upstream_error
+            - internal_error
+        message:
+          type: string
+        detail:
+          type: object
+          additionalProperties: true
