@@ -7,7 +7,7 @@
 # auto = 有密钥走在线模型；改造后将取消 auto / offline 的降级语义，缺密钥直接启动失败（见 docs/技术栈.md）
 provider = "auto"
 base_url = "https://api.deepseek.com/v1"
-model = "deepseek-chat"
+model = "deepseek-flash"    # 2026-07-24 起 deepseek-chat 已停用；现役名称 deepseek-flash / deepseek-v4-pro
 api_key = ""                  # 留空，密钥请写进 config/.env
 api_key_env = "DEEPSEEK_API_KEY"
 temperature = 0.6

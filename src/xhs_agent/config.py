@@ -24,7 +24,7 @@ ENV_OVERRIDES = {
 class LLMConfig:
     provider: str = "auto"  # auto | openai_compatible | offline
     base_url: str = "https://api.deepseek.com/v1"
-    model: str = "deepseek-chat"
+    model: str = "deepseek-flash"
     api_key: str = ""
     api_key_env: str = "DEEPSEEK_API_KEY"
     temperature: float = 0.6
