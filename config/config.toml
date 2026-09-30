@@ -14,8 +14,11 @@ temperature = 0.6
 max_tokens = 2000
 timeout_s = 60
 max_retries = 2
-price_in_per_m = 1.0          # 元/百万 token，仅用于成本估算
-price_out_per_m = 2.0
+# 成本估算单价（人民币元/百万 token），仅用于成本估算
+# 由 DeepSeek deepseek-flash 官方美元价 × 汇率 7.2 折算，取高价时段以免低估
+# 高价时段：输入 $0.3、输出 $1.2；低价时段为其一半（$0.15 / $0.6）
+price_in_per_m = 2.16
+price_out_per_m = 8.64
 
 [vision]
 enabled = true                # 关闭后素材打标退回文件名与人工说明

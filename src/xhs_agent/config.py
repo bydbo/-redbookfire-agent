@@ -31,8 +31,9 @@ class LLMConfig:
     max_tokens: int = 2000
     timeout_s: int = 60
     max_retries: int = 2
-    price_in_per_m: float = 1.0   # 元/百万 token，仅用于成本估算
-    price_out_per_m: float = 2.0
+    # 成本估算单价（人民币元/百万 token）＝ DeepSeek 高价时段单价（$0.3 / $1.2）× 汇率 7.2
+    price_in_per_m: float = 2.16
+    price_out_per_m: float = 8.64
 
     def resolved_key(self) -> str:
         return (self.api_key or os.environ.get(self.api_key_env, "")).strip()
