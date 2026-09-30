@@ -2,11 +2,11 @@
 
 - 状态：已采纳
 - 日期：2026-09-30
-- 关联：`docs/contracts/openapi.yaml`（`/analyze` 的异步模型）、`docs/contracts/配置契约.md` `[queue]` 段
+- 关联：`docs/contracts/openapi.yaml`（`/api/analyze` 的异步模型）、`docs/contracts/配置契约.md` `[queue]` 段
 
 ## 背景
 
-素材索引与热点分析都是长任务（数十秒到数分钟），接口必须异步化：`POST /analyze` 立即返回 `job_id`，前端轮询状态。需要一个任务队列来承接，broker 与 result backend 复用 Redis。
+素材索引与热点分析都是长任务（数十秒到数分钟），接口必须异步化：`POST /api/analyze` 立即返回 `job_id`，前端轮询状态。需要一个任务队列来承接，broker 与 result backend 复用 Redis。
 
 服务本身是 async FastAPI，因此候选里既有原生异步的队列，也有传统的同步队列。
 

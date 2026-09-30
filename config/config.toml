@@ -39,3 +39,36 @@ ip = 0.4
 materials_dir = "data/materials"
 runs_dir = "runs"
 index_dir = "runs/_index"
+
+# 【待落地】以下配置段在企业化改造落地后启用；字段与默认值见 docs/contracts/配置契约.md 第三节
+#
+# [embedding]
+# base_url = "https://dashscope.aliyuncs.com/compatible-mode/v1"
+# model = "text-embedding-v3"
+# dim = 1024
+# batch_size = 16
+# api_key_env = "DASHSCOPE_API_KEY"
+#
+# [retrieval]
+# similarity_threshold = 0.2
+# recall_limit = 50
+# max_cosine_distance = 0.35
+# rrf_k = 60
+# w_element = 0.7
+# w_rrf = 0.3
+# hit_threshold = 0.5
+#
+# [frontend]
+# serve = true
+# dist_dir = "frontend/dist"
+# dev_server_url = "http://localhost:5173"
+#
+# [database]
+# pool_size = 5
+# max_overflow = 10
+# echo = false
+#
+# [queue]
+# task_soft_time_limit_s = 600
+# task_time_limit_s = 900
+# max_retries = 2
