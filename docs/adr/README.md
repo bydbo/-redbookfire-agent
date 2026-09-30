@@ -51,3 +51,5 @@
 | [0005](0005-langfuse-cloud.md) | 可观测选 Langfuse Cloud 而非自建 | 已采纳 |
 | [0006](0006-deterministic-ranking.md) | 检索排序不交给大模型 | 已采纳 |
 | [0007](0007-contract-first-openapi.md) | 契约唯一源 + OpenAPI 3.1 | 已采纳 |
+| [0008](0008-frontend-vue-vite.md) | 前端引入 Vue 3 + Vite 工程 | 已采纳 |
+| [0009](0009-api-prefix.md) | API 路径统一加 /api 前缀 | 已采纳 |

@@ -72,6 +72,9 @@
 | 可观测 | Langfuse Cloud + structlog，run_id 贯穿全链路 |
 | 容器化 / CI | Docker Compose（api / worker / postgres / redis）；GitHub Actions |
 | 代码质量 / 测试 | ruff + mypy + pre-commit；pytest + pytest-asyncio + pytest-cov + testcontainers |
+| 前端 | Vue 3 + Vite + TypeScript + Pinia + Vue Router |
+| UI 与可视化 | Naive UI + Tailwind CSS + ECharts |
+| 接口类型 | `openapi-typescript` 从契约生成 TS 类型 |
 
 以上组件**尚未落地**，落地顺序见 `docs/技术栈.md` 第四节。**简历只写已经落地的技术栈。**
 
@@ -115,6 +118,7 @@ project/
 │   ├─ .env.example       密钥模板（可入库）
 │   └─ .env               真实密钥（本地文件，永不入库）
 ├─ data/materials/        本地素材库（不入库）
+├─ frontend/              Vue 3 单页应用（源码与构建配置）
 ├─ docs/                  全部文档
 ├─ evals/                 评测用例与脱敏示例素材包
 ├─ runs/                  运行产物（不入库）
@@ -168,8 +172,9 @@ uv run pytest
 | --- | --- |
 | P1 工程骨架 | 契约重构、配置加载、质量门与首批单测 |
 | P2 数据与检索 | Postgres + pgvector、混合召回、评测集 |
-| P3 编排与服务 | LangGraph、FastAPI 六个接口、Celery |
+| P3 编排与服务 | LangGraph、FastAPI 五个接口（/api）、Celery |
 | P4 可观测与交付 | 结构化日志与调用追踪、容器化、CI |
+| P5 前端工程 | Vue 3 单页应用：分析台、结果详情、运行历史 + ECharts 可视化 |
 | v1.1 及以后 | 多热点横向对比、历史回看、自动抓热榜、效果回流 |
 
 **完整的任务分解、依赖关系、验收标准与工作量估算见 `docs/backlog.md`** —— 本文件只列阶段，不重复维护任务清单。

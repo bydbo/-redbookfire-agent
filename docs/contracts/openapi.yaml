@@ -15,7 +15,10 @@ info:
     - **本地单人工具**：不提供鉴权、不区分用户、不做限流。此处写"不适用"而非留空，
       是为了让面试追问时能给出明确答案，而不是"还没来得及做"。
     - **不做运行时降级**：依赖不可用时返回错误码，不返回降级结果。
-    - **分析是异步任务**：`POST /analyze` 立即返回 `job_id`，进度与结果分开查询。
+    - **分析是异步任务**：`POST /api/analyze` 立即返回 `job_id`，进度与结果分开查询。
+    - **API 统一 `/api` 前缀**（见 ADR 0009）：根路径与其余非 `/api` 路径全部交给前端单页应用，
+      前端路由与 API 路径互不干扰。
+    - **前端不在本契约内**：单页应用的构建产物由服务端静态挂载，技术栈见 `docs/技术栈.md`。
 
     ## 通用约定
 
@@ -38,7 +41,7 @@ info:
     name: Proprietary
 servers:
   - url: http://localhost:8000
-    description: 本地开发环境
+    description: 本地与演示环境。API 统一挂载在 /api 前缀下；根路径与前端路由由单页应用处理（见 ADR 0009）。
 security: []
 tags:
   - name: 分析
@@ -46,25 +49,10 @@ tags:
   - name: 结果
     description: 读取运行结果与报告
   - name: 运维
-    description: 健康检查与演示页
+    description: 健康检查
 
 paths:
-  /:
-    get:
-      tags:
-        - 运维
-      summary: 零构建演示页
-      description: 返回静态 HTML 演示页，可直接提交热点并跳转到报告。
-      operationId: getDemoPage
-      responses:
-        '200':
-          description: 演示页
-          content:
-            text/html:
-              schema:
-                type: string
-
-  /health:
+  /api/health:
     get:
       tags:
         - 运维
@@ -85,7 +73,7 @@ paths:
               schema:
                 $ref: '#/components/schemas/Health'
 
-  /analyze:
+  /api/analyze:
     post:
       tags:
         - 分析
@@ -121,7 +109,7 @@ paths:
         '503':
           $ref: '#/components/responses/DependencyUnavailable'
 
-  /jobs/{job_id}:
+  /api/jobs/{job_id}:
     get:
       tags:
         - 分析
@@ -147,7 +135,7 @@ paths:
         '503':
           $ref: '#/components/responses/DependencyUnavailable'
 
-  /runs/{run_id}:
+  /api/runs/{run_id}:
     get:
       tags:
         - 结果
@@ -180,7 +168,7 @@ paths:
         '503':
           $ref: '#/components/responses/DependencyUnavailable'
 
-  /runs/{run_id}/report:
+  /api/runs/{run_id}/report:
     get:
       tags:
         - 结果

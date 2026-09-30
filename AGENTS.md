@@ -29,6 +29,7 @@
 | `data/materials/`          | 本地素材库，**不入库**                                 | 任何需要提交的文件  |
 | `runs/`                    | 运行产物，**不入库**                                  | 手写源码       |
 | `docs/`                    | 全部文档：产品方案、简历与面试、技术栈、项目结构、AI 开发说明、开发规范、契约（`docs/contracts/`）、决策记录（`docs/adr/`）、Backlog（`docs/backlog.md`）             | 代码         |
+| `frontend/`              | Vue 3 单页应用源码、构建与前端测试配置                     | 后端代码、密钥     |
 
 四条硬约定：
 
@@ -51,6 +52,8 @@
 - 禁止在 `src/` 下写运行时数据；禁止在 `tests/` 下写运行产物；测试需要落盘时统一用临时目录并在用例结束时清理。
 - 禁止把密钥、真实素材、运行产物写进任何会被提交的文件。
 - 文档只放 `docs/`；仓库根的 Markdown 只允许 `README.md` 与 `AGENTS.md` 两份。
+- 前端只放 `frontend/`，不得在 `src/` 里写前端代码；前端不得直接访问数据库，所有数据经 `/api` 获取。
+- 接口类型必须由 `openapi-typescript` 从 `docs/contracts/openapi.yaml` 生成，禁止手写并行类型定义。
 
 ---
 
@@ -73,8 +76,9 @@
 | 运行时依赖 | 必须走第 6 节流程才能引入；引入后同步更新 `docs/技术栈.md` | 空（核心逻辑只用标准库） |
 | 开发依赖 | 允许测试与代码质量工具 | 仅 `pytest` |
 | 系统级依赖 | 仅指外部程序依赖；缺失时只影响对应能力 | `ffmpeg` / `ffprobe` |
+| 前端依赖 | 由 `frontend/package.json` 管理；直接依赖需在提交信息写明理由，禁止引入第二套组件库或状态管理方案 | pnpm + Node 20 LTS |
 
-- 依赖统一由 `pyproject.toml` 声明、`uv` 管理；`uv.lock` 提交入库。
+- 依赖统一由 `pyproject.toml` 声明、`uv` 管理；`uv.lock` 提交入库。前端依赖由 `frontend/package.json` 声明、pnpm 管理，`pnpm-lock.yaml` 提交入库；`node_modules/` 与 `frontend/dist/` 不入库。
 - Python 版本要求 `>= 3.11`（代码使用了 `tomllib`）。
 - 完整技术栈清单以 `docs/技术栈.md` 为准，本文件只写规则。
 - **引入企业级组件（Web 框架、数据校验、向量检索、数据库、容器化、可观测等）属于计划内演进**，按第 6 节流程走即可，不算违规。
