@@ -1,0 +1,47 @@
+# 本地开发依赖：PostgreSQL 16 + pgvector、Redis。
+# 只服务本地开发与集成测试；api / worker / Dockerfile 属于 E4（S4.4）。
+# 镜像 tag 一律固定（不写 latest），升级时同步改 docs/技术栈.md。
+# 用法：docker compose up -d --wait ／ docker compose ps ／ docker compose down
+name: xhs-agent
+
+services:
+  postgres:
+    image: pgvector/pgvector:0.8.6-pg16
+    container_name: xhs-postgres
+    environment:
+      POSTGRES_USER: xhs
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-xhs}
+      POSTGRES_DB: xhs
+      TZ: Asia/Shanghai
+    ports:
+      - "127.0.0.1:5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      # 扩展由初始化脚本预建（数据契约 §6 迁移策略），迁移里只用 IF NOT EXISTS 兜底
+      - ./docker/postgres/init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U xhs -d xhs"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 10s
+    restart: unless-stopped
+
+  redis:
+    image: redis:7.4.11-alpine
+    container_name: xhs-redis
+    command: ["redis-server", "--appendonly", "yes"]
+    ports:
+      - "127.0.0.1:6379:6379"
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+
+volumes:
+  pgdata:
+  redisdata:

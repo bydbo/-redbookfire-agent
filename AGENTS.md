@@ -29,6 +29,7 @@
 | `data/materials/`          | 本地素材库，**不入库**                                 | 任何需要提交的文件  |
 | `runs/`                    | 运行产物，**不入库**                                  | 手写源码       |
 | `scripts/`                 | 一次性运维与数据生成脚本（建库、生成示例素材包）                      | 业务流程、被运行时 import 的代码 |
+| `docker/`                  | 容器初始化文件（PostgreSQL 扩展、数据库初始化；compose 与集成测试共用）   | 应用代码、业务流程 |
 | `docs/`                    | 全部文档：产品方案、简历与面试、技术栈、项目结构、AI 开发说明、开发规范、契约（`docs/contracts/`）、决策记录（`docs/adr/`）、Backlog（`docs/backlog.md`）             | 代码         |
 | `frontend/`              | Vue 3 单页应用源码、构建与前端测试配置                     | 后端代码、密钥     |
 

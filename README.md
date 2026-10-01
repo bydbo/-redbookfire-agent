@@ -67,7 +67,7 @@
 | Web 服务 | FastAPI + Uvicorn |
 | HTTP 客户端 | httpx（异步、连接池、重试） |
 | Agent 编排 | LangGraph（状态图 + 检查点 + 失败重试） |
-| 数据库 | PostgreSQL 16 + pgvector（Docker Compose 提供） |
+| 数据库与缓存 | PostgreSQL 16 + pgvector 0.8.6、Redis 7.4.11（本地 `docker compose` 起，tag 固定） |
 | 数据访问 | SQLAlchemy 2.0 async + asyncpg + Alembic |
 | 检索 | 混合召回：pg_trgm 字面 + pgvector 语义，RRF 融合后套要素加权 |
 | Embedding | 默认通义 text-embedding-v3（API）；本地小模型为可选实现 |
@@ -87,23 +87,29 @@
 
 前置条件：Python ≥ 3.11、`uv`、`ffmpeg` / `ffprobe`（用于抽帧）。
 
-> **注意**：下面是当前代码可运行的步骤。企业化改造（服务化、数据库、队列）尚未落地，改造后启动方式会变成 `docker compose up`。
+> **注意**：下面是当前代码可运行的步骤。本地依赖（PostgreSQL 16 + pgvector、Redis）已由 `docker-compose.yml` 提供；服务化（FastAPI / Celery）仍在后续阶段。
 
 ```powershell
 # 1. 安装环境（首次需要网络）
 uv sync
 
-# 2. 准备配置（必须填密钥：项目不做无密钥降级）
+# 2. 起本地依赖（PostgreSQL 16 + pgvector、Redis；镜像 tag 固定在 docker-compose.yml）
+docker compose up -d --wait
+
+# 3. 准备配置（必须填必填项：项目不做无密钥降级）
 Copy-Item config/.env.example config/.env
-#    编辑 config/.env 填入 DEEPSEEK_API_KEY（P1 必填）；DASHSCOPE_API_KEY 按能力启用时再填
+#    编辑 config/.env 填 DEEPSEEK_API_KEY（P1 必填）与 DATABASE_URL（P2 必填，
+#    本地默认 postgresql+asyncpg://xhs:xhs@localhost:5432/xhs）；
+#    DASHSCOPE_API_KEY 按能力启用时再填，REDIS_URL 到 P3 才必填
 
-# 3. 验证安装
+# 4. 验证安装与本地依赖（两个服务应是 healthy）
 uv run python -c "import xhs_agent; print(xhs_agent.__version__)"
+docker compose ps
 
-# 4. 验证配置读取（输出不应包含任何密钥）
+# 5. 验证配置读取（输出不应包含任何密钥）
 uv run python -c "from xhs_agent.config import load_config; print(load_config().describe())"
 
-# 5. 跑启动前置检查（缺必填项会打印 E_CONFIG_MISSING 并以退出码 2 结束）
+# 6. 跑启动前置检查（缺必填项会打印 E_CONFIG_MISSING 并以退出码 2 结束）
 uv run python -m xhs_agent.probe
 ```
 

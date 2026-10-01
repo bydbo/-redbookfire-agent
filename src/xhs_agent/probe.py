@@ -22,8 +22,8 @@ from dataclasses import dataclass, field
 
 from .config import AppConfig, ConfigError, EnvView, load_config
 
-# 当前阶段：E2 落地后改成 "P2"（届时 DATABASE_URL 自动变为必填），E3 改成 "P3"。
-CURRENT_STAGE = "P1"
+# 当前阶段：S2.1 起进入 P2（DATABASE_URL 变为必填）；E3 落地队列后改成 "P3"。
+CURRENT_STAGE = "P2"
 
 E_CONFIG_MISSING = "E_CONFIG_MISSING"
 E_CONFIG_INVALID = "E_CONFIG_INVALID"

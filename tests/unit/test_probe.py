@@ -25,19 +25,23 @@ def view(**values: str) -> EnvView:
     return EnvView({}, values)
 
 
+DSN = "postgresql+asyncpg://xhs:xhs@localhost:5432/xhs"
+
+
 def names(report) -> list[str]:
     return [problem.name for problem in report.problems]
 
 
 class TestRequiredVariables:
     def test_complete_env_passes(self, tmp_path):
-        report = preflight(make_config(tmp_path), env=view(DEEPSEEK_API_KEY="sk-x"))
+        report = preflight(make_config(tmp_path),
+                           env=view(DEEPSEEK_API_KEY="sk-x", DATABASE_URL=DSN))
         assert report.ok
         assert report.exit_code == 0
         assert report.problems == []
 
     def test_missing_text_model_key_blocks(self, tmp_path):
-        report = preflight(make_config(tmp_path), env=view())
+        report = preflight(make_config(tmp_path), env=view(), stage="P1")
         assert report.exit_code == 2
         assert names(report) == ["DEEPSEEK_API_KEY"]
         assert report.problems[0].code == E_CONFIG_MISSING
@@ -49,10 +53,11 @@ class TestRequiredVariables:
 
     def test_required_name_follows_config(self, tmp_path):
         cfg = make_config(tmp_path, '[llm]\napi_key_env = "MY_LLM_KEY"\n')
-        assert names(preflight(cfg, env=view())) == ["MY_LLM_KEY"]
+        assert names(preflight(cfg, env=view(), stage="P1")) == ["MY_LLM_KEY"]
 
     def test_explicit_override_satisfies_requirement(self, tmp_path):
-        report = preflight(make_config(tmp_path), env=view(XHS_LLM_API_KEY="sk-explicit"))
+        report = preflight(make_config(tmp_path), env=view(XHS_LLM_API_KEY="sk-explicit"),
+                           stage="P1")
         assert report.ok
 
     def test_blank_value_counts_as_missing(self, tmp_path):
@@ -67,35 +72,36 @@ class TestCapabilityGradedRequirements:
 
     def test_vision_enabled_requires_dashscope(self, tmp_path):
         cfg = make_config(tmp_path, "[vision]\nenabled = true\n")
-        report = preflight(cfg, env=view(DEEPSEEK_API_KEY="sk-x"))
+        report = preflight(cfg, env=view(DEEPSEEK_API_KEY="sk-x"), stage="P1")
         assert names(report) == ["DASHSCOPE_API_KEY"]
 
     def test_embedding_enabled_requires_dashscope(self, tmp_path):
         cfg = make_config(tmp_path, "[embedding]\nenabled = true\n")
-        report = preflight(cfg, env=view(DEEPSEEK_API_KEY="sk-x"))
+        report = preflight(cfg, env=view(DEEPSEEK_API_KEY="sk-x"), stage="P1")
         assert names(report) == ["DASHSCOPE_API_KEY"]
 
     def test_both_capabilities_report_one_problem(self, tmp_path):
         cfg = make_config(tmp_path, "[vision]\nenabled = true\n[embedding]\nenabled = true\n")
-        report = preflight(cfg, env=view(DEEPSEEK_API_KEY="sk-x"))
+        report = preflight(cfg, env=view(DEEPSEEK_API_KEY="sk-x"), stage="P1")
         assert names(report) == ["DASHSCOPE_API_KEY"]
 
     def test_capability_key_present_passes(self, tmp_path):
         cfg = make_config(tmp_path, "[vision]\nenabled = true\n")
-        report = preflight(cfg, env=view(DEEPSEEK_API_KEY="sk-x", DASHSCOPE_API_KEY="sk-v"))
+        report = preflight(cfg, env=view(DEEPSEEK_API_KEY="sk-x", DASHSCOPE_API_KEY="sk-v"),
+                           stage="P1")
         assert report.ok
 
 
 class TestStagedRequirements:
     def test_p2_variables_are_not_required_at_p1(self, tmp_path):
-        report = preflight(make_config(tmp_path), env=view(DEEPSEEK_API_KEY="sk-x"))
+        report = preflight(make_config(tmp_path), env=view(DEEPSEEK_API_KEY="sk-x"), stage="P1")
         assert report.ok
         assert "DATABASE_URL" not in names(report)
         assert "REDIS_URL" not in names(report)
 
     def test_malformed_p2_variable_does_not_block_at_p1(self, tmp_path):
         env = view(DEEPSEEK_API_KEY="sk-x", DATABASE_URL="postgres://wrong-scheme")
-        assert preflight(make_config(tmp_path), env=env).ok
+        assert preflight(make_config(tmp_path), env=env, stage="P1").ok
 
     def test_p2_stage_requires_database_url(self, tmp_path):
         report = preflight(make_config(tmp_path), env=view(DEEPSEEK_API_KEY="sk-x"), stage="P2")
@@ -129,7 +135,7 @@ class TestStagedRequirements:
 class TestObservabilityWarning:
     def test_partial_langfuse_only_warns(self, tmp_path):
         env = view(DEEPSEEK_API_KEY="sk-x", LANGFUSE_PUBLIC_KEY="pk")
-        report = preflight(make_config(tmp_path), env=env)
+        report = preflight(make_config(tmp_path), env=env, stage="P1")
         assert report.ok
         assert len(report.warnings) == 1
         assert "LANGFUSE_SECRET_KEY" in report.warnings[0]
@@ -138,7 +144,7 @@ class TestObservabilityWarning:
     def test_complete_langfuse_is_silent(self, tmp_path):
         env = view(DEEPSEEK_API_KEY="sk-x", LANGFUSE_PUBLIC_KEY="pk",
                    LANGFUSE_SECRET_KEY="sk", LANGFUSE_HOST="https://cloud.langfuse.com")
-        report = preflight(make_config(tmp_path), env=env)
+        report = preflight(make_config(tmp_path), env=env, stage="P1")
         assert report.ok and report.warnings == []
 
 
@@ -147,6 +153,7 @@ class TestCommandLine:
         clean_contract_env.setenv("XHS_CONFIG_PATH", str(tmp_path / "config.toml"))
         (tmp_path / "config.toml").write_text("", encoding="utf-8")
         clean_contract_env.setenv("DEEPSEEK_API_KEY", "sk-test-value")
+        clean_contract_env.setenv("DATABASE_URL", DSN)
         assert main([]) == 0
         out = capsys.readouterr().out
         assert "配置摘要（已脱敏）" in out
@@ -178,8 +185,8 @@ class TestCommandLine:
         assert main(["--nope"]) == 2
         assert "未知参数" in capsys.readouterr().err
 
-    def test_current_stage_is_p1(self):
-        assert CURRENT_STAGE == "P1"
+    def test_current_stage_is_p2(self):
+        assert CURRENT_STAGE == "P2"
 
     def test_report_defaults_to_current_stage(self, tmp_path):
         report = preflight(make_config(tmp_path), env=view(DEEPSEEK_API_KEY="sk-x"))

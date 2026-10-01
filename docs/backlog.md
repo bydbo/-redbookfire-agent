@@ -49,7 +49,7 @@
 | 编号 | Story | 依赖 | 验收标准 | 人日 | 状态 |
 | --- | --- | --- | --- | --- | --- |
 | S2.0 | 评测集与示例素材包制作 | — | 按产品方案 §10.1 的标注标准完成 20 组用例（覆盖五类场景）；`evals/fixtures/demo_pack/` 含 12–20 条素材与旁车说明；**不依赖任何代码，可立即开工**（落地时七维度全标 + v1 冻结校验） | 3 | ✅ |
-| S2.1 | Compose 起 Postgres + Redis | — | `docker compose up` 后数据库含 `vector` 与 `pg_trgm` 扩展，pgvector ≥ 0.5；镜像 tag 固定 | 1 | ⬜ |
+| S2.1 | Compose 起 Postgres + Redis | — | `docker compose up` 后数据库含 `vector` 与 `pg_trgm` 扩展，pgvector ≥ 0.5；镜像 tag 固定（实测 vector 0.8.6 / pg_trgm 1.6 / PG 16.15 / Redis 7.4.11） | 1 | ✅ |
 | S2.9 | 集成测试基座 | S2.1 | 引入 testcontainers 与 pytest-asyncio，提供可复用的 Postgres / Redis 容器夹具；`uv run pytest` 默认只跑单元用例，集成用例以 `-m integration` 显式触发。**必须先于 S2.2 完成**：S2.2 起各 Story 的验收都要求集成用例通过，基座缺席会形成循环依赖 | 3 | ⬜ |
 | S2.2 | SQLAlchemy async 模型与会话 | S1.1, S2.1 | 五张表映射完整，字段与数据契约逐项对齐；testcontainers 集成用例通过 | 1.5 | ⬜ |
 | S2.3 | Alembic 初始迁移 | S2.2 | `upgrade head` 建齐表与索引；`downgrade` 可回滚且不删扩展；迁移往返（upgrade→downgrade→upgrade）集成用例通过 | 1 | ⬜ |
@@ -139,7 +139,7 @@ GET /api/runs/{run_id}/report → 返回完整 HTML 报告
 
 | 风险 | 影响 | 应对 |
 | --- | --- | --- |
-| Docker Desktop 未启动、C 盘仅剩约 33 GB | S2.1 起无法推进 | 开工前启动 Docker，并把镜像存储位置迁到 D 盘 |
+| Docker Desktop 未启动 / 镜像拉取受限 | S2.1 起无法推进 | **已缓解（2026-10-01）**：Docker Desktop 已运行（server 29.8.0），数据盘已在 `D:\docker\DockerDesktopWSL`，registry 加速器已配置；实测 `docker compose up -d --wait` 起服务成功 |
 | 依赖安装需要网络，当前环境受限 | E1–E4 每阶段都被阻塞 | 提前统一授权安装类命令，避免每个 Story 卡一次 |
 | embedding 模型实际输出维度与契约写的 1024 不一致 | S2.3 起全链路返工（维度在建表时固化） | 已升格为 E2 开工前置条件（见第三节的 DoR 说明），不再只是一句口头承诺 |
 | Celery 同步模型与 async 代码的阻抗 | S3.4 出现难排查的阻塞 | 在 S3.4 一次性确定统一写法并写进 `docs/开发规范.md` |
