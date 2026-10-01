@@ -6,8 +6,13 @@
 from __future__ import annotations
 
 from xhs_agent.config import AppConfig, EnvView, load_config
-from xhs_agent.probe import (CURRENT_STAGE, E_CONFIG_INVALID, E_CONFIG_MISSING,
-                             main, preflight)
+from xhs_agent.probe import (
+    CURRENT_STAGE,
+    E_CONFIG_INVALID,
+    E_CONFIG_MISSING,
+    main,
+    preflight,
+)
 
 
 def make_config(tmp_path, body: str = "") -> AppConfig:

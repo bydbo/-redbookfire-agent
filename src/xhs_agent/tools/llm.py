@@ -12,8 +12,8 @@ import json
 import time
 import urllib.error
 import urllib.request
+from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import Callable
 
 from ..config import AppConfig, LLMConfig
 from ..util import extract_json
@@ -238,7 +238,7 @@ class StructuredCaller:
     ):
         prompt = user
         last_error = ""
-        for attempt in range(self.max_repairs + 1):
+        for _attempt in range(self.max_repairs + 1):
             result = self.provider.complete(LLMCall(task=task, system=system, user=prompt,
                                                     context=context or {}, json_mode=json_mode))
             self.records.append(result.record(task))

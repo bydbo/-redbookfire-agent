@@ -11,8 +11,14 @@ import os
 
 import pytest
 
-from xhs_agent.config import (PROJECT_ROOT, AppConfig, ConfigError, EnvView,
-                              config_to_dict, load_config)
+from xhs_agent.config import (
+    PROJECT_ROOT,
+    AppConfig,
+    ConfigError,
+    EnvView,
+    config_to_dict,
+    load_config,
+)
 
 
 def write_config(tmp_path, body: str) -> str:

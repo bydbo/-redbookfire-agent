@@ -222,7 +222,6 @@ def elements_from_tags(tags: list, description: str = "", title: str = "") -> li
 def keywords_from_text(text: str, limit: int = 12) -> list:
     """从文本里抽出可用来做关键词命中的词，词典命中优先。"""
     keywords = [value for _type, value, _surface in detect(text)]
-    norm = normalize_text(text)
     for chunk in _chunks(text):
         chunk_norm = normalize_text(chunk)
         if 2 <= len(chunk_norm) <= 12 and chunk_norm not in [normalize_text(k) for k in keywords]:

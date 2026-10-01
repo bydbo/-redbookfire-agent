@@ -21,11 +21,19 @@ from __future__ import annotations
 import os
 import shutil
 import tomllib
-from typing import Any, Mapping
+from collections.abc import Mapping
+from typing import Any
 
 from dotenv import dotenv_values
-from pydantic import (BaseModel, ConfigDict, Field, PrivateAttr, ValidationError,
-                      field_validator, model_validator)
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    PrivateAttr,
+    ValidationError,
+    field_validator,
+    model_validator,
+)
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -201,7 +209,7 @@ class RetrievalConfig(_Section):
     hit_threshold: float = Field(0.5, ge=0, le=1)
 
     @model_validator(mode="after")
-    def _weights_sum_to_one(self) -> "RetrievalConfig":
+    def _weights_sum_to_one(self) -> RetrievalConfig:
         if abs(self.w_element + self.w_rrf - 1.0) > 1e-6:
             raise ValueError("w_element 与 w_rrf 之和必须为 1")
         return self
@@ -216,7 +224,7 @@ class MatchConfig(_Section):
 
     @field_validator("element_type_weights", mode="before")
     @classmethod
-    def _check_type_weights(cls, value: Any) -> dict:
+    def _check_type_weights(cls, value: Any) -> dict[str, float]:
         out: dict[str, float] = {}
         for key, item in dict(value or {}).items():
             try:
@@ -266,7 +274,7 @@ class QueueConfig(_Section):
     max_retries: int = Field(2, ge=0, le=10)
 
     @model_validator(mode="after")
-    def _hard_limit_not_below_soft(self) -> "QueueConfig":
+    def _hard_limit_not_below_soft(self) -> QueueConfig:
         if self.task_time_limit_s < self.task_soft_time_limit_s:
             raise ValueError("task_time_limit_s 必须 >= task_soft_time_limit_s")
         return self
@@ -337,7 +345,7 @@ class AppConfig(_Section):
     def index_dir(self) -> str:
         return self.paths.resolved(self.paths.index_dir)
 
-    def describe(self) -> dict:
+    def describe(self) -> dict[str, Any]:
         """脱敏配置摘要：只出现布尔值与掩码，可安全写进启动日志。"""
         public, secret, host = self.langfuse_keys
         return {
@@ -425,7 +433,7 @@ def _format_validation_error(exc: ValidationError) -> str:
     return "；".join(parts)
 
 
-def _deep_merge(base: dict, extra: dict) -> dict:
+def _deep_merge(base: dict[str, Any], extra: dict[str, Any]) -> dict[str, Any]:
     out = dict(base)
     for key, value in extra.items():
         if isinstance(value, dict) and isinstance(out.get(key), dict):
@@ -435,9 +443,9 @@ def _deep_merge(base: dict, extra: dict) -> dict:
     return out
 
 
-def _flat_override_data(overrides: _FlatOverrides) -> dict:
+def _flat_override_data(overrides: _FlatOverrides) -> dict[str, Any]:
     """把显式给出的覆盖项折成嵌套 dict；空字符串表示「没给」，不覆盖。"""
-    data: dict = {}
+    data: dict[str, Any] = {}
     for field_name, path in FLAT_OVERRIDE_TARGETS:
         if field_name not in overrides.model_fields_set:
             continue
@@ -465,7 +473,7 @@ def _resolve_config_path(path: str | None, environ: Mapping[str, str]) -> tuple[
     return os.path.abspath(DEFAULT_CONFIG_PATH), False
 
 
-def _read_toml(config_path: str, explicit: bool) -> dict:
+def _read_toml(config_path: str, explicit: bool) -> dict[str, Any]:
     if not os.path.exists(config_path):
         if explicit:
             raise ConfigError(
@@ -519,7 +527,7 @@ def load_config(path: str | None = None, *, env_file: str | None = None) -> AppC
     return cfg
 
 
-def config_to_dict(cfg: AppConfig) -> dict:
+def config_to_dict(cfg: AppConfig) -> dict[str, Any]:
     """配置快照（脱敏）：不含任何密钥，可安全写入日志或报告。"""
     data = cfg.model_dump()
     data["config_path"] = cfg.config_path

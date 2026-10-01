@@ -16,7 +16,12 @@ dependencies = [
 
 # 开发依赖：测试与代码质量工具
 [dependency-groups]
-dev = ["pytest>=8.0"]
+dev = [
+    "mypy>=2.3.1",
+    "pre-commit>=4.6.2",
+    "pytest>=8.0",
+    "ruff>=0.16.9",
+]
 
 [build-system]
 requires = ["hatchling"]
@@ -27,3 +32,20 @@ packages = ["src/xhs_agent"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+
+# 代码质量门（S1.3）：规则集显式写死，避免 ruff 默认集随版本漂移。
+# 本次不启用 ruff format；formatter 与 line-length 留到单独一次提交（docs/backlog.md S1.3）。
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F", "I", "UP", "B", "C4", "SIM"]
+
+# mypy 严格模式先覆盖新代码。pydantic 插件是必需的：否则 Field(default_factory=Model)
+# 会误报，pydantic-settings 的 _env_file 这类初始化参数也解析不了。
+# 存量 tools/、util.py 与 tests/ 逐阶段收紧，见 docs/backlog.md S1.3。
+[tool.mypy]
+plugins = ["pydantic.mypy"]
+strict = true
+files = [
+    "src/xhs_agent/schemas.py",
+    "src/xhs_agent/config.py",
+    "src/xhs_agent/probe.py",
+]

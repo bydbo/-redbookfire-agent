@@ -12,9 +12,20 @@ import json
 import pytest
 from pydantic import ValidationError
 
-from xhs_agent.schemas import (DEFAULT_TYPE_WEIGHTS, ELEMENT_TYPES, TYPE_LABELS,
-                               Coverage, Draft, Element, ElementHit, HotspotClue,
-                               MatchCandidate, Material, Mechanism, SchemaError)
+from xhs_agent.schemas import (
+    DEFAULT_TYPE_WEIGHTS,
+    ELEMENT_TYPES,
+    TYPE_LABELS,
+    Coverage,
+    Draft,
+    Element,
+    ElementHit,
+    HotspotClue,
+    MatchCandidate,
+    Material,
+    Mechanism,
+    SchemaError,
+)
 
 
 def _material(**overrides) -> Material:

@@ -1,0 +1,26 @@
+# 提交前质量门（S1.3）。
+# 全部用 repo: local + language: system，命令走 uv run：复用 uv.lock 里同一套工具版本，
+# 不需要为 hook 另外安装环境，装好之后离线可用。
+# 规则与范围见 AGENTS.md 第 4、5、7、10 节与 docs/backlog.md 的 S1.3。
+default_install_hook_types: [pre-commit]
+repos:
+  - repo: local
+    hooks:
+      - id: ruff
+        name: ruff check（lint，自动修复）
+        entry: uv run ruff check --fix --force-exclude
+        language: system
+        types_or: [python, pyi]
+        require_serial: true
+      - id: mypy
+        name: mypy（新代码严格模式）
+        entry: uv run mypy
+        language: system
+        pass_filenames: false
+        files: ^(src/|tests/|pyproject\.toml|uv\.lock)
+      - id: pytest
+        name: pytest（单元测试）
+        entry: uv run pytest -q
+        language: system
+        pass_filenames: false
+        files: ^(src/|tests/|pyproject\.toml|uv\.lock)

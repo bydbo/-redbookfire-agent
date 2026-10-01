@@ -49,7 +49,7 @@
 | 语言 | Python ≥ 3.11 |
 | 包管理与构建 | uv + `pyproject.toml`（hatchling 后端，src 布局） |
 | 运行时依赖 | pydantic v2、pydantic-settings、python-dotenv |
-| 开发依赖 | pytest |
+| 开发依赖 | pytest、ruff、mypy、pre-commit |
 | 文本模型接入 | OpenAI 兼容 `/chat/completions` 协议（默认 DeepSeek），标准库 `urllib` 直连，JSON mode 结构化输出 + 解析失败自修 |
 | 多模态接入 | 通义千问 VL（`qwen-vl-max`），关键帧 base64 内联 |
 | 音视频处理 | ffmpeg / ffprobe（用于探测与抽帧；缺失时跳过抽帧，属能力裁剪） |
@@ -151,10 +151,19 @@ project/
 ## 测试与开发规范
 
 ```powershell
+# 质量门：lint + 类型检查（mypy 严格模式目前覆盖 schemas / config / probe）
+uv run ruff check .
+uv run mypy
+
+# 全量单元测试
 uv run pytest
+
+# 提交前钩子：装一次即可，之后每次 commit 自动跑上面三条
+uv run pre-commit install
+uv run pre-commit run --all-files
 ```
 
-当前 `tests/unit/` 已有 `schemas.py` 的契约测试，`uv run pytest` 应全绿；`tools/` 的行为回归见 `docs/backlog.md` 的 S1.4。
+当前 `tests/unit/` 已有数据契约、配置加载与启动前置检查的用例，`uv run pytest` 应全绿；`tools/` 的行为回归见 `docs/backlog.md` 的 S1.4。
 
 开发前请先读 `AGENTS.md`（AI 开发规范，含目录约定、文件边界、测试要求、依赖策略、提交检查清单）：
 

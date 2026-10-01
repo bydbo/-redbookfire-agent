@@ -74,7 +74,7 @@
 | 类型 | 规则 | 当前状态 |
 | --- | --- | --- |
 | 运行时依赖 | 必须走第 6 节流程才能引入；引入后同步更新 `docs/技术栈.md` | pydantic 2.x + pydantic-settings 2.x + python-dotenv（S1.1 / S1.2 引入，见 `docs/技术栈.md`） |
-| 开发依赖 | 允许测试与代码质量工具 | 仅 `pytest` |
+| 开发依赖 | 允许测试与代码质量工具 | `pytest`、`ruff`、`mypy`、`pre-commit`（版本见 `docs/技术栈.md`） |
 | 系统级依赖 | 仅指外部程序依赖；缺失时只影响对应能力 | `ffmpeg` / `ffprobe` |
 | 前端依赖 | 由 `frontend/package.json` 管理；直接依赖需在提交信息写明理由，禁止引入第二套组件库或状态管理方案 | pnpm 11.25.0 + Node 25.3.0 |
 
@@ -92,7 +92,7 @@
 按顺序做，缺一步就不算完成：
 
 1. **先补测试再收尾**：新增功能必须带 `tests/` 下的测试用例；纯配置或纯文档改动可以免测，但要在提交信息里说明。
-2. **跑全量测试**：在工程根执行 `uv run pytest`，确认既有用例没有变红。
+2. **跑质量门与全量测试**：在工程根依次执行 `uv run ruff check .`、`uv run mypy`、`uv run pytest`，三者的结果都必须是零告警/零错误。
 3. **跑人工冒烟**：用最小输入走一遍真实链路，例如 `uv run python -c "import xhs_agent; print(xhs_agent.__version__)"` 与 `uv run python -m xhs_agent.probe`；涉及报告渲染的改动必须实际生成一份报告看一眼。
 4. **守住契约与集成路径**：依赖外部服务的改动，必须补集成测试（用 testcontainers 起真实 Postgres / Redis）并在真实依赖下跑通。项目不做运行时降级——缺密钥、缺数据库时报错是预期行为，不要“修”成降级。
 5. **更新文档**：行为或接口变了，同步更新 `README.md` 与 `docs/项目结构.md`；规则变了更新本文件。
@@ -118,7 +118,8 @@
 
 - [ ] `git status` 里没有不该出现的文件：`config/.env`、`data/materials/` 下的素材、`runs/` 下的产物。
 - [ ] 没有把密钥、Token、账号密码写进代码、文档或示例文件。
-- [ ] `uv run pytest` 通过（当前无用例时，确认是"没有测试"而不是"测试失败"）。
+- [ ] `uv run ruff check .` 零告警、`uv run mypy` 零错误（mypy 当前只覆盖新代码，范围见 `pyproject.toml` 的 `[tool.mypy].files`）。
+- [ ] `uv run pytest` 通过；提交前钩子已生效（`uv run pre-commit run --all-files` 全绿）。
 - [ ] 新增或改动的功能有对应测试，或已在提交信息里说明为何免测。
 - [ ] `pyproject.toml`、`uv.lock` 与实际 import 一致；依赖有变化时已同步 `docs/技术栈.md`。
 - [ ] 行为变化已同步到 `README.md` / `docs/`；规则变化已同步到本文件。
@@ -168,7 +169,7 @@
 
 1. 测试通过：`uv run pytest` 全绿；新增功能带用例，涉及外部依赖的补集成用例；
 2. 契约一致：实现与 `docs/contracts/` 无偏差；有偏差先改契约文件并在提交信息中说明原因；
-3. 质量门通过：`ruff` 与 `mypy` 无错误（P1 之后生效）；
+3. 质量门通过：`uv run ruff check .` 零告警、`uv run mypy` 零错误（mypy 严格模式目前只覆盖 `schemas.py`、`config.py`、`probe.py`，存量模块逐阶段收紧）；
 4. 文档同步：行为变化更新 `README.md` 与 `docs/项目结构.md`；规则变化更新本文件；
 5. 成本可查：涉及模型调用的改动，在 `runs` 记录与报告里能看到 token 与成本；
 6. 提交规范：一次提交只做一件事，信息前缀符合第 7 节约定。

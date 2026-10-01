@@ -9,8 +9,14 @@ from __future__ import annotations
 import os
 import time
 
-from ..schemas import (DEFAULT_TYPE_WEIGHTS, Coverage, Element, ElementHit,
-                       HotspotClue, MatchCandidate, Material)
+from ..schemas import (
+    DEFAULT_TYPE_WEIGHTS,
+    Coverage,
+    ElementHit,
+    HotspotClue,
+    MatchCandidate,
+    Material,
+)
 from ..util import normalize_text, text_similarity
 
 HIT_THRESHOLD = 0.5

@@ -90,7 +90,7 @@ def extract_json(text: str) -> Any:
 
 
 def read_text(path: str) -> str:
-    with open(path, "r", encoding="utf-8", errors="replace") as fh:
+    with open(path, encoding="utf-8", errors="replace") as fh:
         return fh.read()
 
 
@@ -105,7 +105,7 @@ def read_json(path: str, default: Any = None) -> Any:
     if not os.path.exists(path):
         return default
     try:
-        with open(path, "r", encoding="utf-8") as fh:
+        with open(path, encoding="utf-8") as fh:
             return json.load(fh)
     except (json.JSONDecodeError, OSError):
         return default

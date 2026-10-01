@@ -13,8 +13,15 @@ from __future__ import annotations
 
 from typing import Any, ClassVar
 
-from pydantic import (BaseModel, ConfigDict, Field, ValidationError,
-                      ValidationInfo, field_validator, model_validator)
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    ValidationError,
+    ValidationInfo,
+    field_validator,
+    model_validator,
+)
 
 from .util import clip01, now_iso, short_hash, slugify
 
@@ -61,13 +68,13 @@ class SchemaError(ValueError):
     """结构不符合契约时抛出，Workflow 会据此重试或降级。"""
 
 
-def _require(data: dict, key: str, ctx: str) -> Any:
+def _require(data: dict[str, Any], key: str, ctx: str) -> Any:
     if key not in data or data[key] in (None, "", [], {}):
         raise SchemaError(f"{ctx} 缺少必填字段 `{key}`")
     return data[key]
 
 
-def _as_list(value: Any) -> list:
+def _as_list(value: Any) -> list[Any]:
     if value in (None, ""):
         return []
     if isinstance(value, list):
@@ -77,7 +84,7 @@ def _as_list(value: Any) -> list:
     return [value]
 
 
-def _as_str_list(value: Any) -> list:
+def _as_str_list(value: Any) -> list[str]:
     out = []
     for item in _as_list(value):
         if isinstance(item, dict):
@@ -168,7 +175,7 @@ class Element(_Contract):
         """要素在打分里的实际份量 = 重要性 x 置信度。"""
         return max(0.05, self.weight * self.confidence)
 
-    def to_dict(self) -> dict:
+    def to_dict(self) -> dict[str, Any]:
         return {
             "type": self.type,
             "value": self.value,
@@ -178,7 +185,7 @@ class Element(_Contract):
         }
 
     @classmethod
-    def from_dict(cls, data: Any) -> "Element":
+    def from_dict(cls, data: Any) -> Element:
         if isinstance(data, str):
             data = {"type": "topic", "value": data}
         if not isinstance(data, dict):
@@ -206,11 +213,11 @@ class Mechanism(_Contract):
     def _norm_text(cls, value: Any) -> str:
         return _clean_str(value)
 
-    def to_dict(self) -> dict:
+    def to_dict(self) -> dict[str, Any]:
         return {"name": self.name, "explain": self.explain}
 
     @classmethod
-    def from_dict(cls, data: Any) -> "Mechanism":
+    def from_dict(cls, data: Any) -> Mechanism:
         if isinstance(data, str):
             return cls(name=data.strip(), explain="")
         if not isinstance(data, dict):
@@ -233,7 +240,7 @@ class HotspotClue(_Contract):
     mechanisms: list[Mechanism] = Field(default_factory=list)
     elements: list[Element] = Field(default_factory=list)
     match_keywords: list[str] = Field(default_factory=list)
-    audience: dict = Field(default_factory=dict)
+    audience: dict[str, Any] = Field(default_factory=dict)
     borrow_angles: list[str] = Field(default_factory=list)
     risk_notes: list[str] = Field(default_factory=list)
     provider: str = ""
@@ -254,33 +261,33 @@ class HotspotClue(_Contract):
     @field_validator("why_it_works", "match_keywords", "borrow_angles", "risk_notes",
                      mode="before")
     @classmethod
-    def _norm_str_list(cls, value: Any) -> list:
+    def _norm_str_list(cls, value: Any) -> list[str]:
         return _as_str_list(value)
 
     @field_validator("mechanisms", "elements", mode="before")
     @classmethod
-    def _norm_model_list(cls, value: Any) -> list:
+    def _norm_model_list(cls, value: Any) -> list[Any]:
         return _as_list(value)
 
     @field_validator("audience", mode="before")
     @classmethod
-    def _norm_audience(cls, value: Any) -> dict:
+    def _norm_audience(cls, value: Any) -> dict[str, Any]:
         if isinstance(value, dict):
             return value
         text = _clean_str(value)
         return {"core": text} if text else {}
 
     @model_validator(mode="after")
-    def _fill_hotspot_key(self) -> "HotspotClue":
+    def _fill_hotspot_key(self) -> HotspotClue:
         if not self.hotspot_key:
             self.hotspot_key = slugify(self.hotspot_raw, max_len=20, fallback="hotspot")
         return self
 
     @property
-    def element_values(self) -> list:
+    def element_values(self) -> list[str]:
         return [e.value for e in self.elements]
 
-    def to_dict(self) -> dict:
+    def to_dict(self) -> dict[str, Any]:
         return {
             "hotspot_raw": self.hotspot_raw,
             "hotspot_key": self.hotspot_key,
@@ -297,7 +304,7 @@ class HotspotClue(_Contract):
         }
 
     @classmethod
-    def from_dict(cls, data: dict, hotspot_raw: str = "", provider: str = "", model: str = "") -> "HotspotClue":
+    def from_dict(cls, data: dict[str, Any], hotspot_raw: str = "", provider: str = "", model: str = "") -> HotspotClue:
         if not isinstance(data, dict):
             raise SchemaError("热点线索必须是一个 JSON 对象")
 
@@ -382,12 +389,12 @@ class Material(_Contract):
 
     @field_validator("tags", "keyframes", mode="before")
     @classmethod
-    def _norm_str_list(cls, value: Any) -> list:
+    def _norm_str_list(cls, value: Any) -> list[str]:
         return _as_str_list(value)
 
     @field_validator("elements", mode="before")
     @classmethod
-    def _norm_model_list(cls, value: Any) -> list:
+    def _norm_model_list(cls, value: Any) -> list[Any]:
         return _as_list(value)
 
     @field_validator("duration_s", "mtime", mode="before")
@@ -424,7 +431,7 @@ class Material(_Contract):
             score += 0.1
         return min(1.0, score)
 
-    def to_dict(self) -> dict:
+    def to_dict(self) -> dict[str, Any]:
         return {
             "id": self.id,
             "path": self.path,
@@ -446,7 +453,7 @@ class Material(_Contract):
         }
 
     @classmethod
-    def from_dict(cls, data: dict) -> "Material":
+    def from_dict(cls, data: dict[str, Any]) -> Material:
         try:
             material = cls(
                 id=str(data.get("id") or ""),
@@ -495,7 +502,7 @@ class ElementHit(_Contract):
     def _norm_float(cls, value: Any) -> float:
         return _as_float(value)
 
-    def to_dict(self) -> dict:
+    def to_dict(self) -> dict[str, Any]:
         return {
             "element_type": self.element_type,
             "clue_value": self.clue_value,
@@ -538,32 +545,32 @@ class MatchCandidate(_Contract):
 
     @field_validator("hits", "missing", mode="before")
     @classmethod
-    def _norm_model_list(cls, value: Any) -> list:
+    def _norm_model_list(cls, value: Any) -> list[Any]:
         return _as_list(value)
 
     @field_validator("reasons", mode="before")
     @classmethod
-    def _norm_reasons(cls, value: Any) -> list:
+    def _norm_reasons(cls, value: Any) -> list[str]:
         return _as_str_list(value)
 
     @model_validator(mode="after")
-    def _require_reasons(self, info: ValidationInfo) -> "MatchCandidate":
+    def _require_reasons(self, info: ValidationInfo) -> MatchCandidate:
         if not self.reasons and not (info.context or {}).get("allow_empty_reasons"):
             raise ValueError("候选素材缺少 reasons：契约不允许无理由候选")
         return self
 
     @classmethod
-    def draft(cls, **kwargs: Any) -> "MatchCandidate":
+    def draft(cls, **kwargs: Any) -> MatchCandidate:
         """中间态构造入口：此时 `reasons` 允许为空，等解释补齐后再 `finalize()`。"""
         return cls.model_validate(kwargs, context={"allow_empty_reasons": True})
 
-    def finalize(self) -> "MatchCandidate":
+    def finalize(self) -> MatchCandidate:
         """终态校验：理由为空即视为未完成，不能流向报告与落库。"""
         if not self.reasons:
             raise SchemaError(f"候选素材 {self.material_id or self.material.id} 缺少 reasons")
         return self
 
-    def to_dict(self) -> dict:
+    def to_dict(self) -> dict[str, Any]:
         return {
             "material_id": self.material_id,
             "score": round(self.score, 3),
@@ -585,7 +592,7 @@ class Coverage(_Contract):
 
     @field_validator("covered", "gaps", mode="before")
     @classmethod
-    def _norm_model_list(cls, value: Any) -> list:
+    def _norm_model_list(cls, value: Any) -> list[Any]:
         return _as_list(value)
 
     @field_validator("ratio", mode="before")
@@ -593,7 +600,7 @@ class Coverage(_Contract):
     def _norm_ratio(cls, value: Any) -> float:
         return _as_float(value)
 
-    def to_dict(self) -> dict:
+    def to_dict(self) -> dict[str, Any]:
         return {
             "ratio": round(self.ratio, 3),
             "covered": [e.to_dict() for e in self.covered],
@@ -606,7 +613,7 @@ class Draft(_Contract):
 
     material_id: str = ""
     hotspot_key: str = ""
-    titles: list[dict] = Field(default_factory=list)   # [{text, style}]
+    titles: list[dict[str, Any]] = Field(default_factory=list)   # [{text, style}]
     body: str = ""
     tags: list[str] = Field(default_factory=list)
     cover_text: str = ""
@@ -627,15 +634,15 @@ class Draft(_Contract):
 
     @field_validator("tags", "shot_list", "compliance_notes", mode="before")
     @classmethod
-    def _norm_str_list(cls, value: Any) -> list:
+    def _norm_str_list(cls, value: Any) -> list[str]:
         return _as_str_list(value)
 
     @field_validator("titles", mode="before")
     @classmethod
-    def _norm_titles(cls, value: Any) -> list:
+    def _norm_titles(cls, value: Any) -> list[dict[str, Any]]:
         return _as_list(value)
 
-    def title_warnings(self) -> list:
+    def title_warnings(self) -> list[str]:
         out = []
         for item in self.titles:
             text = item.get("text", "") if isinstance(item, dict) else str(item)
@@ -643,7 +650,7 @@ class Draft(_Contract):
                 out.append(f"标题超 {self.XHS_TITLE_LIMIT} 字：{text[:30]}…")
         return out
 
-    def to_dict(self) -> dict:
+    def to_dict(self) -> dict[str, Any]:
         return {
             "material_id": self.material_id,
             "hotspot_key": self.hotspot_key,
@@ -681,8 +688,8 @@ class Draft(_Contract):
         return "\n".join(lines)
 
     @classmethod
-    def from_dict(cls, data: dict, material_id: str = "", hotspot_key: str = "",
-                  provider: str = "", model: str = "") -> "Draft":
+    def from_dict(cls, data: dict[str, Any], material_id: str = "", hotspot_key: str = "",
+                  provider: str = "", model: str = "") -> Draft:
         if not isinstance(data, dict):
             raise SchemaError("文案必须是一个 JSON 对象")
         titles_raw = _as_list(data.get("titles"))
