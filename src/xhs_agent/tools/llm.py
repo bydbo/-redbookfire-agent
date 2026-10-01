@@ -1,8 +1,14 @@
 """模型调用层。
 
+用途：把「调一次聊天模型并拿到结构化 JSON」包成可替换的 provider，供上层编排使用。
+输入：`LLMConfig`（provider / base_url / model / 密钥 / 超时 / 重试）+ `LLMCall`
+      （task / system / user / json_mode）。
+输出：`LLMResult`（text / provider / model / token / 耗时 / 成本 / error）。
+      结构化输出统一走 `StructuredCaller`：解析失败时把错误回灌给模型自修一次。
+
 - OpenAICompatibleProvider：任何兼容 /chat/completions 的国内模型都能接
   （DeepSeek、通义千问、智谱、Kimi、SiliconFlow…）
-- OfflineProvider：无 Key 时接管，保证链路可跑
+- OfflineProvider：无 Key 时接管（P2 取消运行时降级后删除，见 backlog S2.7）
 - StructuredCaller：强制模型返回结构化 JSON，解析失败自动修复重试
 """
 

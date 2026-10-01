@@ -1,4 +1,11 @@
-"""视频/图片探测与抽帧。依赖系统里的 ffmpeg / ffprobe，缺失时全部降级为空结果。"""
+"""视频/图片探测与抽帧。
+
+用途：判断文件是不是媒体、读出时长/分辨率/音轨、按时间点抽关键帧。
+输入：文件路径（可选输出目录、帧数与缩放宽度）。
+输出：`kind_of` → `video` / `image` / `other`；`probe` → 固定键的 dict
+      （`duration_s` / `width` / `height` / `has_audio`）；`extract_keyframes` → 生成的文件路径列表。
+依赖：ffmpeg / ffprobe。缺失或文件损坏时返回空结果（能力裁剪），不抛异常打断整条链路。
+"""
 
 from __future__ import annotations
 

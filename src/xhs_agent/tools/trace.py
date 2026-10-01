@@ -1,5 +1,10 @@
 """运行态记录：每一步的状态、耗时、token、成本，以及产物落盘。
 
+用途：把一次运行的进度与花费记下来，落成 `state.json`（当前状态）与 `trace.jsonl`（事件流）。
+输入：`runs_dir` + `slug`（可选 `meta`）；运行过程中调用 `step` / `record_llm` / `save_*`。
+输出：`runs/<run_id>/` 目录，内含 `state.json`、`trace.jsonl` 与各步骤产物；
+      `finalize()` 返回 `state.json` 路径。时间戳来自系统时钟——运行记录本身就是要记时间。
+
 对应十步路线里的「Context / Memory」和「部署与监控」：
 - state.json：这次任务执行到哪一步、哪些还没做、用的什么版本
 - trace.jsonl：逐条事件流，便于排查和统计
@@ -109,8 +114,9 @@ class RunStore:
 
     def save_state(self) -> str:
         path = os.path.join(self.dir, "state.json")
-        self.state["pending"] = [s["name"] for s in self.state.get("planned_steps", []) if s not in
-                                 [step["name"] for step in self.state["steps"]]]
+        done = {step["name"] for step in self.state["steps"]}
+        self.state["pending"] = [step["name"] for step in self.state.get("planned_steps", [])
+                                 if step["name"] not in done]
         write_json(path, self.state)
         return path
 
@@ -121,7 +127,14 @@ class RunStore:
             self._step_stack[-1]["artifacts"].append(name)
 
     def plan(self, steps: list) -> None:
-        self.state["planned_steps"] = list(steps)
+        """登记计划步骤，用于 `save_state()` 计算 pending。
+
+        输入：步骤列表，元素可以是字符串（`"拆解"`）或 `{"name": "拆解"}`；输出：无。
+        内部统一存成 `{"name": ...}`——`save_state()` 按这个形状读取（S1.4 的单测发现的崩溃点）。
+        """
+        self.state["planned_steps"] = [
+            {"name": item} if isinstance(item, str) else dict(item) for item in steps
+        ]
 
     def finalize(self, status: str = "succeeded", notes: str = "") -> str:
         self.state["status"] = status

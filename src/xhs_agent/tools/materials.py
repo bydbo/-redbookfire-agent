@@ -1,5 +1,9 @@
 """素材库：扫描、打标签、建索引。
 
+用途：把本地素材目录变成一份可检索的索引（JSON），一个工具只负责「素材目录 → 索引」这件事。
+输入：素材目录路径 + 索引目录路径；可选注入视觉打标可调用对象、关键帧目录与各种上限。
+输出：`IndexResult`（素材列表 + 新增/更新/复用计数 + 索引文件路径），索引文件结构见 `save_index`。
+
 索引约定（非常重要，决定了匹配质量的上下限）：
 1. 同目录下 `素材名.mp4.txt` / `素材名.md` 会被当成人工说明，优先级最高；
 2. 文件名里的 `-` `_` 分隔词会被当作标签；
@@ -155,7 +159,15 @@ def save_index(index_dir: str, materials_dir: str, materials: list) -> str:
 def build_index(materials_dir: str, index_dir: str, vision=None,
                 keyframes_dir: str | None = None, force: bool = False,
                 max_vision_items: int = 50) -> IndexResult:
-    """扫描并建立素材索引。vision 为可调用对象时用于看图补描述。"""
+    """一次索引流程：扫描 → 解析说明与标签 → 可选视觉打标 → 增量判断 → 落盘。
+
+    输入：`materials_dir`（素材目录）、`index_dir`（索引与关键帧落盘目录）。
+    可注入点：`vision`（`(frames, hint) -> dict | None` 的可调用对象，None = 不做视觉打标）、
+    `keyframes_dir`（默认 `index_dir/keyframes`）、`max_vision_items`（本次最多打标多少条，
+    用于控制成本）、`force`（忽略缓存全量重建）。
+    输出：`IndexResult`（materials / added / updated / reused / index_path）。
+    依赖：ffmpeg / ffprobe 缺失时只跳过抽帧与探测（能力裁剪），不报错。
+    """
     files = scan_materials(materials_dir)
     keyframes_dir = keyframes_dir or os.path.join(index_dir, "keyframes")
     cached, path = load_index(index_dir, materials_dir)

@@ -1,4 +1,21 @@
-"""把一次运行的结果渲染成人能看的报告（Markdown + 单文件 HTML）。"""
+"""把一次运行的结果渲染成人能看的报告（Markdown + 单文件 HTML）。
+
+用途：纯函数渲染，不读文件、不联网、不看系统时钟（生成时间来自输入）。
+输入：`model` dict，形状如下（**任何键缺失都回退为空值，不抛异常**）：
+
+    meta     : {"run_id": str, "created_at": str, "materials_count": int}
+    config   : {"llm": {"provider": str, "model": str}, "materials_dir": str}
+    hotspots : [{"clue": HotspotClue.to_dict(), "coverage": Coverage.to_dict(),
+                 "candidates": [MatchCandidate.to_dict(), ...],
+                 "draft": Draft.to_dict() | None, "error": str}]
+    totals   : {"llm_calls": int, "prompt_tokens": int, "completion_tokens": int,
+                "cost_cny": float, "latency_ms": int}
+    errors   : [str, ...]
+
+    区块口径见 `docs/产品方案.md` §8.1（机会总览 / 为什么能火 / 热点线索 / 可蹭角度 /
+    素材匹配榜 / 覆盖缺口 / 初步文案 / 本次运行）。
+输出：Markdown 字符串 / 单文件 HTML 字符串。同一输入必须得到同一输出。
+"""
 
 from __future__ import annotations
 

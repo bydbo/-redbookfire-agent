@@ -1,6 +1,10 @@
 """看图补描述：把素材关键帧交给多模态模型，转成标签和一句话描述。
 
-没有多模态 Key 时返回 None，索引会退回到「文件名 + 人工说明」的标签体系。
+用途：给没有人工说明的素材补标题 / 标签 / 描述，是素材索引里的一个可选步骤。
+输入：`AppConfig`（读 `[vision]` 段与密钥）；返回的 `describe(frames, hint)` 收关键帧路径列表。
+输出：`{"title": str, "tags": list[str], "description": str}`，或 None 表示本次不出结果。
+能力裁剪：开关关闭、没有密钥、机器没有 ffmpeg 时 `make_describer` 直接返回 None，
+索引会退回「文件名 + 人工说明」的标签体系——这是能力裁剪，不是运行时降级（AGENTS.md 第 4 节）。
 """
 
 from __future__ import annotations
