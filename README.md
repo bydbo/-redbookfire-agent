@@ -28,6 +28,7 @@
 | 数据契约（要素／线索／素材／匹配／文案） | ✅ 已完成（S1.1 起为 Pydantic v2 模型） |
 | 配置加载与启动前置检查（pydantic-settings，分级必填 + 退出码 2） | ✅ 已完成（S1.2） |
 | `tools/` 首批单测（词典 / 打分 / 报告 / 素材 / 媒体 / 模型 / 追踪 / 视觉） | ✅ 已完成（S1.4） |
+| 覆盖率统计（pytest-cov，语句 + 分支，不设门槛） | ✅ 已完成（S1.5） |
 | 爆点要素词典与离线规则引擎 | ✅ 已完成（离线规则引擎将在 P2 删除） |
 | 模型调用层（兼容接口 + 结构化输出自修重试） | ✅ 已完成 |
 | 素材扫描与索引（旁车文件／文件名／视觉打标，增量更新） | ✅ 已完成 |
@@ -50,7 +51,7 @@
 | 语言 | Python ≥ 3.11 |
 | 包管理与构建 | uv + `pyproject.toml`（hatchling 后端，src 布局） |
 | 运行时依赖 | pydantic v2、pydantic-settings、python-dotenv |
-| 开发依赖 | pytest、ruff、mypy、pre-commit |
+| 开发依赖 | pytest、pytest-cov、ruff、mypy、pre-commit |
 | 文本模型接入 | OpenAI 兼容 `/chat/completions` 协议（默认 DeepSeek），标准库 `urllib` 直连，JSON mode 结构化输出 + 解析失败自修 |
 | 多模态接入 | 通义千问 VL（`qwen-vl-max`），关键帧 base64 内联 |
 | 音视频处理 | ffmpeg / ffprobe（用于探测与抽帧；缺失时跳过抽帧，属能力裁剪） |
@@ -73,7 +74,7 @@
 | 队列与缓存 | Redis + Celery |
 | 可观测 | Langfuse Cloud + structlog，run_id 贯穿全链路 |
 | 容器化 / CI | Docker Compose（api / worker / postgres / redis）；GitHub Actions |
-| 代码质量 / 测试 | ruff + mypy + pre-commit；pytest + pytest-asyncio + pytest-cov + testcontainers |
+| 代码质量 / 测试 | ruff + mypy + pre-commit + pytest-cov（已落地）；pytest-asyncio + testcontainers（待落地） |
 | 前端 | Vue 3 + Vite + TypeScript + Pinia + Vue Router |
 | UI 与可视化 | Naive UI + Tailwind CSS + ECharts |
 | 接口类型 | `openapi-typescript` 从契约生成 TS 类型 |
@@ -158,6 +159,9 @@ uv run mypy
 
 # 全量单元测试
 uv run pytest
+
+# 覆盖率（不设门槛，按需查看；加 --cov-report=html 可生成逐行报告）
+uv run pytest --cov
 
 # 提交前钩子：装一次即可，之后每次 commit 自动跑上面三条
 uv run pre-commit install
