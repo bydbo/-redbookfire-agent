@@ -66,6 +66,9 @@ Copy-Item config/.env.example config/.env
 
 # 3. 确认它确实被忽略了（应输出匹配到的忽略规则）
 git check-ignore -v config/.env
+
+# 4. 跑启动前置检查（退出码 0 才算配置齐全；缺什么会直接告诉你补哪个变量）
+uv run python -m xhs_agent.probe
 ```
 
 配套机制：
@@ -81,9 +84,9 @@ git check-ignore -v config/.env
 
 1. **不要单独移动 `src/`、`config/`、`data/`、`runs/` 中的任何一个。** 工程根是靠 `src/xhs_agent/config.py` 上溯三层算出来的，拆开之后不会报错，只会静默用错路径。
 2. **示例素材包放 `evals/fixtures/demo_pack/`，不要放 `data/materials/`。** 后者整个目录被忽略规则挡住，放进去了也不会进版本库。
-3. **`uv run pytest` 现在报"0 用例、退出码 5"是正常的**——`tests/` 还是空目录。第一个功能落地前必须先补测试。
+3. **`tests/unit/` 已有契约、配置与前置检查用例**，`uv run pytest` 应全绿；新增能力必须带用例（`tools/` 的行为回归见 `docs/backlog.md` 的 S1.4）。
 4. **加依赖要论证，不为省几行代码加，也不为凑简历关键词加。** 企业级组件（FastAPI、LangGraph、pgvector 等）已列入最终技术栈，按 `docs/技术栈.md` 第四节分阶段引入，并走 `AGENTS.md` 第 6 节流程。
 5. **项目不做运行时降级。** 缺 API 密钥、连不上数据库或队列时启动直接失败并报错——遇到“没密钥就跑不起来”不是 bug。
 6. **Docker Desktop 必须先启动**，数据库与队列都跑在容器里；C 盘只剩约 33 GB，建议把 Docker 镜像存储位置迁到 D 盘。
 7. **前端是独立工具链**：在 `frontend/` 下用 pnpm 安装与构建；改了 `docs/contracts/openapi.yaml` 之后要重新生成 TS 类型，否则前端类型会与契约漂移。
-8. **`probe.py` 目前是 0 字节空文件。** 它预留给启动自检，属于已知未完成项，不要误以为是损坏文件。
+8. **启动前置检查在 `src/xhs_agent/probe.py`**：`uv run python -m xhs_agent.probe` 退出码 0 表示配置可用，退出码 2 表示配置错误（缺哪些变量、怎么补都会打印出来）。数据库、扩展、Alembic、Redis、前端 dist 的检查属于 S3.8，目前尚未实现。

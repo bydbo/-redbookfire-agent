@@ -1,15 +1,18 @@
 # 小红书热点搭子 · 默认配置
-# 本文件只放可公开的默认值，不存放任何密钥。
-# 真实密钥写在同一目录的 .env（已被 .gitignore 忽略），或用环境变量覆盖。
-# 【现状】本文件描述当前代码可读取的配置项。企业化改造后还会增加 database / redis / langfuse 段，届时同步更新（见 docs/技术栈.md）。
+# 本文件只放可公开的默认值，不存放任何密钥：密钥写 config/.env 或用环境变量覆盖。
+# 字段、默认值与取值范围的事实源是 docs/contracts/配置契约.md 第三节；改这里要同步改契约。
+# 优先级：环境变量 > config/.env > 本文件 > 代码内默认值。
+# 启动前置检查：uv run python -m xhs_agent.probe（配置不合法会以退出码 2 失败）
+
+# 顶层键必须写在第一个表头之前；log_level 也可用环境变量 XHS_LOG_LEVEL 覆盖
+log_level = "INFO"
 
 [llm]
-# auto = 有密钥走在线模型；改造后将取消 auto / offline 的降级语义，缺密钥直接启动失败（见 docs/技术栈.md）
-provider = "auto"
+# 只支持 OpenAI 兼容端点；auto / offline 的降级语义已取消，缺密钥直接启动失败
+provider = "openai_compatible"
 base_url = "https://api.deepseek.com/v1"
-model = "deepseek-flash"    # 2026-07-24 起 deepseek-chat 已停用；现役名称 deepseek-flash / deepseek-v4-pro
-api_key = ""                  # 留空，密钥请写进 config/.env
-api_key_env = "DEEPSEEK_API_KEY"
+model = "deepseek-flash"            # 2026-07-24 起 deepseek-chat 已停用；现役名称 deepseek-flash / deepseek-v4-pro
+api_key_env = "DEEPSEEK_API_KEY"    # 密钥变量名：值写在 config/.env 或环境变量里，本文件不放密钥
 temperature = 0.6
 max_tokens = 2000
 timeout_s = 60
@@ -21,13 +24,32 @@ price_in_per_m = 2.16
 price_out_per_m = 8.64
 
 [vision]
-enabled = true                # 关闭后素材打标退回文件名与人工说明
+# 多模态打标开关：打开即要求 api_key_env 指向的密钥；E2 接入工作流后再打开
+enabled = false
 base_url = "https://dashscope.aliyuncs.com/compatible-mode/v1"
 model = "qwen-vl-max"
-api_key = ""                  # 留空，密钥请写进 config/.env
 api_key_env = "DASHSCOPE_API_KEY"
 max_frames = 3
 max_width = 720
+
+[embedding]
+# 语义召回开关：打开即要求 api_key_env 指向的密钥；E2 接入检索后再打开
+enabled = false
+base_url = "https://dashscope.aliyuncs.com/compatible-mode/v1"
+model = "text-embedding-v3"
+dim = 1024                          # 必须与数据契约里 materials.embedding 的维度一致
+batch_size = 16
+api_key_env = "DASHSCOPE_API_KEY"
+
+[retrieval]
+# 混合召回参数；口径见 docs/contracts/检索契约.md 第八节
+similarity_threshold = 0.2
+recall_limit = 50
+max_cosine_distance = 0.35
+rrf_k = 60
+w_element = 0.7                     # 与 w_rrf 之和必须为 1
+w_rrf = 0.3
+hit_threshold = 0.5
 
 [match]
 topk = 5
@@ -43,35 +65,17 @@ materials_dir = "data/materials"
 runs_dir = "runs"
 index_dir = "runs/_index"
 
-# 【待落地】以下配置段在企业化改造落地后启用；字段与默认值见 docs/contracts/配置契约.md 第三节
-#
-# [embedding]
-# base_url = "https://dashscope.aliyuncs.com/compatible-mode/v1"
-# model = "text-embedding-v3"
-# dim = 1024
-# batch_size = 16
-# api_key_env = "DASHSCOPE_API_KEY"
-#
-# [retrieval]
-# similarity_threshold = 0.2
-# recall_limit = 50
-# max_cosine_distance = 0.35
-# rrf_k = 60
-# w_element = 0.7
-# w_rrf = 0.3
-# hit_threshold = 0.5
-#
-# [frontend]
-# serve = true
-# dist_dir = "frontend/dist"
-# dev_server_url = "http://localhost:5173"
-#
-# [database]
-# pool_size = 5
-# max_overflow = 10
-# echo = false
-#
-# [queue]
-# task_soft_time_limit_s = 600
-# task_time_limit_s = 900
-# max_retries = 2
+[database]
+pool_size = 5
+max_overflow = 10
+echo = false
+
+[queue]
+task_soft_time_limit_s = 600
+task_time_limit_s = 900             # 必须 >= task_soft_time_limit_s
+max_retries = 2
+
+[frontend]
+serve = true                        # 为 true 时要求 dist_dir 存在且非空（preflight 第 7 步，S3.8 落地）
+dist_dir = "frontend/dist"
+dev_server_url = "http://localhost:5173"

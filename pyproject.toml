@@ -6,9 +6,12 @@ description = "小红书热点搭子 · 热点相关性 Agent：把热点拆成�
 readme = "README.md"
 requires-python = ">=3.11"
 authors = [{ name = "tianshugui", email = "tianshugui95@gmail.com" }]
-# 运行时依赖：pydantic v2（S1.1 引入）。最终技术栈（FastAPI / LangGraph / pgvector 等）见 docs/技术栈.md，引入时走 AGENTS.md 第 6 节
+# 运行时依赖：pydantic v2（S1.1）、pydantic-settings + python-dotenv（S1.2）。
+# 最终技术栈（FastAPI / LangGraph / pgvector 等）见 docs/技术栈.md，引入时走 AGENTS.md 第 6 节
 dependencies = [
     "pydantic>=2.9,<3",
+    "pydantic-settings>=2.6,<3",
+    "python-dotenv>=1.0,<2",
 ]
 
 # 开发依赖：测试与代码质量工具

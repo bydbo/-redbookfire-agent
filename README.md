@@ -26,6 +26,7 @@
 | 部分 | 状态 |
 | --- | --- |
 | 数据契约（要素／线索／素材／匹配／文案） | ✅ 已完成（S1.1 起为 Pydantic v2 模型） |
+| 配置加载与启动前置检查（pydantic-settings，分级必填 + 退出码 2） | ✅ 已完成（S1.2） |
 | 爆点要素词典与离线规则引擎 | ✅ 已完成（离线规则引擎将在 P2 删除） |
 | 模型调用层（兼容接口 + 结构化输出自修重试） | ✅ 已完成 |
 | 素材扫描与索引（旁车文件／文件名／视觉打标，增量更新） | ✅ 已完成 |
@@ -47,13 +48,13 @@
 | --- | --- |
 | 语言 | Python ≥ 3.11 |
 | 包管理与构建 | uv + `pyproject.toml`（hatchling 后端，src 布局） |
-| 运行时依赖 | pydantic v2（S1.1 引入） |
+| 运行时依赖 | pydantic v2、pydantic-settings、python-dotenv |
 | 开发依赖 | pytest |
 | 文本模型接入 | OpenAI 兼容 `/chat/completions` 协议（默认 DeepSeek），标准库 `urllib` 直连，JSON mode 结构化输出 + 解析失败自修 |
 | 多模态接入 | 通义千问 VL（`qwen-vl-max`），关键帧 base64 内联 |
 | 音视频处理 | ffmpeg / ffprobe（用于探测与抽帧；缺失时跳过抽帧，属能力裁剪） |
 | 检索算法 | 字符 bigram Jaccard + 要素类型加权；无 embedding、无向量库 |
-| 配置 | TOML + `.env` + 环境变量，三层覆盖 |
+| 配置 | pydantic-settings + TOML：环境变量 > `.env` > config.toml > 代码默认值；启动前置检查见 `uv run python -m xhs_agent.probe` |
 | 数据落地 | JSON 索引 / JSONL 轨迹 / Markdown 与单文件 HTML 报告；无数据库 |
 | 测试 | pytest |
 
@@ -62,7 +63,6 @@
 | 层面 | 选型 |
 | --- | --- |
 | Web 服务 | FastAPI + Uvicorn |
-| 配置加载 | pydantic-settings（Pydantic v2 已落地） |
 | HTTP 客户端 | httpx（异步、连接池、重试） |
 | Agent 编排 | LangGraph（状态图 + 检查点 + 失败重试） |
 | 数据库 | PostgreSQL 16 + pgvector（Docker Compose 提供） |
@@ -100,9 +100,12 @@ uv run python -c "import xhs_agent; print(xhs_agent.__version__)"
 
 # 4. 验证配置读取（输出不应包含任何密钥）
 uv run python -c "from xhs_agent.config import load_config; print(load_config().describe())"
+
+# 5. 跑启动前置检查（缺必填项会打印 E_CONFIG_MISSING 并以退出码 2 结束）
+uv run python -m xhs_agent.probe
 ```
 
-网络受限时：`uv sync --no-dev` 只装运行时环境——当前运行时依赖只有 pydantic；不过 `import xhs_agent` 仍然需要安装或设置 `PYTHONPATH=src`（src 布局）。
+网络受限时：`uv sync --no-dev` 只装运行时环境——当前运行时依赖只有 pydantic、pydantic-settings 与 python-dotenv；不过 `import xhs_agent` 仍然需要安装或设置 `PYTHONPATH=src`（src 布局）。
 
 ---
 

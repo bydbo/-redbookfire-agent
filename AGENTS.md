@@ -73,7 +73,7 @@
 
 | 类型 | 规则 | 当前状态 |
 | --- | --- | --- |
-| 运行时依赖 | 必须走第 6 节流程才能引入；引入后同步更新 `docs/技术栈.md` | pydantic 2.x（S1.1 引入，见 `docs/技术栈.md`） |
+| 运行时依赖 | 必须走第 6 节流程才能引入；引入后同步更新 `docs/技术栈.md` | pydantic 2.x + pydantic-settings 2.x + python-dotenv（S1.1 / S1.2 引入，见 `docs/技术栈.md`） |
 | 开发依赖 | 允许测试与代码质量工具 | 仅 `pytest` |
 | 系统级依赖 | 仅指外部程序依赖；缺失时只影响对应能力 | `ffmpeg` / `ffprobe` |
 | 前端依赖 | 由 `frontend/package.json` 管理；直接依赖需在提交信息写明理由，禁止引入第二套组件库或状态管理方案 | pnpm 11.25.0 + Node 25.3.0 |
@@ -93,7 +93,7 @@
 
 1. **先补测试再收尾**：新增功能必须带 `tests/` 下的测试用例；纯配置或纯文档改动可以免测，但要在提交信息里说明。
 2. **跑全量测试**：在工程根执行 `uv run pytest`，确认既有用例没有变红。
-3. **跑人工冒烟**：用最小输入走一遍真实链路，例如 `uv run python -c "import xhs_agent; print(xhs_agent.__version__)"`；涉及报告渲染的改动必须实际生成一份报告看一眼。
+3. **跑人工冒烟**：用最小输入走一遍真实链路，例如 `uv run python -c "import xhs_agent; print(xhs_agent.__version__)"` 与 `uv run python -m xhs_agent.probe`；涉及报告渲染的改动必须实际生成一份报告看一眼。
 4. **守住契约与集成路径**：依赖外部服务的改动，必须补集成测试（用 testcontainers 起真实 Postgres / Redis）并在真实依赖下跑通。项目不做运行时降级——缺密钥、缺数据库时报错是预期行为，不要“修”成降级。
 5. **更新文档**：行为或接口变了，同步更新 `README.md` 与 `docs/项目结构.md`；规则变了更新本文件。
 
@@ -133,7 +133,7 @@
 - 密钥模板是 `config/.env.example`（可以入库，只含变量名与占位符）。
 - 真实密钥写在 `config/.env`，该文件被 `.gitignore` 强制忽略，**永不提交**。
 - 代码读取顺序：`config/.env` → 环境变量覆盖。任何模块都不得硬编码密钥，也不得把密钥写进日志、报告或 `runs/` 产物。
-- 支持的环境变量：`DEEPSEEK_API_KEY`（P1 起必填）、`DASHSCOPE_API_KEY`（辅助服务，供多模态打标与向量化，按能力启用时必填）、`DATABASE_URL`（P2 起必填）、`REDIS_URL`（P3 起必填），以及 `XHS_LLM_PROVIDER`、`XHS_LLM_BASE_URL`、`XHS_LLM_MODEL`、`XHS_LLM_API_KEY` 覆盖项。**必填项按阶段分级生效**，完整口径见 `docs/contracts/配置契约.md`。
+- 支持的环境变量：`DEEPSEEK_API_KEY`（P1 起必填）、`DASHSCOPE_API_KEY`（辅助服务，供多模态打标与向量化，按能力启用时必填）、`DATABASE_URL`（P2 起必填）、`REDIS_URL`（P3 起必填）、`LANGFUSE_PUBLIC_KEY` / `LANGFUSE_SECRET_KEY` / `LANGFUSE_HOST`（三件套齐全才启用追踪，不齐只告警），以及 `XHS_LLM_PROVIDER`、`XHS_LLM_BASE_URL`、`XHS_LLM_MODEL`、`XHS_LLM_API_KEY`、`XHS_EMBEDDING_MODEL`、`XHS_LOG_LEVEL`、`XHS_CONFIG_PATH` 覆盖项。**必填项按阶段分级生效**，启动前置检查只校验当前阶段的必填项，完整口径见 `docs/contracts/配置契约.md`；就地自检命令见第 5 节。
 - 配置与密钥分离：`config/config.toml` 只放可公开的默认值（模型名、路径、阈值），不放任何凭据。
 - 怀疑密钥已泄漏时：立即停止提交，轮换密钥，再检查 `git log` 与 `git ls-files` 是否已入库。
 
@@ -177,6 +177,6 @@
 
 ## 当前项目状态（规范的诚实边界）
 
-- 已完成：数据契约（S1.1 起为 Pydantic v2 模型）、爆点词典、模型调用层、素材扫描与索引、相关性打分、报告渲染、运行追踪，均在 `src/xhs_agent/`。其中 `tools/offline.py`（离线规则引擎）**将在 P2 阶段删除**——运行时降级已取消。
+- 已完成：数据契约（S1.1 起为 Pydantic v2 模型）、配置加载与启动前置检查（S1.2）、爆点词典、模型调用层、素材扫描与索引、相关性打分、报告渲染、运行追踪，均在 `src/xhs_agent/`。其中 `tools/offline.py`（离线规则引擎）**将在 P2 阶段删除**——运行时降级已取消。
 - 尚未实现：`agents/` 与 `workflows/` 编排层、FastAPI 服务入口与数据库。因此本仓库目前**没有可执行的业务命令**，`README.md` 的快速开始只覆盖环境安装与导入验证。
 - 记录以上状态是为了让 AI 与合作者先看清事实，不要把"计划要实现的东西"当成"已经有的东西"。
