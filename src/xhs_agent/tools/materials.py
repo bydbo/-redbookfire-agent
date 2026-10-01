@@ -7,7 +7,9 @@
 索引约定（非常重要，决定了匹配质量的上下限）：
 1. 同目录下 `素材名.mp4.txt` / `素材名.md` 会被当成人工说明，优先级最高；
 2. 文件名里的 `-` `_` 分隔词会被当作标签；
-3. 开启视觉模型后，会自动抽帧并让模型看图补描述；
+3. 抽帧与视觉打标是分开的两件事：默认每条新增/更新素材抽关键帧（报告要缩略图，
+   `frame_count` / `frame_max_width` 可传参，也能用 `extract_frames=False` 整体跳过），
+   开启视觉模型后才会把这些帧送去补描述；
 4. 索引按 路径+修改时间+大小 做增量，改动的素材才会重新识别。
 """
 
@@ -158,13 +160,16 @@ def save_index(index_dir: str, materials_dir: str, materials: list) -> str:
 
 def build_index(materials_dir: str, index_dir: str, vision=None,
                 keyframes_dir: str | None = None, force: bool = False,
-                max_vision_items: int = 50) -> IndexResult:
+                max_vision_items: int = 50, extract_frames: bool = True,
+                frame_count: int = 3, frame_max_width: int = 720) -> IndexResult:
     """一次索引流程：扫描 → 解析说明与标签 → 可选视觉打标 → 增量判断 → 落盘。
 
     输入：`materials_dir`（素材目录）、`index_dir`（索引与关键帧落盘目录）。
     可注入点：`vision`（`(frames, hint) -> dict | None` 的可调用对象，None = 不做视觉打标）、
     `keyframes_dir`（默认 `index_dir/keyframes`）、`max_vision_items`（本次最多打标多少条，
-    用于控制成本）、`force`（忽略缓存全量重建）。
+    用于控制成本）、`force`（忽略缓存全量重建）、`extract_frames`（是否抽关键帧）、
+    `frame_count` / `frame_max_width`（抽帧数量与缩放宽度，默认 3 / 720；工作流接入时
+    从 `[vision].max_frames` / `[vision].max_width` 传入，索引只负责执行）。
     输出：`IndexResult`（materials / added / updated / reused / index_path）。
     依赖：ffmpeg / ffprobe 缺失时只跳过抽帧与探测（能力裁剪），不报错。
     """
@@ -195,12 +200,14 @@ def build_index(materials_dir: str, index_dir: str, vision=None,
         description = sidecar["description"]
         source = "sidecar" if (sidecar["description"] or sidecar["tags"]) else "filename"
 
-        frames = media.extract_keyframes(
-            file_path,
-            os.path.join(keyframes_dir, material_id),
-            count=3,
-            max_width=720,
-        )
+        frames: list = []
+        if extract_frames:
+            frames = media.extract_keyframes(
+                file_path,
+                os.path.join(keyframes_dir, material_id),
+                count=frame_count,
+                max_width=frame_max_width,
+            )
 
         if vision is not None and frames and vision_used < max_vision_items and not sidecar["description"]:
             try:

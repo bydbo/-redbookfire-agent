@@ -65,18 +65,19 @@ class RunStore:
         self.log("step_started", {"name": name, "detail": detail})
         try:
             yield record
-            record["status"] = "succeeded"
-        except Exception as exc:
+        except BaseException as exc:
+            # 必须捕 BaseException：KeyboardInterrupt / SystemExit 若不在此标记为失败，
+            # finally 里的回填会把中断的步骤写成 succeeded，运行记录失真。
             record["status"] = "failed"
             record["error"] = f"{type(exc).__name__}: {exc}"
             self.log("step_failed", {"name": name, "error": record["error"]})
             raise
+        else:
+            record["status"] = "succeeded"
         finally:
             record["ended_at"] = now_iso()
             record["latency_ms"] = int((time.time() - started) * 1000)
             self._step_stack.pop()
-            if record["status"] == "running":
-                record["status"] = "succeeded"
             self.state["totals"]["latency_ms"] += record["latency_ms"]
             self.log("step_finished", {"name": name, "status": record["status"],
                                        "latency_ms": record["latency_ms"]})

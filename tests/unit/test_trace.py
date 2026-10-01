@@ -54,6 +54,24 @@ class TestSteps:
         assert step["status"] == "failed"
         assert step["error"] == "ValueError: 炸了"
 
+    def test_base_exception_is_recorded_as_failed(self, store):
+        """KeyboardInterrupt / SystemExit 这类 BaseException 不能被记成成功。
+
+        原先只捕 Exception，中断时状态停在 running，再被 finally 回填成 succeeded，
+        运行记录会失真（S1.4 复核发现）。
+        """
+        with pytest.raises(KeyboardInterrupt), store.step("检索"):
+            raise KeyboardInterrupt
+        step = store.state["steps"][0]
+        assert step["status"] == "failed"
+        assert step["error"] == "KeyboardInterrupt: "
+
+    def test_base_exception_status_is_persisted(self, store):
+        with pytest.raises(SystemExit), store.step("报告"):
+            raise SystemExit(2)
+        payload = json.loads(pathlib.Path(store.dir, "state.json").read_text(encoding="utf-8"))
+        assert payload["steps"][0]["status"] == "failed"
+
     def test_steps_are_kept_in_order(self, store):
         with store.step("一"):
             pass

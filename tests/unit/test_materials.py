@@ -163,6 +163,36 @@ class TestBuildIndex:
         assert calls == []
         assert result.added == 2
 
+    def test_extract_frames_can_be_disabled(self, materials_dir, tmp_path, monkeypatch):
+        calls = []
+
+        def fake_extract(*args, **kwargs):
+            calls.append((args, kwargs))
+            return []
+
+        monkeypatch.setattr(materials.media, "extract_keyframes", fake_extract)
+        result = materials.build_index(str(materials_dir), str(tmp_path / "idx"),
+                                       extract_frames=False)
+        assert calls == []
+        assert all(material.keyframes == [] for material in result.materials)
+
+    def test_frame_params_are_forwarded(self, materials_dir, tmp_path, monkeypatch):
+        seen = {}
+
+        def fake_extract(_path, out_dir, count=3, max_width=720, prefix="kf"):
+            seen["count"] = count
+            seen["max_width"] = max_width
+            pathlib.Path(out_dir).mkdir(parents=True, exist_ok=True)
+            target = pathlib.Path(out_dir) / "kf_0.jpg"
+            target.write_bytes(b"\x00")
+            return [str(target)]
+
+        monkeypatch.setattr(materials.media, "extract_keyframes", fake_extract)
+        result = materials.build_index(str(materials_dir), str(tmp_path / "idx"),
+                                       frame_count=5, frame_max_width=1080)
+        assert seen == {"count": 5, "max_width": 1080}
+        assert any(material.keyframes for material in result.materials)
+
     def test_content_is_stable_across_rebuilds(self, materials_dir, tmp_path, no_ffmpeg):
         first = materials.build_index(str(materials_dir), str(tmp_path / "idx"), force=True)
         second = materials.build_index(str(materials_dir), str(tmp_path / "idx"), force=True)
