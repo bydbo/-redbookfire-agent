@@ -74,7 +74,7 @@
 | 队列与缓存 | Redis + Celery |
 | 可观测 | Langfuse Cloud + structlog，run_id 贯穿全链路 |
 | 容器化 / CI | Docker Compose（api / worker / postgres / redis）；GitHub Actions |
-| 代码质量 / 测试 | ruff + mypy + pre-commit + pytest-cov（已落地）；pytest-asyncio + testcontainers（待落地） |
+| 代码质量 / 测试 | ruff + mypy + pre-commit + pytest-cov + pytest-asyncio + testcontainers（均已落地） |
 | 前端 | Vue 3 + Vite + TypeScript + Pinia + Vue Router |
 | UI 与可视化 | Naive UI + Tailwind CSS + ECharts |
 | 接口类型 | `openapi-typescript` 从契约生成 TS 类型 |
@@ -174,7 +174,16 @@ uv run pre-commit install
 uv run pre-commit run --all-files
 ```
 
-当前 `tests/unit/` 覆盖数据契约、配置加载、启动前置检查，以及 `tools/` 下八个可离线测的模块（词典 / 打分 / 报告 / 素材 / 媒体 / 模型调用 / 追踪 / 视觉），`uv run pytest` 应全绿。
+当前 `tests/unit/` 覆盖数据契约、配置加载、启动前置检查，以及 `tools/` 下八个可离线测的模块
+（词典 / 打分 / 报告 / 素材 / 媒体 / 模型调用 / 追踪 / 视觉），`uv run pytest` 应全绿。
+
+依赖真实 Postgres / Redis 的集成用例在 `tests/integration/`：默认**不跑**，需要显式触发——
+
+```powershell
+uv run pytest -m integration   # 用 testcontainers 起真实容器；需要可用的 Docker
+```
+
+Docker 不可用时会直接报错并说明原因（不静默跳过）。
 
 开发前请先读 `AGENTS.md`（AI 开发规范，含目录约定、文件边界、测试要求、依赖策略、提交检查清单）：
 

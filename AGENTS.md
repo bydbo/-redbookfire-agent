@@ -78,6 +78,7 @@
 - **所有测试必须能在没有 API 密钥、没有网络的机器上跑通**：外部调用一律用假实现或固定样本替代，禁止在测试里真调模型。
 - 确定性优先：涉及素材扫描、匹配打分、报告渲染的测试，断言结构化结果（分数、命中要素、覆盖缺口），不要断言自然语言措辞。
 - 涉及文件系统的测试必须使用临时目录，跑完不留残留。
+- **集成测试独立成层**：放 `tests/integration/`，必须带 `integration` 标记；`uv run pytest` 默认只跑 `tests/unit/`（`addopts` 排除该标记），集成用例用 `uv run pytest -m integration` 显式触发。集成测试需要可用的 Docker（testcontainers 起真实 Postgres / Redis），**Docker 不可用时直接失败并说明原因，不静默跳过**——与项目「不做降级」的口径一致。
 - 当前状态：`tests/unit/` 已有 `schemas.py` 契约测试，`uv run pytest` 应全绿；`tools/` 的行为回归测试见 `docs/backlog.md` 的 S1.4。
 
 ---
@@ -88,8 +89,8 @@
 
 | 类型 | 规则 | 当前状态 |
 | --- | --- | --- |
-| 运行时依赖 | 必须走第 6 节流程才能引入；引入后同步更新 `docs/技术栈.md` | pydantic 2.x + pydantic-settings 2.x + python-dotenv（S1.1 / S1.2 引入，见 `docs/技术栈.md`） |
-| 开发依赖 | 允许测试与代码质量工具 | `pytest`、`pytest-cov`、`ruff`、`mypy`、`pre-commit`（版本见 `docs/技术栈.md`） |
+| 运行时依赖 | 必须走第 6 节流程才能引入；引入后同步更新 `docs/技术栈.md` | pydantic 2.x + pydantic-settings 2.x + python-dotenv（S1.1 / S1.2）、sqlalchemy[asyncio] + asyncpg（S2.9，见 `docs/技术栈.md`） |
+| 开发依赖 | 允许测试与代码质量工具 | `pytest`、`pytest-cov`、`pytest-asyncio`、`testcontainers[redis]`、`ruff`、`mypy`、`pre-commit`（版本见 `docs/技术栈.md`） |
 | 系统级依赖 | 仅指外部程序依赖；缺失时只影响对应能力 | `ffmpeg` / `ffprobe` |
 | 前端依赖 | 由 `frontend/package.json` 管理；直接依赖需在提交信息写明理由，禁止引入第二套组件库或状态管理方案 | pnpm 11.25.0 + Node 25.3.0 |
 

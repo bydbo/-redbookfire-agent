@@ -50,7 +50,7 @@
 | --- | --- | --- | --- | --- | --- |
 | S2.0 | 评测集与示例素材包制作 | — | 按产品方案 §10.1 的标注标准完成 20 组用例（覆盖五类场景）；`evals/fixtures/demo_pack/` 含 12–20 条素材与旁车说明；**不依赖任何代码，可立即开工**（落地时七维度全标 + v1 冻结校验） | 3 | ✅ |
 | S2.1 | Compose 起 Postgres + Redis | — | `docker compose up` 后数据库含 `vector` 与 `pg_trgm` 扩展，pgvector ≥ 0.5；镜像 tag 固定（实测 vector 0.8.6 / pg_trgm 1.6 / PG 16.15 / Redis 7.4.11） | 1 | ✅ |
-| S2.9 | 集成测试基座 | S2.1 | 引入 testcontainers 与 pytest-asyncio，提供可复用的 Postgres / Redis 容器夹具；`uv run pytest` 默认只跑单元用例，集成用例以 `-m integration` 显式触发。**必须先于 S2.2 完成**：S2.2 起各 Story 的验收都要求集成用例通过，基座缺席会形成循环依赖 | 3 | ⬜ |
+| S2.9 | 集成测试基座 | S2.1 | 引入 testcontainers 与 pytest-asyncio，提供可复用的 Postgres / Redis 容器夹具；`uv run pytest` 默认只跑单元用例，集成用例以 `-m integration` 显式触发（实测：默认 289 单测 + 7 条集成用例、容器 10 秒级启动、无 Docker 时单条报错退出码 1）。**必须先于 S2.2 完成**：S2.2 起各 Story 的验收都要求集成用例通过，基座缺席会形成循环依赖 | 3 | ⬜ |
 | S2.2 | SQLAlchemy async 模型与会话 | S1.1, S2.1 | 五张表映射完整，字段与数据契约逐项对齐；testcontainers 集成用例通过 | 1.5 | ⬜ |
 | S2.3 | Alembic 初始迁移 | S2.2 | `upgrade head` 建齐表与索引；`downgrade` 可回滚且不删扩展；迁移往返（upgrade→downgrade→upgrade）集成用例通过 | 1 | ⬜ |
 | S2.4 | 素材索引入库 + 增量判断 | S2.3 | 按 `fingerprint` 增量更新；重复运行不重复打标；**重新索引后磁盘上已消失的素材在库中无残留行**（数据契约 §一 的删除侧承诺，避免匹配榜推荐已删除的文件）；**触发路径明确：由分析任务的前置步骤自动做增量索引，首次全量建库走运维命令（不进 HTTP 契约）**；集成用例通过 | 2 | ⬜ |
