@@ -1,0 +1,42 @@
+{
+  "id": "case-19",
+  "version": "v1",
+  "scene": "职场话题",
+  "hotspot": "跳槽面试前，怎么准备才不慌",
+  "clue_expectations": {
+    "must": [
+      {
+        "type": "topic",
+        "value": "职场"
+      }
+    ],
+    "allowed": [
+      {
+        "type": "format",
+        "value": "清单合集"
+      },
+      {
+        "type": "scene",
+        "value": "办公室通勤"
+      },
+      {
+        "type": "audience",
+        "value": "新手小白"
+      }
+    ],
+    "forbidden": []
+  },
+  "match_expectations": {
+    "must_hit": [
+      "职场/会议-白板.jpg"
+    ],
+    "acceptable": [
+      "职场/代码-笔记本.jpg",
+      "职场/工位-加班.jpg"
+    ],
+    "must_not": [
+      "宠物/柯基-遛狗.jpg"
+    ]
+  },
+  "notes": "职场类素材有 4 条，用来观察 Top-5 内排序是否把「流程/准备」类素材排前面。"
+}

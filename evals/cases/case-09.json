@@ -1,0 +1,41 @@
+{
+  "id": "case-09",
+  "version": "v1",
+  "scene": "节目与影视梗",
+  "hotspot": "综艺里素人逆袭名场面，热血又低门槛",
+  "clue_expectations": {
+    "must": [
+      {
+        "type": "emotion",
+        "value": "热血"
+      }
+    ],
+    "allowed": [
+      {
+        "type": "conflict",
+        "value": "低门槛"
+      },
+      {
+        "type": "ip",
+        "value": "素人"
+      },
+      {
+        "type": "format",
+        "value": "跟练"
+      }
+    ],
+    "forbidden": []
+  },
+  "match_expectations": {
+    "must_hit": [
+      "运动/晨跑-公园.jpg"
+    ],
+    "acceptable": [
+      "运动/跳绳-阳台.jpg"
+    ],
+    "must_not": [
+      "美食/探店-小馆.jpg"
+    ]
+  },
+  "notes": "情绪 + 反差结构组合，验证多要素加权下的排序稳定。"
+}

@@ -1,0 +1,41 @@
+{
+  "id": "case-18",
+  "version": "v1",
+  "scene": "职场话题",
+  "hotspot": "加班到深夜，谁懂啊",
+  "clue_expectations": {
+    "must": [
+      {
+        "type": "audience",
+        "value": "打工人"
+      }
+    ],
+    "allowed": [
+      {
+        "type": "emotion",
+        "value": "共鸣"
+      },
+      {
+        "type": "emotion",
+        "value": "焦虑"
+      },
+      {
+        "type": "scene",
+        "value": "办公室通勤"
+      }
+    ],
+    "forbidden": []
+  },
+  "match_expectations": {
+    "must_hit": [
+      "职场/工位-加班.jpg"
+    ],
+    "acceptable": [
+      "职场/通勤-地铁.mp4"
+    ],
+    "must_not": [
+      "美食/咖啡-手冲.mp4"
+    ]
+  },
+  "notes": "与 case-07 同类要素、不同措辞：验证重复要素下的稳定性。"
+}

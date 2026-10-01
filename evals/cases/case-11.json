@@ -1,0 +1,49 @@
+{
+  "id": "case-11",
+  "version": "v1",
+  "scene": "节日与节气",
+  "hotspot": "入秋穿搭怎么穿才显高",
+  "full_gap": true,
+  "clue_expectations": {
+    "must": [
+      {
+        "type": "topic",
+        "value": "穿搭"
+      }
+    ],
+    "allowed": [
+      {
+        "type": "format",
+        "value": "同款"
+      },
+      {
+        "type": "audience",
+        "value": "精致女孩"
+      }
+    ],
+    "forbidden": []
+  },
+  "match_expectations": {
+    "must_hit": [],
+    "acceptable": [],
+    "must_not": [
+      "运动/健身房-撸铁.mp4"
+    ]
+  },
+  "gap_expectations": [
+    {
+      "type": "topic",
+      "value": "穿搭",
+      "note": "示例包没有穿搭素材，必须报缺口"
+    },
+    {
+      "type": "format",
+      "value": "同款",
+      "note": "没有可做同款展示的素材"
+    }
+  ],
+  "tool_expectations": [
+    "no_candidate_padding"
+  ],
+  "notes": "全缺口样例②：覆盖度为 0 时报告仍要结构完整、给出补拍建议。"
+}

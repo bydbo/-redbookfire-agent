@@ -1,0 +1,45 @@
+{
+  "id": "case-16",
+  "version": "v1",
+  "scene": "生活方式",
+  "hotspot": "养猫日常：猫咪治愈瞬间合集",
+  "clue_expectations": {
+    "must": [
+      {
+        "type": "topic",
+        "value": "猫咪"
+      }
+    ],
+    "allowed": [
+      {
+        "type": "emotion",
+        "value": "治愈"
+      },
+      {
+        "type": "ip",
+        "value": "萌宠IP"
+      },
+      {
+        "type": "format",
+        "value": "清单合集"
+      }
+    ],
+    "forbidden": []
+  },
+  "match_expectations": {
+    "must_hit": [
+      "宠物/橘猫-翻肚皮.mp4"
+    ],
+    "acceptable": [
+      "宠物/猫咪-窗台.jpg",
+      "未整理/视频1.mp4"
+    ],
+    "must_not": [
+      "职场/通勤-地铁.mp4"
+    ]
+  },
+  "tool_expectations": [
+    "vision_when_no_hint"
+  ],
+  "notes": "素材最丰富的一组（3 条相关），用于核对 Top-5 命中率与排序质量。"
+}

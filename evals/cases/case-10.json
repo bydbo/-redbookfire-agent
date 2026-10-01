@@ -1,0 +1,36 @@
+{
+  "id": "case-10",
+  "version": "v1",
+  "scene": "节日与节气",
+  "hotspot": "节后减脂，低卡餐三天清单",
+  "clue_expectations": {
+    "must": [
+      {
+        "type": "topic",
+        "value": "减脂餐"
+      }
+    ],
+    "allowed": [
+      {
+        "type": "emotion",
+        "value": "焦虑"
+      },
+      {
+        "type": "format",
+        "value": "清单合集"
+      }
+    ],
+    "forbidden": []
+  },
+  "match_expectations": {
+    "must_hit": [
+      "美食/减脂餐-沙拉.jpg"
+    ],
+    "acceptable": [],
+    "must_not": [
+      "美食/家常菜-番茄炒蛋.jpg",
+      "宠物/柯基-遛狗.jpg"
+    ]
+  },
+  "notes": "含两条 must_not：家常菜看起来像美食素材，但对「减脂」是错配，用来量精确率。"
+}

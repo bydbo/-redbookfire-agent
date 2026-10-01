@@ -1,0 +1,46 @@
+{
+  "id": "case-02",
+  "version": "v1",
+  "scene": "明星运动",
+  "hotspot": "明星健身房撸铁，状态在线",
+  "clue_expectations": {
+    "must": [
+      {
+        "type": "topic",
+        "value": "健身"
+      }
+    ],
+    "allowed": [
+      {
+        "type": "scene",
+        "value": "健身房"
+      },
+      {
+        "type": "ip",
+        "value": "明星艺人"
+      },
+      {
+        "type": "emotion",
+        "value": "解压"
+      }
+    ],
+    "forbidden": []
+  },
+  "match_expectations": {
+    "must_hit": [
+      "运动/健身房-撸铁.mp4"
+    ],
+    "acceptable": [],
+    "must_not": [
+      "宠物/柯基-遛狗.jpg"
+    ]
+  },
+  "gap_expectations": [
+    {
+      "type": "ip",
+      "value": "明星艺人",
+      "note": "无人物素材"
+    }
+  ],
+  "notes": "单素材精确命中，用于核对首选命中率。"
+}

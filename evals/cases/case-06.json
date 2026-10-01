@@ -1,0 +1,44 @@
+{
+  "id": "case-06",
+  "version": "v1",
+  "scene": "节目与影视梗",
+  "hotspot": "综艺名场面：嘉宾摔进泳池，反差笑点拉满",
+  "clue_expectations": {
+    "must": [
+      {
+        "type": "emotion",
+        "value": "反差"
+      }
+    ],
+    "allowed": [
+      {
+        "type": "emotion",
+        "value": "好笑"
+      },
+      {
+        "type": "scene",
+        "value": "球场"
+      },
+      {
+        "type": "ip",
+        "value": "明星艺人"
+      }
+    ],
+    "forbidden": []
+  },
+  "match_expectations": {
+    "must_hit": [
+      "运动/球场-挥拍.mp4"
+    ],
+    "acceptable": [
+      "宠物/橘猫-翻肚皮.mp4"
+    ],
+    "must_not": [
+      "职场/会议-白板.jpg"
+    ]
+  },
+  "hallucination_guards": [
+    "不得出现具体艺人姓名、节目名或代言暗示"
+  ],
+  "notes": "影视梗场景只能借可迁移要素（反差）——不许直用节目内容。"
+}

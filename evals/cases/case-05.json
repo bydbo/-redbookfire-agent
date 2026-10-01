@@ -1,0 +1,43 @@
+{
+  "id": "case-05",
+  "version": "v1",
+  "scene": "明星运动",
+  "hotspot": "明星跳绳挑战，居家也能跟练",
+  "clue_expectations": {
+    "must": [
+      {
+        "type": "topic",
+        "value": "跳绳"
+      }
+    ],
+    "allowed": [
+      {
+        "type": "format",
+        "value": "跟练"
+      },
+      {
+        "type": "conflict",
+        "value": "低门槛"
+      },
+      {
+        "type": "scene",
+        "value": "居家"
+      },
+      {
+        "type": "ip",
+        "value": "明星艺人"
+      }
+    ],
+    "forbidden": []
+  },
+  "match_expectations": {
+    "must_hit": [
+      "运动/跳绳-阳台.jpg"
+    ],
+    "acceptable": [],
+    "must_not": [
+      "美食/咖啡-手冲.mp4"
+    ]
+  },
+  "notes": "要素「跳绳」不在爆点词典内，用来观察词典兜底失败时靠模型拆解补齐的表现。"
+}

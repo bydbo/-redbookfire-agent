@@ -1,0 +1,35 @@
+{
+  "id": "case-03",
+  "version": "v1",
+  "scene": "明星运动",
+  "hotspot": "明星清晨跑步被偶遇，路人镜头",
+  "clue_expectations": {
+    "must": [
+      {
+        "type": "topic",
+        "value": "跑步"
+      }
+    ],
+    "allowed": [
+      {
+        "type": "ip",
+        "value": "明星艺人"
+      },
+      {
+        "type": "emotion",
+        "value": "热血"
+      }
+    ],
+    "forbidden": []
+  },
+  "match_expectations": {
+    "must_hit": [
+      "运动/晨跑-公园.jpg"
+    ],
+    "acceptable": [],
+    "must_not": [
+      "职场/会议-白板.jpg"
+    ]
+  },
+  "notes": "与 case-02 同结构，验证同类型热点的稳定性（两次运行结果应一致）。"
+}

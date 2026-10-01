@@ -1,0 +1,39 @@
+{
+  "id": "case-15",
+  "version": "v1",
+  "scene": "生活方式",
+  "hotspot": "出租屋阳台改造成小健身角",
+  "clue_expectations": {
+    "must": [
+      {
+        "type": "topic",
+        "value": "健身"
+      }
+    ],
+    "allowed": [
+      {
+        "type": "scene",
+        "value": "居家"
+      },
+      {
+        "type": "format",
+        "value": "同款"
+      },
+      {
+        "type": "conflict",
+        "value": "低门槛"
+      }
+    ],
+    "forbidden": []
+  },
+  "match_expectations": {
+    "must_hit": [
+      "运动/跳绳-阳台.jpg"
+    ],
+    "acceptable": [],
+    "must_not": [
+      "美食/咖啡-手冲.mp4"
+    ]
+  },
+  "notes": "场景（居家）+ 主题（健身）组合，正确答案只有一条阳台素材。"
+}

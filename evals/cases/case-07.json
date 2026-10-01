@@ -1,0 +1,40 @@
+{
+  "id": "case-07",
+  "version": "v1",
+  "scene": "节目与影视梗",
+  "hotspot": "热播剧台词梗：一句打工人共鸣",
+  "clue_expectations": {
+    "must": [
+      {
+        "type": "audience",
+        "value": "打工人"
+      }
+    ],
+    "allowed": [
+      {
+        "type": "emotion",
+        "value": "共鸣"
+      },
+      {
+        "type": "scene",
+        "value": "办公室通勤"
+      }
+    ],
+    "forbidden": []
+  },
+  "match_expectations": {
+    "must_hit": [
+      "职场/工位-加班.jpg"
+    ],
+    "acceptable": [
+      "职场/通勤-地铁.mp4"
+    ],
+    "must_not": [
+      "运动/跳绳-阳台.jpg"
+    ]
+  },
+  "hallucination_guards": [
+    "不得引用具体剧名、角色名或台词原文"
+  ],
+  "notes": "人群要素（打工人）单独成立，用来测非主题类要素的召回。"
+}

@@ -1,0 +1,39 @@
+{
+  "id": "case-14",
+  "version": "v1",
+  "scene": "生活方式",
+  "hotspot": "手冲咖啡入门，新手也能一次成功",
+  "clue_expectations": {
+    "must": [
+      {
+        "type": "topic",
+        "value": "咖啡"
+      }
+    ],
+    "allowed": [
+      {
+        "type": "format",
+        "value": "教程"
+      },
+      {
+        "type": "audience",
+        "value": "新手小白"
+      },
+      {
+        "type": "scene",
+        "value": "门店"
+      }
+    ],
+    "forbidden": []
+  },
+  "match_expectations": {
+    "must_hit": [
+      "美食/咖啡-手冲.mp4"
+    ],
+    "acceptable": [],
+    "must_not": [
+      "运动/晨跑-公园.jpg"
+    ]
+  },
+  "notes": "与 case-12 同素材、不同要素：验证同一素材在多组用例下的稳定召回。"
+}

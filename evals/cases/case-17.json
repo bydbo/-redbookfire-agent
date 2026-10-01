@@ -1,0 +1,38 @@
+{
+  "id": "case-17",
+  "version": "v1",
+  "scene": "生活方式",
+  "hotspot": "通勤路上的一人食",
+  "clue_expectations": {
+    "must": [
+      {
+        "type": "audience",
+        "value": "打工人"
+      }
+    ],
+    "allowed": [
+      {
+        "type": "scene",
+        "value": "办公室通勤"
+      },
+      {
+        "type": "topic",
+        "value": "美食探店"
+      }
+    ],
+    "forbidden": []
+  },
+  "match_expectations": {
+    "must_hit": [
+      "职场/通勤-地铁.mp4"
+    ],
+    "acceptable": [
+      "美食/探店-小馆.jpg",
+      "美食/减脂餐-沙拉.jpg"
+    ],
+    "must_not": [
+      "宠物/橘猫-翻肚皮.mp4"
+    ]
+  },
+  "notes": "跨类别组合（职场通勤 + 美食）——正确的候选来自两个不同目录。"
+}

@@ -1,0 +1,67 @@
+{
+  "id": "case-01",
+  "version": "v1",
+  "scene": "明星运动",
+  "hotspot": "某顶流明星打羽毛球被拍，素人场边对打反差感拉满",
+  "clue_expectations": {
+    "must": [
+      {
+        "type": "topic",
+        "value": "羽毛球"
+      }
+    ],
+    "allowed": [
+      {
+        "type": "ip",
+        "value": "明星艺人"
+      },
+      {
+        "type": "scene",
+        "value": "球场"
+      },
+      {
+        "type": "emotion",
+        "value": "反差"
+      },
+      {
+        "type": "conflict",
+        "value": "身份反差"
+      }
+    ],
+    "forbidden": [
+      {
+        "type": "ip",
+        "value": "具体艺人姓名",
+        "reason": "热点原文没有姓名，拆解不得补出"
+      }
+    ]
+  },
+  "match_expectations": {
+    "must_hit": [
+      "运动/球场-挥拍.mp4"
+    ],
+    "acceptable": [
+      "运动/球拍特写.jpg",
+      "未整理/IMG_20260901_143012.jpg"
+    ],
+    "must_not": [
+      "美食/家常菜-番茄炒蛋.jpg"
+    ]
+  },
+  "gap_expectations": [
+    {
+      "type": "ip",
+      "value": "明星艺人",
+      "note": "示例素材包没有人物 IP 素材，必须如实标为缺口并给补拍建议"
+    }
+  ],
+  "tool_expectations": [
+    "vision_when_no_hint"
+  ],
+  "hallucination_guards": [
+    "不得出现具体艺人姓名、节目名或代言暗示",
+    "不得声称素材里出现了明星本人",
+    "不得引用示例素材包中不存在的素材"
+  ],
+  "notes": "主线用例：要素齐全 + 有缺口 + 引用一条无说明素材，同时验证召回、缺口与文件名兜底。"
+}

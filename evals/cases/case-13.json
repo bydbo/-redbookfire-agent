@@ -1,0 +1,37 @@
+{
+  "id": "case-13",
+  "version": "v1",
+  "scene": "生活方式",
+  "hotspot": "周末在家做一顿番茄炒蛋",
+  "clue_expectations": {
+    "must": [
+      {
+        "type": "topic",
+        "value": "家常菜"
+      }
+    ],
+    "allowed": [
+      {
+        "type": "audience",
+        "value": "新手小白"
+      },
+      {
+        "type": "scene",
+        "value": "居家"
+      }
+    ],
+    "forbidden": []
+  },
+  "match_expectations": {
+    "must_hit": [
+      "美食/家常菜-番茄炒蛋.jpg"
+    ],
+    "acceptable": [
+      "美食/减脂餐-沙拉.jpg"
+    ],
+    "must_not": [
+      "职场/工位-加班.jpg"
+    ]
+  },
+  "notes": "主题词直命中的基线场景（字面召回就该拿到分）。"
+}

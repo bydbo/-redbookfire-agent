@@ -1,0 +1,42 @@
+{
+  "id": "case-08",
+  "version": "v1",
+  "scene": "节目与影视梗",
+  "hotspot": "影视里的治愈慢镜头被做成合集",
+  "clue_expectations": {
+    "must": [
+      {
+        "type": "emotion",
+        "value": "治愈"
+      }
+    ],
+    "allowed": [
+      {
+        "type": "emotion",
+        "value": "解压"
+      },
+      {
+        "type": "format",
+        "value": "清单合集"
+      },
+      {
+        "type": "scene",
+        "value": "居家"
+      }
+    ],
+    "forbidden": []
+  },
+  "match_expectations": {
+    "must_hit": [
+      "宠物/橘猫-翻肚皮.mp4"
+    ],
+    "acceptable": [
+      "宠物/猫咪-窗台.jpg",
+      "美食/咖啡-手冲.mp4"
+    ],
+    "must_not": [
+      "职场/工位-加班.jpg"
+    ]
+  },
+  "notes": "纯情绪要素召回：正确答案是三条情绪一致的素材，缺一不可不代表失败。"
+}

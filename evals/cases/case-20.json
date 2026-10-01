@@ -1,0 +1,41 @@
+{
+  "id": "case-20",
+  "version": "v1",
+  "scene": "职场话题",
+  "hotspot": "用 AI 写代码提效，实测一遍",
+  "clue_expectations": {
+    "must": [
+      {
+        "type": "format",
+        "value": "测评"
+      }
+    ],
+    "allowed": [
+      {
+        "type": "topic",
+        "value": "数码"
+      },
+      {
+        "type": "ip",
+        "value": "专业人士"
+      },
+      {
+        "type": "scene",
+        "value": "办公室通勤"
+      }
+    ],
+    "forbidden": []
+  },
+  "match_expectations": {
+    "must_hit": [
+      "职场/代码-笔记本.jpg"
+    ],
+    "acceptable": [
+      "美食/探店-小馆.jpg"
+    ],
+    "must_not": [
+      "运动/球拍特写.jpg"
+    ]
+  },
+  "notes": "形式要素（测评）单独成立：探店小馆虽然品类不同，但形式一致，标注为可接受。"
+}

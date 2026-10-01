@@ -1,0 +1,51 @@
+{
+  "id": "case-04",
+  "version": "v1",
+  "scene": "明星运动",
+  "hotspot": "明星打篮球被拍，三分绝杀",
+  "full_gap": true,
+  "clue_expectations": {
+    "must": [
+      {
+        "type": "topic",
+        "value": "篮球"
+      }
+    ],
+    "allowed": [
+      {
+        "type": "ip",
+        "value": "明星艺人"
+      },
+      {
+        "type": "scene",
+        "value": "球场"
+      }
+    ],
+    "forbidden": []
+  },
+  "match_expectations": {
+    "must_hit": [],
+    "acceptable": [
+      "运动/球场-挥拍.mp4"
+    ],
+    "must_not": [
+      "美食/减脂餐-沙拉.jpg"
+    ]
+  },
+  "gap_expectations": [
+    {
+      "type": "topic",
+      "value": "篮球",
+      "note": "示例包没有篮球素材，必须报缺口"
+    },
+    {
+      "type": "ip",
+      "value": "明星艺人",
+      "note": "无人物素材"
+    }
+  ],
+  "tool_expectations": [
+    "no_candidate_padding"
+  ],
+  "notes": "全缺口样例①：验证「不硬凑候选」与补拍建议，而不是拿球场素材充数。"
+}

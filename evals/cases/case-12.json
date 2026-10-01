@@ -1,0 +1,41 @@
+{
+  "id": "case-12",
+  "version": "v1",
+  "scene": "节日与节气",
+  "hotspot": "立秋了，来一杯热咖啡",
+  "clue_expectations": {
+    "must": [
+      {
+        "type": "topic",
+        "value": "咖啡"
+      }
+    ],
+    "allowed": [
+      {
+        "type": "scene",
+        "value": "门店"
+      },
+      {
+        "type": "emotion",
+        "value": "治愈"
+      }
+    ],
+    "forbidden": []
+  },
+  "match_expectations": {
+    "must_hit": [
+      "美食/咖啡-手冲.mp4"
+    ],
+    "acceptable": [
+      "美食/探店-小馆.jpg",
+      "未整理/临时素材.mp4"
+    ],
+    "must_not": [
+      "职场/代码-笔记本.jpg"
+    ]
+  },
+  "tool_expectations": [
+    "vision_when_no_hint"
+  ],
+  "notes": "acceptable 里放了一条无说明素材：靠文件名/画面兜底判它相关，属于可接受而非必须。"
+}
