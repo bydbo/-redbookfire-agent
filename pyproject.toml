@@ -10,6 +10,7 @@ authors = [{ name = "tianshugui", email = "tianshugui95@gmail.com" }]
 # 最终技术栈（FastAPI / LangGraph / pgvector 等）见 docs/技术栈.md，引入时走 AGENTS.md 第 6 节
 dependencies = [
     "asyncpg>=0.30,<1",
+    "pgvector>=0.5,<1",
     "pydantic>=2.9,<3",
     "pydantic-settings>=2.6,<3",
     "python-dotenv>=1.0,<2",

@@ -68,7 +68,7 @@
 | HTTP 客户端 | httpx（异步、连接池、重试） |
 | Agent 编排 | LangGraph（状态图 + 检查点 + 失败重试） |
 | 数据库与缓存 | PostgreSQL 16 + pgvector 0.8.6、Redis 7.4.11（本地 `docker compose` 起，tag 固定） |
-| 数据访问 | SQLAlchemy 2.0 async + asyncpg + Alembic |
+| 数据访问 | SQLAlchemy 2.0 async ORM + asyncpg + pgvector（已落地，模型见 `src/xhs_agent/db/`）；Alembic 迁移待落地（S2.3） |
 | 检索 | 混合召回：pg_trgm 字面 + pgvector 语义，RRF 融合后套要素加权 |
 | Embedding | 默认通义 text-embedding-v3（API）；本地小模型为可选实现 |
 | 队列与缓存 | Redis + Celery |
