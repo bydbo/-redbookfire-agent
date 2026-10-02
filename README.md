@@ -38,11 +38,13 @@
 | 本地依赖编排（PostgreSQL 16 + pgvector、Redis，Docker Compose） | ✅ 已完成（S2.1） |
 | 集成测试基座（testcontainers + pytest-asyncio） | ✅ 已完成（S2.9） |
 | 数据库 ORM 与会话（五张表、14 条索引、向量列） | ✅ 已完成（S2.2） |
+| 素材索引入库 + 增量判断（`materials` 表 + 指纹增量 + 消失即删） | ✅ 已完成（S2.4） |
+| Alembic 数据库迁移（唯一建表路径） | ✅ 已完成（S2.3） |
 | 评测集 v1 与示例素材包（七维度口径、版本冻结） | ✅ 已完成（S2.0） |
-| 服务入口（FastAPI）与 Alembic 迁移 | ⬜ 未实现 |
+| 服务入口（FastAPI）与编排层 | ⬜ 未实现 |
 | 前端单页应用（Vue 3 + Vite） | ⬜ 未实现 |
 
-当前可运行的只有本地依赖编排与启动前置检查（`docker compose up -d --wait`、`uv run python -m xhs_agent.probe`），业务链路尚未打通。路线图见文末。
+当前可运行的是本地依赖编排、启动前置检查与素材索引入库（`docker compose up -d --wait`、`uv run python -m xhs_agent.probe`、`uv run python scripts/index_materials.py`），业务链路尚未打通。路线图见文末。
 
 ---
 
@@ -54,14 +56,14 @@
 | --- | --- |
 | 语言 | Python ≥ 3.11 |
 | 包管理与构建 | uv + `pyproject.toml`（hatchling 后端，src 布局） |
-| 运行时依赖 | pydantic v2、pydantic-settings、python-dotenv |
-| 开发依赖 | pytest、pytest-cov、ruff、mypy、pre-commit |
+| 运行时依赖 | pydantic v2、pydantic-settings、python-dotenv、SQLAlchemy 2.0 async + asyncpg、pgvector、alembic |
+| 开发依赖 | pytest、pytest-cov、pytest-asyncio、testcontainers、ruff、mypy、pre-commit |
 | 文本模型接入 | OpenAI 兼容 `/chat/completions` 协议（默认 DeepSeek），标准库 `urllib` 直连，JSON mode 结构化输出 + 解析失败自修 |
 | 多模态接入 | 通义千问 VL（`qwen-vl-max`），关键帧 base64 内联 |
 | 音视频处理 | ffmpeg / ffprobe（用于探测与抽帧；缺失时跳过抽帧，属能力裁剪） |
 | 检索算法 | 字符 bigram Jaccard + 要素类型加权；无 embedding、无向量库 |
 | 配置 | pydantic-settings + TOML：环境变量 > `.env` > config.toml > 代码默认值；启动前置检查见 `uv run python -m xhs_agent.probe` |
-| 数据落地 | JSON 索引 / JSONL 轨迹 / Markdown 与单文件 HTML 报告；无数据库 |
+| 数据落地 | PostgreSQL `materials` 表（素材索引，增量同步）+ JSONL 轨迹 + Markdown 与单文件 HTML 报告；旧 JSON 索引保留但标为 legacy |
 | 测试 | pytest |
 
 ### 最终技术栈（企业级，已确定待落地）
@@ -110,14 +112,18 @@ Copy-Item config/.env.example config/.env
 uv run alembic upgrade head
 #    回滚与一致性自查：uv run alembic downgrade base / uv run alembic check
 
-# 5. 验证安装与本地依赖（两个服务应是 healthy）
+# 5. 素材索引入库（可选，首次使用素材库时跑一次全量；之后每次分析前自动增量）
+#    把素材放进 data/materials/ 后执行；--max-vision-items 控制视觉打标的成本上限
+uv run python scripts/index_materials.py
+
+# 6. 验证安装与本地依赖（两个服务应是 healthy）
 uv run python -c "import xhs_agent; print(xhs_agent.__version__)"
 docker compose ps
 
-# 6. 验证配置读取（输出不应包含任何密钥）
+# 7. 验证配置读取（输出不应包含任何密钥）
 uv run python -c "from xhs_agent.config import load_config; print(load_config().describe())"
 
-# 7. 跑启动前置检查（缺必填项会打印 E_CONFIG_MISSING 并以退出码 2 结束）
+# 8. 跑启动前置检查（缺必填项会打印 E_CONFIG_MISSING 并以退出码 2 结束）
 uv run python -m xhs_agent.probe
 ```
 
@@ -154,7 +160,7 @@ project/
 
 配置分三层，**密钥与源码彻底分离**：
 
-- `config/config.toml`：可公开的默认值，按段组织（`llm` / `vision` / `embedding` / `retrieval` / `match` / `paths` / `database` / `queue`）；
+- `config/config.toml`：可公开的默认值，按段组织（`llm` / `vision` / `embedding` / `retrieval` / `match` / `paths` / `database` / `queue` / `frontend`）；
 - `config/.env`：只放密钥，被 `.gitignore` 忽略，永不提交；
 - 环境变量：优先级最高，用于密钥与部署差异。
 

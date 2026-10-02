@@ -182,8 +182,6 @@ def build_index(materials_dir: str, index_dir: str, vision=None,
     vision_used = 0
 
     for file_path in files:
-        rel = os.path.relpath(file_path, materials_dir)
-        material_id = Material.make_id(rel)
         fp = fingerprint(file_path)
         cached_item = cache_by_path.get(os.path.abspath(file_path))
         if cached_item and cached_item.fingerprint == fp and fp:
@@ -191,56 +189,19 @@ def build_index(materials_dir: str, index_dir: str, vision=None,
             result.reused += 1
             continue
 
-        stat = os.stat(file_path)
-        kind = media.kind_of(file_path)
-        info = media.probe(file_path) if kind == "video" else _image_size(file_path)
-        sidecar = parse_sidecar(sidecar_path(file_path) or "")
-        tags = list(sidecar["tags"]) or filename_tags(file_path)
-        title = sidecar["title"] or os.path.splitext(os.path.basename(file_path))[0]
-        description = sidecar["description"]
-        source = "sidecar" if (sidecar["description"] or sidecar["tags"]) else "filename"
-
-        frames: list = []
-        if extract_frames:
-            frames = media.extract_keyframes(
-                file_path,
-                os.path.join(keyframes_dir, material_id),
-                count=frame_count,
-                max_width=frame_max_width,
-            )
-
-        if vision is not None and frames and vision_used < max_vision_items and not sidecar["description"]:
-            try:
-                described = vision(frames, title)
-            except Exception:
-                described = None
-            if described:
-                description = described.get("description") or description
-                tags = _merge_tags(tags, described.get("tags") or [])
-                if described.get("title"):
-                    title = described["title"]
-                source = "vision"
-                vision_used += 1
-
-        material = Material(
-            id=material_id,
-            path=file_path,
-            type=kind if kind != "other" else "video",
-            title=title,
-            description=description,
-            tags=tags,
-            elements=build_elements(tags, title, description),
-            duration_s=float(info.get("duration_s") or 0.0),
-            width=int(info.get("width") or 0),
-            height=int(info.get("height") or 0),
-            has_audio=bool(info.get("has_audio")),
-            size_bytes=int(stat.st_size),
-            mtime=float(stat.st_mtime),
-            source=source,
-            keyframes=frames,
-            indexed_at=now_iso(),
-            fingerprint=fp,
+        # 视觉打标有成本上限：预算用完后把 `vision` 置 None，build_material 就不打标了。
+        allow_vision = vision if vision_used < max_vision_items else None
+        material = build_material(
+            file_path,
+            materials_dir,
+            keyframes_dir,
+            vision=allow_vision,
+            extract_frames=extract_frames,
+            frame_count=frame_count,
+            frame_max_width=frame_max_width,
         )
+        if allow_vision is not None and material.source == "vision":
+            vision_used += 1
         result.materials.append(material)
         if cached_item:
             result.updated += 1
@@ -249,6 +210,72 @@ def build_index(materials_dir: str, index_dir: str, vision=None,
 
     save_index(index_dir, materials_dir, result.materials)
     return result
+
+
+def build_material(file_path: str, materials_dir: str, keyframes_dir: str, *,
+                   vision=None, extract_frames: bool = True,
+                   frame_count: int = 3, frame_max_width: int = 720) -> Material:
+    """把单个素材文件变成 `Material`：旁车说明 → 文件名标签 → 要素 → 探测 → 抽帧 → 可选视觉打标。
+
+    输入：`file_path`（素材文件）、`materials_dir`（用于算 `Material.make_id` 的相对根）、
+    `keyframes_dir`（关键帧落盘根目录，实际写到 `keyframes_dir/<material_id>/`）。
+    可注入点：`vision`（`(frames, hint) -> dict | None`，None = 不打标）、
+    `extract_frames`（False = 不抽帧）、`frame_count` / `frame_max_width`（抽帧数量与缩放宽度）。
+    输出：`Material`（未入库；`indexed_at` 取当前时间，`fingerprint` = 文件 mtime+size）。
+    依赖：ffmpeg / ffprobe 缺失时只跳过抽帧与探测（能力裁剪），不报错。
+    """
+    rel = os.path.relpath(file_path, materials_dir)
+    material_id = Material.make_id(rel)
+    fp = fingerprint(file_path)
+    stat = os.stat(file_path)
+    kind = media.kind_of(file_path)
+    info = media.probe(file_path) if kind == "video" else _image_size(file_path)
+    sidecar = parse_sidecar(sidecar_path(file_path) or "")
+    tags = list(sidecar["tags"]) or filename_tags(file_path)
+    title = sidecar["title"] or os.path.splitext(os.path.basename(file_path))[0]
+    description = sidecar["description"]
+    source = "sidecar" if (sidecar["description"] or sidecar["tags"]) else "filename"
+
+    frames: list = []
+    if extract_frames:
+        frames = media.extract_keyframes(
+            file_path,
+            os.path.join(keyframes_dir, material_id),
+            count=frame_count,
+            max_width=frame_max_width,
+        )
+
+    if vision is not None and frames and not sidecar["description"]:
+        try:
+            described = vision(frames, title)
+        except Exception:
+            described = None
+        if described:
+            description = described.get("description") or description
+            tags = _merge_tags(tags, described.get("tags") or [])
+            if described.get("title"):
+                title = described["title"]
+            source = "vision"
+
+    return Material(
+        id=material_id,
+        path=file_path,
+        type=kind if kind != "other" else "video",
+        title=title,
+        description=description,
+        tags=tags,
+        elements=build_elements(tags, title, description),
+        duration_s=float(info.get("duration_s") or 0.0),
+        width=int(info.get("width") or 0),
+        height=int(info.get("height") or 0),
+        has_audio=bool(info.get("has_audio")),
+        size_bytes=int(stat.st_size),
+        mtime=float(stat.st_mtime),
+        source=source,
+        keyframes=frames,
+        indexed_at=now_iso(),
+        fingerprint=fp,
+    )
 
 
 def _merge_tags(existing: list, extra: list, limit: int = 14) -> list:

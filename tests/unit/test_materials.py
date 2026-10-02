@@ -201,3 +201,73 @@ class TestBuildIndex:
             return {k: v for k, v in material.to_dict().items() if k != "indexed_at"}
 
         assert [strip(m) for m in first.materials] == [strip(m) for m in second.materials]
+
+
+class TestBuildMaterial:
+    """单文件构造器（S2.4 从 build_index 抽出）：离线、临时目录，可独立测试。"""
+
+    def test_sidecar_wins_over_filename(self, materials_dir, tmp_path, no_ffmpeg):
+        material = materials.build_material(
+            str(materials_dir / "球场-挥拍.mp4"),
+            str(materials_dir),
+            str(tmp_path / "kf"),
+            extract_frames=False,
+        )
+        assert (material.source, material.title) == ("sidecar", "球场热身")
+        assert material.tags == ["羽毛球", "挥拍"]
+        assert material.fingerprint == materials.fingerprint(str(materials_dir / "球场-挥拍.mp4"))
+        assert material.id == materials.Material.make_id("球场-挥拍.mp4")
+
+    def test_falls_back_to_filename_without_sidecar(self, tmp_path, make_png, no_ffmpeg):
+        root = tmp_path / "m"
+        root.mkdir()
+        (root / "晨跑-公园.png").write_bytes(make_png(720, 1280))
+        material = materials.build_material(str(root / "晨跑-公园.png"), str(root),
+                                            str(tmp_path / "kf"), extract_frames=False)
+        assert material.source == "filename"
+        assert material.title == "晨跑-公园"
+        assert material.tags == ["晨跑", "公园"]
+        assert (material.type, material.width, material.height) == ("image", 720, 1280)
+
+    def test_frame_params_are_forwarded(self, materials_dir, tmp_path, monkeypatch):
+        seen = {}
+
+        def fake_extract(_path, out_dir, count=3, max_width=720, prefix="kf"):
+            seen["count"] = count
+            seen["max_width"] = max_width
+            pathlib.Path(out_dir).mkdir(parents=True, exist_ok=True)
+            target = pathlib.Path(out_dir) / "kf_0.jpg"
+            target.write_bytes(b"\x00")
+            return [str(target)]
+
+        monkeypatch.setattr(materials.media, "extract_keyframes", fake_extract)
+        material = materials.build_material(str(materials_dir / "球场-挥拍.mp4"),
+                                            str(materials_dir), str(tmp_path / "kf"),
+                                            frame_count=7, frame_max_width=480)
+        assert seen == {"count": 7, "max_width": 480}
+        assert material.keyframes == [str(tmp_path / "kf" / material.id / "kf_0.jpg")]
+
+    def test_extract_frames_false_skips_ffmpeg(self, materials_dir, tmp_path, monkeypatch):
+        def boom(*_args, **_kwargs):
+            raise AssertionError("extract_frames=False 时不应调用抽帧")
+
+        monkeypatch.setattr(materials.media, "extract_keyframes", boom)
+        material = materials.build_material(str(materials_dir / "球场-挥拍.mp4"),
+                                            str(materials_dir), str(tmp_path / "kf"),
+                                            extract_frames=False)
+        assert material.keyframes == []
+
+    def test_vision_result_overrides_description_and_source(self, materials_dir, tmp_path,
+                                                            monkeypatch):
+        def fake_extract(_path, out_dir, count=3, max_width=720, prefix="kf"):
+            pathlib.Path(out_dir).mkdir(parents=True, exist_ok=True)
+            target = pathlib.Path(out_dir) / "kf_0.jpg"
+            target.write_bytes(b"\x00")
+            return [str(target)]
+
+        monkeypatch.setattr(materials.media, "extract_keyframes", fake_extract)
+        material = materials.build_material(
+            str(materials_dir / "宠物猫.png"), str(materials_dir), str(tmp_path / "kf"),
+            vision=lambda _frames, _hint: {"title": "猫", "tags": ["猫"], "description": "打盹"},
+        )
+        assert (material.source, material.title, material.description) == ("vision", "猫", "打盹")

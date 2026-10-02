@@ -24,6 +24,7 @@
 | `src/xhs_agent/agents/`    | 单点智能体（线索拆解、匹配解释、撰稿）                           | 跨步骤流程      |
 | `src/xhs_agent/workflows/` | 把各步骤串成一次完整运行                                  | 底层算法实现     |
 | `src/xhs_agent/db/`        | SQLAlchemy ORM 模型、会话工厂与引擎（表结构以数据契约为准）        | 业务流程、查询逻辑 |
+| `src/xhs_agent/services/`  | 用例层：一次场景化操作（素材索引同步、分析、报告）；编排 tools/db/agents | 底层算法、HTTP 接口 |
 | `alembic/`                 | 数据库迁移脚本（唯一建表路径；`alembic.ini` 在工程根）              | 业务代码、手工改库 |
 | `tests/`                   | 单元测试与集成测试                                     | 运行产物、真实素材  |
 | `evals/`                   | 评测用例、标注数据、脱敏示例素材包 `evals/fixtures/demo_pack/` | 真实素材       |
@@ -46,9 +47,11 @@
 
 ## 2. 文件边界
 
-依赖方向只能单向：`workflows/` → `agents/` → `tools/` → `models/`（P1 之前为 `schemas.py`）。
+依赖方向只能单向：`workflows/` → `services/` → `{agents/, tools/, db/}` → `models/`（P1 之前为 `schemas.py`）。
 
-- `tools/` 只放确定性能力，**不得反向调用 `agents/` 或 `workflows/`**。
+- `tools/` 只放确定性能力，**不得反向调用 `agents/`、`services/`、`workflows/` 或 `db/`**。
+- `services/` 是用例层（编排 tools/db/agents 的"一次动作"），**不重复实现 `tools/` 里已有的算法**，也不直接暴露 HTTP。
+- `db/` 只依赖 `models/`（P1 之前为 `schemas.py`）与标准库/驱动（SQLAlchemy、asyncpg、pgvector），不依赖 `tools/`、`agents/`、`services/`。
 - `agents/` 与 `workflows/` 只做编排与判断，不重复实现 `tools/` 里已有的算法。
 - 数据契约的**内容**定义在 `docs/contracts/`（API / 数据 / 检索 / 配置四份），代码里的类型定义必须与之一致；`src/xhs_agent/schemas.py`（P1 之后为 `models/`）是内存实现，`docs/contracts/` 是事实源。**改契约必须先改契约文件，再改实现。**
 - 契约未覆盖的能力不得先写代码——先补契约，再实现。
