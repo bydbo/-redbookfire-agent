@@ -25,6 +25,7 @@
 | `src/xhs_agent/workflows/` | 把各步骤串成一次完整运行                                  | 底层算法实现     |
 | `src/xhs_agent/db/`        | SQLAlchemy ORM 模型、会话工厂与引擎（表结构以数据契约为准）        | 业务流程、查询逻辑 |
 | `src/xhs_agent/services/`  | 用例层：一次场景化操作（素材索引同步、分析、报告）；编排 tools/db/agents | 底层算法、HTTP 接口 |
+| `src/xhs_agent/prompts/` | prompt 资产：一任务一份 Markdown，五段结构（契约见 `docs/contracts/prompt契约.md`） | 代码、逻辑实现 |
 | `alembic/`                 | 数据库迁移脚本（唯一建表路径；`alembic.ini` 在工程根）              | 业务代码、手工改库 |
 | `tests/`                   | 单元测试与集成测试                                     | 运行产物、真实素材  |
 | `evals/`                   | 评测用例、标注数据、脱敏示例素材包 `evals/fixtures/demo_pack/` | 真实素材       |
@@ -36,12 +37,13 @@
 | `docs/`                    | 全部文档：产品方案、简历与面试、技术栈、项目结构、AI 开发说明、开发规范、契约（`docs/contracts/`）、决策记录（`docs/adr/`）、Backlog（`docs/backlog.md`）             | 代码         |
 | `frontend/`              | Vue 3 单页应用源码、构建与前端测试配置                     | 后端代码、密钥     |
 
-四条硬约定：
+五条硬约定：
 
 1. `docs/contracts/` 是**数据与接口契约的事实源**；`src/xhs_agent/schemas.py`（P1 之后迁至 `models/`）是内存实现，必须与契约逐字段一致。新增字段或结构必须先改契约文件，再改实现，最后改调用方。
 2. 工程根由 `src/xhs_agent/config.py` 上溯三层推导得出，因此 `src/`、`config/`、`data/`、`runs/` 必须保持同级。**不要单独移动其中任何一个**，否则配置与路径会集体失效。
 3. 新增顶层目录前，先在 `docs/项目结构.md` 登记，再更新本表。
 4. **显示名与代码标识分离**：项目显示名（小红书热点搭子）可以改，但 Python 包名 `xhs_agent`、分发名 `xhs-agent`、环境变量前缀 `XHS_` 保持不变；确需改名时按第 6 节流程单独处理，不要顺手替换。
+5. **`src/xhs_agent/prompts/` 是 prompt 的唯一来源**：禁止在代码里内联 prompt 文本，也禁止引入模板引擎（确有需要时走第 6 节流程并补 ADR）；改 prompt 结构或渲染规则，先改 `docs/contracts/prompt契约.md`。
 
 ---
 

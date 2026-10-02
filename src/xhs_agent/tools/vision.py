@@ -3,6 +3,8 @@
 用途：给没有人工说明的素材补标题 / 标签 / 描述，是素材索引里的一个可选步骤。
 输入：`AppConfig`（读 `[vision]` 段与密钥）；返回的 `describe(frames, hint)` 收关键帧路径列表。
 输出：`{"title": str, "tags": list[str], "description": str}`，或 None 表示本次不出结果。
+prompt 来源：`src/xhs_agent/prompts/material_tagging.md`（五段结构，见
+`docs/contracts/prompt契约.md`）——本模块**不再内联 prompt 文本**。
 能力裁剪：开关关闭、没有密钥、机器没有 ffmpeg 时 `make_describer` 直接返回 None，
 索引会退回「文件名 + 人工说明」的标签体系——这是能力裁剪，不是运行时降级（AGENTS.md 第 4 节）。
 """
@@ -17,14 +19,9 @@ import urllib.request
 
 from ..config import AppConfig
 from ..util import extract_json
+from . import prompt as prompt_tools
 
-PROMPT = """你在帮一个小红书素材库做标注。看这几张来自同一条素材的截图，输出 JSON：
-{
-  "title": "12 字以内的素材标题",
-  "tags": ["3-8 个标签，优先写画面里能直接看到的物体、场景、动作、人物身份、情绪氛围"],
-  "description": "一句话描述画面里发生了什么，不要猜地名和品牌"
-}
-只输出 JSON。"""
+TASK_ID = "material_tagging"
 
 
 def make_describer(cfg: AppConfig):
@@ -41,7 +38,9 @@ def make_describer(cfg: AppConfig):
         images = [f for f in frames[:max_frames] if os.path.exists(f)]
         if not images:
             return None
-        content = [{"type": "text", "text": PROMPT + (f"\n文件名提示：{hint}" if hint else "")}]
+        # prompt 资产缺失或变量不全时直接抛 PromptError，不静默降级（契约 §四）
+        rendered = prompt_tools.render(TASK_ID, file_name_hint=hint or "（未提供）")
+        content: list = [{"type": "text", "text": rendered.user}]
         for path in images:
             content.append({
                 "type": "image_url",
@@ -49,7 +48,10 @@ def make_describer(cfg: AppConfig):
             })
         payload = {
             "model": model,
-            "messages": [{"role": "user", "content": content}],
+            "messages": [
+                {"role": "system", "content": rendered.system},
+                {"role": "user", "content": content},
+            ],
             "temperature": 0.2,
             "max_tokens": 600,
             "response_format": {"type": "json_object"},
