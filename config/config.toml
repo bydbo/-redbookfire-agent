@@ -42,6 +42,9 @@ dim = 1024                          # 必须与数据契约里 materials.embeddi
 batch_size = 10                     # 客户端按 min(batch_size, 供应商单请求上限=10) 自动拆批
 timeout_s = 60
 max_retries = 2
+# 成本估算单价（人民币元/百万 token），仅用于成本估算
+# 2026-10 阿里云百炼 text-embedding-v3 官方价；调价请同步 docs/contracts/配置契约.md §3.3
+price_in_per_m = 0.5
 api_key_env = "DASHSCOPE_API_KEY"
 
 [retrieval]

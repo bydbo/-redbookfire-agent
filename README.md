@@ -41,6 +41,7 @@
 | 素材索引入库 + 增量判断（`materials` 表 + 指纹增量 + 消失即删） | ✅ 已完成（S2.4） |
 | 向量回填（embedding 客户端 + `materials.embedding` / `embedding_model`） | ✅ 已完成（S2.5） |
 | 双通道召回 + RRF + 要素加权（素材检索服务） | ✅ 已完成（S2.6） |
+| 检索层基线对比评测（纯字面基线 vs 混合召回，报告落 `evals/reports/`） | ✅ 已完成（S2.8） |
 | Alembic 数据库迁移（唯一建表路径） | ✅ 已完成（S2.3） |
 | 评测集 v1 与示例素材包（七维度口径、版本冻结） | ✅ 已完成（S2.0） |
 | 服务入口（FastAPI）与编排层 | ⬜ 未实现 |
@@ -131,6 +132,10 @@ uv run python -c "from xhs_agent.config import load_config; print(load_config().
 
 # 9. 跑启动前置检查（缺必填项会打印 E_CONFIG_MISSING 并以退出码 2 结束）
 uv run python -m xhs_agent.probe
+
+# 10. （可选）跑检索层基线对比评测：临时库只装 demo_pack，真实回填向量后两臂对照
+#     结果落 evals/reports/retrieval-v1-<日期>.md；需要 Docker 与真实 DASHSCOPE_API_KEY
+uv run python scripts/eval_retrieval.py
 ```
 
 网络受限时：`uv sync --no-dev` 只装运行时环境（pydantic / pydantic-settings / python-dotenv / SQLAlchemy async + asyncpg / pgvector / alembic）；不过 `import xhs_agent` 仍然需要安装或设置 `PYTHONPATH=src`（src 布局）。

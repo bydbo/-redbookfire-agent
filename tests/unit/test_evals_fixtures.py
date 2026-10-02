@@ -71,7 +71,9 @@ class TestManifest:
         registered = set(manifest["files"])
         actual = {path.relative_to(EVALS_DIR).as_posix()
                   for path in EVALS_DIR.rglob("*")
-                  if path.is_file() and path.name not in {".gitkeep", "manifest.json"}}
+                  if path.is_file() and path.name not in {".gitkeep", "manifest.json"}
+                  # evals/reports/ 是评测输出（不入 manifest、不属于冻结资产），见 docs/评测集.md §六
+                  and not path.relative_to(EVALS_DIR).as_posix().startswith("reports/")}
         unexpected = sorted(actual - registered)
         assert not unexpected, f"这些文件没登记进 manifest：{unexpected}"
 

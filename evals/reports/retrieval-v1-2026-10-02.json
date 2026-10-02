@@ -1,0 +1,936 @@
+{
+  "generated_at": "2026-10-02T15:46:57+08:00",
+  "eval_version": "v1",
+  "manifest_frozen_at": "2026-10-01",
+  "cases_total": 20,
+  "cases_run": 20,
+  "now": 1790927160.6545346,
+  "environment": {
+    "postgres_image": "pgvector/pgvector:0.8.6-pg16",
+    "python": "3.12.14",
+    "platform": "Windows-10-10.0.19045-SP0"
+  },
+  "params": {
+    "similarity_threshold": 0.2,
+    "recall_limit": 50,
+    "max_cosine_distance": 0.35,
+    "rrf_k": 60,
+    "w_element": 0.7,
+    "w_rrf": 0.3,
+    "hit_threshold": 0.5,
+    "topk": 5,
+    "min_score": 0.15,
+    "embedding_model": "text-embedding-v3",
+    "embedding_price_in_per_m": 0.5
+  },
+  "library": {
+    "materials_dir": "D:\\agentxiangmu\\project\\evals\\fixtures\\demo_pack",
+    "materials": 19,
+    "embedding_calls": 20,
+    "prompt_tokens": 210
+  },
+  "arms": {
+    "baseline": [
+      {
+        "id": "case-01",
+        "scene": "明星运动",
+        "full_gap": false,
+        "correct": [
+          "未整理/IMG_20260901_143012.jpg",
+          "运动/球场-挥拍.mp4",
+          "运动/球拍特写.jpg"
+        ],
+        "ranked": [
+          "运动/球场-挥拍.mp4",
+          "运动/球拍特写.jpg"
+        ],
+        "top5_hit": true,
+        "first_hit": true,
+        "coverage_ratio": null,
+        "latency_ms": 0.63,
+        "cost_cny": 0.0,
+        "must_not_hits": []
+      },
+      {
+        "id": "case-02",
+        "scene": "明星运动",
+        "full_gap": false,
+        "correct": [
+          "运动/健身房-撸铁.mp4"
+        ],
+        "ranked": [
+          "运动/健身房-撸铁.mp4",
+          "宠物/橘猫-翻肚皮.mp4"
+        ],
+        "top5_hit": true,
+        "first_hit": true,
+        "coverage_ratio": null,
+        "latency_ms": 0.47,
+        "cost_cny": 0.0,
+        "must_not_hits": []
+      },
+      {
+        "id": "case-03",
+        "scene": "明星运动",
+        "full_gap": false,
+        "correct": [
+          "运动/晨跑-公园.jpg"
+        ],
+        "ranked": [
+          "运动/晨跑-公园.jpg"
+        ],
+        "top5_hit": true,
+        "first_hit": true,
+        "coverage_ratio": null,
+        "latency_ms": 0.43,
+        "cost_cny": 0.0,
+        "must_not_hits": []
+      },
+      {
+        "id": "case-04",
+        "scene": "明星运动",
+        "full_gap": true,
+        "correct": [
+          "运动/球场-挥拍.mp4"
+        ],
+        "ranked": [
+          "运动/球场-挥拍.mp4"
+        ],
+        "top5_hit": null,
+        "first_hit": null,
+        "coverage_ratio": null,
+        "latency_ms": 0.54,
+        "cost_cny": 0.0,
+        "must_not_hits": []
+      },
+      {
+        "id": "case-05",
+        "scene": "明星运动",
+        "full_gap": false,
+        "correct": [
+          "运动/跳绳-阳台.jpg"
+        ],
+        "ranked": [
+          "运动/跳绳-阳台.jpg",
+          "宠物/猫咪-窗台.jpg",
+          "运动/晨跑-公园.jpg"
+        ],
+        "top5_hit": true,
+        "first_hit": true,
+        "coverage_ratio": null,
+        "latency_ms": 0.57,
+        "cost_cny": 0.0,
+        "must_not_hits": []
+      },
+      {
+        "id": "case-06",
+        "scene": "节目与影视梗",
+        "full_gap": false,
+        "correct": [
+          "宠物/橘猫-翻肚皮.mp4",
+          "运动/球场-挥拍.mp4"
+        ],
+        "ranked": [
+          "运动/球场-挥拍.mp4"
+        ],
+        "top5_hit": true,
+        "first_hit": true,
+        "coverage_ratio": null,
+        "latency_ms": 0.7,
+        "cost_cny": 0.0,
+        "must_not_hits": []
+      },
+      {
+        "id": "case-07",
+        "scene": "节目与影视梗",
+        "full_gap": false,
+        "correct": [
+          "职场/工位-加班.jpg",
+          "职场/通勤-地铁.mp4"
+        ],
+        "ranked": [
+          "职场/工位-加班.jpg",
+          "职场/通勤-地铁.mp4",
+          "职场/会议-白板.jpg"
+        ],
+        "top5_hit": true,
+        "first_hit": true,
+        "coverage_ratio": null,
+        "latency_ms": 0.63,
+        "cost_cny": 0.0,
+        "must_not_hits": []
+      },
+      {
+        "id": "case-08",
+        "scene": "节目与影视梗",
+        "full_gap": false,
+        "correct": [
+          "宠物/橘猫-翻肚皮.mp4",
+          "宠物/猫咪-窗台.jpg",
+          "美食/咖啡-手冲.mp4"
+        ],
+        "ranked": [
+          "宠物/橘猫-翻肚皮.mp4",
+          "宠物/猫咪-窗台.jpg",
+          "宠物/柯基-遛狗.jpg",
+          "美食/咖啡-手冲.mp4",
+          "职场/会议-白板.jpg"
+        ],
+        "top5_hit": true,
+        "first_hit": true,
+        "coverage_ratio": null,
+        "latency_ms": 0.54,
+        "cost_cny": 0.0,
+        "must_not_hits": []
+      },
+      {
+        "id": "case-09",
+        "scene": "节目与影视梗",
+        "full_gap": false,
+        "correct": [
+          "运动/晨跑-公园.jpg",
+          "运动/跳绳-阳台.jpg"
+        ],
+        "ranked": [
+          "运动/晨跑-公园.jpg",
+          "运动/跳绳-阳台.jpg",
+          "运动/球场-挥拍.mp4"
+        ],
+        "top5_hit": true,
+        "first_hit": true,
+        "coverage_ratio": null,
+        "latency_ms": 0.56,
+        "cost_cny": 0.0,
+        "must_not_hits": []
+      },
+      {
+        "id": "case-10",
+        "scene": "节日与节气",
+        "full_gap": false,
+        "correct": [
+          "美食/减脂餐-沙拉.jpg"
+        ],
+        "ranked": [
+          "美食/减脂餐-沙拉.jpg",
+          "职场/会议-白板.jpg",
+          "职场/通勤-地铁.mp4"
+        ],
+        "top5_hit": true,
+        "first_hit": true,
+        "coverage_ratio": null,
+        "latency_ms": 0.52,
+        "cost_cny": 0.0,
+        "must_not_hits": []
+      },
+      {
+        "id": "case-11",
+        "scene": "节日与节气",
+        "full_gap": true,
+        "correct": [],
+        "ranked": [
+          "运动/球拍特写.jpg"
+        ],
+        "top5_hit": null,
+        "first_hit": null,
+        "coverage_ratio": null,
+        "latency_ms": 0.48,
+        "cost_cny": 0.0,
+        "must_not_hits": []
+      },
+      {
+        "id": "case-12",
+        "scene": "节日与节气",
+        "full_gap": false,
+        "correct": [
+          "未整理/临时素材.mp4",
+          "美食/咖啡-手冲.mp4",
+          "美食/探店-小馆.jpg"
+        ],
+        "ranked": [
+          "美食/咖啡-手冲.mp4",
+          "宠物/柯基-遛狗.jpg",
+          "宠物/橘猫-翻肚皮.mp4",
+          "宠物/猫咪-窗台.jpg",
+          "美食/探店-小馆.jpg"
+        ],
+        "top5_hit": true,
+        "first_hit": true,
+        "coverage_ratio": null,
+        "latency_ms": 0.49,
+        "cost_cny": 0.0,
+        "must_not_hits": []
+      },
+      {
+        "id": "case-13",
+        "scene": "生活方式",
+        "full_gap": false,
+        "correct": [
+          "美食/减脂餐-沙拉.jpg",
+          "美食/家常菜-番茄炒蛋.jpg"
+        ],
+        "ranked": [
+          "美食/家常菜-番茄炒蛋.jpg",
+          "宠物/猫咪-窗台.jpg",
+          "运动/跳绳-阳台.jpg"
+        ],
+        "top5_hit": true,
+        "first_hit": true,
+        "coverage_ratio": null,
+        "latency_ms": 0.4,
+        "cost_cny": 0.0,
+        "must_not_hits": []
+      },
+      {
+        "id": "case-14",
+        "scene": "生活方式",
+        "full_gap": false,
+        "correct": [
+          "美食/咖啡-手冲.mp4"
+        ],
+        "ranked": [
+          "美食/咖啡-手冲.mp4",
+          "美食/家常菜-番茄炒蛋.jpg",
+          "美食/探店-小馆.jpg",
+          "职场/代码-笔记本.jpg"
+        ],
+        "top5_hit": true,
+        "first_hit": true,
+        "coverage_ratio": null,
+        "latency_ms": 0.69,
+        "cost_cny": 0.0,
+        "must_not_hits": []
+      },
+      {
+        "id": "case-15",
+        "scene": "生活方式",
+        "full_gap": false,
+        "correct": [
+          "运动/跳绳-阳台.jpg"
+        ],
+        "ranked": [
+          "运动/跳绳-阳台.jpg",
+          "宠物/猫咪-窗台.jpg",
+          "运动/健身房-撸铁.mp4",
+          "运动/球拍特写.jpg"
+        ],
+        "top5_hit": true,
+        "first_hit": true,
+        "coverage_ratio": null,
+        "latency_ms": 0.52,
+        "cost_cny": 0.0,
+        "must_not_hits": []
+      },
+      {
+        "id": "case-16",
+        "scene": "生活方式",
+        "full_gap": false,
+        "correct": [
+          "宠物/橘猫-翻肚皮.mp4",
+          "宠物/猫咪-窗台.jpg",
+          "未整理/视频1.mp4"
+        ],
+        "ranked": [
+          "宠物/橘猫-翻肚皮.mp4",
+          "宠物/猫咪-窗台.jpg",
+          "宠物/柯基-遛狗.jpg",
+          "美食/咖啡-手冲.mp4",
+          "职场/会议-白板.jpg"
+        ],
+        "top5_hit": true,
+        "first_hit": true,
+        "coverage_ratio": null,
+        "latency_ms": 0.78,
+        "cost_cny": 0.0,
+        "must_not_hits": []
+      },
+      {
+        "id": "case-17",
+        "scene": "生活方式",
+        "full_gap": false,
+        "correct": [
+          "美食/减脂餐-沙拉.jpg",
+          "美食/探店-小馆.jpg",
+          "职场/通勤-地铁.mp4"
+        ],
+        "ranked": [
+          "职场/工位-加班.jpg",
+          "职场/通勤-地铁.mp4",
+          "职场/会议-白板.jpg"
+        ],
+        "top5_hit": true,
+        "first_hit": false,
+        "coverage_ratio": null,
+        "latency_ms": 0.37,
+        "cost_cny": 0.0,
+        "must_not_hits": []
+      },
+      {
+        "id": "case-18",
+        "scene": "职场话题",
+        "full_gap": false,
+        "correct": [
+          "职场/工位-加班.jpg",
+          "职场/通勤-地铁.mp4"
+        ],
+        "ranked": [
+          "职场/工位-加班.jpg",
+          "职场/通勤-地铁.mp4",
+          "美食/减脂餐-沙拉.jpg",
+          "职场/会议-白板.jpg"
+        ],
+        "top5_hit": true,
+        "first_hit": true,
+        "coverage_ratio": null,
+        "latency_ms": 0.58,
+        "cost_cny": 0.0,
+        "must_not_hits": []
+      },
+      {
+        "id": "case-19",
+        "scene": "职场话题",
+        "full_gap": false,
+        "correct": [
+          "职场/代码-笔记本.jpg",
+          "职场/会议-白板.jpg",
+          "职场/工位-加班.jpg"
+        ],
+        "ranked": [
+          "职场/会议-白板.jpg",
+          "职场/工位-加班.jpg",
+          "美食/家常菜-番茄炒蛋.jpg",
+          "职场/通勤-地铁.mp4"
+        ],
+        "top5_hit": true,
+        "first_hit": true,
+        "coverage_ratio": null,
+        "latency_ms": 0.54,
+        "cost_cny": 0.0,
+        "must_not_hits": []
+      },
+      {
+        "id": "case-20",
+        "scene": "职场话题",
+        "full_gap": false,
+        "correct": [
+          "美食/探店-小馆.jpg",
+          "职场/代码-笔记本.jpg"
+        ],
+        "ranked": [
+          "职场/代码-笔记本.jpg",
+          "美食/探店-小馆.jpg",
+          "职场/会议-白板.jpg",
+          "职场/工位-加班.jpg",
+          "职场/通勤-地铁.mp4"
+        ],
+        "top5_hit": true,
+        "first_hit": true,
+        "coverage_ratio": null,
+        "latency_ms": 0.59,
+        "cost_cny": 0.0,
+        "must_not_hits": []
+      }
+    ],
+    "hybrid": [
+      {
+        "id": "case-01",
+        "scene": "明星运动",
+        "full_gap": false,
+        "correct": [
+          "未整理/IMG_20260901_143012.jpg",
+          "运动/球场-挥拍.mp4",
+          "运动/球拍特写.jpg"
+        ],
+        "ranked": [
+          "运动/球场-挥拍.mp4"
+        ],
+        "top5_hit": true,
+        "first_hit": true,
+        "coverage_ratio": 1.0,
+        "latency_ms": 1715.9,
+        "cost_cny": 1.1e-05,
+        "must_not_hits": [],
+        "literal_recalled": 0,
+        "vector_recalled": 1
+      },
+      {
+        "id": "case-02",
+        "scene": "明星运动",
+        "full_gap": false,
+        "correct": [
+          "运动/健身房-撸铁.mp4"
+        ],
+        "ranked": [
+          "运动/健身房-撸铁.mp4"
+        ],
+        "top5_hit": true,
+        "first_hit": true,
+        "coverage_ratio": 1.0,
+        "latency_ms": 1482.48,
+        "cost_cny": 4e-06,
+        "must_not_hits": [],
+        "literal_recalled": 0,
+        "vector_recalled": 1
+      },
+      {
+        "id": "case-03",
+        "scene": "明星运动",
+        "full_gap": false,
+        "correct": [
+          "运动/晨跑-公园.jpg"
+        ],
+        "ranked": [],
+        "top5_hit": false,
+        "first_hit": false,
+        "coverage_ratio": 0.0,
+        "latency_ms": 2829.26,
+        "cost_cny": 5e-06,
+        "must_not_hits": [],
+        "literal_recalled": 0,
+        "vector_recalled": 0
+      },
+      {
+        "id": "case-04",
+        "scene": "明星运动",
+        "full_gap": true,
+        "correct": [
+          "运动/球场-挥拍.mp4"
+        ],
+        "ranked": [],
+        "top5_hit": null,
+        "first_hit": null,
+        "coverage_ratio": 0.0,
+        "latency_ms": 2154.76,
+        "cost_cny": 4.5e-06,
+        "must_not_hits": [],
+        "literal_recalled": 0,
+        "vector_recalled": 0
+      },
+      {
+        "id": "case-05",
+        "scene": "明星运动",
+        "full_gap": false,
+        "correct": [
+          "运动/跳绳-阳台.jpg"
+        ],
+        "ranked": [
+          "运动/跳绳-阳台.jpg"
+        ],
+        "top5_hit": true,
+        "first_hit": true,
+        "coverage_ratio": 1.0,
+        "latency_ms": 2100.93,
+        "cost_cny": 4.5e-06,
+        "must_not_hits": [],
+        "literal_recalled": 0,
+        "vector_recalled": 1
+      },
+      {
+        "id": "case-06",
+        "scene": "节目与影视梗",
+        "full_gap": false,
+        "correct": [
+          "宠物/橘猫-翻肚皮.mp4",
+          "运动/球场-挥拍.mp4"
+        ],
+        "ranked": [],
+        "top5_hit": false,
+        "first_hit": false,
+        "coverage_ratio": 0.0,
+        "latency_ms": 3961.2,
+        "cost_cny": 8.5e-06,
+        "must_not_hits": [],
+        "literal_recalled": 0,
+        "vector_recalled": 0
+      },
+      {
+        "id": "case-07",
+        "scene": "节目与影视梗",
+        "full_gap": false,
+        "correct": [
+          "职场/工位-加班.jpg",
+          "职场/通勤-地铁.mp4"
+        ],
+        "ranked": [
+          "职场/工位-加班.jpg"
+        ],
+        "top5_hit": true,
+        "first_hit": true,
+        "coverage_ratio": 1.0,
+        "latency_ms": 1849.29,
+        "cost_cny": 6e-06,
+        "must_not_hits": [],
+        "literal_recalled": 0,
+        "vector_recalled": 1
+      },
+      {
+        "id": "case-08",
+        "scene": "节目与影视梗",
+        "full_gap": false,
+        "correct": [
+          "宠物/橘猫-翻肚皮.mp4",
+          "宠物/猫咪-窗台.jpg",
+          "美食/咖啡-手冲.mp4"
+        ],
+        "ranked": [],
+        "top5_hit": false,
+        "first_hit": false,
+        "coverage_ratio": 0.0,
+        "latency_ms": 1357.02,
+        "cost_cny": 5e-06,
+        "must_not_hits": [],
+        "literal_recalled": 0,
+        "vector_recalled": 0
+      },
+      {
+        "id": "case-09",
+        "scene": "节目与影视梗",
+        "full_gap": false,
+        "correct": [
+          "运动/晨跑-公园.jpg",
+          "运动/跳绳-阳台.jpg"
+        ],
+        "ranked": [],
+        "top5_hit": false,
+        "first_hit": false,
+        "coverage_ratio": 0.0,
+        "latency_ms": 1403.48,
+        "cost_cny": 8e-06,
+        "must_not_hits": [],
+        "literal_recalled": 0,
+        "vector_recalled": 0
+      },
+      {
+        "id": "case-10",
+        "scene": "节日与节气",
+        "full_gap": false,
+        "correct": [
+          "美食/减脂餐-沙拉.jpg"
+        ],
+        "ranked": [
+          "美食/减脂餐-沙拉.jpg"
+        ],
+        "top5_hit": true,
+        "first_hit": true,
+        "coverage_ratio": 1.0,
+        "latency_ms": 2041.82,
+        "cost_cny": 5e-06,
+        "must_not_hits": [],
+        "literal_recalled": 0,
+        "vector_recalled": 1
+      },
+      {
+        "id": "case-11",
+        "scene": "节日与节气",
+        "full_gap": true,
+        "correct": [],
+        "ranked": [],
+        "top5_hit": null,
+        "first_hit": null,
+        "coverage_ratio": 0.0,
+        "latency_ms": 2932.59,
+        "cost_cny": 4e-06,
+        "must_not_hits": [],
+        "literal_recalled": 0,
+        "vector_recalled": 0
+      },
+      {
+        "id": "case-12",
+        "scene": "节日与节气",
+        "full_gap": false,
+        "correct": [
+          "未整理/临时素材.mp4",
+          "美食/咖啡-手冲.mp4",
+          "美食/探店-小馆.jpg"
+        ],
+        "ranked": [],
+        "top5_hit": false,
+        "first_hit": false,
+        "coverage_ratio": 0.0,
+        "latency_ms": 2787.28,
+        "cost_cny": 4e-06,
+        "must_not_hits": [],
+        "literal_recalled": 0,
+        "vector_recalled": 0
+      },
+      {
+        "id": "case-13",
+        "scene": "生活方式",
+        "full_gap": false,
+        "correct": [
+          "美食/减脂餐-沙拉.jpg",
+          "美食/家常菜-番茄炒蛋.jpg"
+        ],
+        "ranked": [
+          "美食/家常菜-番茄炒蛋.jpg"
+        ],
+        "top5_hit": true,
+        "first_hit": true,
+        "coverage_ratio": 1.0,
+        "latency_ms": 1277.86,
+        "cost_cny": 4e-06,
+        "must_not_hits": [],
+        "literal_recalled": 0,
+        "vector_recalled": 1
+      },
+      {
+        "id": "case-14",
+        "scene": "生活方式",
+        "full_gap": false,
+        "correct": [
+          "美食/咖啡-手冲.mp4"
+        ],
+        "ranked": [
+          "美食/咖啡-手冲.mp4"
+        ],
+        "top5_hit": true,
+        "first_hit": true,
+        "coverage_ratio": 1.0,
+        "latency_ms": 2374.81,
+        "cost_cny": 5e-06,
+        "must_not_hits": [],
+        "literal_recalled": 0,
+        "vector_recalled": 1
+      },
+      {
+        "id": "case-15",
+        "scene": "生活方式",
+        "full_gap": false,
+        "correct": [
+          "运动/跳绳-阳台.jpg"
+        ],
+        "ranked": [
+          "运动/跳绳-阳台.jpg"
+        ],
+        "top5_hit": true,
+        "first_hit": true,
+        "coverage_ratio": 1.0,
+        "latency_ms": 2424.5,
+        "cost_cny": 4.5e-06,
+        "must_not_hits": [],
+        "literal_recalled": 0,
+        "vector_recalled": 1
+      },
+      {
+        "id": "case-16",
+        "scene": "生活方式",
+        "full_gap": false,
+        "correct": [
+          "宠物/橘猫-翻肚皮.mp4",
+          "宠物/猫咪-窗台.jpg",
+          "未整理/视频1.mp4"
+        ],
+        "ranked": [
+          "宠物/猫咪-窗台.jpg",
+          "宠物/橘猫-翻肚皮.mp4"
+        ],
+        "top5_hit": true,
+        "first_hit": true,
+        "coverage_ratio": 1.0,
+        "latency_ms": 4470.6,
+        "cost_cny": 5.5e-06,
+        "must_not_hits": [],
+        "literal_recalled": 0,
+        "vector_recalled": 2
+      },
+      {
+        "id": "case-17",
+        "scene": "生活方式",
+        "full_gap": false,
+        "correct": [
+          "美食/减脂餐-沙拉.jpg",
+          "美食/探店-小馆.jpg",
+          "职场/通勤-地铁.mp4"
+        ],
+        "ranked": [],
+        "top5_hit": false,
+        "first_hit": false,
+        "coverage_ratio": 0.0,
+        "latency_ms": 2288.28,
+        "cost_cny": 2.5e-06,
+        "must_not_hits": [],
+        "literal_recalled": 0,
+        "vector_recalled": 0
+      },
+      {
+        "id": "case-18",
+        "scene": "职场话题",
+        "full_gap": false,
+        "correct": [
+          "职场/工位-加班.jpg",
+          "职场/通勤-地铁.mp4"
+        ],
+        "ranked": [
+          "职场/工位-加班.jpg"
+        ],
+        "top5_hit": true,
+        "first_hit": true,
+        "coverage_ratio": 1.0,
+        "latency_ms": 2809.47,
+        "cost_cny": 3.5e-06,
+        "must_not_hits": [],
+        "literal_recalled": 0,
+        "vector_recalled": 1
+      },
+      {
+        "id": "case-19",
+        "scene": "职场话题",
+        "full_gap": false,
+        "correct": [
+          "职场/代码-笔记本.jpg",
+          "职场/会议-白板.jpg",
+          "职场/工位-加班.jpg"
+        ],
+        "ranked": [],
+        "top5_hit": false,
+        "first_hit": false,
+        "coverage_ratio": 0.0,
+        "latency_ms": 1652.88,
+        "cost_cny": 5e-06,
+        "must_not_hits": [],
+        "literal_recalled": 0,
+        "vector_recalled": 0
+      },
+      {
+        "id": "case-20",
+        "scene": "职场话题",
+        "full_gap": false,
+        "correct": [
+          "美食/探店-小馆.jpg",
+          "职场/代码-笔记本.jpg"
+        ],
+        "ranked": [],
+        "top5_hit": false,
+        "first_hit": false,
+        "coverage_ratio": 0.0,
+        "latency_ms": 2071.05,
+        "cost_cny": 5.5e-06,
+        "must_not_hits": [],
+        "literal_recalled": 0,
+        "vector_recalled": 0
+      }
+    ],
+    "baseline_metrics": {
+      "cases": 20,
+      "scored_cases": 18,
+      "top5_hit_rate": 1.0,
+      "first_hit_rate": 0.9444,
+      "mean_coverage": null,
+      "mean_latency_ms": 0.6,
+      "max_latency_ms": 0.78,
+      "mean_cost_cny": 0.0,
+      "must_not_violations": 0
+    },
+    "hybrid_metrics": {
+      "cases": 20,
+      "scored_cases": 18,
+      "top5_hit_rate": 0.5556,
+      "first_hit_rate": 0.5556,
+      "mean_coverage": 0.5,
+      "mean_latency_ms": 2299.3,
+      "max_latency_ms": 4470.6,
+      "mean_cost_cny": 5.25e-06,
+      "must_not_violations": 0
+    }
+  },
+  "sweep": [
+    {
+      "similarity_threshold": 0.2,
+      "max_cosine_distance": 0.35,
+      "is_default": true,
+      "top5_hit_rate": 0.5556,
+      "first_hit_rate": 0.5556,
+      "mean_coverage": 0.5,
+      "mean_latency_ms": 48.1,
+      "literal_recalled": 0,
+      "vector_recalled": 11
+    },
+    {
+      "similarity_threshold": 0.2,
+      "max_cosine_distance": 0.6,
+      "is_default": false,
+      "top5_hit_rate": 1.0,
+      "first_hit_rate": 0.9444,
+      "mean_coverage": 0.95,
+      "mean_latency_ms": 54.0,
+      "literal_recalled": 0,
+      "vector_recalled": 181
+    },
+    {
+      "similarity_threshold": 0.2,
+      "max_cosine_distance": 1.0,
+      "is_default": false,
+      "top5_hit_rate": 1.0,
+      "first_hit_rate": 0.9444,
+      "mean_coverage": 1.0,
+      "mean_latency_ms": 61.8,
+      "literal_recalled": 0,
+      "vector_recalled": 380
+    },
+    {
+      "similarity_threshold": 0.05,
+      "max_cosine_distance": 0.35,
+      "is_default": false,
+      "top5_hit_rate": 0.7222,
+      "first_hit_rate": 0.7222,
+      "mean_coverage": 0.85,
+      "mean_latency_ms": 48.5,
+      "literal_recalled": 22,
+      "vector_recalled": 11
+    },
+    {
+      "similarity_threshold": 0.05,
+      "max_cosine_distance": 0.6,
+      "is_default": false,
+      "top5_hit_rate": 1.0,
+      "first_hit_rate": 0.8889,
+      "mean_coverage": 1.0,
+      "mean_latency_ms": 54.0,
+      "literal_recalled": 22,
+      "vector_recalled": 181
+    },
+    {
+      "similarity_threshold": 0.05,
+      "max_cosine_distance": 1.0,
+      "is_default": false,
+      "top5_hit_rate": 1.0,
+      "first_hit_rate": 0.7778,
+      "mean_coverage": 1.0,
+      "mean_latency_ms": 62.1,
+      "literal_recalled": 22,
+      "vector_recalled": 380
+    },
+    {
+      "similarity_threshold": 0.02,
+      "max_cosine_distance": 0.35,
+      "is_default": false,
+      "top5_hit_rate": 0.9444,
+      "first_hit_rate": 0.8889,
+      "mean_coverage": 1.0,
+      "mean_latency_ms": 51.0,
+      "literal_recalled": 64,
+      "vector_recalled": 11
+    },
+    {
+      "similarity_threshold": 0.02,
+      "max_cosine_distance": 0.6,
+      "is_default": false,
+      "top5_hit_rate": 1.0,
+      "first_hit_rate": 0.8333,
+      "mean_coverage": 1.0,
+      "mean_latency_ms": 55.1,
+      "literal_recalled": 64,
+      "vector_recalled": 181
+    },
+    {
+      "similarity_threshold": 0.02,
+      "max_cosine_distance": 1.0,
+      "is_default": false,
+      "top5_hit_rate": 1.0,
+      "first_hit_rate": 0.7778,
+      "mean_coverage": 1.0,
+      "mean_latency_ms": 64.0,
+      "literal_recalled": 64,
+      "vector_recalled": 380
+    }
+  ]
+}

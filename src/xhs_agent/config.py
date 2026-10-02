@@ -176,6 +176,8 @@ class EmbeddingConfig(_Section):
     batch_size: int = Field(10, ge=1, le=128)
     timeout_s: int = Field(60, ge=1, le=600)
     max_retries: int = Field(2, ge=0, le=10)
+    # 成本估算单价（人民币元/百万 token），仅用于成本估算；取 2026-10 阿里云百炼官方价
+    price_in_per_m: float = Field(0.5, ge=0)
     api_key_env: str = "DASHSCOPE_API_KEY"
 
     _env: EnvView = PrivateAttr(default_factory=EnvView)
