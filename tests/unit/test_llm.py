@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import importlib
+import inspect
+
 import pytest
 
 from xhs_agent.config import LLMConfig
@@ -94,10 +97,6 @@ class TestBuildProvider:
         provider = llm.build_provider(FakeConfig(provider=name))
         assert isinstance(provider, llm.OpenAICompatibleProvider)
 
-    def test_force_offline_returns_offline_provider(self):
-        provider = llm.build_provider(FakeConfig(), force_offline=True)
-        assert isinstance(provider, llm.OfflineProvider)
-
     def test_unknown_provider_is_rejected(self):
         # provider 的合法值由配置层校验（S1.2），这里用 model_construct 绕过校验，
         # 验证工具层自己的兜底分支仍然存在。
@@ -107,6 +106,24 @@ class TestBuildProvider:
     def test_empty_base_url_is_rejected(self):
         with pytest.raises(LLMError):
             llm.build_provider(FakeConfig(base_url=""))
+
+
+class TestOfflinePathIsGone:
+    """S2.7：运行时降级链路已整条删除，这里把"不许复活"钉成可回归的断言。"""
+
+    def test_offline_module_is_removed(self):
+        with pytest.raises(ModuleNotFoundError):
+            importlib.import_module("xhs_agent.tools.offline")
+
+    def test_offline_provider_class_is_removed(self):
+        assert not hasattr(llm, "OfflineProvider")
+
+    def test_build_provider_has_no_force_offline_parameter(self):
+        assert "force_offline" not in inspect.signature(llm.build_provider).parameters
+
+    def test_offline_provider_name_is_rejected(self):
+        with pytest.raises(LLMError):
+            llm.build_provider(FakeConfig(provider="offline"))
 
 
 class TestExtractMessageText:

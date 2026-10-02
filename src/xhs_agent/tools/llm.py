@@ -8,8 +8,9 @@
 
 - OpenAICompatibleProvider：任何兼容 /chat/completions 的国内模型都能接
   （DeepSeek、通义千问、智谱、Kimi、SiliconFlow…）
-- OfflineProvider：无 Key 时接管（P2 取消运行时降级后删除，见 backlog S2.7）
 - StructuredCaller：强制模型返回结构化 JSON，解析失败自动修复重试
+
+运行时降级已取消（ADR 0001）：没有密钥就是配置错误，启动前置检查会拦住，不存在"离线接管"。
 """
 
 from __future__ import annotations
@@ -23,7 +24,6 @@ from dataclasses import dataclass, field
 
 from ..config import AppConfig, LLMConfig
 from ..util import extract_json
-from . import offline
 
 
 class LLMError(RuntimeError):
@@ -185,41 +185,9 @@ def _extract_message_text(data: dict) -> str:
     return str(content)
 
 
-class OfflineProvider(BaseProvider):
-    name = "offline"
-
-    def __init__(self) -> None:
-        super().__init__(model="rule-based")
-
-    def complete(self, call: LLMCall) -> LLMResult:
-        started = time.time()
-        if call.task == "hotspot_clue":
-            obj = offline.hotspot_clue(call.context.get("hotspot_raw", ""))
-        elif call.task == "copy_draft":
-            obj = offline.copy_draft(
-                call.context.get("clue", {}),
-                call.context.get("material", {}),
-                call.context.get("style", ""),
-            )
-        elif call.task == "material_select":
-            obj = {"selected_material_id": call.context.get("default_material_id", ""), "reasons": [], "usage": ""}
-        else:
-            raise LLMError(f"离线模式不支持的任务：{call.task}")
-        text = json.dumps(obj, ensure_ascii=False)
-        return LLMResult(
-            text=text,
-            provider=self.name,
-            model="rule-based",
-            prompt_tokens=0,
-            completion_tokens=0,
-            latency_ms=int((time.time() - started) * 1000),
-        )
-
-
-def build_provider(cfg: AppConfig, force_offline: bool = False) -> BaseProvider:
-    provider_name = "offline" if force_offline else cfg.llm.resolved_provider()
-    if provider_name == "offline":
-        return OfflineProvider()
+def build_provider(cfg: AppConfig) -> BaseProvider:
+    """按配置造 provider：只支持 OpenAI 兼容端点，未知值抛 `LLMError`（无效配置在启动前置检查就拦）。"""
+    provider_name = cfg.llm.resolved_provider()
     if provider_name in {"openai_compatible", "openai", "deepseek", "qwen", "dashscope", "compatible"}:
         return OpenAICompatibleProvider(cfg.llm)
     raise LLMError(f"未知的 provider：{provider_name}")

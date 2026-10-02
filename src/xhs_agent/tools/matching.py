@@ -1,10 +1,12 @@
-"""热点线索 <-> 素材 的相关性打分。
+"""热点线索 <-> 素材 的要素级匹配与规则解释。
 
-用途：只用确定性算法把「哪些素材能蹭上这条热点线索」排出来，再交给 Agent 解释与取舍。
-输入：`HotspotClue` + `Material` 列表，以及可选的要素类型权重与**时间基准**。
-输出：候选列表（`MatchCandidate`）+ 覆盖度（`Coverage`），分数归一化到 0~1。
+用途：只做确定性判断——把线索要素逐条对到素材上（类型对齐 + 文案/关键词兜底），给出加权
+      相关度、命中/缺口，以及规则版解释；**排序与终分在 `tools/retrieval.py`**。
+输入：`HotspotClue` + `Material`，以及可选的要素类型权重与**时间基准** `now`。
+输出：`ElementMatch` 列表 / `(relevance, hits, missing)` / 时效加减分 / 原地补齐候选的
+      `reasons` 与 `usage`。
 
-输出稳定性：分数里的「时效加减分」依赖当前时间，因此时间基准可以用 `now` 注入；
+输出稳定性：时效加减分依赖当前时间，因此时间基准可以用 `now` 注入；
 不注入时取 `time.time()`（默认行为不变）。同一输入 + 同一 `now` 必须得到同一结果。
 """
 
@@ -16,11 +18,10 @@ from dataclasses import dataclass
 
 from ..schemas import (
     DEFAULT_TYPE_WEIGHTS,
-    Coverage,
+    TYPE_LABELS,
     Element,
     ElementHit,
     HotspotClue,
-    MatchCandidate,
     Material,
 )
 from ..util import normalize_text, text_similarity
@@ -122,20 +123,6 @@ def element_relevance(clue: HotspotClue, material: Material,
     return relevance, hits, missing
 
 
-def score_material(clue: HotspotClue, material: Material, type_weights: dict | None = None,
-                   now: float | None = None) -> tuple:
-    """给单条素材打分（**要素加权口径**，legacy 要素级排序用）。
-
-    输入：`clue`、`material`、`type_weights`（可选）、`now`（时间基准，Unix 秒，可选）。
-    输出：`(score, hits, missing)`——score = clamp01(element_relevance·(0.9+0.1·quality) + 时效分)。
-    注意：这是 `W_ELEMENT = 1` 的特例；含 RRF 融合的契约终分见 `tools/retrieval.py`。
-    """
-    relevance, hits, missing = element_relevance(clue, material, type_weights)
-    score = relevance * (0.9 + 0.1 * material.quality_score)
-    score += recency_bonus(material, now)
-    return max(0.0, min(1.0, score)), hits, missing
-
-
 def recency_bonus(material: Material, now: float | None = None) -> float:
     """时效加减分：30 天内 +0.02，一年以上 -0.03，其余 0；`mtime` 为空时不加减。"""
     if not material.mtime:
@@ -149,74 +136,41 @@ def recency_bonus(material: Material, now: float | None = None) -> float:
     return 0.0
 
 
-def rank_materials(clue: HotspotClue, materials: list, topk: int = 5, min_score: float = 0.0,
-                   type_weights: dict | None = None, now: float | None = None) -> tuple:
-    """给所有素材打分排序，返回 (候选列表, 覆盖度)。**legacy**：不含双通道 RRF。
+def _rule_explain(clue: HotspotClue, material: Material, hits: list) -> dict:
+    """规则版匹配解释：由真实 hits 推出「为什么相关 / 怎么用」（确定性，不调模型）。
 
-    生产路径请用 `tools.retrieval.rank_candidates`（《检索契约》§二／§五 的终分口径）；
-    本函数保留给要素级回归用例与 S2.7 之前的离线链路，清理离线链路时一并评估删除。
-
-    输入：`materials` 列表、截断参数 `topk` / `min_score`，以及可选的 `type_weights` 与 `now`。
-    输出：候选按分数降序、同分按 `path` 升序；低于 `min_score` 的候选直接截止（后面的也不再取）；
-    覆盖度 = 被命中要素的权重之和 ÷ 全部要素权重之和。
+    文案口径自 S2.7 起内联在这里（此前属已删除的 `offline` 模块），逐字未变：
+    `duration_s` 取 `to_dict()` 的两位小数。
     """
-    scored = []
-    coverage_map: dict = {}
+    reasons = [f"命中{TYPE_LABELS.get(str(hit.element_type), str(hit.element_type))}："
+               f"{hit.clue_value} ↔ 素材的「{hit.hit_value}」"
+               for hit in hits[:3]]
+    if not reasons:
+        reasons.append("没有明显命中，只是兜底候选")
 
-    for material in materials:
-        score, hits, missing = score_material(clue, material, type_weights, now)
-        scored.append((score, hits, missing, material))
-        for element in clue.elements:
-            best = 0.0
-            for hit in hits:
-                if hit.element_type == element.type and hit.clue_value == element.value:
-                    best = max(best, hit.similarity)
-            key = (element.type, element.value)
-            coverage_map[key] = max(coverage_map.get(key, 0.0), best)
-
-    scored.sort(key=lambda item: (-item[0], item[3].path))
-    candidates = []
-    for rank, (score, hits, missing, material) in enumerate(scored[:max(0, topk)], start=1):
-        if score < min_score:
+    topic = "这个热点"
+    for element in clue.elements or []:
+        if element.type == "topic":
+            topic = element.value
             break
-        # 候选先以中间态产出（reasons 由 explain_candidates 补齐），再 finalize 成契约终态。
-        candidates.append(MatchCandidate.draft(
-            material_id=material.id,
-            material=material,
-            score=score,
-            hits=hits,
-            missing=missing,
-            rank=rank,
-        ))
-
-    covered, gaps, covered_weight, total_weight = [], [], 0.0, 0.0
-    for element in clue.elements:
-        weight = max(0.05, element.weight * element.confidence)
-        total_weight += weight
-        if coverage_map.get((element.type, element.value), 0.0) >= HIT_THRESHOLD:
-            covered.append(element)
-            covered_weight += weight
-        else:
-            gaps.append(element)
-
-    coverage = Coverage(covered=covered, gaps=gaps, ratio=(covered_weight / total_weight) if total_weight else 0.0)
-    return candidates, coverage
+    usage = f"可用作{topic}的实拍素材，建议放在开头 3 秒或作为过程画面"
+    if material.duration_s:
+        usage += f"（时长 {round(material.duration_s, 2)} 秒）"
+    return {"reasons": reasons, "usage": usage}
 
 
 def explain_candidates(clue: HotspotClue, candidates: list) -> None:
-    """兜底解释（规则版）：给每个候选补上「为什么相关 / 怎么用」。
+    """规则版解释：给每个候选补上「为什么相关 / 怎么用」。
 
     输入：线索 + 中间态候选（`MatchCandidate.draft`）；输出：原地写入 `reasons` / `usage`
-    并 `finalize()` 成契约终态。解释文案来自 `offline` 规则引擎，P2 会换成模型解释（S2.7）。
+    并 `finalize()` 成契约终态。文案由真实 hits 推出，是确定性结果、不调模型；
+    E3 的匹配解释 agent 会替换文案来源（那是能力升级，不是降级）。
     """
-    from . import offline
-
     for candidate in candidates:
         if candidate.reasons:
             candidate.finalize()
             continue
-        payload = offline.material_explain(clue.to_dict(), candidate.material.to_dict(),
-                                          [h.to_dict() for h in candidate.hits])
+        payload = _rule_explain(clue, candidate.material, list(candidate.hits))
         candidate.reasons = payload["reasons"]
         candidate.usage = payload["usage"]
         candidate.finalize()

@@ -201,6 +201,7 @@
 
 ## 当前项目状态（规范的诚实边界）
 
-- 已完成：数据契约（S1.1 起为 Pydantic v2 模型）、配置加载与启动前置检查（S1.2，`src/xhs_agent/probe.py`）、爆点词典、模型调用层、素材扫描与索引、相关性打分、报告渲染、运行追踪；P2 阶段已完成本地依赖编排（S2.1，`docker-compose.yml`）、集成测试基座（S2.9，`tests/integration/`）、数据库 ORM 与会话（S2.2，`src/xhs_agent/db/`）与评测集 v1（S2.0，`evals/`）。其中 `tools/offline.py`（离线规则引擎）**将在 P2 阶段删除**——运行时降级已取消。
-- 尚未实现：Alembic 迁移（S2.3）、素材索引入库与检索层（S2.4–S2.8）、`agents/` 与 `workflows/` 编排层、FastAPI 服务入口与前端。当前可运行的只有 `docker compose up -d --wait` 与 `uv run python -m xhs_agent.probe`（启动前置检查的前两步）。
+- 已完成：数据契约（S1.1）、配置加载与启动前置检查（S1.2）、质量门与覆盖率（S1.3–S1.5）、爆点词典、模型调用层、素材扫描与索引、要素级匹配与规则解释、报告渲染、运行追踪；P2 已完成本地依赖编排（S2.1）、集成测试基座（S2.9）、数据库 ORM 与会话（S2.2）、Alembic 迁移（S2.3）、评测集 v1（S2.0）、素材索引入库（S2.4）、向量回填（S2.5）、双通道召回与 RRF（S2.6）与离线降级链路清理（S2.7）。
+- 运行时降级已取消（ADR 0001）：`tools/offline.py` 与 `OfflineProvider` 已在 S2.7 删除，不存在"无密钥也能跑"的路径；缺密钥、缺依赖一律失败并报错。
+- 尚未实现：基线对比脚本（S2.8）、`agents/` 与 `workflows/` 编排层、FastAPI 服务入口与前端（E3 进行中：S3.0 prompt 契约、S3.9 prompt 版本落库已落地，其余见 `docs/backlog.md`）。当前可直接运行 `docker compose up -d --wait`、`uv run python -m xhs_agent.probe`、`uv run python scripts/index_materials.py`、`uv run python scripts/backfill_embeddings.py`。
 - 记录以上状态是为了让 AI 与合作者先看清事实，不要把"计划要实现的东西"当成"已经有的东西"。

@@ -177,9 +177,10 @@ class TestHotspotClue:
             "risk_notes": ["别用明星肖像"],
             "hotspot_key": "hotspot-key",
         }
-        clue = HotspotClue.from_dict(payload, provider="offline", model="rule-based")
+        clue = HotspotClue.from_dict(payload, provider="openai_compatible",
+                                     model="deepseek-flash")
         # provider / model / created_at 由调用方（模型调用层）注入，不从 data 里读，这是既有口径。
-        expected = dict(payload, provider="offline", model="rule-based",
+        expected = dict(payload, provider="openai_compatible", model="deepseek-flash",
                         created_at=clue.created_at)
         assert clue.to_dict() == expected
 
