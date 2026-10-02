@@ -27,7 +27,7 @@ from alembic import command
 pytestmark = pytest.mark.integration
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
-REVISION = "0001"
+REVISION = "0002"
 
 
 @pytest.fixture

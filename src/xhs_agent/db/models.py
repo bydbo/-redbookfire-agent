@@ -130,6 +130,7 @@ class Run(Base):
     cost_cny: Mapped[Decimal] = mapped_column(Numeric(10, 4), nullable=False,
                                               server_default=text("0"))
     latency_ms: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
+    prompt_versions: Mapped[dict] = mapped_column(JSONB, nullable=False, server_default=text("'{}'"))
     error: Mapped[str | None] = mapped_column(Text, nullable=True)
 
     __table_args__ = (

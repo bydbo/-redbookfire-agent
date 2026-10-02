@@ -34,7 +34,7 @@ COLUMN_SPECS: dict[str, dict[str, str]] = {
         "id": "uuid", "job_id": "text", "status": "text", "created_at": "timestamptz",
         "started_at": "timestamptz", "finished_at": "timestamptz", "llm_calls": "int4",
         "prompt_tokens": "int4", "completion_tokens": "int4", "cost_cny": "numeric",
-        "latency_ms": "int4", "error": "text",
+        "latency_ms": "int4", "prompt_versions": "jsonb", "error": "text",
     },
     "run_hotspots": {
         "id": "uuid", "run_id": "uuid", "hotspot_id": "uuid", "position": "int4",
@@ -148,10 +148,11 @@ class TestStructure:
         async with db_engine.begin() as conn:
             run = (await conn.execute(text(
                 "INSERT INTO runs (job_id) VALUES ('job-defaults') "
-                "RETURNING status, llm_calls, cost_cny, created_at"))).one()
+                "RETURNING status, llm_calls, cost_cny, created_at, prompt_versions"))).one()
         assert run.status == "queued"
         assert (run.llm_calls, float(run.cost_cny)) == (0, 0.0)
         assert run.created_at is not None
+        assert run.prompt_versions == {}
 
 
 class TestConstraints:

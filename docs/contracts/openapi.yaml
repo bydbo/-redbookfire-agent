@@ -337,6 +337,7 @@ components:
         - status
         - created_at
         - totals
+        - prompt_versions
         - hotspots
       properties:
         run_id:
@@ -359,6 +360,11 @@ components:
             - type: 'null'
         totals:
           $ref: '#/components/schemas/RunTotals'
+        prompt_versions:
+          type: object
+          description: 本次运行各任务所用的 prompt 版本；键为 task_id，见 docs/contracts/prompt契约.md
+          additionalProperties:
+            type: integer
         hotspots:
           type: array
           description: 本次运行中每个热点的分析结果
