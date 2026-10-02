@@ -9,6 +9,7 @@ authors = [{ name = "tianshugui", email = "tianshugui95@gmail.com" }]
 # 运行时依赖：pydantic v2（S1.1）、pydantic-settings + python-dotenv（S1.2）。
 # 最终技术栈（FastAPI / LangGraph / pgvector 等）见 docs/技术栈.md，引入时走 AGENTS.md 第 6 节
 dependencies = [
+    "alembic>=1.16,<2",
     "asyncpg>=0.30,<1",
     "pgvector>=0.5,<1",
     "pydantic>=2.9,<3",

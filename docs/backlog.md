@@ -52,7 +52,7 @@
 | S2.1 | Compose 起 Postgres + Redis | — | `docker compose up` 后数据库含 `vector` 与 `pg_trgm` 扩展，pgvector ≥ 0.5；镜像 tag 固定（实测 vector 0.8.6 / pg_trgm 1.6 / PG 16.15 / Redis 7.4.11） | 1 | ✅ |
 | S2.9 | 集成测试基座 | S2.1 | 引入 testcontainers 与 pytest-asyncio，提供可复用的 Postgres / Redis 容器夹具；`uv run pytest` 默认只跑单元用例，集成用例以 `-m integration` 显式触发（实测：默认 289 单测 + 7 条集成用例、容器 10 秒级启动、无 Docker 时单条报错退出码 1）。**必须先于 S2.2 完成**：S2.2 起各 Story 的验收都要求集成用例通过，基座缺席会形成循环依赖 | 3 | ✅ |
 | S2.2 | SQLAlchemy async 模型与会话 | S1.1, S2.1 | 五张表映射完整，字段与数据契约逐项对齐；testcontainers 集成用例通过（实测：逐列/逐约束/14 条索引/级联/向量维度全部核对通过，17 条集成用例） | 1.5 | ✅ |
-| S2.3 | Alembic 初始迁移 | S2.2 | `upgrade head` 建齐表与索引；`downgrade` 可回滚且不删扩展；迁移往返（upgrade→downgrade→upgrade）集成用例通过 | 1 | ⬜ |
+| S2.3 | Alembic 初始迁移 | S2.2 | `upgrade head` 建齐表与索引；`downgrade` 可回滚且不删扩展；迁移往返（upgrade→downgrade→upgrade）集成用例通过（实测：`alembic check` 零差异、扩展兜底路径与 CLI 冒烟都过，6 条集成用例） | 1 | ✅ |
 | S2.4 | 素材索引入库 + 增量判断 | S2.3 | 按 `fingerprint` 增量更新；重复运行不重复打标；**重新索引后磁盘上已消失的素材在库中无残留行**（数据契约 §一 的删除侧承诺，避免匹配榜推荐已删除的文件）；**触发路径明确：由分析任务的前置步骤自动做增量索引，首次全量建库走运维命令（不进 HTTP 契约）**；集成用例通过 | 2 | ⬜ |
 | S2.5 | Embedding 客户端与向量回填 | S2.4 | 批量调用 + 重试；`embedding_model` 与向量同时写入；集成用例通过 | 1.5 | ⬜ |
 | S2.6 | 双通道召回 + RRF + 要素加权 | S2.5 | 排序、平局规则、截断全部符合检索契约；`recall_sources` 有值；**报告展示向量覆盖率**（本次参与检索的素材中有向量的比例，对应检索契约 §三 与 §十）；集成用例按检索契约第八节参数表逐项验证 | 3 | ⬜ |

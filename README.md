@@ -106,14 +106,18 @@ Copy-Item config/.env.example config/.env
 #    本地默认 postgresql+asyncpg://xhs:xhs@localhost:5432/xhs）；
 #    DASHSCOPE_API_KEY 按能力启用时再填，REDIS_URL 到 P3 才必填
 
-# 4. 验证安装与本地依赖（两个服务应是 healthy）
+# 4. 建表（Alembic 迁移；改模型后必须同时提交迁移脚本）
+uv run alembic upgrade head
+#    回滚与一致性自查：uv run alembic downgrade base / uv run alembic check
+
+# 5. 验证安装与本地依赖（两个服务应是 healthy）
 uv run python -c "import xhs_agent; print(xhs_agent.__version__)"
 docker compose ps
 
-# 5. 验证配置读取（输出不应包含任何密钥）
+# 6. 验证配置读取（输出不应包含任何密钥）
 uv run python -c "from xhs_agent.config import load_config; print(load_config().describe())"
 
-# 6. 跑启动前置检查（缺必填项会打印 E_CONFIG_MISSING 并以退出码 2 结束）
+# 7. 跑启动前置检查（缺必填项会打印 E_CONFIG_MISSING 并以退出码 2 结束）
 uv run python -m xhs_agent.probe
 ```
 
