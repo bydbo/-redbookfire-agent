@@ -1,9 +1,12 @@
-"""素材索引同步：把素材目录的变化增量落进 `materials` 表。
+"""素材索引同步与向量回填：把素材目录的变化增量落进 `materials` 表，并补齐语义向量。
 
-用途：一次增量同步——扫描目录 → 规划新增/更新/未变/删除 → 对变化的文件重建素材行并落库。
+用途：① 一次增量同步——扫描目录 → 规划新增/更新/未变/删除 → 对变化的文件重建素材行并落库；
+      ② `backfill_embeddings`——给缺向量或换了模型的素材补齐 `embedding` / `embedding_model`。
 输入：`AsyncSession`、`AppConfig`；可选注入 `vision`（`(frames, hint) -> dict | None` 的
-      视觉打标可调用对象）与 `max_vision_items`（本次最多打标多少条，控制成本）。
-输出：`SyncReport`（扫描 / 新增 / 更新 / 未变 / 删除计数 + 摘要文本）。
+      视觉打标可调用对象）与 `max_vision_items`（本次最多打标多少条，控制成本）；回填可注入
+      `embedder`（与 `tools.embedding.EmbeddingClient` 同形状，便于离线测试）。
+输出：`SyncReport`（扫描 / 新增 / 更新 / 未变 / 删除）与 `EmbeddingBackfillReport`
+      （待处理 / 写入 / 跳过空文本 / 失败 / 批次 / prompt_tokens），都带 `summary()`。
 
 口径（决定增量判断的上限）：
 1. 新鲜度 = 文件 `mtime + size`（`fingerprint`）；只改旁车说明、不改素材文件不算变化；
@@ -11,7 +14,9 @@
    宁可暂时缺向量，也不拿旧向量当新素材的相似度；
 3. 素材目录不存在时**直接报错**（配置问题，不降级）——绝不因为"目录读不到"就清空索引；
 4. 磁盘上消失的素材按 `path` 删行，`run_matches` 的外键是 `ON DELETE CASCADE`，会一并清理；
-5. `plan_sync` 是纯函数（只读文件系统、不碰数据库），增量判断逻辑可以离线单测。
+5. `plan_sync` 是纯函数（只读文件系统、不碰数据库），增量判断逻辑可以离线单测；
+6. 向量回填按批提交、失败即停、重跑幂等：只处理 `embedding IS NULL` 或 `embedding_model`
+   与当前模型不符的行（换模型即重建），不修改 `indexed_at`。
 """
 
 from __future__ import annotations
@@ -21,12 +26,13 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from decimal import Decimal
 
-from sqlalchemy import select
+from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..config import PROJECT_ROOT, AppConfig, ConfigError
 from ..db.models import Material as MaterialRow
 from ..tools import materials as materials_tool
+from ..tools.embedding import EmbeddingError, build_embedder, material_embedding_text
 
 
 @dataclass
@@ -183,4 +189,95 @@ async def sync_materials(session: AsyncSession, cfg: AppConfig, *,
             await session.delete(row)
 
     await session.commit()
+    return report
+
+
+@dataclass
+class EmbeddingBackfillReport:
+    """向量回填结果：给运维命令与上层编排看的计数报告。"""
+
+    model: str = ""
+    pending: int = 0
+    embedded: int = 0
+    skipped_empty: int = 0
+    failed: int = 0
+    batches: int = 0
+    prompt_tokens: int = 0
+    error: str = ""
+
+    def summary(self) -> str:
+        text = (f"向量回填（{self.model or '未启用'}）：待处理 {self.pending}、写入 {self.embedded}、"
+                f"跳过空文本 {self.skipped_empty}、失败 {self.failed}、批次 {self.batches}、"
+                f"prompt_tokens {self.prompt_tokens}")
+        return f"{text}；错误：{self.error}" if self.error else text
+
+
+def _chunks(items: list, size: int) -> list[list]:
+    step = max(1, int(size))
+    return [items[i:i + step] for i in range(0, len(items), step)]
+
+
+async def backfill_embeddings(session: AsyncSession, cfg: AppConfig, *, embedder=None,
+                              batch_size: int | None = None,
+                              limit: int | None = None) -> EmbeddingBackfillReport:
+    """给缺向量或换了模型的素材回填 `embedding` / `embedding_model`，返回计数报告。
+
+    输入：`session`（异步会话）、`cfg`（读 `[embedding]` 的模型 / 批量 / 超时 / 重试）、
+    `embedder`（可注入的向量化对象，None = 按配置现造）、`batch_size`（覆盖配置的每批条数）、
+    `limit`（本次最多处理多少条，便于分批运维）。
+    行为：选行 → 拼文本 → 分批调用 → 成功批提交（失败批未写入，停止并报告）→ 返回报告。
+    异常：`[embedding].enabled = false` 抛 `ConfigError`（提示先打开开关，不做静默空跑）。
+    """
+    if not cfg.embedding.enabled:
+        raise ConfigError(
+            "向量召回未启用（[embedding].enabled = false）",
+            "把 config/config.toml 的 [embedding].enabled 设为 true 后再回填；"
+            "索引同步不会隐式调用模型")
+    client = embedder if embedder is not None else build_embedder(cfg)
+    if client is None:
+        raise ConfigError(
+            "向量召回未启用（[embedding].enabled = false）",
+            "把 config/config.toml 的 [embedding].enabled 设为 true 后再回填")
+
+    model = cfg.embedding.model
+    statement = (
+        select(MaterialRow)
+        .where(or_(MaterialRow.embedding.is_(None),
+                   MaterialRow.embedding_model.is_distinct_from(model)))
+        .order_by(MaterialRow.path)
+    )
+    if limit:
+        statement = statement.limit(int(limit))
+    rows = list((await session.execute(statement)).scalars().all())
+
+    report = EmbeddingBackfillReport(model=model, pending=len(rows))
+    todo: list[tuple[MaterialRow, str]] = []
+    for row in rows:
+        text = material_embedding_text(row.title, row.description, row.tags or [],
+                                       row.elements or [])
+        if text:
+            todo.append((row, text))
+        else:
+            report.skipped_empty += 1
+
+    for batch in _chunks(todo, batch_size or cfg.embedding.batch_size):
+        try:
+            result = client.embed([text for _row, text in batch])
+        except EmbeddingError as exc:
+            # 失败批尚未写入任何行，直接停止；已提交的批保留，重跑只补未完成的行
+            report.failed = len(batch)
+            report.error = str(exc)
+            break
+        if len(result.vectors) != len(batch):
+            report.failed = len(batch)
+            report.error = f"返回向量条数 {len(result.vectors)} 与请求 {len(batch)} 不符"
+            break
+        for (row, _text), vector in zip(batch, result.vectors, strict=True):
+            row.embedding = vector
+            row.embedding_model = model
+        await session.commit()
+        report.batches += 1
+        report.embedded += len(batch)
+        report.prompt_tokens += result.prompt_tokens
+
     return report

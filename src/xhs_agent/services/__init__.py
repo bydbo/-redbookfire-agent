@@ -7,11 +7,20 @@
 输出：各服务自己的结果对象（如 `SyncReport`）。
 """
 
-from .materials import SyncPlan, SyncReport, plan_sync, sync_materials
+from .materials import (
+    EmbeddingBackfillReport,
+    SyncPlan,
+    SyncReport,
+    backfill_embeddings,
+    plan_sync,
+    sync_materials,
+)
 
 __all__ = [
+    "EmbeddingBackfillReport",
     "SyncPlan",
     "SyncReport",
+    "backfill_embeddings",
     "plan_sync",
     "sync_materials",
 ]

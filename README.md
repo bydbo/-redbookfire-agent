@@ -39,12 +39,13 @@
 | 集成测试基座（testcontainers + pytest-asyncio） | ✅ 已完成（S2.9） |
 | 数据库 ORM 与会话（五张表、14 条索引、向量列） | ✅ 已完成（S2.2） |
 | 素材索引入库 + 增量判断（`materials` 表 + 指纹增量 + 消失即删） | ✅ 已完成（S2.4） |
+| 向量回填（embedding 客户端 + `materials.embedding` / `embedding_model`） | ✅ 已完成（S2.5） |
 | Alembic 数据库迁移（唯一建表路径） | ✅ 已完成（S2.3） |
 | 评测集 v1 与示例素材包（七维度口径、版本冻结） | ✅ 已完成（S2.0） |
 | 服务入口（FastAPI）与编排层 | ⬜ 未实现 |
 | 前端单页应用（Vue 3 + Vite） | ⬜ 未实现 |
 
-当前可运行的是本地依赖编排、启动前置检查与素材索引入库（`docker compose up -d --wait`、`uv run python -m xhs_agent.probe`、`uv run python scripts/index_materials.py`），业务链路尚未打通。路线图见文末。
+当前可运行的是本地依赖编排、启动前置检查、素材索引入库与向量回填（`docker compose up -d --wait`、`uv run python -m xhs_agent.probe`、`uv run python scripts/index_materials.py`、`uv run python scripts/backfill_embeddings.py`），业务链路尚未打通。路线图见文末。
 
 ---
 
@@ -61,7 +62,7 @@
 | 文本模型接入 | OpenAI 兼容 `/chat/completions` 协议（默认 DeepSeek），标准库 `urllib` 直连，JSON mode 结构化输出 + 解析失败自修 |
 | 多模态接入 | 通义千问 VL（`qwen-vl-max`），关键帧 base64 内联 |
 | 音视频处理 | ffmpeg / ffprobe（用于探测与抽帧；缺失时跳过抽帧，属能力裁剪） |
-| 检索算法 | 字符 bigram Jaccard + 要素类型加权；无 embedding、无向量库 |
+| 检索算法 | 字符 bigram Jaccard + 要素类型加权（现行排序）；向量回填已落地，双通道召回在 S2.6 接入 |
 | 配置 | pydantic-settings + TOML：环境变量 > `.env` > config.toml > 代码默认值；启动前置检查见 `uv run python -m xhs_agent.probe` |
 | 数据落地 | PostgreSQL `materials` 表（素材索引，增量同步）+ JSONL 轨迹 + Markdown 与单文件 HTML 报告；旧 JSON 索引保留但标为 legacy |
 | 测试 | pytest |
@@ -104,9 +105,9 @@ docker compose up -d --wait
 
 # 3. 准备配置（必须填必填项：项目不做无密钥降级）
 Copy-Item config/.env.example config/.env
-#    编辑 config/.env 填 DEEPSEEK_API_KEY（P1 必填）与 DATABASE_URL（P2 必填，
-#    本地默认 postgresql+asyncpg://xhs:xhs@localhost:5432/xhs）；
-#    DASHSCOPE_API_KEY 按能力启用时再填，REDIS_URL 到 P3 才必填
+#    编辑 config/.env 填 DEEPSEEK_API_KEY（P1 必填）、DASHSCOPE_API_KEY（向量召回默认
+#    启用，故默认必填）与 DATABASE_URL（P2 必填，本地默认
+#    postgresql+asyncpg://xhs:xhs@localhost:5432/xhs）；REDIS_URL 到 P3 才必填
 
 # 4. 建表（Alembic 迁移；改模型后必须同时提交迁移脚本）
 uv run alembic upgrade head
@@ -116,18 +117,22 @@ uv run alembic upgrade head
 #    把素材放进 data/materials/ 后执行；--max-vision-items 控制视觉打标的成本上限
 uv run python scripts/index_materials.py
 
-# 6. 验证安装与本地依赖（两个服务应是 healthy）
+# 6. 向量回填（首次建库后 / 素材内容变更后 / 更换 embedding 模型后各跑一次）
+#    逐批提交、失败即停、重跑幂等；--batch-size 控制每批条数、--limit 限制本次条数
+uv run python scripts/backfill_embeddings.py
+
+# 7. 验证安装与本地依赖（两个服务应是 healthy）
 uv run python -c "import xhs_agent; print(xhs_agent.__version__)"
 docker compose ps
 
-# 7. 验证配置读取（输出不应包含任何密钥）
+# 8. 验证配置读取（输出不应包含任何密钥）
 uv run python -c "from xhs_agent.config import load_config; print(load_config().describe())"
 
-# 8. 跑启动前置检查（缺必填项会打印 E_CONFIG_MISSING 并以退出码 2 结束）
+# 9. 跑启动前置检查（缺必填项会打印 E_CONFIG_MISSING 并以退出码 2 结束）
 uv run python -m xhs_agent.probe
 ```
 
-网络受限时：`uv sync --no-dev` 只装运行时环境——当前运行时依赖只有 pydantic、pydantic-settings 与 python-dotenv；不过 `import xhs_agent` 仍然需要安装或设置 `PYTHONPATH=src`（src 布局）。
+网络受限时：`uv sync --no-dev` 只装运行时环境（pydantic / pydantic-settings / python-dotenv / SQLAlchemy async + asyncpg / pgvector / alembic）；不过 `import xhs_agent` 仍然需要安装或设置 `PYTHONPATH=src`（src 布局）。
 
 ---
 

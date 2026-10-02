@@ -33,12 +33,15 @@ max_frames = 3
 max_width = 720
 
 [embedding]
-# 语义召回开关：打开即要求 api_key_env 指向的密钥；E2 接入检索后再打开
-enabled = false
+# 语义召回：默认启用（向量召回是产品主线）；打开即要求 api_key_env 指向的密钥。
+# 换模型必须先补 ADR 并重建向量（《检索契约》§九）。
+enabled = true
 base_url = "https://dashscope.aliyuncs.com/compatible-mode/v1"
 model = "text-embedding-v3"
 dim = 1024                          # 必须与数据契约里 materials.embedding 的维度一致
-batch_size = 16
+batch_size = 10                     # 客户端按 min(batch_size, 供应商单请求上限=10) 自动拆批
+timeout_s = 60
+max_retries = 2
 api_key_env = "DASHSCOPE_API_KEY"
 
 [retrieval]

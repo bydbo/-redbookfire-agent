@@ -209,7 +209,11 @@ class TestAppConfigSurface:
         assert cfg.llm.provider == "openai_compatible"
         assert cfg.llm.api_key_env == "DEEPSEEK_API_KEY"
         assert cfg.vision.enabled is False
-        assert cfg.embedding.enabled is False
+        # 向量召回是产品主线，S2.5 起默认启用（配置契约 §3.3）
+        assert cfg.embedding.enabled is True
         assert cfg.embedding.dim == 1024
+        assert cfg.embedding.batch_size == 10
+        assert cfg.embedding.timeout_s == 60
+        assert cfg.embedding.max_retries == 2
         assert cfg.retrieval.w_element + cfg.retrieval.w_rrf == pytest.approx(1.0)
         assert cfg.frontend.serve is True

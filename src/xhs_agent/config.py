@@ -169,11 +169,13 @@ class VisionConfig(_Section):
 class EmbeddingConfig(_Section):
     """文本向量化。默认值 / 取值范围见《配置契约》§3.3。"""
 
-    enabled: bool = False
+    enabled: bool = True
     base_url: str = "https://dashscope.aliyuncs.com/compatible-mode/v1"
     model: str = "text-embedding-v3"
     dim: int = 1024
-    batch_size: int = Field(16, ge=1, le=128)
+    batch_size: int = Field(10, ge=1, le=128)
+    timeout_s: int = Field(60, ge=1, le=600)
+    max_retries: int = Field(2, ge=0, le=10)
     api_key_env: str = "DASHSCOPE_API_KEY"
 
     _env: EnvView = PrivateAttr(default_factory=EnvView)

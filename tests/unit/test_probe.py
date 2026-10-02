@@ -16,6 +16,14 @@ from xhs_agent.probe import (
 
 
 def make_config(tmp_path, body: str = "") -> AppConfig:
+    """写一份临时 config.toml 并加载。
+
+    `[embedding].enabled` 的默认值是 `true`（S2.5 起，见配置契约 §3.3），因此除显式测试
+    embedding 开关的用例外，本模块统一先把它关掉——否则每个用例都得额外带 DASHSCOPE_API_KEY，
+    掩盖了各自的测试意图。需要测向量的用例自己传 `[embedding]` 段。
+    """
+    if "[embedding]" not in body:
+        body = "[embedding]\nenabled = false\n" + body
     path = tmp_path / "config.toml"
     path.write_text(body, encoding="utf-8")
     return load_config(str(path))
@@ -151,7 +159,7 @@ class TestObservabilityWarning:
 class TestCommandLine:
     def test_main_returns_zero_when_ready(self, tmp_path, clean_contract_env, capsys):
         clean_contract_env.setenv("XHS_CONFIG_PATH", str(tmp_path / "config.toml"))
-        (tmp_path / "config.toml").write_text("", encoding="utf-8")
+        (tmp_path / "config.toml").write_text("[embedding]\nenabled = false\n", encoding="utf-8")
         clean_contract_env.setenv("DEEPSEEK_API_KEY", "sk-test-value")
         clean_contract_env.setenv("DATABASE_URL", DSN)
         assert main([]) == 0

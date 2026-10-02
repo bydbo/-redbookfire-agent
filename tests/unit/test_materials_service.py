@@ -6,7 +6,7 @@ import os
 
 import pytest
 
-from xhs_agent.config import ConfigError
+from xhs_agent.config import ConfigError, load_config
 from xhs_agent.services import materials as service
 from xhs_agent.tools import materials as tool
 
@@ -92,3 +92,14 @@ class TestSyncMaterials:
         with pytest.raises(ConfigError) as excinfo:
             await service.sync_materials(None, cfg)  # type: ignore[arg-type]
         assert excinfo.value.fix
+
+
+class TestBackfillEmbeddings:
+    @pytest.mark.asyncio
+    async def test_disabled_capability_raises_before_touching_db(self, tmp_path):
+        path = tmp_path / "config.toml"
+        path.write_text("[embedding]\nenabled = false\n", encoding="utf-8")
+        cfg = load_config(str(path))
+        with pytest.raises(ConfigError, match="未启用"):
+            # 开关校验在选行之前，因此 session=None 不会被使用
+            await service.backfill_embeddings(None, cfg)  # type: ignore[arg-type]
