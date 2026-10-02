@@ -44,7 +44,31 @@
 
 ## 04 Examples
 
-> ⚠️ 待 S3.1 填写：1–2 个精简样例，字段必须与 05 一致；不得引用 `evals/cases/`。
+### 输入
+
+```
+某顶流明星周末在社区球场打羽毛球，被路人拍到挥拍侧影
+```
+
+### 输出（节选）
+
+```json
+{
+  "why_it_works": ["反差：顶流身份出现在社区球场这种日常场景里", "新鲜感：羽毛球在明星日常里少见，画面本身少见"],
+  "mechanisms": [{"name": "反差", "explain": "身份与场景错位"}, {"name": "新鲜感", "explain": "少见的动作组合"}],
+  "elements": [
+    {"type": "ip", "value": "明星艺人", "weight": 0.3, "confidence": 0.8, "evidence": "某顶流明星"},
+    {"type": "topic", "value": "羽毛球", "weight": 1.0, "confidence": 0.9, "evidence": "打羽毛球"},
+    {"type": "scene", "value": "球场", "weight": 0.7, "confidence": 0.8, "evidence": "社区球场"},
+    {"type": "conflict", "value": "身份反差", "weight": 0.7, "confidence": 0.7, "evidence": "被路人拍到挥拍侧影"}
+  ],
+  "match_keywords": ["羽毛球", "球场", "挥拍", "反差"],
+  "borrow_angles": ["用自己的球场素材复刻「被路人随手拍到」的瞬时感", "以「平民视角打两拍」切入，不出现明星肖像"],
+  "risk_notes": ["不得使用明星姓名与肖像，改用「同款动作」表述"]
+}
+```
+
+注意样例里的 IP 权重压到 0.3、风险提醒写清不直用——这两处是硬边界的示范。
 
 ## 05 Output Schema
 
