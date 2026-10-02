@@ -22,7 +22,7 @@ import urllib.request
 from collections.abc import Callable
 from dataclasses import dataclass, field
 
-from ..config import AppConfig, LLMConfig
+from ..config import LLM_PROVIDERS, AppConfig, LLMConfig
 from ..util import extract_json
 
 
@@ -188,7 +188,8 @@ def _extract_message_text(data: dict) -> str:
 def build_provider(cfg: AppConfig) -> BaseProvider:
     """按配置造 provider：只支持 OpenAI 兼容端点，未知值抛 `LLMError`（无效配置在启动前置检查就拦）。"""
     provider_name = cfg.llm.resolved_provider()
-    if provider_name in {"openai_compatible", "openai", "deepseek", "qwen", "dashscope", "compatible"}:
+    # 白名单与配置层共用一份（config.LLM_PROVIDERS），避免两处漂移
+    if provider_name in LLM_PROVIDERS:
         return OpenAICompatibleProvider(cfg.llm)
     raise LLMError(f"未知的 provider：{provider_name}")
 

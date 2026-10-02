@@ -49,7 +49,7 @@ def _vector_coverage_text(vector: dict) -> str:
     return f"向量覆盖率 {with_embedding}/{total}（{_fmt_score(vector.get('ratio', 0))}）{note}"
 
 
-def render_markdown(model: dict, base_dir: str = "") -> str:
+def render_markdown(model: dict) -> str:
     meta = model.get("meta") or {}
     cfg = model.get("config") or {}
     hotspots = model.get("hotspots") or []

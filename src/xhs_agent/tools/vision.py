@@ -63,7 +63,7 @@ def make_describer(cfg: AppConfig):
             headers={"Content-Type": "application/json", "Authorization": f"Bearer {api_key}"},
         )
         try:
-            with urllib.request.urlopen(request, timeout=cfg.llm.timeout_s) as response:
+            with urllib.request.urlopen(request, timeout=cfg.vision.timeout_s) as response:
                 data = json.loads(response.read().decode("utf-8", errors="replace"))
             text = data["choices"][0]["message"]["content"]
             parsed = extract_json(text)

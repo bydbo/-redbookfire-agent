@@ -21,10 +21,13 @@
 
 from __future__ import annotations
 
+import asyncio
 import os
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from decimal import Decimal
+from typing import Any, Protocol, TypeVar
 
 from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -33,7 +36,12 @@ from ..config import PROJECT_ROOT, AppConfig, ConfigError
 from ..db.models import Material as MaterialRow
 from ..schemas import Material
 from ..tools import materials as materials_tool
-from ..tools.embedding import EmbeddingError, build_embedder, material_embedding_text
+from ..tools.embedding import (
+    EmbeddingClient,
+    EmbeddingError,
+    build_embedder,
+    material_embedding_text,
+)
 
 
 @dataclass
@@ -65,14 +73,34 @@ class SyncReport:
                 f"未变 {self.unchanged}、删除 {self.deleted}（视觉打标 {self.vision_used} 条）")
 
 
+def _path_key(path: str) -> str:
+    """路径比较键：绝对化 + `normcase`。
+
+    Windows 的路径比较大小写不敏感，而字符串 `startswith` / 字典键是敏感的：统一走
+    `normcase` 再比，避免同一路径只因盘符大小写不同就被当成两条素材（会写出重复行）。
+    """
+    return os.path.normcase(os.path.abspath(path))
+
+
 def _is_under(path: str, root: str) -> bool:
     """`path` 是否位于 `root` 之下（`root` 自身不算）。"""
-    abs_path = os.path.abspath(path)
-    abs_root = os.path.abspath(root)
-    return abs_path != abs_root and abs_path.startswith(abs_root + os.sep)
+    key_path = _path_key(path)
+    key_root = _path_key(root)
+    return key_path != key_root and key_path.startswith(key_root + os.sep)
 
 
-def plan_sync(disk_entries: list[str], db_rows: list, materials_dir: str) -> SyncPlan:
+T = TypeVar("T")
+
+
+class _SyncRow(Protocol):
+    """`plan_sync` 需要的行属性（只依赖这两列，不绑定 ORM 类型）。"""
+
+    path: str
+    fingerprint: str | None
+
+
+def plan_sync(disk_entries: list[str], db_rows: Sequence[_SyncRow],
+              materials_dir: str) -> SyncPlan:
     """规划增量：纯函数，只读文件系统、不碰数据库。
 
     输入：`disk_entries`（本次扫描到的素材文件路径）、`db_rows`（`materials` 表里的行，
@@ -81,22 +109,26 @@ def plan_sync(disk_entries: list[str], db_rows: list, materials_dir: str) -> Syn
     磁盘扫描为空时**不删任何行**（避免目录读不到时误清索引）。
     输出：`SyncPlan`（added / updated / unchanged / deleted，均为绝对路径并按字典序排序）。
     """
-    disk_map = {os.path.abspath(p): materials_tool.fingerprint(p) for p in disk_entries}
-    db_map = {os.path.abspath(row.path): row.fingerprint
+    # 键用 normcase 后的路径比较；值保留原始绝对路径，供落库与报错使用
+    disk_map = {_path_key(p): (os.path.abspath(p), materials_tool.fingerprint(p))
+                for p in disk_entries}
+    db_map = {_path_key(row.path): (os.path.abspath(row.path), row.fingerprint)
               for row in db_rows if _is_under(row.path, materials_dir)}
 
     added, updated, unchanged = [], [], []
-    for path in sorted(disk_map):
-        disk_fp = disk_map[path]
-        if path not in db_map:
+    for key in sorted(disk_map, key=lambda item: disk_map[item][0]):
+        path, disk_fp = disk_map[key]
+        row = db_map.get(key)
+        if row is None:
             added.append(path)
-        elif db_map[path] and db_map[path] == disk_fp:
+        elif row[1] and row[1] == disk_fp:
             unchanged.append(path)
         else:
             # 内容变了，或历史行没有 fingerprint（需要重建）
             updated.append(path)
 
-    deleted = [] if not disk_map else sorted(p for p in db_map if p not in disk_map)
+    deleted = [] if not disk_map else sorted(
+        path for key, (path, _fp) in db_map.items() if key not in disk_map)
     return SyncPlan(added=added, updated=updated, unchanged=unchanged, deleted=deleted)
 
 
@@ -115,7 +147,7 @@ def _relative_keyframes(keyframes: list[str]) -> list[str]:
     return out
 
 
-def _row_values(material, keyframes: list[str]) -> dict:
+def _row_values(material: Material, keyframes: list[str]) -> dict[str, Any]:
     """把内存 `Material` 映射成 `materials` 表的列值（id 由数据库生成）。"""
     mtime = (datetime.fromtimestamp(material.mtime, tz=UTC)
              if material.mtime else None)
@@ -167,7 +199,8 @@ def row_to_material(row: MaterialRow) -> Material:
 
 
 async def sync_materials(session: AsyncSession, cfg: AppConfig, *,
-                         vision=None, max_vision_items: int = 50) -> SyncReport:
+                         vision: Callable[[list[str], str], dict[str, Any] | None] | None = None,
+                         max_vision_items: int = 50) -> SyncReport:
     """把素材目录增量同步进 `materials` 表，返回计数报告。
 
     输入：`session`（异步会话）、`cfg`（读 `[paths]` 的素材 / 索引目录）、
@@ -240,12 +273,13 @@ class EmbeddingBackfillReport:
         return f"{text}；错误：{self.error}" if self.error else text
 
 
-def _chunks(items: list, size: int) -> list[list]:
+def _chunks(items: Sequence[T], size: int) -> list[list[T]]:
     step = max(1, int(size))
-    return [items[i:i + step] for i in range(0, len(items), step)]
+    return [list(items[i:i + step]) for i in range(0, len(items), step)]
 
 
-async def backfill_embeddings(session: AsyncSession, cfg: AppConfig, *, embedder=None,
+async def backfill_embeddings(session: AsyncSession, cfg: AppConfig, *,
+                              embedder: EmbeddingClient | None = None,
                               batch_size: int | None = None,
                               limit: int | None = None) -> EmbeddingBackfillReport:
     """给缺向量或换了模型的素材回填 `embedding` / `embedding_model`，返回计数报告。
@@ -290,7 +324,9 @@ async def backfill_embeddings(session: AsyncSession, cfg: AppConfig, *, embedder
 
     for batch in _chunks(todo, batch_size or cfg.embedding.batch_size):
         try:
-            result = client.embed([text for _row, text in batch])
+            # embed 是同步 urllib 调用，放线程里跑，避免阻塞事件循环（S3.5 换 httpx 后改回原生异步）
+            result = await asyncio.to_thread(
+                client.embed, [text for _row, text in batch])
         except EmbeddingError as exc:
             # 失败批尚未写入任何行，直接停止；已提交的批保留，重跑只补未完成的行
             report.failed = len(batch)

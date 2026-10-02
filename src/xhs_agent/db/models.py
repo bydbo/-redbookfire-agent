@@ -16,6 +16,7 @@ from __future__ import annotations
 import uuid
 from datetime import datetime
 from decimal import Decimal
+from typing import Any
 
 from pgvector.sqlalchemy import Vector
 from sqlalchemy import (
@@ -62,7 +63,8 @@ class Material(Base):
     description: Mapped[str] = mapped_column(Text, nullable=False, server_default=text("''"))
     tags: Mapped[list[str]] = mapped_column(ARRAY(Text), nullable=False,
                                             server_default=text("'{}'"))
-    elements: Mapped[list] = mapped_column(JSONB, nullable=False, server_default=text("'[]'"))
+    elements: Mapped[list[dict[str, Any]]] = mapped_column(JSONB, nullable=False,
+                                                            server_default=text("'[]'"))
     source: Mapped[str] = mapped_column(Text, nullable=False,
                                         server_default=text("'filename'"))
     duration_s: Mapped[Decimal] = mapped_column(Numeric(8, 2), nullable=False,
@@ -72,7 +74,8 @@ class Material(Base):
     has_audio: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=text("false"))
     size_bytes: Mapped[int] = mapped_column(BigInteger, nullable=False, server_default=text("0"))
     mtime: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
-    keyframes: Mapped[list] = mapped_column(JSONB, nullable=False, server_default=text("'[]'"))
+    keyframes: Mapped[list[str]] = mapped_column(JSONB, nullable=False,
+                                                  server_default=text("'[]'"))
     fingerprint: Mapped[str | None] = mapped_column(Text, nullable=True)
     embedding: Mapped[list[float] | None] = mapped_column(Vector(EMBEDDING_DIM), nullable=True)
     embedding_model: Mapped[str | None] = mapped_column(Text, nullable=True)
@@ -106,7 +109,7 @@ class Hotspot(Base):
 
     id: Mapped[uuid.UUID] = _pk()
     raw_text: Mapped[str] = mapped_column(Text, nullable=False)
-    clue: Mapped[dict] = mapped_column(JSONB, nullable=False)
+    clue: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)
     created_at: Mapped[datetime] = _created_at()
 
     __table_args__ = (Index("ix_hotspots_created_at", "created_at"),)
@@ -130,7 +133,8 @@ class Run(Base):
     cost_cny: Mapped[Decimal] = mapped_column(Numeric(10, 4), nullable=False,
                                               server_default=text("0"))
     latency_ms: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
-    prompt_versions: Mapped[dict] = mapped_column(JSONB, nullable=False, server_default=text("'{}'"))
+    prompt_versions: Mapped[dict[str, int]] = mapped_column(JSONB, nullable=False,
+                                                            server_default=text("'{}'"))
     error: Mapped[str | None] = mapped_column(Text, nullable=True)
 
     __table_args__ = (
@@ -154,8 +158,9 @@ class RunHotspot(Base):
         UUID(as_uuid=True), ForeignKey("hotspots.id", ondelete="RESTRICT"), nullable=False)
     position: Mapped[int] = mapped_column(Integer, nullable=False)
     status: Mapped[str] = mapped_column(Text, nullable=False, server_default=text("'queued'"))
-    coverage: Mapped[dict] = mapped_column(JSONB, nullable=False, server_default=text("'{}'"))
-    draft: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+    coverage: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False,
+                                                      server_default=text("'{}'"))
+    draft: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
     error: Mapped[str | None] = mapped_column(Text, nullable=True)
 
     __table_args__ = (
@@ -180,9 +185,12 @@ class RunMatch(Base):
     score: Mapped[Decimal] = mapped_column(Numeric(6, 4), nullable=False)
     recall_sources: Mapped[list[str]] = mapped_column(ARRAY(Text), nullable=False,
                                                       server_default=text("'{}'"))
-    hits: Mapped[list] = mapped_column(JSONB, nullable=False, server_default=text("'[]'"))
-    missing: Mapped[list] = mapped_column(JSONB, nullable=False, server_default=text("'[]'"))
-    reasons: Mapped[list] = mapped_column(JSONB, nullable=False, server_default=text("'[]'"))
+    hits: Mapped[list[dict[str, Any]]] = mapped_column(JSONB, nullable=False,
+                                                        server_default=text("'[]'"))
+    missing: Mapped[list[dict[str, Any]]] = mapped_column(JSONB, nullable=False,
+                                                           server_default=text("'[]'"))
+    reasons: Mapped[list[str]] = mapped_column(JSONB, nullable=False,
+                                               server_default=text("'[]'"))
     usage: Mapped[str] = mapped_column(Text, nullable=False, server_default=text("''"))
 
     __table_args__ = (

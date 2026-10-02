@@ -151,8 +151,15 @@ class Element(_Contract):
     @field_validator("type", mode="before")
     @classmethod
     def _norm_type(cls, value: Any) -> str:
-        text = _clean_str(value or "topic").lower()
-        return text if text in ELEMENT_TYPES else "topic"
+        """类型必须是九类之一：未知值直接报错，由结构化输出的自修重试处理。
+
+        静默回退成 `topic` 会同时踩两个坑：`topic` 权重最高（1.0），等于给错值加权重；
+        模型输出跑偏也看不见——而 `docs/评测集.md` 的「幻觉」维度要求这类问题暴露出来。
+        """
+        text = _clean_str(value or "").lower()
+        if text not in ELEMENT_TYPES:
+            raise ValueError(f"要素类型必须是 {'/'.join(ELEMENT_TYPES)} 之一，收到 {value!r}")
+        return text
 
     @field_validator("value", "evidence", mode="before")
     @classmethod

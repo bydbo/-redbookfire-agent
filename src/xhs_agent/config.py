@@ -147,6 +147,7 @@ class VisionConfig(_Section):
     api_key_env: str = "DASHSCOPE_API_KEY"
     max_frames: int = Field(3, ge=1, le=10)
     max_width: int = Field(720, ge=64, le=4096)
+    timeout_s: int = Field(60, ge=1, le=600)
 
     _env: EnvView = PrivateAttr(default_factory=EnvView)
 

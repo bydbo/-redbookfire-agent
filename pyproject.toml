@@ -75,4 +75,10 @@ files = [
     "src/xhs_agent/schemas.py",
     "src/xhs_agent/config.py",
     "src/xhs_agent/probe.py",
+    # E2 新增的 db / services / 检索与向量化工具——async + ORM + SQL 交互，类型风险最高
+    "src/xhs_agent/db",
+    "src/xhs_agent/services",
+    "src/xhs_agent/tools/retrieval.py",
+    "src/xhs_agent/tools/embedding.py",
+    "src/xhs_agent/tools/prompt.py",
 ]

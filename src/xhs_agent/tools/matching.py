@@ -61,6 +61,8 @@ def match_elements(clue: HotspotClue, material: Material,
     weights = dict(DEFAULT_TYPE_WEIGHTS)
     weights.update(type_weights or {})
     corpus = material_text(material)
+    # 归一化与循环无关，提到循环外只算一次（原先每个 surface 都重算）
+    corpus_norm = normalize_text(corpus)
     material_elements = material.elements or []
 
     matches: list[ElementMatch] = []
@@ -85,7 +87,8 @@ def match_elements(clue: HotspotClue, material: Material,
             surface = (surface or "").strip()
             if len(surface) < 2:
                 continue
-            if normalize_text(surface) and normalize_text(surface) in normalize_text(corpus):
+            surface_norm = normalize_text(surface)
+            if surface_norm and surface_norm in corpus_norm:
                 if best_sim < 0.9:
                     best_sim, best_value = 0.9, f"关键词「{surface}」命中"
                 break

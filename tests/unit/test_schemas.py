@@ -36,14 +36,17 @@ def _material(**overrides) -> Material:
 
 
 class TestElement:
-    def test_unknown_type_falls_back_to_topic(self):
-        assert Element(type="明星", value="顶流").type == "topic"
+    def test_unknown_type_raises(self):
+        """未知类型不再静默回退 topic：报错交给结构化输出的自修重试（见 schemas 注释）。"""
+        with pytest.raises(ValidationError):
+            Element(type="明星", value="顶流")
 
     def test_type_is_trimmed_and_case_insensitive(self):
         assert Element(type=" IP ", value="顶流").type == "ip"
 
-    def test_empty_type_falls_back_to_topic(self):
-        assert Element(type=None, value="顶流").type == "topic"
+    def test_empty_type_raises(self):
+        with pytest.raises(ValidationError):
+            Element(type=None, value="顶流")
 
     def test_weight_and_confidence_are_clipped(self):
         element = Element(type="topic", value="羽毛球", weight=5, confidence=-3)

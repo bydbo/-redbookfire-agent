@@ -127,6 +127,11 @@ def preflight(cfg: AppConfig, env: EnvView | None = None,
                 f"{name} 必须以前缀 {' 或 '.join(schemes)} 开头",
                 f"按《配置契约》§2.1 修正 {name} 的连接串前缀"))
 
+    # 3.5) 多模态打标开着但机器没有 ffmpeg：属于能力裁剪，只告警、不阻断启动
+    if cfg.vision.enabled and cfg.vision.resolved_key() and not cfg.vision.available():
+        report.warnings.append(
+            "多模态打标不会生效：机器上没有 ffmpeg / ffprobe（[vision].enabled = true，属能力裁剪）")
+
     # 4) 可观测三件套：不齐只告警，不阻断启动
     values = {name: env.get(name) for name in _LANGFUSE_NAMES}
     if any(values.values()) and not all(values.values()):
