@@ -195,6 +195,6 @@
 
 ## 当前项目状态（规范的诚实边界）
 
-- 已完成：数据契约（S1.1 起为 Pydantic v2 模型）、配置加载与启动前置检查（S1.2）、爆点词典、模型调用层、素材扫描与索引、相关性打分、报告渲染、运行追踪，均在 `src/xhs_agent/`。其中 `tools/offline.py`（离线规则引擎）**将在 P2 阶段删除**——运行时降级已取消。
-- 尚未实现：`agents/` 与 `workflows/` 编排层、FastAPI 服务入口与数据库。因此本仓库目前**没有可执行的业务命令**，`README.md` 的快速开始只覆盖环境安装与导入验证。
+- 已完成：数据契约（S1.1 起为 Pydantic v2 模型）、配置加载与启动前置检查（S1.2，`src/xhs_agent/probe.py`）、爆点词典、模型调用层、素材扫描与索引、相关性打分、报告渲染、运行追踪；P2 阶段已完成本地依赖编排（S2.1，`docker-compose.yml`）、集成测试基座（S2.9，`tests/integration/`）、数据库 ORM 与会话（S2.2，`src/xhs_agent/db/`）与评测集 v1（S2.0，`evals/`）。其中 `tools/offline.py`（离线规则引擎）**将在 P2 阶段删除**——运行时降级已取消。
+- 尚未实现：Alembic 迁移（S2.3）、素材索引入库与检索层（S2.4–S2.8）、`agents/` 与 `workflows/` 编排层、FastAPI 服务入口与前端。当前可运行的只有 `docker compose up -d --wait` 与 `uv run python -m xhs_agent.probe`（启动前置检查的前两步）。
 - 记录以上状态是为了让 AI 与合作者先看清事实，不要把"计划要实现的东西"当成"已经有的东西"。
