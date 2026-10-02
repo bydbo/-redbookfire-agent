@@ -203,5 +203,5 @@
 
 - 已完成：数据契约（S1.1）、配置加载与启动前置检查（S1.2）、质量门与覆盖率（S1.3–S1.5）、爆点词典、模型调用层、素材扫描与索引、要素级匹配与规则解释、报告渲染、运行追踪；P2 已全部完成（S2.0–S2.9：本地依赖编排、集成测试基座、ORM 与会话、Alembic 迁移、评测集 v1、素材索引入库、向量回填、双通道召回与 RRF、离线链路清理、检索层基线对比）；E3 已完成 prompt 契约（S3.0）、LangGraph 五节点状态图与三条 agent prompt 正文（S3.1）与 prompt 版本落库（S3.9）。
 - 运行时降级已取消（ADR 0001）：`tools/offline.py` 与 `OfflineProvider` 已在 S2.7 删除，不存在"无密钥也能跑"的路径；缺密钥、缺依赖一律失败并报错。
-- 尚未实现：FastAPI 服务入口与 Celery 异步任务（S3.2–S3.8）、`runs` / `run_hotspots` / `run_matches` 的落库接线（S3.4）、前端（E5）。当前可直接运行 `docker compose up -d --wait`、`uv run python -m xhs_agent.probe`、`uv run python scripts/index_materials.py`、`uv run python scripts/backfill_embeddings.py`、`uv run python scripts/eval_retrieval.py`；五节点工作流是可直接调用的服务（`xhs_agent.workflows.run_analysis`），但还没有 HTTP 入口。
+- 尚未实现：FastAPI 服务入口与 Celery 异步任务（S3.2–S3.8）、`runs` / `run_hotspots` / `run_matches` 的落库接线（S3.4a）、前端（E5）。当前可直接运行 `docker compose up -d --wait`、`uv run python -m xhs_agent.probe`、`uv run python scripts/index_materials.py`、`uv run python scripts/backfill_embeddings.py`、`uv run python scripts/eval_retrieval.py`；五节点工作流是可直接调用的服务（`xhs_agent.workflows.run_analysis`），但还没有 HTTP 入口。
 - 记录以上状态是为了让 AI 与合作者先看清事实，不要把"计划要实现的东西"当成"已经有的东西"。

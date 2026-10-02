@@ -17,10 +17,10 @@
 | E0 契约与决策 | 把方案变成可开工的契约与决策记录 | 3.5 | ✅ 已完成 | M1 |
 | E1 工程骨架 | 建立契约与质量基线，行为不变 | 7.5 | ✅ 已完成 | M2 |
 | E2 数据与检索 | 持久化 + 语义召回，产出评测数字 | 20 | 🔄 进行中 | M3 |
-| E3 编排与服务 | 服务化与异步，端到端可演示 | 19 | 🔄 进行中 | M4 |
+| E3 编排与服务 | 服务化与异步，端到端可演示 | 20.5 | 🔄 进行中 | M4 |
 | E4 可观测与交付 | 可运维、可交付 | 7.5 | ⬜ 未开始 | M5 |
 | E5 前端工程 | 把演示页升级为可交互的单页应用 | 17 | ⬜ 未开始 | M6 |
-| **合计** | | **74.5** | | |
+| **合计** | | **76** | | |
 
 全职投入约 9 周；按每天 3 小时的业余节奏约 5 个月。总量比初版（41.5）增加 26 人日：前端 Epic 17、API 前缀与静态挂载 1、完整 preflight 1.5、mypy 收紧 0.5、E2 净增 5（集成测试基座 +3、评测集与示例素材包 +3、对比脚本精简 −1）、E1 落地时的范围调整 1（S1.2 配置段全量 +0.5、S1.4 覆盖 8 个模块 +0.5）。
 
@@ -72,17 +72,17 @@
 | 编号 | Story | 依赖 | 验收标准 | 人日 | 状态 |
 | --- | --- | --- | --- | --- | --- |
 | S3.0 | Prompt 契约与资产骨架 | S0.1 | `docs/contracts/prompt契约.md` 定义五段结构与变更门槛；`src/xhs_agent/prompts/` 四份文件五段齐全；`tools/prompt.py` 零依赖渲染（缺变量／缺段／requires 不符即报错）；`tools/vision.py` 改为从 prompt 文件加载；单测覆盖全部失败路径 | 2.5 | ✅ |
-| S3.1 | LangGraph 状态图 | S2.6 | 拆解 → 检索 → 缺口 → 撰稿 → 报告五节点；节点级重试与进度上报可用；**三条 agent 任务的 prompt 正文按五段结构交付，并把各任务版本号写入 `runs.prompt_versions`**（实测：引入 langgraph 1.2，单热点图 + `run_analysis` 多热点循环；三条 prompt 正文按段拆 4 个提交交付、版本保持 v1；`material_select` 一次调用覆盖 Top-K 并覆盖规则解释；缺口节点产出结构化补拍建议；`prompt_versions` 在 state / `RunResult` / `state.json` 里产出、落库归 S3.4；节点级重试需显式 `retry_on`——langgraph 默认不重试 `RuntimeError`/`ValueError`；顺带补齐 ADR 0010 漏掉的阈值默认值。新增 62 条单测 + 2 条集成冒烟） | 2.5 | ✅ |
-| S3.2 | FastAPI 应用骨架 | S1.2 | 路由分层、依赖注入、统一错误响应中间件；`X-Request-ID` 贯穿 | 2 | ⬜ |
+| S3.1 | LangGraph 状态图 | S2.6 | 拆解 → 检索 → 缺口 → 撰稿 → 报告五节点；节点级重试与进度上报可用；**三条 agent 任务的 prompt 正文按五段结构交付，并把各任务版本号写入 `runs.prompt_versions`**（实测：引入 langgraph 1.2，单热点图 + `run_analysis` 多热点循环；三条 prompt 正文按段拆 4 个提交交付、版本保持 v1；`material_select` 一次调用覆盖 Top-K 并覆盖规则解释；缺口节点产出结构化补拍建议；`prompt_versions` 在 state / `RunResult` / `state.json` 里产出、落库归 S3.4a；节点级重试需显式 `retry_on`——langgraph 默认不重试 `RuntimeError`/`ValueError`；顺带补齐 ADR 0010 漏掉的阈值默认值。新增 62 条单测 + 2 条集成冒烟） | 2.5 | ✅ |
+| S3.2 | FastAPI 应用骨架 | S1.2 | 应用可启动并挂载 `/api` 前缀下的路由树；**错误响应与 `openapi.yaml` 的 `ErrorResponse` 逐字段一致**（集成用例断言 code / message / detail 三键）；未捕获异常返回 500 且不泄漏堆栈；响应回写 `X-Request-ID` 且与请求头一致 | 2 | ⬜ |
 | S3.3 | 五个接口实现（`/api` 前缀） | S3.1, S3.2, S2.3 | 逐个对齐 OpenAPI 契约；错误码与响应结构一致；接口级集成用例通过 | 2.5 | ⬜ |
-| S3.4 | Celery worker 与任务状态回写 | S3.3 | 任务状态与 `runs.status` 同步；软/硬超时生效；**在进入 LangGraph 前完成索引新鲜度检查与增量索引**；集成用例通过 | 2 | ⬜ |
-| S3.5 | httpx 替换 urllib | S1.2 | 异步调用 + 连接池 + 重试策略；失败映射到 `upstream_error` | 1 | ⬜ |
-> 补充（E2 审查项 7）：顺手把 `services/retrieval.py` 的向量字面量拼接改为 asyncpg 原生参数绑定（`CAST(:v AS vector)` → 直接绑 `vector` 类型），省掉约 20KB 的 SQL 字面量与序列化开销。
-| S3.6 | Walking Skeleton 联调 | S3.4, S3.5 | 见第四节的最薄链路定义 | 1 | ⬜ |
-| S3.7 | API 前缀与前端静态挂载 | S3.3 | `/api` 前缀生效；前端 dist 挂载根路径并支持 history 回落；`[frontend].serve` 开关可用 | 1 | ⬜ |
-| S3.8 | 完整 preflight | S3.7, S2.1 | 逐项实现配置契约 §四的 7 步检查：配置合法性、DB 连接、扩展版本、Alembic head、Redis PING、前端 dist、模型探测不入启动；退出码 2/3 与报错文案对齐契约 | 1.5 | ⬜ |
-| S3.9 | Prompt 版本落库 | S2.3, S3.0 | 数据契约 §3.3 加 `prompt_versions`（jsonb，默认 `{}`）、API 契约 `RunDetail` 暴露同名字段、ORM 列、Alembic `0002` 可往返、集成用例覆盖列清单与默认值；**写入接线归 S3.1／S3.4** | 1.5 | ✅ |
-| S3.10 | Prompt 变更回归报告 | S2.8, S3.0 | 复用评测脚本产出 `evals/reports/prompt-<task_id>-v<N>-<日期>.md` 对比报告模板与归档规则；落实 prompt 契约 §六 的七维度硬门槛判定 | 1.5 | ⬜ |
+| S3.4a | 运行结果仓储层 | S3.1, S2.3 | 按数据契约 §3.2–§3.5 写入 `runs` / `hotspots` / `run_hotspots` / `run_matches` 四表；`hotspots` 按原文去重复用（"避免重复付费"的承诺）；`(run_id, position)` 与 `(run_hotspot_id, rank)` 幂等；`reasons` 非空约束在 Pydantic 与数据库两处都生效；`prompt_versions` 与 LLM 统计（llm_calls / tokens / cost / latency）落库；单测 + 集成用例覆盖。**RunStore 与 DB 的权威关系按 ADR 0011 执行**（停写 state.json） | 1.5 | ⬜ |
+| S3.4b | Celery worker 接线与状态回写 | S3.3, S3.4a, S3.5 | 任务状态与 `runs.status` 同步（含失败路径）；软/硬超时生效；**在进入 LangGraph 前完成索引新鲜度检查与增量索引**；集成用例通过 | 2 | ⬜ |
+| S3.5 | httpx 替换 urllib | S2.5, S2.6 | 异步调用 + 连接池 + 重试策略；失败映射到 `upstream_error`；**调用方一并接线**——`services/retrieval.py` 与 `services/materials.py` 的 embed 调用改为 `await`（去掉临时的 `asyncio.to_thread` 包裹，只换客户端不改调用方等于没修）。**须在 S3.4b 之前完成**（E2 审查建议 1 的时序风险）。顺带把向量字面量拼接改为 asyncpg 原生参数绑定（E2 审查项 7） | 1 | ⬜ |
+| S3.6 | Walking Skeleton 联调 | S3.4b, S3.5 | 见第四节的最薄链路定义 | 1 | ⬜ |
+| S3.7 | 前端静态资源挂载 | S3.3 | `frontend/dist` 挂载到根路径并支持 history 回落；`[frontend].serve = false` 时只跑 API；`dist` 缺失且 serve 为 true 时启动失败（退出码 2）。`/api` 前缀的验收归 S3.3，本 Story 不重复 | 1 | ⬜ |
+| S3.8 | 完整 preflight | S3.7, S2.1 | 逐项实现配置契约 §四的 7 步检查：配置合法性、DB 连接、扩展版本、Alembic head、Redis PING、前端 dist、模型探测不入启动；退出码 2/3 与报错文案对齐契约；**检查接入 FastAPI lifespan（启动事件）**——任一步失败即中止启动。第 1–6 步不依赖 S3.7，可提前开工 | 1.5 | ⬜ |
+| S3.9 | Prompt 版本落库 | S2.3, S3.0 | 数据契约 §3.3 加 `prompt_versions`（jsonb，默认 `{}`）、API 契约 `RunDetail` 暴露同名字段、ORM 列、Alembic `0002` 可往返、集成用例覆盖列清单与默认值；**写入接线归 S3.4a** | 1.5 | ✅ |
+| S3.10 | Prompt 变更回归报告 | S2.8, S3.0 | 复用评测脚本产出 `evals/reports/prompt-<task_id>-v<N>-<日期>.md` 对比报告模板与归档规则；落实 prompt 契约 §六 的七维度硬门槛判定；**报告附人工 1–5 分「文案可用率」列**（口径按产品方案 §10.2），只记录、不阻断回退判定——它没有产出物就无法打分，因此不进硬门槛 | 1.5 | ⬜ |
 
 ### E4 · 可观测与交付
 
@@ -91,7 +91,7 @@
 | S4.1 | structlog + run_id 贯穿 | S3.2 | 每条日志带 run_id 与 request_id；JSON 输出可被检索 | 1 | ⬜ |
 | S4.2 | Langfuse 接入 | S4.1 | 模型调用可看到 token、成本、延迟；`LANGFUSE_*` 不齐时只告警不阻断 | 1 | ⬜ |
 | S4.3 | OpenTelemetry 追踪 | S4.1 | 一次请求可从 API 追到数据库与模型调用 | 1.5 | ⬜ |
-| S4.4 | 多阶段 Dockerfile + 全栈 compose | S3.4 | `docker compose up` 一条命令起 api / worker / postgres / redis | 2 | ⬜ |
+| S4.4 | 多阶段 Dockerfile + 全栈 compose | S3.4b | `docker compose up` 一条命令起 api / worker / postgres / redis | 2 | ⬜ |
 | S4.5 | GitHub Actions CI | S1.3, S1.4 | lint + typecheck + test 三关通过（推送后生效） | 1 | ⬜ |
 | S4.6 | 契约一致性校验进 CI | S4.5, S3.3 | FastAPI 导出的 schema 与 `openapi.yaml` 不一致时 CI 失败 | 1 | ⬜ |
 
@@ -101,7 +101,7 @@
 | --- | --- | --- | --- | --- | --- |
 | S5.1 | Vite 工程脚手架 | S3.7 | Vue 3 + TS + Router + Pinia + Naive UI + Tailwind 可跑起来；目录结构符合 `docs/项目结构.md` | 2 | ⬜ |
 | S5.2 | 契约生成接口类型 | S5.1 | `openapi-typescript` 生成 `schema.d.ts` 并入库；CI 校验生成结果无变化 | 1 | ⬜ |
-| S5.3 | 分析台页面 | S5.2, S3.4 | 可输入多个热点、提交、轮询进度并跳转结果 | 2.5 | ⬜ |
+| S5.3 | 分析台页面 | S5.2, S3.4b | 可输入多个热点、提交、轮询进度并跳转结果 | 2.5 | ⬜ |
 | S5.4 | 结果详情页 | S5.3 | 要素标签、候选素材（含关键帧）、覆盖缺口、文案初稿四块齐全，文案可一键复制 | 3 | ⬜ |
 | S5.5 | 数据可视化 | S5.4 | 覆盖度、得分分布、成本与耗时用 ECharts 呈现 | 2 | ⬜ |
 | S5.6 | 运行历史 | S5.2 | 列出历史运行，可回看结果并下载报告 | 1.5 | ⬜ |
@@ -125,7 +125,7 @@ GET /api/runs/{run_id} → 至少 1 条候选，带命中要素与理由
 GET /api/runs/{run_id}/report → 返回完整 HTML 报告
 ```
 
-**必须在此之前完成的 Story**：S0.1、S1.1、S1.2、S2.1–S2.6、S2.9、S3.1–S3.5、S3.7。
+**必须在此之前完成的 Story**：S0.1、S1.1、S1.2、S2.1–S2.6、S2.9、S3.1、S3.2、S3.3、S3.4a、S3.4b、S3.5、S3.7。
 
 前端（E5）**不在关键路径上**：Walking Skeleton 用 curl 或 OpenAPI 文档页即可验证，不必等前端完成。
 
@@ -149,7 +149,7 @@ GET /api/runs/{run_id}/report → 返回完整 HTML 报告
 | Docker Desktop 未启动 / 镜像拉取受限 | S2.1 起无法推进 | **已缓解（2026-10-01）**：Docker Desktop 已运行（server 29.8.0），数据盘已在 `D:\docker\DockerDesktopWSL`，registry 加速器已配置；实测 `docker compose up -d --wait` 起服务成功 |
 | 依赖安装需要网络，当前环境受限 | E1–E4 每阶段都被阻塞 | 提前统一授权安装类命令，避免每个 Story 卡一次 |
 | embedding 模型实际输出维度与契约写的 1024 不一致 | S2.3 起全链路返工（维度在建表时固化） | 已升格为 E2 开工前置条件（见第三节的 DoR 说明），不再只是一句口头承诺 |
-| Celery 同步模型与 async 代码的阻抗 | S3.4 出现难排查的阻塞 | 在 S3.4 一次性确定统一写法并写进 `docs/开发规范.md` |
+| Celery 同步模型与 async 代码的阻抗 | S3.4b 出现难排查的阻塞 | 在 S3.4b 一次性确定统一写法并写进 `docs/开发规范.md` |
 | 20 组评测用例的标注耗时被低估 | M3 延期 | 已拆出 S2.0 提前开工，标注标准先写进产品方案 §10.1 |
 | 评测集由作者自建自评 | 数字说服力弱 | 标注标准先写进产品方案 §10.1，再按标准标注；必要时请他人复核 |
 | 前端依赖数量多、审计成本高 | 供应链风险与构建不稳定 | 锁文件入库；直接依赖在提交信息说明理由；定期更新 |
