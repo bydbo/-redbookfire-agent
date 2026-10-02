@@ -72,7 +72,7 @@
 | 编号 | Story | 依赖 | 验收标准 | 人日 | 状态 |
 | --- | --- | --- | --- | --- | --- |
 | S3.0 | Prompt 契约与资产骨架 | S0.1 | `docs/contracts/prompt契约.md` 定义五段结构与变更门槛；`src/xhs_agent/prompts/` 四份文件五段齐全；`tools/prompt.py` 零依赖渲染（缺变量／缺段／requires 不符即报错）；`tools/vision.py` 改为从 prompt 文件加载；单测覆盖全部失败路径 | 2.5 | ✅ |
-| S3.1 | LangGraph 状态图 | S2.6 | 拆解 → 检索 → 缺口 → 撰稿 → 报告五节点；节点级重试与进度上报可用；**三条 agent 任务的 prompt 正文按五段结构交付，并把各任务版本号写入 `runs.prompt_versions`** | 2.5 | ⬜ |
+| S3.1 | LangGraph 状态图 | S2.6 | 拆解 → 检索 → 缺口 → 撰稿 → 报告五节点；节点级重试与进度上报可用；**三条 agent 任务的 prompt 正文按五段结构交付，并把各任务版本号写入 `runs.prompt_versions`**（实测：引入 langgraph 1.2，单热点图 + `run_analysis` 多热点循环；三条 prompt 正文按段拆 4 个提交交付、版本保持 v1；`material_select` 一次调用覆盖 Top-K 并覆盖规则解释；缺口节点产出结构化补拍建议；`prompt_versions` 在 state / `RunResult` / `state.json` 里产出、落库归 S3.4；节点级重试需显式 `retry_on`——langgraph 默认不重试 `RuntimeError`/`ValueError`；顺带补齐 ADR 0010 漏掉的阈值默认值。新增 62 条单测 + 2 条集成冒烟） | 2.5 | ✅ |
 | S3.2 | FastAPI 应用骨架 | S1.2 | 路由分层、依赖注入、统一错误响应中间件；`X-Request-ID` 贯穿 | 2 | ⬜ |
 | S3.3 | 五个接口实现（`/api` 前缀） | S3.1, S3.2, S2.3 | 逐个对齐 OpenAPI 契约；错误码与响应结构一致；接口级集成用例通过 | 2.5 | ⬜ |
 | S3.4 | Celery worker 与任务状态回写 | S3.3 | 任务状态与 `runs.status` 同步；软/硬超时生效；**在进入 LangGraph 前完成索引新鲜度检查与增量索引**；集成用例通过 | 2 | ⬜ |

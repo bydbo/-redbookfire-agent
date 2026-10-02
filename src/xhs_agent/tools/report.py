@@ -120,7 +120,15 @@ def render_markdown(model: dict) -> str:
         coverage = item.get("coverage") or {}
         lines += ["", f"### 覆盖缺口（{_fmt_score(coverage.get('ratio', 0))} 的线索有素材）", ""]
         gaps = coverage.get("gaps") or []
-        if gaps:
+        advice = item.get("gap_advice") or []
+        if advice:
+            # 缺口节点给出的结构化补拍建议优先（S3.1）；缺该键时回退下面的模板句
+            for entry in advice:
+                label = entry.get("label") or TYPE_LABELS.get(entry.get("type"),
+                                                              entry.get("type"))
+                lines.append(f"- 缺少 [{label}] {_cell(entry.get('value', ''))} → "
+                             f"{_cell(entry.get('advice', ''), 90)}")
+        elif gaps:
             for gap in gaps:
                 lines.append(f"- 缺少 [{TYPE_LABELS.get(gap.get('type'), gap.get('type'))}] {gap.get('value')} 相关素材 → 建议补拍或去素材库再捞")
         else:
@@ -167,11 +175,18 @@ def render_html(model: dict, base_dir: str = "") -> str:
         )
         whys = "".join(f"<li>{html.escape(str(w))}</li>" for w in clue.get("why_it_works") or [])
         angles = "".join(f"<li>{html.escape(str(a))}</li>" for a in clue.get("borrow_angles") or [])
-        gaps = item.get("coverage", {}).get("gaps") or []
-        gap_html = "".join(
-            f'<li>[{html.escape(str(TYPE_LABELS.get(g.get("type"), g.get("type"))))}] {html.escape(str(g.get("value", "")))} → 建议补拍</li>'
-            for g in gaps
-        ) or "<li>线索要素都有素材覆盖</li>"
+        advice = item.get("gap_advice") or []
+        if advice:
+            gap_html = "".join(
+                f'<li>缺少 [{html.escape(str(a.get("label") or a.get("type", "")))}] '
+                f'{html.escape(str(a.get("value", "")))} → {html.escape(str(a.get("advice", "")))}</li>'
+                for a in advice)
+        else:
+            gaps = item.get("coverage", {}).get("gaps") or []
+            gap_html = "".join(
+                f'<li>[{html.escape(str(TYPE_LABELS.get(g.get("type"), g.get("type"))))}] {html.escape(str(g.get("value", "")))} → 建议补拍</li>'
+                for g in gaps
+            ) or "<li>线索要素都有素材覆盖</li>"
 
         rows = []
         for candidate in candidates:

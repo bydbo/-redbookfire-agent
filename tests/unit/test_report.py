@@ -89,3 +89,34 @@ class TestVectorCoverage:
     def test_absent_key_renders_nothing(self, sample_report_model):
         assert "向量覆盖率" not in report.render_markdown(sample_report_model)
         assert "向量覆盖率" not in report.render_html(sample_report_model)
+
+
+def _with_gap_advice(model: dict) -> dict:
+    """给样例模型挂上缺口建议（S3.1 起报告优先渲染它）。"""
+    model["hotspots"][0]["gap_advice"] = [
+        {"type": "ip", "value": "顶流明星", "label": "人物IP",
+         "advice": "人物 IP 不直用：改拍「同款动作 / 平替场景」"},
+        {"type": "scene", "value": "球场", "label": "场景",
+         "advice": "补拍同场景环境镜头（空镜 / 全景）"},
+    ]
+    return model
+
+
+class TestGapAdviceRendering:
+    def test_markdown_prefers_structured_advice(self, sample_report_model):
+        text = report.render_markdown(_with_gap_advice(sample_report_model))
+        assert "缺少 [人物IP] 顶流明星 → 人物 IP 不直用" in text
+        assert "缺少 [场景] 球场 → 补拍同场景环境镜头" in text
+        assert "建议补拍或去素材库再捞" not in text
+
+    def test_markdown_falls_back_to_template_without_advice(self, sample_report_model):
+        text = report.render_markdown(sample_report_model)
+        assert "缺少 [人物IP] 顶流明星 相关素材 → 建议补拍或去素材库再捞" in text
+
+    def test_html_prefers_structured_advice(self, sample_report_model):
+        html = report.render_html(_with_gap_advice(sample_report_model))
+        assert "缺少 [人物IP] 顶流明星 → 人物 IP 不直用" in html
+
+    def test_html_falls_back_to_template_without_advice(self, sample_report_model):
+        html = report.render_html(sample_report_model)
+        assert "顶流明星 → 建议补拍" in html
