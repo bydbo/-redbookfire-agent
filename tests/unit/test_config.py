@@ -216,4 +216,7 @@ class TestAppConfigSurface:
         assert cfg.embedding.timeout_s == 60
         assert cfg.embedding.max_retries == 2
         assert cfg.retrieval.w_element + cfg.retrieval.w_rrf == pytest.approx(1.0)
+        # 阈值默认值随 ADR 0010 重标定，代码默认必须与配置契约 §3.4 一致
+        assert cfg.retrieval.similarity_threshold == 0.3
+        assert cfg.retrieval.max_cosine_distance == 0.6
         assert cfg.frontend.serve is True

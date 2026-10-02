@@ -85,9 +85,9 @@ def normalize_rrf(scores: Mapping[str, float]) -> dict[str, float]:
 class RetrievalParams:
     """《检索契约》§八 的参数表（`[retrieval]` 与 `[match]` 两段配置的合并视图）。"""
 
-    similarity_threshold: float = 0.2
+    similarity_threshold: float = 0.3
     recall_limit: int = 50
-    max_cosine_distance: float = 0.35
+    max_cosine_distance: float = 0.6
     rrf_k: int = 60
     w_element: float = 0.7
     w_rrf: float = 0.3

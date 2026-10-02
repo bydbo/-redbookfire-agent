@@ -205,9 +205,10 @@ class EmbeddingConfig(_Section):
 class RetrievalConfig(_Section):
     """混合召回参数。默认值 / 取值范围见《配置契约》§3.4 与《检索契约》§8。"""
 
-    similarity_threshold: float = Field(0.2, ge=0, le=1)
+    # 默认值随 ADR 0010 重标定：字面通道改用 word_similarity 语义（0.3），向量距离上限 0.6
+    similarity_threshold: float = Field(0.3, ge=0, le=1)
     recall_limit: int = Field(50, ge=1, le=500)
-    max_cosine_distance: float = Field(0.35, ge=0, le=2)
+    max_cosine_distance: float = Field(0.6, ge=0, le=2)
     rrf_k: int = Field(60, ge=1, le=1000)
     w_element: float = Field(0.7, ge=0, le=1)
     w_rrf: float = Field(0.3, ge=0, le=1)
