@@ -13,7 +13,8 @@
   因此数字只反映**检索层**；
 - 正确答案 = `must_hit ∪ acceptable`；全缺口用例（`must_hit` 为空）不计入两项命中率的分母，
   但仍计入覆盖度 / 耗时 / 成本；
-- 耗时是单次检索（不含首次建索引与向量回填）；成本只含查询向量（检索层无 LLM 调用）。
+- 耗时是单次检索（不含首次建索引与向量回填），但**包含一次真实的查询向量化调用**；
+  阈值扫描复用向量缓存，因此扫描行的耗时不是生产口径；成本只含查询向量（检索层无 LLM 调用）。
 
 用法：
 
@@ -66,8 +67,10 @@ MANIFEST_PATH = EVALS_DIR / "manifest.json"
 POSTGRES_IMAGE = "pgvector/pgvector:0.8.6-pg16"
 
 # 阈值扫描的小网格：默认点 + 逐级放宽（S2.6 实测契约默认阈值下召回为空，见 docs/backlog.md S2.6）
-SWEEP_SIMILARITY_THRESHOLDS = (0.2, 0.05, 0.02)
-SWEEP_MAX_COSINE_DISTANCES = (0.35, 0.6, 1.0)
+# 阈值扫描：similarity_threshold 已改为 word_similarity 语义（ADR 0010），量级与旧的
+# 对称 similarity() 不同，扫描区间整体上移。
+SWEEP_SIMILARITY_THRESHOLDS = (0.2, 0.3, 0.4, 0.5, 0.6)
+SWEEP_MAX_COSINE_DISTANCES = (0.35, 0.5, 0.6, 0.7)
 
 
 # ---------------------------------------------------------------- 纯函数（可单测）
@@ -485,7 +488,9 @@ def render_markdown(report: dict) -> str:
         "- **正确答案** = `must_hit ∪ acceptable`；`must_not` 不计入正确答案，另行统计违规数。",
         f"- **分母**：全缺口用例（`must_hit` 为空）不计入两项命中率的分母"
         f"（本次分母 {hybrid['scored_cases']} 组），但仍计入覆盖度 / 耗时 / 成本。",
-        "- **耗时**：单次检索（不含首次建索引与向量回填）；**成本**：只含查询向量"
+        "- **耗时**：单次检索（不含首次建索引与向量回填），但**包含一次真实的查询向量化调用**"
+        "（接口往返约 1–2 秒，即生产口径）；下方阈值扫描复用向量缓存，扫描行耗时不代表生产。"
+        "**成本**：只含查询向量"
         f"（检索层无 LLM 调用，单价 {params['embedding_price_in_per_m']} 元/百万 token）。",
         "- **基线**不建模要素，因此没有覆盖度（记 `—`）、成本恒为 0。",
         "",

@@ -15,17 +15,20 @@
 
 from __future__ import annotations
 
+import asyncio
 import uuid
 from dataclasses import dataclass, field
+from typing import Any
 
-from sqlalchemy import select, text
+from sqlalchemy import Text, bindparam, select, text
+from sqlalchemy.dialects.postgresql import ARRAY
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..config import AppConfig
 from ..db.models import Material as MaterialRow
 from ..schemas import Coverage, HotspotClue, MatchCandidate
 from ..tools import retrieval as retrieval_tool
-from ..tools.embedding import build_embedder
+from ..tools.embedding import EmbeddingClient, build_embedder
 from .materials import row_to_material
 
 # 通道 A 的文本表达式必须与数据契约 §4.1 的索引表达式逐字一致，
@@ -47,7 +50,7 @@ class VectorCoverage:
     with_embedding: int = 0
     ratio: float = 0.0
 
-    def to_dict(self) -> dict:
+    def to_dict(self) -> dict[str, Any]:
         return {
             "enabled": self.enabled,
             "model": self.model,
@@ -69,17 +72,30 @@ class RetrievalOutcome:
     candidates_considered: int = 0
 
 
-async def literal_recall(session: AsyncSession, query: str, *, limit: int,
+async def literal_recall(session: AsyncSession, keywords: list[str], *, limit: int,
                          threshold: float) -> list[tuple[str, float]]:
-    """通道 A：pg_trgm 字面召回，返回 `[(material_id, similarity), ...]`（相似度降序）。"""
-    if not query.strip():
+    """通道 A：pg_trgm 字面召回，返回 `[(material_id, word_similarity), ...]`（得分降序）。
+
+    度量是 `word_similarity(关键词, 素材文本)`：取「关键词 trigram 集合」与素材文本中任意连续
+    片段的最大相似度，语义就是「关键词是否出现在素材文案里」。**不能用对称的 `similarity()`**：
+    素材文案几十字、关键词只有 2–5 字时，分母被素材侧 trigram 主导，实测相似度仅 0.03–0.14，
+    默认阈值 0.2 下召回恒为 0（实测见 `evals/reports/`，决策见 ADR 0010）。
+
+    多关键词逐行取最大值：任一关键词过阈值即召回该素材。
+    """
+    cleaned = [item.strip() for item in keywords if item and item.strip()]
+    if not cleaned:
         return []
-    rows = (await session.execute(text(
-        f"SELECT id::text AS material_id, similarity({LITERAL_TEXT_SQL}, CAST(:q AS text)) AS score "
-        "FROM materials "
-        f"WHERE similarity({LITERAL_TEXT_SQL}, CAST(:q AS text)) > CAST(:threshold AS real) "
-        "ORDER BY score DESC, path ASC LIMIT CAST(:limit AS integer)"
-    ), {"q": query, "threshold": threshold, "limit": limit})).all()
+    statement = text(
+        f"SELECT m.id::text AS material_id, max(word_similarity(kw, {LITERAL_TEXT_SQL})) AS score "
+        "FROM materials AS m "
+        "CROSS JOIN unnest(CAST(:keywords AS text[])) AS kw "
+        "GROUP BY m.id, m.path "
+        f"HAVING max(word_similarity(kw, {LITERAL_TEXT_SQL})) > CAST(:threshold AS real) "
+        "ORDER BY score DESC, m.path ASC LIMIT CAST(:limit AS integer)"
+    ).bindparams(bindparam("keywords", type_=ARRAY(Text())))
+    rows = (await session.execute(statement, {
+        "keywords": cleaned, "threshold": threshold, "limit": limit})).all()
     return [(row.material_id, float(row.score)) for row in rows]
 
 
@@ -135,7 +151,8 @@ def _ranks(hits: list[tuple[str, float]]) -> dict[str, int]:
 
 
 async def retrieve_candidates(session: AsyncSession, cfg: AppConfig, clue: HotspotClue, *,
-                              embedder=None, now: float | None = None) -> RetrievalOutcome:
+                              embedder: EmbeddingClient | None = None,
+                              now: float | None = None) -> RetrievalOutcome:
     """一次检索：双通道召回 → 映射成内存素材 → 融合排序 → 返回结果。
 
     输入：`session`、`cfg`（读 `[retrieval]` / `[match]` / `[embedding]`）、`clue`；
@@ -145,7 +162,7 @@ async def retrieve_candidates(session: AsyncSession, cfg: AppConfig, clue: Hotsp
     params = retrieval_tool.RetrievalParams.from_config(cfg)
     outcome = RetrievalOutcome(vector_coverage=await vector_coverage(session, cfg))
 
-    literal_hits = await literal_recall(session, retrieval_tool.literal_query_text(clue),
+    literal_hits = await literal_recall(session, retrieval_tool.literal_query_keywords(clue),
                                         limit=params.recall_limit,
                                         threshold=params.similarity_threshold)
     outcome.literal_recalled = len(literal_hits)
@@ -155,7 +172,9 @@ async def retrieve_candidates(session: AsyncSession, cfg: AppConfig, clue: Hotsp
         client = embedder if embedder is not None else build_embedder(cfg)
         if client is None:  # pragma: no cover - enabled 为真时 build_embedder 不会返回 None
             raise RuntimeError("向量召回已启用但没有可用的 embedding 客户端")
-        query_vector = client.embed([retrieval_tool.vector_query_text(clue)]).vectors[0]
+        # embed 是同步 urllib 调用，放线程里执行以免阻塞事件循环；S3.5 换 httpx 后改回原生异步
+        query_vector = (await asyncio.to_thread(
+            client.embed, [retrieval_tool.vector_query_text(clue)])).vectors[0]
         vector_hits = await vector_recall(session, query_vector, cfg.embedding.model,
                                           limit=params.recall_limit,
                                           max_distance=params.max_cosine_distance)

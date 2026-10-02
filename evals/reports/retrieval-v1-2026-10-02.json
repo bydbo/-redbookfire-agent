@@ -1,19 +1,19 @@
 {
-  "generated_at": "2026-10-02T15:46:57+08:00",
+  "generated_at": "2026-10-02T17:26:03+08:00",
   "eval_version": "v1",
   "manifest_frozen_at": "2026-10-01",
   "cases_total": 20,
   "cases_run": 20,
-  "now": 1790927160.6545346,
+  "now": 1790933096.3978014,
   "environment": {
     "postgres_image": "pgvector/pgvector:0.8.6-pg16",
     "python": "3.12.14",
     "platform": "Windows-10-10.0.19045-SP0"
   },
   "params": {
-    "similarity_threshold": 0.2,
+    "similarity_threshold": 0.3,
     "recall_limit": 50,
-    "max_cosine_distance": 0.35,
+    "max_cosine_distance": 0.6,
     "rrf_k": 60,
     "w_element": 0.7,
     "w_rrf": 0.3,
@@ -47,7 +47,7 @@
         "top5_hit": true,
         "first_hit": true,
         "coverage_ratio": null,
-        "latency_ms": 0.63,
+        "latency_ms": 0.66,
         "cost_cny": 0.0,
         "must_not_hits": []
       },
@@ -65,7 +65,7 @@
         "top5_hit": true,
         "first_hit": true,
         "coverage_ratio": null,
-        "latency_ms": 0.47,
+        "latency_ms": 0.75,
         "cost_cny": 0.0,
         "must_not_hits": []
       },
@@ -82,7 +82,7 @@
         "top5_hit": true,
         "first_hit": true,
         "coverage_ratio": null,
-        "latency_ms": 0.43,
+        "latency_ms": 0.52,
         "cost_cny": 0.0,
         "must_not_hits": []
       },
@@ -99,7 +99,7 @@
         "top5_hit": null,
         "first_hit": null,
         "coverage_ratio": null,
-        "latency_ms": 0.54,
+        "latency_ms": 0.51,
         "cost_cny": 0.0,
         "must_not_hits": []
       },
@@ -118,7 +118,7 @@
         "top5_hit": true,
         "first_hit": true,
         "coverage_ratio": null,
-        "latency_ms": 0.57,
+        "latency_ms": 0.91,
         "cost_cny": 0.0,
         "must_not_hits": []
       },
@@ -136,7 +136,7 @@
         "top5_hit": true,
         "first_hit": true,
         "coverage_ratio": null,
-        "latency_ms": 0.7,
+        "latency_ms": 1.13,
         "cost_cny": 0.0,
         "must_not_hits": []
       },
@@ -156,7 +156,7 @@
         "top5_hit": true,
         "first_hit": true,
         "coverage_ratio": null,
-        "latency_ms": 0.63,
+        "latency_ms": 0.57,
         "cost_cny": 0.0,
         "must_not_hits": []
       },
@@ -179,7 +179,7 @@
         "top5_hit": true,
         "first_hit": true,
         "coverage_ratio": null,
-        "latency_ms": 0.54,
+        "latency_ms": 0.69,
         "cost_cny": 0.0,
         "must_not_hits": []
       },
@@ -199,7 +199,7 @@
         "top5_hit": true,
         "first_hit": true,
         "coverage_ratio": null,
-        "latency_ms": 0.56,
+        "latency_ms": 0.58,
         "cost_cny": 0.0,
         "must_not_hits": []
       },
@@ -218,7 +218,7 @@
         "top5_hit": true,
         "first_hit": true,
         "coverage_ratio": null,
-        "latency_ms": 0.52,
+        "latency_ms": 0.54,
         "cost_cny": 0.0,
         "must_not_hits": []
       },
@@ -233,7 +233,7 @@
         "top5_hit": null,
         "first_hit": null,
         "coverage_ratio": null,
-        "latency_ms": 0.48,
+        "latency_ms": 0.58,
         "cost_cny": 0.0,
         "must_not_hits": []
       },
@@ -256,7 +256,7 @@
         "top5_hit": true,
         "first_hit": true,
         "coverage_ratio": null,
-        "latency_ms": 0.49,
+        "latency_ms": 0.63,
         "cost_cny": 0.0,
         "must_not_hits": []
       },
@@ -276,7 +276,7 @@
         "top5_hit": true,
         "first_hit": true,
         "coverage_ratio": null,
-        "latency_ms": 0.4,
+        "latency_ms": 0.47,
         "cost_cny": 0.0,
         "must_not_hits": []
       },
@@ -296,7 +296,7 @@
         "top5_hit": true,
         "first_hit": true,
         "coverage_ratio": null,
-        "latency_ms": 0.69,
+        "latency_ms": 0.63,
         "cost_cny": 0.0,
         "must_not_hits": []
       },
@@ -316,7 +316,7 @@
         "top5_hit": true,
         "first_hit": true,
         "coverage_ratio": null,
-        "latency_ms": 0.52,
+        "latency_ms": 0.63,
         "cost_cny": 0.0,
         "must_not_hits": []
       },
@@ -339,7 +339,7 @@
         "top5_hit": true,
         "first_hit": true,
         "coverage_ratio": null,
-        "latency_ms": 0.78,
+        "latency_ms": 0.57,
         "cost_cny": 0.0,
         "must_not_hits": []
       },
@@ -360,7 +360,7 @@
         "top5_hit": true,
         "first_hit": false,
         "coverage_ratio": null,
-        "latency_ms": 0.37,
+        "latency_ms": 0.62,
         "cost_cny": 0.0,
         "must_not_hits": []
       },
@@ -381,7 +381,7 @@
         "top5_hit": true,
         "first_hit": true,
         "coverage_ratio": null,
-        "latency_ms": 0.58,
+        "latency_ms": 0.66,
         "cost_cny": 0.0,
         "must_not_hits": []
       },
@@ -403,7 +403,7 @@
         "top5_hit": true,
         "first_hit": true,
         "coverage_ratio": null,
-        "latency_ms": 0.54,
+        "latency_ms": 0.64,
         "cost_cny": 0.0,
         "must_not_hits": []
       },
@@ -425,7 +425,7 @@
         "top5_hit": true,
         "first_hit": true,
         "coverage_ratio": null,
-        "latency_ms": 0.59,
+        "latency_ms": 0.53,
         "cost_cny": 0.0,
         "must_not_hits": []
       }
@@ -441,16 +441,20 @@
           "运动/球拍特写.jpg"
         ],
         "ranked": [
-          "运动/球场-挥拍.mp4"
+          "运动/球场-挥拍.mp4",
+          "运动/球拍特写.jpg",
+          "未整理/视频1.mp4",
+          "未整理/IMG_20260901_143012.jpg",
+          "职场/工位-加班.jpg"
         ],
         "top5_hit": true,
         "first_hit": true,
         "coverage_ratio": 1.0,
-        "latency_ms": 1715.9,
+        "latency_ms": 1482.69,
         "cost_cny": 1.1e-05,
         "must_not_hits": [],
-        "literal_recalled": 0,
-        "vector_recalled": 1
+        "literal_recalled": 2,
+        "vector_recalled": 8
       },
       {
         "id": "case-02",
@@ -460,16 +464,20 @@
           "运动/健身房-撸铁.mp4"
         ],
         "ranked": [
-          "运动/健身房-撸铁.mp4"
+          "运动/健身房-撸铁.mp4",
+          "宠物/橘猫-翻肚皮.mp4",
+          "未整理/视频1.mp4",
+          "运动/球场-挥拍.mp4",
+          "运动/跳绳-阳台.jpg"
         ],
         "top5_hit": true,
         "first_hit": true,
         "coverage_ratio": 1.0,
-        "latency_ms": 1482.48,
+        "latency_ms": 1546.58,
         "cost_cny": 4e-06,
         "must_not_hits": [],
-        "literal_recalled": 0,
-        "vector_recalled": 1
+        "literal_recalled": 2,
+        "vector_recalled": 11
       },
       {
         "id": "case-03",
@@ -478,15 +486,21 @@
         "correct": [
           "运动/晨跑-公园.jpg"
         ],
-        "ranked": [],
-        "top5_hit": false,
-        "first_hit": false,
-        "coverage_ratio": 0.0,
-        "latency_ms": 2829.26,
+        "ranked": [
+          "运动/晨跑-公园.jpg",
+          "美食/家常菜-番茄炒蛋.jpg",
+          "宠物/柯基-遛狗.jpg",
+          "未整理/视频1.mp4",
+          "职场/工位-加班.jpg"
+        ],
+        "top5_hit": true,
+        "first_hit": true,
+        "coverage_ratio": 1.0,
+        "latency_ms": 4519.72,
         "cost_cny": 5e-06,
         "must_not_hits": [],
-        "literal_recalled": 0,
-        "vector_recalled": 0
+        "literal_recalled": 2,
+        "vector_recalled": 10
       },
       {
         "id": "case-04",
@@ -495,15 +509,21 @@
         "correct": [
           "运动/球场-挥拍.mp4"
         ],
-        "ranked": [],
+        "ranked": [
+          "运动/球场-挥拍.mp4",
+          "运动/球拍特写.jpg",
+          "未整理/视频1.mp4",
+          "未整理/IMG_20260901_143012.jpg",
+          "职场/工位-加班.jpg"
+        ],
         "top5_hit": null,
         "first_hit": null,
-        "coverage_ratio": 0.0,
-        "latency_ms": 2154.76,
+        "coverage_ratio": 1.0,
+        "latency_ms": 2625.44,
         "cost_cny": 4.5e-06,
         "must_not_hits": [],
-        "literal_recalled": 0,
-        "vector_recalled": 0
+        "literal_recalled": 2,
+        "vector_recalled": 5
       },
       {
         "id": "case-05",
@@ -513,16 +533,20 @@
           "运动/跳绳-阳台.jpg"
         ],
         "ranked": [
-          "运动/跳绳-阳台.jpg"
+          "运动/跳绳-阳台.jpg",
+          "宠物/猫咪-窗台.jpg",
+          "运动/晨跑-公园.jpg",
+          "运动/健身房-撸铁.mp4",
+          "未整理/视频1.mp4"
         ],
         "top5_hit": true,
         "first_hit": true,
         "coverage_ratio": 1.0,
-        "latency_ms": 2100.93,
+        "latency_ms": 3158.27,
         "cost_cny": 4.5e-06,
         "must_not_hits": [],
-        "literal_recalled": 0,
-        "vector_recalled": 1
+        "literal_recalled": 2,
+        "vector_recalled": 15
       },
       {
         "id": "case-06",
@@ -532,15 +556,21 @@
           "宠物/橘猫-翻肚皮.mp4",
           "运动/球场-挥拍.mp4"
         ],
-        "ranked": [],
-        "top5_hit": false,
-        "first_hit": false,
-        "coverage_ratio": 0.0,
-        "latency_ms": 3961.2,
+        "ranked": [
+          "运动/球场-挥拍.mp4",
+          "运动/球拍特写.jpg",
+          "未整理/视频1.mp4",
+          "运动/健身房-撸铁.mp4",
+          "运动/跳绳-阳台.jpg"
+        ],
+        "top5_hit": true,
+        "first_hit": true,
+        "coverage_ratio": 1.0,
+        "latency_ms": 1991.82,
         "cost_cny": 8.5e-06,
         "must_not_hits": [],
-        "literal_recalled": 0,
-        "vector_recalled": 0
+        "literal_recalled": 2,
+        "vector_recalled": 8
       },
       {
         "id": "case-07",
@@ -551,16 +581,20 @@
           "职场/通勤-地铁.mp4"
         ],
         "ranked": [
-          "职场/工位-加班.jpg"
+          "职场/工位-加班.jpg",
+          "职场/通勤-地铁.mp4",
+          "未整理/视频1.mp4",
+          "未整理/临时素材.mp4",
+          "运动/健身房-撸铁.mp4"
         ],
         "top5_hit": true,
         "first_hit": true,
         "coverage_ratio": 1.0,
-        "latency_ms": 1849.29,
+        "latency_ms": 1541.41,
         "cost_cny": 6e-06,
         "must_not_hits": [],
-        "literal_recalled": 0,
-        "vector_recalled": 1
+        "literal_recalled": 1,
+        "vector_recalled": 6
       },
       {
         "id": "case-08",
@@ -571,15 +605,21 @@
           "宠物/猫咪-窗台.jpg",
           "美食/咖啡-手冲.mp4"
         ],
-        "ranked": [],
-        "top5_hit": false,
-        "first_hit": false,
-        "coverage_ratio": 0.0,
-        "latency_ms": 1357.02,
+        "ranked": [
+          "宠物/猫咪-窗台.jpg",
+          "宠物/柯基-遛狗.jpg",
+          "宠物/橘猫-翻肚皮.mp4",
+          "职场/会议-白板.jpg",
+          "美食/咖啡-手冲.mp4"
+        ],
+        "top5_hit": true,
+        "first_hit": true,
+        "coverage_ratio": 1.0,
+        "latency_ms": 1306.24,
         "cost_cny": 5e-06,
         "must_not_hits": [],
-        "literal_recalled": 0,
-        "vector_recalled": 0
+        "literal_recalled": 7,
+        "vector_recalled": 15
       },
       {
         "id": "case-09",
@@ -589,15 +629,21 @@
           "运动/晨跑-公园.jpg",
           "运动/跳绳-阳台.jpg"
         ],
-        "ranked": [],
-        "top5_hit": false,
-        "first_hit": false,
-        "coverage_ratio": 0.0,
-        "latency_ms": 1403.48,
+        "ranked": [
+          "运动/晨跑-公园.jpg",
+          "运动/跳绳-阳台.jpg",
+          "运动/球场-挥拍.mp4",
+          "美食/家常菜-番茄炒蛋.jpg",
+          "未整理/视频1.mp4"
+        ],
+        "top5_hit": true,
+        "first_hit": true,
+        "coverage_ratio": 1.0,
+        "latency_ms": 2392.22,
         "cost_cny": 8e-06,
         "must_not_hits": [],
-        "literal_recalled": 0,
-        "vector_recalled": 0
+        "literal_recalled": 4,
+        "vector_recalled": 9
       },
       {
         "id": "case-10",
@@ -607,31 +653,38 @@
           "美食/减脂餐-沙拉.jpg"
         ],
         "ranked": [
-          "美食/减脂餐-沙拉.jpg"
+          "美食/减脂餐-沙拉.jpg",
+          "职场/会议-白板.jpg",
+          "未整理/临时素材.mp4",
+          "未整理/视频1.mp4"
         ],
         "top5_hit": true,
         "first_hit": true,
         "coverage_ratio": 1.0,
-        "latency_ms": 2041.82,
+        "latency_ms": 2327.21,
         "cost_cny": 5e-06,
         "must_not_hits": [],
-        "literal_recalled": 0,
-        "vector_recalled": 1
+        "literal_recalled": 2,
+        "vector_recalled": 3
       },
       {
         "id": "case-11",
         "scene": "节日与节气",
         "full_gap": true,
         "correct": [],
-        "ranked": [],
+        "ranked": [
+          "运动/球拍特写.jpg",
+          "运动/跳绳-阳台.jpg",
+          "未整理/视频1.mp4"
+        ],
         "top5_hit": null,
         "first_hit": null,
-        "coverage_ratio": 0.0,
-        "latency_ms": 2932.59,
+        "coverage_ratio": 1.0,
+        "latency_ms": 1397.93,
         "cost_cny": 4e-06,
         "must_not_hits": [],
-        "literal_recalled": 0,
-        "vector_recalled": 0
+        "literal_recalled": 1,
+        "vector_recalled": 2
       },
       {
         "id": "case-12",
@@ -642,15 +695,21 @@
           "美食/咖啡-手冲.mp4",
           "美食/探店-小馆.jpg"
         ],
-        "ranked": [],
-        "top5_hit": false,
-        "first_hit": false,
-        "coverage_ratio": 0.0,
-        "latency_ms": 2787.28,
+        "ranked": [
+          "美食/咖啡-手冲.mp4",
+          "宠物/柯基-遛狗.jpg",
+          "美食/探店-小馆.jpg",
+          "宠物/橘猫-翻肚皮.mp4",
+          "宠物/猫咪-窗台.jpg"
+        ],
+        "top5_hit": true,
+        "first_hit": true,
+        "coverage_ratio": 1.0,
+        "latency_ms": 1611.77,
         "cost_cny": 4e-06,
         "must_not_hits": [],
-        "literal_recalled": 0,
-        "vector_recalled": 0
+        "literal_recalled": 4,
+        "vector_recalled": 12
       },
       {
         "id": "case-13",
@@ -661,16 +720,20 @@
           "美食/家常菜-番茄炒蛋.jpg"
         ],
         "ranked": [
-          "美食/家常菜-番茄炒蛋.jpg"
+          "美食/家常菜-番茄炒蛋.jpg",
+          "运动/跳绳-阳台.jpg",
+          "宠物/猫咪-窗台.jpg",
+          "美食/减脂餐-沙拉.jpg",
+          "未整理/视频1.mp4"
         ],
         "top5_hit": true,
         "first_hit": true,
         "coverage_ratio": 1.0,
-        "latency_ms": 1277.86,
+        "latency_ms": 1863.07,
         "cost_cny": 4e-06,
         "must_not_hits": [],
-        "literal_recalled": 0,
-        "vector_recalled": 1
+        "literal_recalled": 3,
+        "vector_recalled": 10
       },
       {
         "id": "case-14",
@@ -680,16 +743,20 @@
           "美食/咖啡-手冲.mp4"
         ],
         "ranked": [
-          "美食/咖啡-手冲.mp4"
+          "美食/家常菜-番茄炒蛋.jpg",
+          "美食/咖啡-手冲.mp4",
+          "美食/探店-小馆.jpg",
+          "未整理/视频1.mp4",
+          "职场/通勤-地铁.mp4"
         ],
         "top5_hit": true,
-        "first_hit": true,
+        "first_hit": false,
         "coverage_ratio": 1.0,
-        "latency_ms": 2374.81,
+        "latency_ms": 2072.99,
         "cost_cny": 5e-06,
         "must_not_hits": [],
-        "literal_recalled": 0,
-        "vector_recalled": 1
+        "literal_recalled": 2,
+        "vector_recalled": 6
       },
       {
         "id": "case-15",
@@ -699,16 +766,20 @@
           "运动/跳绳-阳台.jpg"
         ],
         "ranked": [
-          "运动/跳绳-阳台.jpg"
+          "运动/跳绳-阳台.jpg",
+          "宠物/猫咪-窗台.jpg",
+          "运动/健身房-撸铁.mp4",
+          "运动/球拍特写.jpg",
+          "运动/球场-挥拍.mp4"
         ],
         "top5_hit": true,
         "first_hit": true,
         "coverage_ratio": 1.0,
-        "latency_ms": 2424.5,
+        "latency_ms": 2126.22,
         "cost_cny": 4.5e-06,
         "must_not_hits": [],
-        "literal_recalled": 0,
-        "vector_recalled": 1
+        "literal_recalled": 4,
+        "vector_recalled": 15
       },
       {
         "id": "case-16",
@@ -720,17 +791,20 @@
           "未整理/视频1.mp4"
         ],
         "ranked": [
+          "宠物/橘猫-翻肚皮.mp4",
+          "宠物/柯基-遛狗.jpg",
+          "美食/咖啡-手冲.mp4",
           "宠物/猫咪-窗台.jpg",
-          "宠物/橘猫-翻肚皮.mp4"
+          "职场/会议-白板.jpg"
         ],
         "top5_hit": true,
         "first_hit": true,
         "coverage_ratio": 1.0,
-        "latency_ms": 4470.6,
+        "latency_ms": 1620.63,
         "cost_cny": 5.5e-06,
         "must_not_hits": [],
-        "literal_recalled": 0,
-        "vector_recalled": 2
+        "literal_recalled": 4,
+        "vector_recalled": 12
       },
       {
         "id": "case-17",
@@ -741,15 +815,21 @@
           "美食/探店-小馆.jpg",
           "职场/通勤-地铁.mp4"
         ],
-        "ranked": [],
-        "top5_hit": false,
+        "ranked": [
+          "职场/工位-加班.jpg",
+          "职场/通勤-地铁.mp4",
+          "职场/会议-白板.jpg",
+          "美食/探店-小馆.jpg",
+          "未整理/视频1.mp4"
+        ],
+        "top5_hit": true,
         "first_hit": false,
-        "coverage_ratio": 0.0,
-        "latency_ms": 2288.28,
+        "coverage_ratio": 1.0,
+        "latency_ms": 1565.45,
         "cost_cny": 2.5e-06,
         "must_not_hits": [],
-        "literal_recalled": 0,
-        "vector_recalled": 0
+        "literal_recalled": 1,
+        "vector_recalled": 13
       },
       {
         "id": "case-18",
@@ -760,16 +840,20 @@
           "职场/通勤-地铁.mp4"
         ],
         "ranked": [
-          "职场/工位-加班.jpg"
+          "职场/工位-加班.jpg",
+          "职场/通勤-地铁.mp4",
+          "美食/减脂餐-沙拉.jpg",
+          "职场/会议-白板.jpg",
+          "未整理/视频1.mp4"
         ],
         "top5_hit": true,
         "first_hit": true,
         "coverage_ratio": 1.0,
-        "latency_ms": 2809.47,
+        "latency_ms": 5109.43,
         "cost_cny": 3.5e-06,
         "must_not_hits": [],
-        "literal_recalled": 0,
-        "vector_recalled": 1
+        "literal_recalled": 2,
+        "vector_recalled": 10
       },
       {
         "id": "case-19",
@@ -780,15 +864,21 @@
           "职场/会议-白板.jpg",
           "职场/工位-加班.jpg"
         ],
-        "ranked": [],
-        "top5_hit": false,
-        "first_hit": false,
-        "coverage_ratio": 0.0,
-        "latency_ms": 1652.88,
+        "ranked": [
+          "职场/工位-加班.jpg",
+          "职场/通勤-地铁.mp4",
+          "职场/会议-白板.jpg",
+          "美食/家常菜-番茄炒蛋.jpg",
+          "未整理/临时素材.mp4"
+        ],
+        "top5_hit": true,
+        "first_hit": true,
+        "coverage_ratio": 1.0,
+        "latency_ms": 1972.59,
         "cost_cny": 5e-06,
         "must_not_hits": [],
-        "literal_recalled": 0,
-        "vector_recalled": 0
+        "literal_recalled": 2,
+        "vector_recalled": 6
       },
       {
         "id": "case-20",
@@ -798,15 +888,21 @@
           "美食/探店-小馆.jpg",
           "职场/代码-笔记本.jpg"
         ],
-        "ranked": [],
-        "top5_hit": false,
-        "first_hit": false,
-        "coverage_ratio": 0.0,
-        "latency_ms": 2071.05,
+        "ranked": [
+          "职场/代码-笔记本.jpg",
+          "职场/工位-加班.jpg",
+          "未整理/视频1.mp4",
+          "未整理/临时素材.mp4",
+          "美食/咖啡-手冲.mp4"
+        ],
+        "top5_hit": true,
+        "first_hit": true,
+        "coverage_ratio": 1.0,
+        "latency_ms": 1504.63,
         "cost_cny": 5.5e-06,
         "must_not_hits": [],
         "literal_recalled": 0,
-        "vector_recalled": 0
+        "vector_recalled": 5
       }
     ],
     "baseline_metrics": {
@@ -816,18 +912,18 @@
       "first_hit_rate": 0.9444,
       "mean_coverage": null,
       "mean_latency_ms": 0.6,
-      "max_latency_ms": 0.78,
+      "max_latency_ms": 1.13,
       "mean_cost_cny": 0.0,
       "must_not_violations": 0
     },
     "hybrid_metrics": {
       "cases": 20,
       "scored_cases": 18,
-      "top5_hit_rate": 0.5556,
-      "first_hit_rate": 0.5556,
-      "mean_coverage": 0.5,
-      "mean_latency_ms": 2299.3,
-      "max_latency_ms": 4470.6,
+      "top5_hit_rate": 1.0,
+      "first_hit_rate": 0.8889,
+      "mean_coverage": 1.0,
+      "mean_latency_ms": 2186.8,
+      "max_latency_ms": 5109.43,
       "mean_cost_cny": 5.25e-06,
       "must_not_violations": 0
     }
@@ -836,101 +932,222 @@
     {
       "similarity_threshold": 0.2,
       "max_cosine_distance": 0.35,
-      "is_default": true,
-      "top5_hit_rate": 0.5556,
-      "first_hit_rate": 0.5556,
-      "mean_coverage": 0.5,
-      "mean_latency_ms": 48.1,
-      "literal_recalled": 0,
-      "vector_recalled": 11
-    },
-    {
-      "similarity_threshold": 0.2,
-      "max_cosine_distance": 0.6,
       "is_default": false,
-      "top5_hit_rate": 1.0,
-      "first_hit_rate": 0.9444,
-      "mean_coverage": 0.95,
-      "mean_latency_ms": 54.0,
-      "literal_recalled": 0,
-      "vector_recalled": 181
-    },
-    {
-      "similarity_threshold": 0.2,
-      "max_cosine_distance": 1.0,
-      "is_default": false,
-      "top5_hit_rate": 1.0,
-      "first_hit_rate": 0.9444,
-      "mean_coverage": 1.0,
-      "mean_latency_ms": 61.8,
-      "literal_recalled": 0,
-      "vector_recalled": 380
-    },
-    {
-      "similarity_threshold": 0.05,
-      "max_cosine_distance": 0.35,
-      "is_default": false,
-      "top5_hit_rate": 0.7222,
-      "first_hit_rate": 0.7222,
-      "mean_coverage": 0.85,
-      "mean_latency_ms": 48.5,
-      "literal_recalled": 22,
-      "vector_recalled": 11
-    },
-    {
-      "similarity_threshold": 0.05,
-      "max_cosine_distance": 0.6,
-      "is_default": false,
-      "top5_hit_rate": 1.0,
+      "top5_hit_rate": 0.8889,
       "first_hit_rate": 0.8889,
-      "mean_coverage": 1.0,
-      "mean_latency_ms": 54.0,
-      "literal_recalled": 22,
-      "vector_recalled": 181
+      "mean_coverage": 0.95,
+      "mean_latency_ms": 51.8,
+      "literal_recalled": 55,
+      "vector_recalled": 11
     },
     {
-      "similarity_threshold": 0.05,
-      "max_cosine_distance": 1.0,
+      "similarity_threshold": 0.2,
+      "max_cosine_distance": 0.5,
       "is_default": false,
       "top5_hit_rate": 1.0,
       "first_hit_rate": 0.7778,
       "mean_coverage": 1.0,
-      "mean_latency_ms": 62.1,
-      "literal_recalled": 22,
-      "vector_recalled": 380
+      "mean_latency_ms": 52.9,
+      "literal_recalled": 55,
+      "vector_recalled": 38
     },
     {
-      "similarity_threshold": 0.02,
-      "max_cosine_distance": 0.35,
+      "similarity_threshold": 0.2,
+      "max_cosine_distance": 0.6,
       "is_default": false,
-      "top5_hit_rate": 0.9444,
+      "top5_hit_rate": 1.0,
       "first_hit_rate": 0.8889,
       "mean_coverage": 1.0,
-      "mean_latency_ms": 51.0,
-      "literal_recalled": 64,
+      "mean_latency_ms": 59.3,
+      "literal_recalled": 55,
+      "vector_recalled": 181
+    },
+    {
+      "similarity_threshold": 0.2,
+      "max_cosine_distance": 0.7,
+      "is_default": false,
+      "top5_hit_rate": 1.0,
+      "first_hit_rate": 0.8889,
+      "mean_coverage": 1.0,
+      "mean_latency_ms": 64.2,
+      "literal_recalled": 55,
+      "vector_recalled": 372
+    },
+    {
+      "similarity_threshold": 0.3,
+      "max_cosine_distance": 0.35,
+      "is_default": false,
+      "top5_hit_rate": 0.8889,
+      "first_hit_rate": 0.8889,
+      "mean_coverage": 0.95,
+      "mean_latency_ms": 53.0,
+      "literal_recalled": 49,
       "vector_recalled": 11
     },
     {
-      "similarity_threshold": 0.02,
+      "similarity_threshold": 0.3,
+      "max_cosine_distance": 0.5,
+      "is_default": false,
+      "top5_hit_rate": 1.0,
+      "first_hit_rate": 0.7778,
+      "mean_coverage": 1.0,
+      "mean_latency_ms": 52.5,
+      "literal_recalled": 49,
+      "vector_recalled": 38
+    },
+    {
+      "similarity_threshold": 0.3,
+      "max_cosine_distance": 0.6,
+      "is_default": true,
+      "top5_hit_rate": 1.0,
+      "first_hit_rate": 0.8889,
+      "mean_coverage": 1.0,
+      "mean_latency_ms": 57.5,
+      "literal_recalled": 49,
+      "vector_recalled": 181
+    },
+    {
+      "similarity_threshold": 0.3,
+      "max_cosine_distance": 0.7,
+      "is_default": false,
+      "top5_hit_rate": 1.0,
+      "first_hit_rate": 0.8889,
+      "mean_coverage": 1.0,
+      "mean_latency_ms": 64.6,
+      "literal_recalled": 49,
+      "vector_recalled": 372
+    },
+    {
+      "similarity_threshold": 0.4,
+      "max_cosine_distance": 0.35,
+      "is_default": false,
+      "top5_hit_rate": 0.7778,
+      "first_hit_rate": 0.7778,
+      "mean_coverage": 0.9,
+      "mean_latency_ms": 51.3,
+      "literal_recalled": 28,
+      "vector_recalled": 11
+    },
+    {
+      "similarity_threshold": 0.4,
+      "max_cosine_distance": 0.5,
+      "is_default": false,
+      "top5_hit_rate": 0.9444,
+      "first_hit_rate": 0.7778,
+      "mean_coverage": 1.0,
+      "mean_latency_ms": 51.9,
+      "literal_recalled": 28,
+      "vector_recalled": 38
+    },
+    {
+      "similarity_threshold": 0.4,
+      "max_cosine_distance": 0.6,
+      "is_default": false,
+      "top5_hit_rate": 1.0,
+      "first_hit_rate": 0.8889,
+      "mean_coverage": 1.0,
+      "mean_latency_ms": 57.5,
+      "literal_recalled": 28,
+      "vector_recalled": 181
+    },
+    {
+      "similarity_threshold": 0.4,
+      "max_cosine_distance": 0.7,
+      "is_default": false,
+      "top5_hit_rate": 1.0,
+      "first_hit_rate": 0.8333,
+      "mean_coverage": 1.0,
+      "mean_latency_ms": 64.2,
+      "literal_recalled": 28,
+      "vector_recalled": 372
+    },
+    {
+      "similarity_threshold": 0.5,
+      "max_cosine_distance": 0.35,
+      "is_default": false,
+      "top5_hit_rate": 0.7222,
+      "first_hit_rate": 0.7222,
+      "mean_coverage": 0.9,
+      "mean_latency_ms": 51.3,
+      "literal_recalled": 27,
+      "vector_recalled": 11
+    },
+    {
+      "similarity_threshold": 0.5,
+      "max_cosine_distance": 0.5,
+      "is_default": false,
+      "top5_hit_rate": 0.8889,
+      "first_hit_rate": 0.7778,
+      "mean_coverage": 1.0,
+      "mean_latency_ms": 52.5,
+      "literal_recalled": 27,
+      "vector_recalled": 38
+    },
+    {
+      "similarity_threshold": 0.5,
       "max_cosine_distance": 0.6,
       "is_default": false,
       "top5_hit_rate": 1.0,
       "first_hit_rate": 0.8333,
       "mean_coverage": 1.0,
-      "mean_latency_ms": 55.1,
-      "literal_recalled": 64,
+      "mean_latency_ms": 58.1,
+      "literal_recalled": 27,
       "vector_recalled": 181
     },
     {
-      "similarity_threshold": 0.02,
-      "max_cosine_distance": 1.0,
+      "similarity_threshold": 0.5,
+      "max_cosine_distance": 0.7,
       "is_default": false,
       "top5_hit_rate": 1.0,
       "first_hit_rate": 0.7778,
       "mean_coverage": 1.0,
-      "mean_latency_ms": 64.0,
-      "literal_recalled": 64,
-      "vector_recalled": 380
+      "mean_latency_ms": 63.6,
+      "literal_recalled": 27,
+      "vector_recalled": 372
+    },
+    {
+      "similarity_threshold": 0.6,
+      "max_cosine_distance": 0.35,
+      "is_default": false,
+      "top5_hit_rate": 0.7222,
+      "first_hit_rate": 0.7222,
+      "mean_coverage": 0.85,
+      "mean_latency_ms": 49.7,
+      "literal_recalled": 24,
+      "vector_recalled": 11
+    },
+    {
+      "similarity_threshold": 0.6,
+      "max_cosine_distance": 0.5,
+      "is_default": false,
+      "top5_hit_rate": 0.8889,
+      "first_hit_rate": 0.8333,
+      "mean_coverage": 0.95,
+      "mean_latency_ms": 50.7,
+      "literal_recalled": 24,
+      "vector_recalled": 38
+    },
+    {
+      "similarity_threshold": 0.6,
+      "max_cosine_distance": 0.6,
+      "is_default": false,
+      "top5_hit_rate": 1.0,
+      "first_hit_rate": 0.8333,
+      "mean_coverage": 1.0,
+      "mean_latency_ms": 55.5,
+      "literal_recalled": 24,
+      "vector_recalled": 181
+    },
+    {
+      "similarity_threshold": 0.6,
+      "max_cosine_distance": 0.7,
+      "is_default": false,
+      "top5_hit_rate": 1.0,
+      "first_hit_rate": 0.7778,
+      "mean_coverage": 1.0,
+      "mean_latency_ms": 62.3,
+      "literal_recalled": 24,
+      "vector_recalled": 372
     }
   ]
 }

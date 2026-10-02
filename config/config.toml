@@ -31,6 +31,7 @@ model = "qwen-vl-max"
 api_key_env = "DASHSCOPE_API_KEY"
 max_frames = 3
 max_width = 720
+timeout_s = 60                       # 独立于 [llm].timeout_s，按多模态调用自行设定
 
 [embedding]
 # 语义召回：默认启用（向量召回是产品主线）；打开即要求 api_key_env 指向的密钥。
@@ -49,9 +50,9 @@ api_key_env = "DASHSCOPE_API_KEY"
 
 [retrieval]
 # 混合召回参数；口径见 docs/contracts/检索契约.md 第八节
-similarity_threshold = 0.2
+similarity_threshold = 0.3            # word_similarity 语义（ADR 0010）；0.2–0.4 为指标平台区
 recall_limit = 50
-max_cosine_distance = 0.35
+max_cosine_distance = 0.6            # 向量通道距离阈值；0.7 起接近不过滤（见评测报告扫描表）
 rrf_k = 60
 w_element = 0.7                     # 与 w_rrf 之和必须为 1
 w_rrf = 0.3

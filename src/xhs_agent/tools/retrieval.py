@@ -32,12 +32,21 @@ def _push(parts: list[str], value: Any) -> None:
         parts.append(text)
 
 
-def literal_query_text(clue: HotspotClue) -> str:
-    """通道 A 的查询串：`match_keywords` + 全部要素 value（去重去空、空格连接，§三）。"""
+def literal_query_keywords(clue: HotspotClue) -> list[str]:
+    """通道 A 的查询关键词：`match_keywords` + 全部要素 value（去重去空，§三）。
+
+    逐关键词调用 `word_similarity`（ADR 0010）：关键词当「模式」、素材文案当「被查文本」，
+    语义即「关键词是否出现在素材文案里」——不能用对称的 `similarity()`。
+    """
     parts: list[str] = []
     for text in list(clue.match_keywords or []) + [element.value for element in clue.elements or []]:
         _push(parts, text)
-    return " ".join(parts)
+    return parts
+
+
+def literal_query_text(clue: HotspotClue) -> str:
+    """通道 A 查询关键词的空格连接形式（保留给日志与测试断言）。"""
+    return " ".join(literal_query_keywords(clue))
 
 
 def vector_query_text(clue: HotspotClue) -> str:
@@ -135,7 +144,8 @@ def _coverage(clue: HotspotClue, coverage_map: Mapping[tuple[str, str], float],
 
 def rank_candidates(clue: HotspotClue, materials: list[Material],
                     channel_ranks: Mapping[str, Mapping[str, int]],
-                    params: RetrievalParams, *, now: float | None = None) -> tuple:
+                    params: RetrievalParams, *, now: float | None = None
+                    ) -> tuple[list[MatchCandidate], Coverage]:
     """融合 + 要素加权 + 排序 + 截断，返回 `(终态候选列表, 覆盖度)`。
 
     输入：`materials` 是本次**召回集**（两个通道带回来的素材），`channel_ranks` 是各通道的
@@ -145,7 +155,7 @@ def rank_candidates(clue: HotspotClue, materials: list[Material],
     """
     rrf_map = normalize_rrf(rrf_scores(channel_ranks, params.rrf_k))
     coverage_map: dict[tuple[str, str], float] = {}
-    scored: list[tuple[float, Material, list, list, list[str]]] = []
+    scored: list[tuple[float, Material, list[Any], list[Any], list[str]]] = []
 
     for material in materials:
         sources = [name for name in CHANNELS if material.id in channel_ranks.get(name, {})]

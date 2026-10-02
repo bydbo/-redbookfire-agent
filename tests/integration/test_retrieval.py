@@ -157,15 +157,25 @@ class TestRecallChannels:
         assert outcome.candidates[0].recall_sources == ["literal", "vector"]
         assert outcome.candidates[0].to_dict()["recall_sources"] == ["literal", "vector"]
 
-    async def test_similarity_threshold_gates_literal_channel(self, db_session: AsyncSession,
-                                                              tmp_path: Path) -> None:
+    async def test_literal_channel_gates_on_keyword_presence(self, db_session: AsyncSession,
+                                                             tmp_path: Path) -> None:
+        """通道 A 的度量是「关键词是否出现」（word_similarity）：不在文案里的词不召回。
+
+        负例与正例成对出现。旧实现用对称的 `similarity()`，短关键词对长文案的相似度天然只有
+        0.03–0.14，**正例也会恒为 0**（字面通道等于失效）；该缺陷与修复见 ADR 0010。
+        """
         await seed_hit(db_session, "D:/m/a.mp4")
-        clue = clue_with([("topic", "羽毛球")], keywords=["羽毛球", "球场"])
-        strict = write_config(tmp_path, retrieval={"similarity_threshold": 0.5},
-                              embedding={"enabled": False})
-        outcome = await retrieve_candidates(db_session, strict, clue)
-        assert outcome.literal_recalled == 0
-        assert outcome.candidates == []
+
+        absent = clue_with([("topic", "露营")], keywords=["帐篷", "天幕"])
+        none_hit = await retrieve_candidates(
+            db_session, write_config(tmp_path, embedding={"enabled": False}), absent)
+        assert none_hit.literal_recalled == 0
+        assert none_hit.candidates == []
+
+        present = clue_with([("topic", "羽毛球")], keywords=["球场"])
+        recalled = await retrieve_candidates(
+            db_session, write_config(tmp_path, embedding={"enabled": False}), present)
+        assert recalled.literal_recalled == 1
 
     async def test_recall_limit_truncates_channel(self, db_session: AsyncSession,
                                                   tmp_path: Path) -> None:
