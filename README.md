@@ -40,12 +40,13 @@
 | 数据库 ORM 与会话（五张表、14 条索引、向量列） | ✅ 已完成（S2.2） |
 | 素材索引入库 + 增量判断（`materials` 表 + 指纹增量 + 消失即删） | ✅ 已完成（S2.4） |
 | 向量回填（embedding 客户端 + `materials.embedding` / `embedding_model`） | ✅ 已完成（S2.5） |
+| 双通道召回 + RRF + 要素加权（素材检索服务） | ✅ 已完成（S2.6） |
 | Alembic 数据库迁移（唯一建表路径） | ✅ 已完成（S2.3） |
 | 评测集 v1 与示例素材包（七维度口径、版本冻结） | ✅ 已完成（S2.0） |
 | 服务入口（FastAPI）与编排层 | ⬜ 未实现 |
 | 前端单页应用（Vue 3 + Vite） | ⬜ 未实现 |
 
-当前可运行的是本地依赖编排、启动前置检查、素材索引入库与向量回填（`docker compose up -d --wait`、`uv run python -m xhs_agent.probe`、`uv run python scripts/index_materials.py`、`uv run python scripts/backfill_embeddings.py`），业务链路尚未打通。路线图见文末。
+当前可运行的是本地依赖编排、启动前置检查、素材索引入库与向量回填（`docker compose up -d --wait`、`uv run python -m xhs_agent.probe`、`uv run python scripts/index_materials.py`、`uv run python scripts/backfill_embeddings.py`）；素材检索已经是可调用的服务（`xhs_agent.services.retrieve_candidates`），但还没有 HTTP 入口与工作流编排，业务链路尚未打通。路线图见文末。
 
 ---
 
@@ -62,7 +63,7 @@
 | 文本模型接入 | OpenAI 兼容 `/chat/completions` 协议（默认 DeepSeek），标准库 `urllib` 直连，JSON mode 结构化输出 + 解析失败自修 |
 | 多模态接入 | 通义千问 VL（`qwen-vl-max`），关键帧 base64 内联 |
 | 音视频处理 | ffmpeg / ffprobe（用于探测与抽帧；缺失时跳过抽帧，属能力裁剪） |
-| 检索算法 | 字符 bigram Jaccard + 要素类型加权（现行排序）；向量回填已落地，双通道召回在 S2.6 接入 |
+| 检索算法 | 双通道召回（pg_trgm 字面 + pgvector 余弦）→ RRF 融合 → 要素类型加权终分 → Top-K 截断；同分按 material_id 升序 |
 | 配置 | pydantic-settings + TOML：环境变量 > `.env` > config.toml > 代码默认值；启动前置检查见 `uv run python -m xhs_agent.probe` |
 | 数据落地 | PostgreSQL `materials` 表（素材索引，增量同步）+ JSONL 轨迹 + Markdown 与单文件 HTML 报告；旧 JSON 索引保留但标为 legacy |
 | 测试 | pytest |

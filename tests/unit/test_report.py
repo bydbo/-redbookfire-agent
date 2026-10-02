@@ -64,3 +64,28 @@ class TestHtml:
 
     def test_is_stable(self, sample_report_model):
         assert report.render_html(sample_report_model) == report.render_html(sample_report_model)
+
+
+class TestVectorCoverage:
+    """向量覆盖率（产品方案 §8.1「本次运行」区块）：可选键，缺省不渲染。"""
+
+    def test_markdown_shows_ratio(self, sample_report_model):
+        sample_report_model["meta"]["vector_coverage"] = {
+            "enabled": True, "model": "text-embedding-v3", "total": 12,
+            "with_embedding": 3, "ratio": 0.25}
+        assert "向量覆盖率 3/12（25%）" in report.render_markdown(sample_report_model)
+
+    def test_markdown_marks_disabled_capability(self, sample_report_model):
+        sample_report_model["meta"]["vector_coverage"] = {
+            "enabled": False, "total": 5, "with_embedding": 0, "ratio": 0.0}
+        text = report.render_markdown(sample_report_model)
+        assert "向量覆盖率 0/5（0%）（向量召回未启用）" in text
+
+    def test_html_shows_ratio(self, sample_report_model):
+        sample_report_model["meta"]["vector_coverage"] = {
+            "enabled": True, "total": 12, "with_embedding": 3, "ratio": 0.25}
+        assert "向量覆盖率 3/12（25%）" in report.render_html(sample_report_model)
+
+    def test_absent_key_renders_nothing(self, sample_report_model):
+        assert "向量覆盖率" not in report.render_markdown(sample_report_model)
+        assert "向量覆盖率" not in report.render_html(sample_report_model)

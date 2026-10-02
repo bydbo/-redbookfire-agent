@@ -63,6 +63,9 @@ DEFAULT_TYPE_WEIGHTS = {
     "audience": 0.5,
 }
 
+# 召回通道（《检索契约》§三）：字面通道 A 与向量通道 B。
+RECALL_SOURCES = ("literal", "vector")
+
 
 class SchemaError(ValueError):
     """结构不符合契约时抛出，Workflow 会据此重试或降级。"""
@@ -522,6 +525,7 @@ class MatchCandidate(_Contract):
     material_id: str
     material: Material
     score: float = 0.0
+    recall_sources: list[str] = Field(default_factory=list)
     hits: list[ElementHit] = Field(default_factory=list)
     missing: list[Element] = Field(default_factory=list)
     reasons: list[str] = Field(default_factory=list)
@@ -542,6 +546,13 @@ class MatchCandidate(_Contract):
     @classmethod
     def _norm_rank(cls, value: Any) -> int:
         return _as_int(value)
+
+    @field_validator("recall_sources", mode="before")
+    @classmethod
+    def _norm_recall_sources(cls, value: Any) -> list[str]:
+        """只保留契约允许的召回通道，去重后按固定顺序（literal → vector）排列。"""
+        present = set(_as_str_list(value))
+        return [name for name in RECALL_SOURCES if name in present]
 
     @field_validator("hits", "missing", mode="before")
     @classmethod
@@ -575,6 +586,7 @@ class MatchCandidate(_Contract):
             "material_id": self.material_id,
             "score": round(self.score, 3),
             "rank": self.rank,
+            "recall_sources": list(self.recall_sources),
             "reasons": self.reasons,
             "usage": self.usage,
             "hits": [h.to_dict() for h in self.hits],

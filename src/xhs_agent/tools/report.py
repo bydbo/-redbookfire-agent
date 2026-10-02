@@ -3,7 +3,9 @@
 用途：纯函数渲染，不读文件、不联网、不看系统时钟（生成时间来自输入）。
 输入：`model` dict，形状如下（**任何键缺失都回退为空值，不抛异常**）：
 
-    meta     : {"run_id": str, "created_at": str, "materials_count": int}
+    meta     : {"run_id": str, "created_at": str, "materials_count": int,
+                "vector_coverage": {"enabled": bool, "model": str, "total": int,
+                                    "with_embedding": int, "ratio": float}}  # 可选键
     config   : {"llm": {"provider": str, "model": str}, "materials_dir": str}
     hotspots : [{"clue": HotspotClue.to_dict(), "coverage": Coverage.to_dict(),
                  "candidates": [MatchCandidate.to_dict(), ...],
@@ -37,6 +39,14 @@ def _rel(base_dir: str, path: str) -> str:
 
 def _fmt_score(score: float) -> str:
     return f"{score * 100:.0f}%"
+
+
+def _vector_coverage_text(vector: dict) -> str:
+    """向量覆盖率文案（Markdown 与 HTML 共用）：`有向量/总数（比例）`，未启用时注明。"""
+    total = vector.get("total", 0)
+    with_embedding = vector.get("with_embedding", 0)
+    note = "" if vector.get("enabled", True) else "（向量召回未启用）"
+    return f"向量覆盖率 {with_embedding}/{total}（{_fmt_score(vector.get('ratio', 0))}）{note}"
 
 
 def render_markdown(model: dict, base_dir: str = "") -> str:
@@ -129,6 +139,9 @@ def render_markdown(model: dict, base_dir: str = "") -> str:
         f"- 预估成本：{totals.get('cost_cny', 0)} 元",
         f"- 总耗时：{totals.get('latency_ms', 0) / 1000:.1f} 秒",
     ]
+    vector = meta.get("vector_coverage")
+    if vector:
+        lines.append(f"- {_vector_coverage_text(vector)}")
     for note in model.get("errors") or []:
         lines.append(f"- ⚠️ {note}")
     return "\n".join(lines) + "\n"
@@ -220,6 +233,8 @@ def render_html(model: dict, base_dir: str = "") -> str:
         </section>""")
 
     errors = "".join(f"<li>{html.escape(str(e))}</li>" for e in model.get("errors") or [])
+    vector = meta.get("vector_coverage")
+    vector_html = f" · {html.escape(_vector_coverage_text(vector))}" if vector else ""
     return f"""<!doctype html>
 <html lang="zh-CN"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
@@ -273,7 +288,7 @@ footer {{ padding:0 32px 40px; color:var(--dim); font-size:13px; }}
 </main>
 <footer>
   本次运行：模型调用 {totals.get('llm_calls', 0)} 次 · Token 输入 {totals.get('prompt_tokens', 0)} / 输出 {totals.get('completion_tokens', 0)} ·
-  预估成本 {totals.get('cost_cny', 0)} 元 · 总耗时 {totals.get('latency_ms', 0) / 1000:.1f} 秒
+  预估成本 {totals.get('cost_cny', 0)} 元 · 总耗时 {totals.get('latency_ms', 0) / 1000:.1f} 秒{vector_html}
   {('<ul>' + errors + '</ul>') if errors else ''}
 </footer>
 </body></html>

@@ -13,14 +13,20 @@ from .materials import (
     SyncReport,
     backfill_embeddings,
     plan_sync,
+    row_to_material,
     sync_materials,
 )
+from .retrieval import RetrievalOutcome, VectorCoverage, retrieve_candidates
 
 __all__ = [
     "EmbeddingBackfillReport",
+    "RetrievalOutcome",
     "SyncPlan",
     "SyncReport",
+    "VectorCoverage",
     "backfill_embeddings",
     "plan_sync",
+    "retrieve_candidates",
+    "row_to_material",
     "sync_materials",
 ]

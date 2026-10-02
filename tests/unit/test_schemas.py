@@ -15,6 +15,7 @@ from pydantic import ValidationError
 from xhs_agent.schemas import (
     DEFAULT_TYPE_WEIGHTS,
     ELEMENT_TYPES,
+    RECALL_SOURCES,
     TYPE_LABELS,
     Coverage,
     Draft,
@@ -413,3 +414,29 @@ class TestContractConstants:
 
     def test_schema_error_is_value_error(self):
         assert issubclass(SchemaError, ValueError)
+
+
+class TestRecallSources:
+    """`recall_sources`（检索契约 §三）：只允许已知通道，顺序固定。"""
+
+    def test_defaults_to_empty(self):
+        candidate = MatchCandidate(material_id="m_1", material=_material(), reasons=["r"])
+        assert candidate.recall_sources == []
+
+    def test_keeps_only_known_channels_in_canonical_order(self):
+        candidate = MatchCandidate(material_id="m_1", material=_material(), reasons=["r"],
+                                   recall_sources=["vector", "literal", "vector", "bogus"])
+        assert candidate.recall_sources == ["literal", "vector"]
+
+    def test_accepts_a_single_channel(self):
+        candidate = MatchCandidate(material_id="m_1", material=_material(), reasons=["r"],
+                                   recall_sources="vector")
+        assert candidate.recall_sources == ["vector"]
+
+    def test_to_dict_carries_recall_sources(self):
+        candidate = MatchCandidate(material_id="m_1", material=_material(), reasons=["r"],
+                                   recall_sources=["vector"])
+        assert candidate.to_dict()["recall_sources"] == ["vector"]
+
+    def test_constant_matches_contract(self):
+        assert RECALL_SOURCES == ("literal", "vector")

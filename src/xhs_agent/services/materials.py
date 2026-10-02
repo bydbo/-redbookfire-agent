@@ -31,6 +31,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..config import PROJECT_ROOT, AppConfig, ConfigError
 from ..db.models import Material as MaterialRow
+from ..schemas import Material
 from ..tools import materials as materials_tool
 from ..tools.embedding import EmbeddingError, build_embedder, material_embedding_text
 
@@ -136,6 +137,33 @@ def _row_values(material, keyframes: list[str]) -> dict:
         "fingerprint": material.fingerprint,
         "indexed_at": datetime.now(UTC),
     }
+
+
+def row_to_material(row: MaterialRow) -> Material:
+    """ORM 行 → 内存 `Material`（检索与解释共用）。
+
+    输入：`materials` 表的一行。输出：`schemas.Material`——`id` 取数据库 uuid（与 API 契约的
+    `format: uuid` 一致），`mtime` 由 timestamptz 转 epoch 秒，`elements` 复用 JSONB 结构。
+    """
+    return Material.from_dict({
+        "id": str(row.id),
+        "path": row.path,
+        "type": row.type,
+        "title": row.title,
+        "description": row.description,
+        "tags": list(row.tags or []),
+        "elements": list(row.elements or []),
+        "duration_s": float(row.duration_s or 0),
+        "width": row.width,
+        "height": row.height,
+        "has_audio": row.has_audio,
+        "size_bytes": row.size_bytes,
+        "mtime": row.mtime.timestamp() if row.mtime else 0.0,
+        "source": row.source,
+        "keyframes": list(row.keyframes or []),
+        "indexed_at": row.indexed_at.isoformat() if row.indexed_at else "",
+        "fingerprint": row.fingerprint or "",
+    })
 
 
 async def sync_materials(session: AsyncSession, cfg: AppConfig, *,
