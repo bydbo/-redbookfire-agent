@@ -161,3 +161,15 @@ class TestBuildMaterial:
             vision=lambda _frames, _hint: {"title": "猫", "tags": ["猫"], "description": "打盹"},
         )
         assert (material.source, material.title, material.description) == ("vision", "猫", "打盹")
+
+    def test_vision_is_not_called_without_frames(self, materials_dir, tmp_path):
+        """没有关键帧（抽帧被跳过）时，即使传了 vision 也不该调用它。"""
+
+        def boom(*_args, **_kwargs):
+            raise AssertionError("没有关键帧时不应调用视觉打标")
+
+        material = materials.build_material(str(materials_dir / "宠物猫.png"),
+                                            str(materials_dir), str(tmp_path / "kf"),
+                                            vision=boom, extract_frames=False)
+        assert material.keyframes == []
+        assert material.source != "vision"

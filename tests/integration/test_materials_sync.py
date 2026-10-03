@@ -138,6 +138,17 @@ class TestFirstSync:
         json_files = list(index_dir.glob("materials-*.json")) if index_dir.exists() else []
         assert json_files == []
 
+    async def test_vision_budget_caps_tagging(
+            self, db_session: AsyncSession, tmp_path: Path, fake_frames: None) -> None:
+        """`max_vision_items` 是成本闸门：预算用完后其余素材不再打标（S2.4 起的语义）。"""
+        pack = _make_pack(tmp_path)
+        vision = FakeVision()
+        report = await sync_materials(db_session, _Cfg(pack, tmp_path / "idx"),
+                                      vision=vision, max_vision_items=1)
+        assert report.added == 3
+        assert report.vision_used == 1     # 只有一条拿到预算
+        assert len(vision.calls) == 1
+
 
 class TestIncrementalChanges:
     async def test_new_file_is_added(self, db_session: AsyncSession, tmp_path: Path,

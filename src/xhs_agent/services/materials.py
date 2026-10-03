@@ -218,10 +218,18 @@ async def sync_materials(session: AsyncSession, cfg: AppConfig, *,
     keyframes_dir = os.path.join(cfg.index_dir(), "keyframes")
     disk_files = materials_tool.scan_materials(materials_dir)
 
-    rows = list((await session.execute(select(MaterialRow))).scalars().all())
-    plan = plan_sync(disk_files, rows, materials_dir)
-    rows_by_path = {os.path.abspath(row.path): row
-                    for row in rows if _is_under(row.path, materials_dir)}
+    # 规划只取两列：大库场景下不把 elements / keyframes / embedding 这些大列整行读进来
+    plan_rows = (await session.execute(
+        select(MaterialRow.path, MaterialRow.fingerprint))).all()
+    plan = plan_sync(disk_files, list(plan_rows), materials_dir)
+
+    # 只有要更新/删除的行才取回完整 ORM 对象（新增行本来就不在库里）
+    rows_by_path: dict[str, MaterialRow] = {}
+    touched = [*plan.updated, *plan.deleted]
+    if touched:
+        changed = (await session.execute(
+            select(MaterialRow).where(MaterialRow.path.in_(touched)))).scalars().all()
+        rows_by_path = {os.path.abspath(row.path): row for row in changed}
 
     report = SyncReport(scanned=len(disk_files), unchanged=len(plan.unchanged),
                         deleted=len(plan.deleted))
