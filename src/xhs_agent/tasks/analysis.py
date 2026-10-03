@@ -43,6 +43,9 @@ TRANSIENT_ERRORS: tuple[type[BaseException], ...] = (
     OperationalError, InterfaceError, ConnectionError, TimeoutError, OSError)
 
 MAX_RETRY_COUNTDOWN_S = 30
+# enqueue 早于 commit 的窄窗口（以及任何可见性延迟）：job 查不到时先短等再查一次，
+# 否则任务会被消费掉、run 永远停在 queued（E3 审查建议 2）
+JOB_LOOKUP_GRACE_S = 0.5
 
 logger = logging.getLogger("xhs_agent.tasks")
 
@@ -59,6 +62,10 @@ async def run_job(job_id: str, cfg: AppConfig, *, caller: Any = None, embedder: 
         factory = create_session_factory(engine)
         async with factory() as session:
             job = await load_job(session, job_id)
+            if job is None:
+                # 投递可能先于事务提交到达 worker：短等一次再查（READ COMMITTED 下能读到新提交）
+                await asyncio.sleep(JOB_LOOKUP_GRACE_S)
+                job = await load_job(session, job_id)
             if job is None:
                 raise ValueError(f"job 不存在（脏投递或 run 已被删）：{job_id}")
             if job["status"] in TERMINAL_STATUSES:

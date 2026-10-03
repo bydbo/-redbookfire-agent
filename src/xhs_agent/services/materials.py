@@ -21,6 +21,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import os
 from collections.abc import Callable, Sequence
 from contextlib import AsyncExitStack
@@ -236,8 +237,11 @@ async def sync_materials(session: AsyncSession, cfg: AppConfig, *,
                         deleted=len(plan.deleted))
     for path in plan.added + plan.updated:
         allow_vision = vision if report.vision_used < max_vision_items else None
-        material = materials_tool.build_material(path, materials_dir, keyframes_dir,
-                                                 vision=allow_vision)
+        # build_material 是同步函数（读文件 + 可能调多模态打标，单条可达数秒）：放线程里跑，
+        # 避免在 Celery worker 的 async 上下文里阻塞事件循环（E3 审查建议 1）
+        material = await asyncio.to_thread(
+            materials_tool.build_material, path, materials_dir, keyframes_dir,
+            vision=allow_vision)
         if allow_vision is not None and material.source == "vision":
             report.vision_used += 1
         values = _row_values(material, _relative_keyframes(material.keyframes))

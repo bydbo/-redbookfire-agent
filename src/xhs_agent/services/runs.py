@@ -175,6 +175,13 @@ async def _matches_by_run_hotspot(session: AsyncSession,
                 "title": material.title,
                 "description": material.description,
                 "tags": list(material.tags or []),
+                # 契约 MaterialSummary 声明的其余字段必须一并投影：少了 keyframes，
+                # 报告 HTML 的关键帧缩略图会全部退化成「无预览」（E3 审查·严重项）
+                "duration_s": float(material.duration_s or 0),
+                "width": int(material.width or 0),
+                "height": int(material.height or 0),
+                "has_audio": bool(material.has_audio),
+                "keyframes": list(material.keyframes or []),
             },
         })
     return grouped

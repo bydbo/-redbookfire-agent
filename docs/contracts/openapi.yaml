@@ -35,7 +35,7 @@ info:
     | `validation_error` | 422 | 字段级校验失败（如 topk 越界） |
     | `not_found` | 404 | job_id 或 run_id 不存在 |
     | `conflict` | 409 | 当前状态不允许该操作（如运行尚未完成就取结果） |
-    | `dependency_unavailable` | 503 | 数据库、Redis 或模型服务不可用 |
+    | `dependency_unavailable` | 503 | 数据库或 Redis 不可用，或模型配置缺失 |
     | `upstream_error` | 502 | 上游模型返回错误或连续重试失败 |
     | `internal_error` | 500 | 未分类的内部错误 |
   license:
@@ -58,7 +58,7 @@ paths:
       tags:
         - 运维
       summary: 健康检查
-      description: 逐项返回数据库、Redis 与模型服务的可用性；任一不可用时整体状态为 down 并返回 503。
+      description: 逐项返回探测结果——数据库与 Redis 是**真实连接探测**；llm 项只校验**配置就绪性**（不发真实请求：会烧钱，也容易被网络抖动误判，与 probe.py 的口径一致）。任一不可用时整体状态为 down 并返回 503。
       operationId: getHealth
       responses:
         '200':

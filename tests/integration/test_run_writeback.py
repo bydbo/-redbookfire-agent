@@ -22,7 +22,7 @@ from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
 from xhs_agent.config import AppConfig, load_config
 from xhs_agent.db import Base
 from xhs_agent.db.models import EMBEDDING_DIM, Hotspot, Run, RunHotspot, RunMatch
-from xhs_agent.services.runs import planned_hotspots, submit_analysis
+from xhs_agent.services.runs import load_run, planned_hotspots, submit_analysis
 from xhs_agent.tools import llm
 from xhs_agent.tools.embedding import EmbeddingResult
 from xhs_agent.tools.llm import LLMResult, StructuredCaller
@@ -261,6 +261,30 @@ class TestWriteBack:
 
         run = await db_session.get(Run, uuid.UUID(run_id))
         assert run.status == "failed" and run.error
+
+    async def test_load_run_projects_full_material_summary(
+            self, db_session: AsyncSession, tmp_path: Path) -> None:
+        """候选里的 material 必须投影契约 `MaterialSummary` 声明的全部字段。
+
+        少投影 `keyframes` 会让报告 HTML 的关键帧缩略图全部退化成「无预览」——
+        这正是 E3 代码审查发现的契约漂移，这条用例防它再次发生。
+        """
+        material_ids = await seed_library(db_session, count=1)
+        await db_session.execute(text(
+            "UPDATE materials SET keyframes = CAST(:kf AS jsonb) WHERE id = CAST(:m AS uuid)"
+        ), {"kf": json.dumps(["runs/_index/keyframes/keep/kf_0.jpg"]), "m": material_ids[0]})
+        cfg = write_config(tmp_path)
+        run_id = await start_run(db_session, ["某明星打球场被拍"])
+        await run_for(db_session, run_id, cfg, provider=FakeProvider())
+
+        payload = await load_run(db_session, uuid.UUID(run_id))
+        material = payload["hotspots"][0]["candidates"][0]["material"]
+        assert set(material) >= {"id", "path", "type", "title", "description", "tags",
+                                 "duration_s", "width", "height", "has_audio", "keyframes"}
+        assert material["keyframes"] == ["runs/_index/keyframes/keep/kf_0.jpg"]
+        assert (material["width"], material["height"]) == (1080, 1920)
+        assert material["duration_s"] == 15.0
+        assert material["has_audio"] is False
 
     async def test_empty_reasons_violate_the_database_constraint(
             self, db_session: AsyncSession, tmp_path: Path) -> None:

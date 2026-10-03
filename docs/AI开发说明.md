@@ -88,5 +88,6 @@ uv run python -m xhs_agent.probe
 4. **加依赖要论证，不为省几行代码加，也不为凑简历关键词加。** 企业级组件（FastAPI、LangGraph、pgvector 等）已列入最终技术栈，按 `docs/技术栈.md` 第四节分阶段引入，并走 `AGENTS.md` 第 6 节流程。
 5. **项目不做运行时降级。** 缺 API 密钥、连不上数据库或队列时启动直接失败并报错——遇到“没密钥就跑不起来”不是 bug。
 6. **Docker Desktop 必须先启动**，数据库与队列都跑在容器里；C 盘只剩约 33 GB，建议把 Docker 镜像存储位置迁到 D 盘。
-7. **前端是独立工具链**：在 `frontend/` 下用 pnpm 安装与构建；改了 `docs/contracts/openapi.yaml` 之后要重新生成 TS 类型，否则前端类型会与契约漂移。
-8. **启动前置检查在 `src/xhs_agent/probe.py`**：`uv run python -m xhs_agent.probe` 退出码 0 表示配置可用，退出码 2 表示配置错误（缺哪些变量、怎么补都会打印出来）。数据库、扩展、Alembic、Redis、前端 dist 的检查属于 S3.8，目前尚未实现。
+7. **代理会拦截本地 HTTP，导致集成测试假失败。** 若本机开着代理工具（TUN/透明模式），跑 `uv run pytest -m integration` 时 `tests/integration/test_http_pool.py` 的 2 条用例会拿到 `502 Bad Gateway`（服务端收到请求数为 0）——透明代理解析了 loopback 的 HTTP，而 Postgres / Redis 这类裸 TCP 不受影响。**处置**：给代理加 loopback 直连规则，或跑集成本地 HTTP 用例前暂时关闭代理；判据是"沙箱内同一脚本返回 200、真实终端返回 502"。
+8. **前端是独立工具链**：在 `frontend/` 下用 pnpm 安装与构建；改了 `docs/contracts/openapi.yaml` 之后要重新生成 TS 类型，否则前端类型会与契约漂移。
+9. **启动前置检查在 `src/xhs_agent/probe.py`**：`uv run python -m xhs_agent.probe` 退出码 0 表示配置可用，退出码 2 表示配置错误（缺哪些变量、怎么补都会打印出来）。数据库、扩展、Alembic、Redis、前端 dist 的检查属于 S3.8，目前尚未实现。
