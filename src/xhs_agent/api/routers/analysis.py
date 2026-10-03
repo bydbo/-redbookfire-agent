@@ -2,7 +2,8 @@
 
 - `POST /api/analyze`：按契约校验（1–10 条热点、每条 1–500 字、`topk` 1–20）→
   落库（复用/新建 hotspots、建 runs(queued)、建 run_hotspots 骨架）→ 投递 → 202。
-  投递器由 `get_dispatcher` 注入；S3.4b 之前默认实现显式失败（503），不做进程内假执行。
+  投递器由 `get_dispatcher` 注入：S3.4b 起默认投 Celery；broker 不可达时显式失败（503），
+  不做进程内假执行（进程内后台任务会在重启时静默丢任务）。
 - `GET /api/jobs/{job_id}`：返回契约的 `JobStatus`；不存在 → 404。
 """
 

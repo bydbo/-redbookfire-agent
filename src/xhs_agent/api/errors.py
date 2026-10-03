@@ -15,6 +15,8 @@ from fastapi import FastAPI, Request
 from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
+from kombu.exceptions import KombuError
+from redis.exceptions import RedisError
 from sqlalchemy.exc import InterfaceError, OperationalError
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
@@ -100,6 +102,18 @@ def register_exception_handlers(app: FastAPI) -> None:
 
     for upstream_type in (LLMError, EmbeddingError):
         app.add_exception_handler(upstream_type, _handle_upstream_error)
+
+    async def _handle_queue_unavailable(request: Request, exc: Exception) -> JSONResponse:
+        # 任务队列（broker=Redis）不可用：与数据库同类，按依赖不可用折成 503。
+        # 投递侧通常已在 `CeleryDispatcher` 里折过一道，这里是兜底（其它路径拿到裸异常时）。
+        request_id = request_id_of(request)
+        logger.warning("任务队列不可用（request_id=%s）：%s", request_id, exc)
+        return json_error(DEPENDENCY_UNAVAILABLE, "任务队列不可用",
+                          {"request_id": request_id,
+                           "error": f"{type(exc).__name__}: {exc}"[:200]})
+
+    for queue_type in (KombuError, RedisError):
+        app.add_exception_handler(queue_type, _handle_queue_unavailable)
 
     @app.exception_handler(StarletteHTTPException)
     async def _handle_http_exception(request: Request,

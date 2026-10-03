@@ -47,12 +47,13 @@
 | 五个接口实现（`/api` 前缀：health / analyze / jobs / runs / report） | ✅ 已完成（S3.3） |
 | 分析结果写回（`run_matches` / 统计 / `prompt_versions` 落库，RunStore 退化为产物目录） | ✅ 已完成（S3.4a） |
 | 分析主链路 HTTP 异步化（文本模型与向量共用 httpx 连接池，去掉 `asyncio.to_thread`） | ✅ 已完成（S3.5） |
+| Celery worker 接线（`POST /api/analyze` 真投递 → 消费 → 索引新鲜度 → 分析 → 写回） | ✅ 已完成（S3.4b） |
 | Alembic 数据库迁移（唯一建表路径） | ✅ 已完成（S2.3） |
 | 评测集 v1 与示例素材包（七维度口径、版本冻结） | ✅ 已完成（S2.0） |
 | 服务入口（FastAPI）与编排层 | ⬜ 未实现 |
 | 前端单页应用（Vue 3 + Vite） | ⬜ 未实现 |
 
-当前可运行的是本地依赖编排、启动前置检查、素材索引入库、向量回填、检索层评测与 HTTP 服务（`docker compose up -d --wait`、`uv run python -m xhs_agent.probe`、`uv run python scripts/index_materials.py`、`uv run python scripts/backfill_embeddings.py`、`uv run python scripts/eval_retrieval.py`、`uv run uvicorn xhs_agent.api.main:app`）；五个接口都已可用，但 `POST /api/analyze` 目前会以 503 明确提示"队列未接线"（Celery 属 S3.4b），业务链路尚未端到端打通。路线图见文末。
+业务链路**已端到端跑通**：`docker compose up -d --wait` 起依赖 → `uv run celery -A xhs_agent.tasks.worker:app worker` 起 worker → `uv run uvicorn xhs_agent.api.main:app` 起接口 → `POST /api/analyze` 投递 → worker 自动消费（索引新鲜度 → 五节点分析 → 逐热点写回）→ `/api/jobs/{job_id}` 轮询 → `/api/runs/{run_id}` 取结构化结果、`/report` 取报告。另可运行 `uv run python -m xhs_agent.probe`、`uv run python scripts/index_materials.py`、`uv run python scripts/backfill_embeddings.py`、`uv run python scripts/eval_retrieval.py`。路线图见文末。
 
 ---
 
@@ -64,7 +65,7 @@
 | --- | --- |
 | 语言 | Python ≥ 3.11 |
 | 包管理与构建 | uv + `pyproject.toml`（hatchling 后端，src 布局） |
-| 运行时依赖 | pydantic v2、pydantic-settings、python-dotenv、SQLAlchemy 2.0 async + asyncpg、pgvector、alembic、langgraph、fastapi + uvicorn、redis、httpx |
+| 运行时依赖 | pydantic v2、pydantic-settings、python-dotenv、SQLAlchemy 2.0 async + asyncpg、pgvector、alembic、langgraph、fastapi + uvicorn、redis、httpx、celery |
 | 开发依赖 | pytest、pytest-cov、pytest-asyncio、testcontainers、ruff、mypy、pre-commit |
 | 文本模型接入 | OpenAI 兼容 `/chat/completions` 协议（默认 DeepSeek），标准库 `urllib` 直连，JSON mode 结构化输出 + 解析失败自修 |
 | 多模态接入 | 通义千问 VL（`qwen-vl-max`），关键帧 base64 内联 |
@@ -101,7 +102,7 @@
 
 前置条件：Python ≥ 3.11、`uv`、`ffmpeg` / `ffprobe`（用于抽帧）。
 
-> **注意**：下面是当前代码可运行的步骤。本地依赖（PostgreSQL 16 + pgvector、Redis）已由 `docker-compose.yml` 提供；服务化（FastAPI / Celery）仍在后续阶段。
+> **注意**：下面是当前代码可运行的步骤。本地依赖（PostgreSQL 16 + pgvector、Redis）由 `docker-compose.yml` 提供；FastAPI 与 Celery worker 都可直接跑（容器镜像归 S4.4）。
 
 ```powershell
 # 1. 安装环境（首次需要网络）
@@ -113,8 +114,11 @@ docker compose up -d --wait
 # 3. 准备配置（必须填必填项：项目不做无密钥降级）
 Copy-Item config/.env.example config/.env
 #    编辑 config/.env 填 DEEPSEEK_API_KEY（P1 必填）、DASHSCOPE_API_KEY（向量召回默认
-#    启用，故默认必填）与 DATABASE_URL（P2 必填，本地默认
-#    postgresql+asyncpg://xhs:xhs@localhost:5432/xhs）；REDIS_URL 到 P3 才必填
+#    启用，故默认必填）、DATABASE_URL（P2 必填，本地默认
+#    postgresql+asyncpg://xhs:xhs@localhost:5432/xhs）与 REDIS_URL（P3 必填，S3.4b 起
+#    需要队列；**建议写 127.0.0.1 而不是 localhost**——compose 只绑 IPv4，Windows 上
+#    localhost 常先解析到 ::1，会让 Redis 连接超时）
+REDIS_URL=redis://127.0.0.1:6379/0
 
 # 4. 建表（Alembic 迁移；改模型后必须同时提交迁移脚本）
 uv run alembic upgrade head
@@ -142,9 +146,20 @@ uv run python -m xhs_agent.probe
 #     结果落 evals/reports/retrieval-v1-<日期>.md；需要 Docker 与真实 DASHSCOPE_API_KEY
 uv run python scripts/eval_retrieval.py
 
-# 11. 起 HTTP 服务（骨架：/api 路由树 + 统一错误响应 + X-Request-ID；业务接口在 S3.3）
+# 11. 起 Celery worker（S3.4b：消费 POST /api/analyze 投递的 job）
+uv run celery -A xhs_agent.tasks.worker:app worker --loglevel=info
+#    Windows 本地开发建议加 --pool=solo（prefork 在 Windows 上不稳；软超时只在
+#    Linux 的 prefork worker 上生效）
+
+# 12. 起 HTTP 服务（另开一个终端）
 uv run uvicorn xhs_agent.api.main:app --port 8000
 #    文档页：http://127.0.0.1:8000/api/docs（挂在 /api 下，非 /api 路径留给前端单页应用）
+
+# 13. 投一个热点并轮询（完整链路：队列 → worker → 索引新鲜度 → 五节点分析 → 落库）
+curl -s -X POST http://127.0.0.1:8000/api/analyze -H "Content-Type: application/json" `
+  -d '{"hotspots": ["某明星打羽毛球场被拍，反差感拉满"], "topk": 5}'
+#    拿返回的 job_id 轮询 /api/jobs/{job_id}，succeeded 后用 run_id 取 /api/runs/{run_id}
+#    与 /api/runs/{run_id}/report?format=html
 ```
 
 网络受限时：`uv sync --no-dev` 只装运行时环境（pydantic / pydantic-settings / python-dotenv / SQLAlchemy async + asyncpg / pgvector / alembic）；不过 `import xhs_agent` 仍然需要安装或设置 `PYTHONPATH=src`（src 布局）。

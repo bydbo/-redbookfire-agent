@@ -22,8 +22,9 @@ from dataclasses import dataclass, field
 
 from .config import AppConfig, ConfigError, EnvView, load_config
 
-# 当前阶段：S2.1 起进入 P2（DATABASE_URL 变为必填）；E3 落地队列后改成 "P3"。
-CURRENT_STAGE = "P2"
+# 当前阶段：S2.1 起进入 P2（DATABASE_URL 必填）；S3.4b 落地 Celery 队列后进入 P3
+# （REDIS_URL 变为必填）。第 3–7 步的完整 preflight 归 S3.8。
+CURRENT_STAGE = "P3"
 
 E_CONFIG_MISSING = "E_CONFIG_MISSING"
 E_CONFIG_INVALID = "E_CONFIG_INVALID"

@@ -12,9 +12,10 @@
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import AsyncIterator
 from functools import lru_cache
-from typing import Annotated, Protocol
+from typing import Annotated, Any, Protocol
 
 from fastapi import Depends
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
@@ -53,28 +54,53 @@ async def get_session() -> AsyncIterator[AsyncSession]:
         yield session
 
 
-class QueueNotConfigured:
-    """S3.4b 之前没有任务队列：显式失败，不做进程内假执行。
-
-    为什么不做假执行：进程内后台任务会在重启时静默丢任务，与"DB 是运行状态唯一权威源"
-    （ADR 0011）和"不做降级"的口径都冲突。接口集成用例用 `dependency_overrides`
-    注入假投递器来验证 202 分支。
-    """
-
-    async def enqueue(self, job_id: str) -> None:
-        raise DependencyUnavailableError(
-            "分析队列未接线（Celery 属 S3.4b，当前未安装）", {"job_id": job_id})
-
-
 class Dispatcher(Protocol):
     """任务投递器：只要能把 `job_id` 投出去即可（S3.4b 的 Celery 实现也满足它）。"""
 
     async def enqueue(self, job_id: str) -> None: ...
 
 
-def get_dispatcher() -> Dispatcher:
-    """任务投递器依赖；S3.4b 把它换成 Celery 实现。"""
-    return QueueNotConfigured()
+class CeleryDispatcher:
+    """把 job 投到 Celery（broker=Redis）的任务投递器。
+
+    为什么在 `enqueue` 里现造 app：`build_celery_app` 要读 `REDIS_URL`，而导入期不许读配置
+    （S3.2 的"导入期不读配置"口径）——所以延迟到第一次投递时才导入 `tasks` 包并用本进程缓存的
+    `get_config()` 建 app。
+    `send_task` 是同步网络调用，放线程里执行以免阻塞事件循环；broker 不可达时折成
+    `DependencyUnavailableError`（503），此时 `submit_analysis` 会整体回滚，不留脏 queued 行。
+    """
+
+    def __init__(self, cfg: AppConfig) -> None:
+        self.cfg = cfg
+        self._app: Any = None
+
+    def app(self) -> Any:
+        """进程内缓存的 Celery 应用（首次调用才读配置）。"""
+        if self._app is None:
+            from ..tasks.celery_app import build_celery_app
+            self._app = build_celery_app(self.cfg)
+        return self._app
+
+    async def enqueue(self, job_id: str) -> None:
+        from kombu.exceptions import KombuError
+
+        from ..tasks.analysis import ANALYZE_TASK_NAME
+
+        try:
+            await asyncio.to_thread(self.app().send_task, ANALYZE_TASK_NAME, args=[job_id])
+        except (KombuError, OSError) as exc:
+            raise DependencyUnavailableError(
+                "分析队列不可用：投递失败",
+                {"job_id": job_id, "error": f"{type(exc).__name__}: {exc}"[:200]}) from exc
+
+
+def get_dispatcher(cfg: ConfigDep) -> Dispatcher:
+    """任务投递器依赖：S3.4b 起默认投 Celery。
+
+    走 `ConfigDep` 而不是直接调 `get_config()`：这样测试覆盖 `get_config` 时投递器也会用
+    测试配置（否则 `dependency_overrides` 对嵌套的直接函数调用不生效）。
+    """
+    return CeleryDispatcher(cfg)
 
 
 # 路由签名里用 Annotated 别名注入依赖（不用 `= Depends(...)` 默认值，避免 ruff B008）

@@ -8,14 +8,15 @@ from pathlib import Path
 import pytest
 from fastapi import APIRouter
 from fastapi.testclient import TestClient
+from kombu.exceptions import KombuError
 from pydantic import ValidationError
 from sqlalchemy.ext.asyncio import create_async_engine
 
-from xhs_agent.api.deps import QueueNotConfigured
+from xhs_agent.api.deps import CeleryDispatcher
 from xhs_agent.api.main import API_PREFIX, create_app
 from xhs_agent.api.routers import ops
 from xhs_agent.api.routers.analysis import AnalyzeRequest
-from xhs_agent.config import AppConfig, EnvView, load_config
+from xhs_agent.config import AppConfig, ConfigError, EnvView, load_config
 from xhs_agent.core.errors import (
     CODE_STATUS,
     CONFLICT,
@@ -109,14 +110,35 @@ class TestHealthProbes:
         assert "latency_ms" in result
 
 
-class TestDispatcher:
+class TestCeleryDispatcher:
+    """S3.4b：默认投递器投 Celery；broker 不可达时折成 503（不做进程内假执行）。"""
+
+    class BrokenApp:
+        """假 Celery 应用：send_task 直接抛 kombu 的连接类错误（用例不真连 broker）。"""
+
+        def send_task(self, *_args, **_kwargs):
+            raise KombuError("broker 连不上")
+
+    @pytest.fixture
+    def dispatcher(self, tmp_path) -> CeleryDispatcher:
+        cfg = make_config(tmp_path, "[queue]\nmax_retries = 1\n")
+        cfg._env = EnvView({}, {"REDIS_URL": "redis://127.0.0.1:6379/0"})
+        instance = CeleryDispatcher(cfg)
+        instance._app = self.BrokenApp()      # 注入假 app：不真连 Redis
+        return instance
+
     @pytest.mark.asyncio
-    async def test_queue_not_configured_fails_loudly(self):
+    async def test_broker_failure_becomes_dependency_unavailable(self, dispatcher):
         with pytest.raises(DependencyUnavailableError) as info:
-            await QueueNotConfigured().enqueue("job-1")
+            await dispatcher.enqueue("job-1")
         assert info.value.code == "dependency_unavailable"          # → HTTP 503
         assert info.value.detail["job_id"] == "job-1"
-        assert "S3.4b" in info.value.message
+        assert "KombuError" in info.value.detail["error"]
+
+    def test_redis_url_is_required(self, tmp_path):
+        """缺 REDIS_URL 是配置错误（由接口层折成 503），不是静默跳过。"""
+        with pytest.raises(ConfigError):
+            CeleryDispatcher(make_config(tmp_path)).app()
 
 
 class TestConflictError:

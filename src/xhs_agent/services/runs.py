@@ -11,7 +11,8 @@
 - S3.4a（写回）：`RunRecorder` 逐热点落库（`run_hotspots` / `run_matches` / `hotspots.clue`），
   收尾写 `runs` 的状态、统计与 `prompt_versions`；ADR 0011 的 RunStore 改造同期落地。
 
-不做（S3.4b）：Celery 接线、软/硬超时、索引新鲜度检查与"已成功即跳过"的断点续跑。
+不在本模块：worker 接线、软/硬超时、索引新鲜度前置在 `tasks/`（S3.4b）；
+"已成功热点即跳过"的断点续跑仍未实现。
 """
 
 from __future__ import annotations
@@ -404,3 +405,25 @@ class RunRecorder:
                                for key, value in (prompt_versions or {}).items()}
         run.error = None if status == SUCCEEDED else ("；".join(errors) or "运行失败")
         await self._commit()
+
+
+async def mark_run_failed(session: AsyncSession, run_id: uuid.UUID | str,
+                          error: str) -> bool:
+    """把运行标成 `failed`（兜底路径：异常逃出 `run_analysis`，S3.4b 的任务层调用）。
+
+    只写 `status` / `finished_at` / `error`，**不动**已有的统计与 `prompt_versions`——那些
+    可能已被逐热点写回更新过，覆盖成 0 等于丢事实。查不到该 run 时返回 `False`。
+    """
+    run = (await session.execute(
+        select(Run).where(Run.id == uuid.UUID(str(run_id))))).scalar_one_or_none()
+    if run is None:
+        return False
+    run.status = FAILED
+    run.finished_at = datetime.now(UTC)
+    run.error = str(error)[:2000] or "运行失败"
+    try:
+        await session.commit()
+    except BaseException:
+        await session.rollback()
+        raise
+    return True

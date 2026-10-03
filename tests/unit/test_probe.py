@@ -34,6 +34,7 @@ def view(**values: str) -> EnvView:
 
 
 DSN = "postgresql+asyncpg://xhs:xhs@localhost:5432/xhs"
+REDIS_DSN = "redis://localhost:6379/0"
 
 
 def names(report) -> list[str]:
@@ -43,7 +44,8 @@ def names(report) -> list[str]:
 class TestRequiredVariables:
     def test_complete_env_passes(self, tmp_path):
         report = preflight(make_config(tmp_path),
-                           env=view(DEEPSEEK_API_KEY="sk-x", DATABASE_URL=DSN))
+                           env=view(DEEPSEEK_API_KEY="sk-x", DATABASE_URL=DSN,
+                                    REDIS_URL=REDIS_DSN))
         assert report.ok
         assert report.exit_code == 0
         assert report.problems == []
@@ -162,6 +164,7 @@ class TestCommandLine:
         (tmp_path / "config.toml").write_text("[embedding]\nenabled = false\n", encoding="utf-8")
         clean_contract_env.setenv("DEEPSEEK_API_KEY", "sk-test-value")
         clean_contract_env.setenv("DATABASE_URL", DSN)
+        clean_contract_env.setenv("REDIS_URL", REDIS_DSN)
         assert main([]) == 0
         out = capsys.readouterr().out
         assert "配置摘要（已脱敏）" in out
@@ -193,8 +196,9 @@ class TestCommandLine:
         assert main(["--nope"]) == 2
         assert "未知参数" in capsys.readouterr().err
 
-    def test_current_stage_is_p2(self):
-        assert CURRENT_STAGE == "P2"
+    def test_current_stage_is_p3(self):
+        # S3.4b 落地 Celery 队列后进入 P3：REDIS_URL 变为必填
+        assert CURRENT_STAGE == "P3"
 
     def test_report_defaults_to_current_stage(self, tmp_path):
         report = preflight(make_config(tmp_path), env=view(DEEPSEEK_API_KEY="sk-x"))
