@@ -50,6 +50,7 @@
 | Celery worker 接线（`POST /api/analyze` 真投递 → 消费 → 索引新鲜度 → 分析 → 写回） | ✅ 已完成（S3.4b） |
 | Walking Skeleton 端到端联调（一键脚本：起进程 → 投热点 → 验候选与报告 → 落样例报告） | ✅ 已完成（S3.6） |
 | 完整启动前置检查（配置契约 §四 的 7 步 + 接入 lifespan + `python -m xhs_agent.serve`） | ✅ 已完成（S3.8） |
+| Prompt 变更回归报告（两臂对照 + prompt 契约 §六 七维度门槛，落 `evals/reports/prompt-*.md`） | ✅ 已完成（S3.10） |
 | Alembic 数据库迁移（唯一建表路径） | ✅ 已完成（S2.3） |
 | 评测集 v1 与示例素材包（七维度口径、版本冻结） | ✅ 已完成（S2.0） |
 | 服务入口（FastAPI）与编排层 | ⬜ 未实现 |
@@ -181,6 +182,26 @@ uv run python scripts/smoke_skeleton.py
 > **还没有前端产物（E5 之前）时**：`serve = true` + 缺 dist 属于配置错误，启动前置检查会**拒绝启动**（退出码 2）。本地纯后端开发用环境变量覆盖即可只跑 API：`XHS_FRONTEND_SERVE=false`（等价于把 `[frontend].serve` 设为 `false`）——`scripts/smoke_skeleton.py` 已经默认这么做了。前端源码与 `pnpm build` 属 E5。
 
 网络受限时：`uv sync --no-dev` 只装运行时环境（pydantic / pydantic-settings / python-dotenv / SQLAlchemy async + asyncpg / pgvector / alembic）；不过 `import xhs_agent` 仍然需要安装或设置 `PYTHONPATH=src`（src 布局）。
+
+### prompt 变更怎么走（prompt 契约 §六）
+
+1. **一次只改一层**：单个提交只改五段中的一段（`src/xhs_agent/prompts/<task>.md`），版本号随内容递增；
+2. **跑回归**：把被改那个 prompt 的新旧两版各跑一遍同一批 20 组用例——旧正文用 `git show` 取，
+   不写文件、不改工作区：
+
+   ```powershell
+   uv run python scripts/eval_prompts.py --task hotspot_clue --note "本次改动的原因"
+   # 冒烟（真容器 + 真模型，只跑前 2 组用例，约 0.4 元）：
+   uv run python scripts/eval_prompts.py --task hotspot_clue --limit 2 --out <临时目录>
+   ```
+
+3. **看门槛**：脚本按契约 §六 判七维度（幻觉=0、事实准确率≥90% 且不降、输出结构 100%、
+   Tool 选择 100%、任务完成率 Top-5≥80%/首选≥50% 且不降、成本≤0.05 元/热点、速度≤60 秒/热点），
+   **任一不达标即输出"回退"**（脚本本身仍退 0——回退是给人看的结论）；
+4. **归档**：报告落 `evals/reports/prompt-<task_id>-v<N>-<日期>.md` + 同名 `.json`，
+   里面逐用例列维度变化、附改动 diff，并留一列人工 1–5 分「文案可用率」（**只记录、不进门槛**）。
+
+> 代价参考：全量两臂 = 20 组 × 2 臂 × 3 次模型调用 ≈ 3–4 元、30–40 分钟；只跑被改任务的单步属后续优化。
 
 ---
 
