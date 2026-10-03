@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import asyncio
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any
 
 from sqlalchemy import Text, bindparam, select, text
@@ -152,14 +152,18 @@ def _ranks(hits: list[tuple[str, float]]) -> dict[str, int]:
 
 async def retrieve_candidates(session: AsyncSession, cfg: AppConfig, clue: HotspotClue, *,
                               embedder: EmbeddingClient | None = None,
-                              now: float | None = None) -> RetrievalOutcome:
+                              now: float | None = None,
+                              topk: int | None = None) -> RetrievalOutcome:
     """一次检索：双通道召回 → 映射成内存素材 → 融合排序 → 返回结果。
 
     输入：`session`、`cfg`（读 `[retrieval]` / `[match]` / `[embedding]`）、`clue`；
     `embedder`（可注入的向量化对象，None = 按配置现造）、`now`（时间基准，Unix 秒，可选）。
+    `topk`（可选覆盖：worker 传 `runs.topk`；None = 用 `cfg.match.topk`）。
     异常：向量召回已启用但查询向量化失败时抛 `EmbeddingError`（不降级）。
     """
     params = retrieval_tool.RetrievalParams.from_config(cfg)
+    if topk is not None:
+        params = replace(params, topk=int(topk))   # RetrievalParams 是 frozen dataclass
     outcome = RetrievalOutcome(vector_coverage=await vector_coverage(session, cfg))
 
     literal_hits = await literal_recall(session, retrieval_tool.literal_query_keywords(clue),

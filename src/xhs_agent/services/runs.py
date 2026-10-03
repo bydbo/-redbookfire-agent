@@ -5,8 +5,13 @@
 输入：`AsyncSession`、热点文本列表（可选 `topk` / `request_id` / 投递器）。
 输出：`Submission`（job_id + run_id）；查询类函数查不到时返回 `None`，由接口层折成 404。
 
-范围（S3.3）：只写 `hotspots`（按原文去重复用）+ `runs`（`queued`）+ `run_hotspots` 骨架；
-分析结果的写回（`run_matches`、统计、`prompt_versions`）与 ADR 0011 的 RunStore 改造归 S3.4a。
+范围：
+- S3.3（提交与读取）：`hotspots` 按原文去重复用 + `runs`（`queued`）+ `run_hotspots` 骨架；
+  `load_job` / `load_run` / `load_report_model` 从库里组装契约形状。
+- S3.4a（写回）：`RunRecorder` 逐热点落库（`run_hotspots` / `run_matches` / `hotspots.clue`），
+  收尾写 `runs` 的状态、统计与 `prompt_versions`；ADR 0011 的 RunStore 改造同期落地。
+
+不做（S3.4b）：Celery 接线、软/硬超时、索引新鲜度检查与"已成功即跳过"的断点续跑。
 """
 
 from __future__ import annotations
@@ -14,14 +19,16 @@ from __future__ import annotations
 import uuid
 from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, datetime
+from decimal import Decimal
 from typing import Any
 
-from sqlalchemy import func, select
+from sqlalchemy import delete, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..config import AppConfig
 from ..db.models import Hotspot, Material, Run, RunHotspot, RunMatch
+from ..schemas import SchemaError
 from ..tools import gaps as gaps_tool
 from .reporting import build_report_model
 from .retrieval import vector_coverage
@@ -236,3 +243,164 @@ async def load_report_model(session: AsyncSession, cfg: AppConfig,
         errors=errors,
         vector_coverage=coverage.to_dict(),
     )
+
+
+# ---------------------------------------------------------------------------
+# S3.4a · 分析结果写回（Repository 层；ADR 0011：DB 是运行状态的唯一权威源）
+# ---------------------------------------------------------------------------
+
+
+def match_row_values(candidate: dict[str, Any]) -> dict[str, Any]:
+    """终态候选 dict（`MatchCandidate.to_dict()`）→ `run_matches` 的字段值。
+
+    输入：候选字典（含 `rank` / `score` / `recall_sources` / `hits` / `missing` /
+          `reasons` / `usage`，外加用于排障的 `material_id`）。输出：喂给 `RunMatch(**值)`
+          的字段（**不含外键**，外键由调用方补）。
+    异常：`reasons` 为空或 `rank` 越界即抛 `SchemaError`——"不允许无理由候选"在 Pydantic
+          侧的把关；数据库侧另有 `jsonb_array_length(reasons) >= 1` 与 `rank >= 1` 的 CHECK 兜底。
+    """
+    reasons = [str(item) for item in (candidate.get("reasons") or []) if str(item).strip()]
+    if not reasons:
+        raise SchemaError(f"候选素材 {candidate.get('material_id') or '?'} 缺少 reasons")
+    rank = int(candidate.get("rank") or 0)
+    if rank < 1:
+        raise SchemaError(f"候选素材 {candidate.get('material_id') or '?'} 的 rank 必须 >= 1")
+    return {
+        "rank": rank,
+        "score": float(candidate.get("score") or 0.0),
+        "recall_sources": [str(item) for item in (candidate.get("recall_sources") or [])],
+        "hits": list(candidate.get("hits") or []),
+        "missing": list(candidate.get("missing") or []),
+        "reasons": reasons,
+        "usage": str(candidate.get("usage") or ""),
+    }
+
+
+def _candidate_material_id(candidate: dict[str, Any]) -> uuid.UUID:
+    """取候选里的素材 uuid（`material_id` 或 `material.id`），缺失即报错。"""
+    raw = candidate.get("material_id") or (candidate.get("material") or {}).get("id") or ""
+    try:
+        return uuid.UUID(str(raw))
+    except (TypeError, ValueError) as exc:
+        raise SchemaError(f"候选素材缺少可解析的 material_id：{raw!r}") from exc
+
+
+async def planned_hotspots(session: AsyncSession,
+                           run_id: uuid.UUID | str) -> list[tuple[int, str]]:
+    """按 `position` 读本次运行要分析的热点原文（worker 与写回用例的对齐入口）。
+
+    输入：`session`、`run_id`。输出：`[(position, raw_text), ...]`，与 S3.3 建骨架时的顺序一致。
+    """
+    rows = (await session.execute(
+        select(RunHotspot.position, Hotspot.raw_text)
+        .join(Hotspot, Hotspot.id == RunHotspot.hotspot_id)
+        .where(RunHotspot.run_id == uuid.UUID(str(run_id)))
+        .order_by(RunHotspot.position))).all()
+    return [(int(row.position), str(row.raw_text)) for row in rows]
+
+
+class RunRecorder:
+    """一次运行在库里的写回句柄（每跑完一个热点就落一次库）。
+
+    用途：让 `JobStatus.progress` 能由"已完成热点数 / 热点总数"推导；批次收尾再写 `runs`
+          的状态与统计。写回是**先删后插**，因此同一 run 重跑按 `(run_hotspot_id, rank)` 幂等。
+    输入：`AsyncSession` 与 `run_id`（S3.3 已建好的 `runs` 行）。
+    输出：无（就地写库）。每个写方法内部提交，失败回滚后原样上抛——不静默吞错。
+    """
+
+    def __init__(self, session: AsyncSession, run_id: uuid.UUID | str) -> None:
+        self.session = session
+        try:
+            self.run_id = uuid.UUID(str(run_id))
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"run_id 不是合法 uuid：{run_id!r}") from exc
+
+    async def _run(self) -> Run:
+        run = (await self.session.execute(
+            select(Run).where(Run.id == self.run_id))).scalar_one_or_none()
+        if run is None:
+            raise ValueError(f"run 不存在：{self.run_id}")
+        return run
+
+    async def _commit(self) -> None:
+        try:
+            await self.session.commit()
+        except BaseException:
+            await self.session.rollback()
+            raise
+
+    async def total(self) -> int:
+        """本次运行的热点总数（`run_hotspots` 行数）。"""
+        return int((await self.session.execute(
+            select(func.count()).select_from(RunHotspot)
+            .where(RunHotspot.run_id == self.run_id))).scalar_one())
+
+    async def topk(self) -> int:
+        """本次运行的截断上限（来自提交时的 `topk`）。"""
+        return int((await self._run()).topk)
+
+    async def start(self) -> None:
+        """开跑：`runs.status='running'` 并记 `started_at`。"""
+        run = await self._run()
+        run.status = RUNNING
+        run.started_at = datetime.now(UTC)
+        run.error = None
+        await self._commit()
+
+    async def load_clue(self, raw_text: str) -> dict[str, Any] | None:
+        """读该热点已有的线索快照；非空即复用（`{}` 视为没线索，返回 None）。"""
+        clue = (await self.session.execute(
+            select(Hotspot.clue)
+            .join(RunHotspot, RunHotspot.hotspot_id == Hotspot.id)
+            .where(RunHotspot.run_id == self.run_id, Hotspot.raw_text == raw_text)
+            .limit(1))).scalar_one_or_none()
+        return dict(clue) if clue else None
+
+    async def hotspot_finished(self, position: int, *, clue: dict[str, Any],
+                               coverage: dict[str, Any],
+                               candidates: list[dict[str, Any]],
+                               draft: dict[str, Any] | None, status: str,
+                               error: str = "") -> None:
+        """把一个热点的结果写回：`hotspots.clue` → `run_hotspots` → `run_matches`。
+
+        `hotspots.clue` 只在拿到非空线索时才写（失败热点可能还没有线索）；
+        `run_matches` 先按 `run_hotspot_id` 删干净再按 rank 插入，保证重跑幂等。
+        """
+        run_hotspot = (await self.session.execute(
+            select(RunHotspot).where(RunHotspot.run_id == self.run_id,
+                                     RunHotspot.position == position))).scalar_one_or_none()
+        if run_hotspot is None:
+            raise ValueError(f"run_hotspots 缺少 position={position} 的行")
+        if clue:
+            hotspot = (await self.session.execute(
+                select(Hotspot).where(Hotspot.id == run_hotspot.hotspot_id))).scalar_one()
+            hotspot.clue = dict(clue)
+        run_hotspot.status = status
+        run_hotspot.coverage = dict(coverage or {})
+        run_hotspot.draft = dict(draft) if draft else None
+        run_hotspot.error = error or None
+        await self.session.execute(
+            delete(RunMatch).where(RunMatch.run_hotspot_id == run_hotspot.id))
+        for candidate in candidates or []:
+            values = match_row_values(candidate)
+            self.session.add(RunMatch(run_hotspot_id=run_hotspot.id,
+                                      material_id=_candidate_material_id(candidate),
+                                      **values))
+        await self._commit()
+
+    async def finish(self, *, status: str, totals: dict[str, Any],
+                     prompt_versions: dict[str, int],
+                     errors: list[str]) -> None:
+        """批次收尾：写 `runs` 的状态、结束时间、LLM 统计与 `prompt_versions`。"""
+        run = await self._run()
+        run.status = status
+        run.finished_at = datetime.now(UTC)
+        run.llm_calls = int(totals.get("llm_calls") or 0)
+        run.prompt_tokens = int(totals.get("prompt_tokens") or 0)
+        run.completion_tokens = int(totals.get("completion_tokens") or 0)
+        run.cost_cny = Decimal(f"{float(totals.get('cost_cny') or 0.0):.4f}")
+        run.latency_ms = int(totals.get("latency_ms") or 0)
+        run.prompt_versions = {str(key): int(value)
+                               for key, value in (prompt_versions or {}).items()}
+        run.error = None if status == SUCCEEDED else ("；".join(errors) or "运行失败")
+        await self._commit()

@@ -139,10 +139,14 @@ class TestWorkflowSmoke:
         assert "某明星打球场被拍" in markdown
         assert "向量覆盖率 1/1（100%）" in markdown
 
-        state_path = Path(result.report_paths["markdown"]).parent / "state.json"
-        state = json.loads(state_path.read_text(encoding="utf-8"))
-        assert [step["name"] for step in state["steps"]] == list(NODE_STEPS)
-        assert Path(cfg.runs_dir()) in Path(result.report_paths["markdown"]).parents
+        # ADR 0011：状态以数据库为准，产物目录只有报告与 trace.jsonl（不再有 state.json）
+        run_dir = Path(result.report_paths["markdown"]).parent
+        assert Path(cfg.runs_dir()) in run_dir.parents
+        assert not (run_dir / "state.json").exists()
+        events = [json.loads(line) for line
+                  in (run_dir / "trace.jsonl").read_text(encoding="utf-8").splitlines()]
+        steps = [event["payload"]["name"] for event in events if event["event"] == "step_started"]
+        assert steps == list(NODE_STEPS)
 
     async def test_empty_library_still_produces_report(self, db_session: AsyncSession,
                                                       tmp_path: Path) -> None:

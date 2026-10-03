@@ -14,6 +14,7 @@
 
 from __future__ import annotations
 
+import uuid
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 
@@ -25,13 +26,14 @@ from ..config import PROJECT_ROOT, AppConfig
 from ..schemas import HotspotClue
 from ..services.reporting import build_report_model, hotspot_entry, render_and_save
 from ..services.retrieval import RetrievalOutcome, retrieve_candidates
+from ..services.runs import RunRecorder
 from ..tools import gaps as gaps_tool
 from ..tools.llm import StructuredCaller, build_provider
 from ..tools.prompt import PromptError
 from ..tools.trace import RunStore
 from .state import AnalysisState
 
-# 计划步骤：写进 RunStore.plan，用于 state.json 的 pending 计算
+# 计划步骤：写进 RunStore.plan，用于 pending_steps() 的未完成步骤计算
 NODE_STEPS: tuple[str, ...] = ("拆解", "检索", "缺口", "撰稿", "报告")
 
 
@@ -100,6 +102,12 @@ def build_graph(*, caller: StructuredCaller, retrieve: Callable[[HotspotClue], A
             store.record_llm(record)
 
     async def clue_node(state: AnalysisState) -> dict:
+        # 线索复用：同一个热点第二次分析时直接用库里已存的快照，省掉一次模型调用
+        # （数据契约 §3.2「避免重复付费」）。步骤照记，pending 计算不受影响。
+        if state.get("clue"):
+            with store.step(NODE_STEPS[0], detail="复用已有线索"):
+                pass
+            return {}
         with store.step(NODE_STEPS[0], detail=state.get("hotspot_raw", "")):
             before = len(caller.records)
             outcome = extract_clue(state["hotspot_raw"], caller)
@@ -186,23 +194,41 @@ def build_graph(*, caller: StructuredCaller, retrieve: Callable[[HotspotClue], A
 async def run_analysis(hotspots: list[str], *, cfg: AppConfig, session, store: RunStore | None = None,
                        caller: StructuredCaller | None = None, embedder=None,
                        now: float | None = None, style: str = DEFAULT_STYLE,
-                       retry_policy: RetryPolicy | None = None) -> RunResult:
+                       retry_policy: RetryPolicy | None = None,
+                       run_id: str | uuid.UUID | None = None,
+                       topk: int | None = None) -> RunResult:
     """跑一批热点：循环调用五节点图，返回 `RunResult`。
 
     输入：热点原文列表、`AppConfig`、异步会话；`store` / `caller` / `embedder` 可注入（测试用）。
-    输出：`RunResult`——`prompt_versions` 在这里汇总，供 S3.4 写进 `runs.prompt_versions`。
+    `run_id` 传入即进入**写回模式**（ADR 0011）：本批对应库里一条 `runs` 行，热点顺序按
+      `run_hotspots.position` 对齐，每个热点跑完立即落库，收尾写 `runs` 的状态与统计；
+      不传 `run_id` 时保持纯离线行为（完全不碰库），评测脚本与既有单测沿用这条路径。
+    `topk` 显式传入时优先，其次读 `runs.topk`，都没有才用 `cfg.match.topk`。
+    输出：`RunResult`——`prompt_versions` 在这里汇总，写回模式下同时已落 `runs.prompt_versions`。
     """
     raws = [str(item).strip() for item in hotspots if str(item or "").strip()]
     if not raws:
         raise ValueError("至少需要一个非空的热点原文")
 
+    recorder = RunRecorder(session, run_id) if run_id is not None else None
+    effective_topk = topk
+    if effective_topk is None and recorder is not None:
+        effective_topk = await recorder.topk()   # 收口 S3.3 的 runs.topk：提交时的 topk 真的影响检索
+    if recorder is not None:
+        total = await recorder.total()
+        if total != len(raws):
+            raise ValueError(f"热点数量与 run_hotspots 不一致：传入 {len(raws)}、库里 {total}")
+        await recorder.start()
+
     store = store if store is not None else RunStore(cfg.runs_dir(), slug=raws[0],
-                                                     meta={"hotspots": len(raws)})
+                                                     meta={"hotspots": len(raws)},
+                                                     run_id=str(run_id) if run_id else None)
     store.plan(list(NODE_STEPS))
     caller = caller if caller is not None else StructuredCaller(provider=build_provider(cfg))
 
     async def retrieve(clue: HotspotClue):
-        return await retrieve_candidates(session, cfg, clue, embedder=embedder, now=now)
+        return await retrieve_candidates(session, cfg, clue, embedder=embedder, now=now,
+                                         topk=effective_topk)
 
     graph = build_graph(caller=caller, retrieve=retrieve, store=store,
                         style=style, retry_policy=retry_policy)
@@ -219,19 +245,37 @@ async def run_analysis(hotspots: list[str], *, cfg: AppConfig, session, store: R
     failed: list[dict] = []
     report_paths: dict[str, str] = {}
 
-    for raw in raws:
+    for position, raw in enumerate(raws, start=1):
+        initial: dict = {"hotspot_raw": raw, "report_model": model,
+                         "prompt_versions": versions, "errors": errors}
+        reused = await recorder.load_clue(raw) if recorder is not None else None
+        if reused:
+            initial["clue"] = reused      # 预置线索 → 拆解节点短路，不再付费
         try:
-            result = await graph.ainvoke({"hotspot_raw": raw, "report_model": model,
-                                          "prompt_versions": versions, "errors": errors})
+            result = await graph.ainvoke(initial)
         except Exception as exc:  # 节点重试后仍失败：记进报告，不阻断整批
             detail = f"{type(exc).__name__}: {exc}"
             errors = [*errors, f"[{raw}] {detail}"]
-            failed.append(hotspot_entry(clue={}, coverage={}, candidates=[], error=detail))
+            failed.append(hotspot_entry(clue=reused or {}, coverage={}, candidates=[],
+                                        error=detail))
+            if recorder is not None:
+                await recorder.hotspot_finished(position, clue=reused or {}, coverage={},
+                                                candidates=[], draft=None,
+                                                status="failed", error=detail)
             continue
         model = result.get("report_model") or model
         versions = result.get("prompt_versions") or versions
         errors = result.get("errors") or errors
         report_paths = result.get("report_paths") or report_paths
+        if recorder is not None:
+            await recorder.hotspot_finished(
+                position,
+                clue=result.get("clue") or reused or {},
+                coverage=(result.get("retrieval") or {}).get("coverage") or {},
+                candidates=(result.get("retrieval") or {}).get("candidates") or [],
+                draft=result.get("draft"),
+                status="succeeded",
+            )
 
     if failed:
         model = {**model, "hotspots": [*(model.get("hotspots") or []), *failed],
@@ -241,6 +285,9 @@ async def run_analysis(hotspots: list[str], *, cfg: AppConfig, session, store: R
 
     status = "succeeded" if not errors else "failed"
     store.finalize(status=status, notes="；".join(errors))
+    if recorder is not None:
+        await recorder.finish(status=status, totals=dict(store.state["totals"]),
+                              prompt_versions=versions, errors=errors)
     return RunResult(
         run_id=store.run_id,
         status=status,

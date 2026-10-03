@@ -17,11 +17,21 @@ from .materials import (
     sync_materials,
 )
 from .retrieval import RetrievalOutcome, VectorCoverage, retrieve_candidates
-from .runs import Submission, load_job, load_report_model, load_run, submit_analysis
+from .runs import (
+    RunRecorder,
+    Submission,
+    load_job,
+    load_report_model,
+    load_run,
+    match_row_values,
+    planned_hotspots,
+    submit_analysis,
+)
 
 __all__ = [
     "EmbeddingBackfillReport",
     "RetrievalOutcome",
+    "RunRecorder",
     "SyncPlan",
     "SyncReport",
     "Submission",
@@ -30,7 +40,9 @@ __all__ = [
     "load_job",
     "load_report_model",
     "load_run",
+    "match_row_values",
     "plan_sync",
+    "planned_hotspots",
     "retrieve_candidates",
     "row_to_material",
     "submit_analysis",

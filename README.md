@@ -34,7 +34,7 @@
 | 素材扫描与索引（旁车文件／文件名／视觉打标，增量更新） | ✅ 已完成 |
 | 相关性打分与覆盖度计算 | ✅ 已完成 |
 | 报告渲染（HTML + Markdown）与运行追踪 | ✅ 已完成 |
-| `agents/` 与 `workflows/` 编排层 | ⬜ 未实现 |
+| `agents/` 与 `workflows/` 编排层 | ✅ 已完成（S3.1） |
 | 本地依赖编排（PostgreSQL 16 + pgvector、Redis，Docker Compose） | ✅ 已完成（S2.1） |
 | 集成测试基座（testcontainers + pytest-asyncio） | ✅ 已完成（S2.9） |
 | 数据库 ORM 与会话（五张表、14 条索引、向量列） | ✅ 已完成（S2.2） |
@@ -45,6 +45,7 @@
 | LangGraph 五节点状态图（拆解 → 检索 → 缺口 → 撰稿 → 报告）与三条 agent prompt 正文 | ✅ 已完成（S3.1） |
 | FastAPI 应用骨架（`/api` 路由树、统一错误响应、`X-Request-ID`） | ✅ 已完成（S3.2） |
 | 五个接口实现（`/api` 前缀：health / analyze / jobs / runs / report） | ✅ 已完成（S3.3） |
+| 分析结果写回（`run_matches` / 统计 / `prompt_versions` 落库，RunStore 退化为产物目录） | ✅ 已完成（S3.4a） |
 | Alembic 数据库迁移（唯一建表路径） | ✅ 已完成（S2.3） |
 | 评测集 v1 与示例素材包（七维度口径、版本冻结） | ✅ 已完成（S2.0） |
 | 服务入口（FastAPI）与编排层 | ⬜ 未实现 |

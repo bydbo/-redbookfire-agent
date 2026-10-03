@@ -86,6 +86,8 @@ files = [
     "src/xhs_agent/tools/retrieval.py",
     "src/xhs_agent/tools/embedding.py",
     "src/xhs_agent/tools/prompt.py",
+    # S3.4a 改写了运行记录落盘（停写 state.json）——运行产物与事件流的核心，纳入严格范围
+    "src/xhs_agent/tools/trace.py",
     # E3 新增的 HTTP 层与核心层（S3.2）：对外错误语义与请求上下文，类型错误代价高
     "src/xhs_agent/api",
     "src/xhs_agent/core",

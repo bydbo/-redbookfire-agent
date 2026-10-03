@@ -1,4 +1,8 @@
-"""运行追踪单测：结构、计数、落盘。时间戳只断言「有值」，不断言具体时间。"""
+"""运行追踪单测：结构、计数、事件流。时间戳只断言「有值」，不断言具体时间。
+
+ADR 0011 起 `RunStore` **不再落 `state.json`**（运行状态以数据库为准），本文件据此更新：
+只断言 `trace.jsonl` 的事件与内存态，并新增"产物目录里没有 state.json"与"注入 run_id"两条。
+"""
 
 from __future__ import annotations
 
@@ -20,6 +24,14 @@ class TestInit:
     def test_run_id_and_directory(self, store, tmp_path):
         assert re.fullmatch(r"\d{8}-\d{6}-.+", store.run_id)
         assert pathlib.Path(store.dir).parent == tmp_path / "runs"
+        assert pathlib.Path(store.dir).is_dir()
+
+    def test_injected_run_id_becomes_directory_name(self, tmp_path):
+        """worker 传 DB 的 run_id：产物目录就是 runs/<run_id>/（ADR 0011）。"""
+        run_id = "362cc22a-8d5e-4b7d-8a92-857cb6705f2c"
+        store = trace.RunStore(str(tmp_path / "runs"), "忽略的 slug", run_id=run_id)
+        assert store.run_id == run_id
+        assert pathlib.Path(store.dir) == tmp_path / "runs" / run_id
         assert pathlib.Path(store.dir).is_dir()
 
     def test_initial_state_shape(self, store):
@@ -66,11 +78,15 @@ class TestSteps:
         assert step["status"] == "failed"
         assert step["error"] == "KeyboardInterrupt: "
 
-    def test_base_exception_status_is_persisted(self, store):
+    def test_base_exception_is_logged_to_trace(self, store):
+        """中断也要留事件流（state.json 已停写，事件流是唯一的落盘证据）。"""
         with pytest.raises(SystemExit), store.step("报告"):
             raise SystemExit(2)
-        payload = json.loads(pathlib.Path(store.dir, "state.json").read_text(encoding="utf-8"))
-        assert payload["steps"][0]["status"] == "failed"
+        events = [json.loads(line) for line
+                  in pathlib.Path(store.trace_path).read_text(encoding="utf-8").splitlines()]
+        failed = [event for event in events if event["event"] == "step_failed"]
+        assert failed and failed[0]["payload"]["name"] == "报告"
+        assert "SystemExit" in failed[0]["payload"]["error"]
 
     def test_steps_are_kept_in_order(self, store):
         with store.step("一"):
@@ -117,16 +133,24 @@ class TestPlanAndFinalize:
         store.plan(["拆解", "检索", "撰稿"])
         with store.step("拆解"):
             pass
-        store.save_state()
-        assert store.state["pending"] == ["检索", "撰稿"]
+        assert store.pending_steps() == ["检索", "撰稿"]
 
-    def test_finalize_writes_state_file(self, store):
+    def test_finalize_marks_status_and_returns_run_dir(self, store):
         path = store.finalize(status="succeeded", notes="完成")
-        assert path.endswith("state.json")
-        payload = json.loads(pathlib.Path(path).read_text(encoding="utf-8"))
-        assert payload["status"] == "succeeded"
-        assert payload["finished_at"]
-        assert payload["notes"] == "完成"
+        assert path == store.dir
+        assert store.state["status"] == "succeeded"
+        assert store.state["finished_at"]
+        assert store.state["notes"] == "完成"
+
+    def test_no_state_json_is_written(self, store):
+        """ADR 0011：运行状态以数据库为准，产物目录里不许再出现 state.json。"""
+        with store.step("拆解"):
+            pass
+        store.save_text("report.md", "x")
+        store.finalize()
+        assert not pathlib.Path(store.dir, "state.json").exists()
+        assert sorted(item.name for item in pathlib.Path(store.dir).iterdir()) == \
+            ["report.md", "trace.jsonl"]
 
     def test_trace_lines_are_json_events(self, store):
         store.finalize()

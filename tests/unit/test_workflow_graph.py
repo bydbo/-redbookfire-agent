@@ -86,14 +86,17 @@ def make_outcome(*, with_candidate: bool = True) -> RetrievalOutcome:
 
 
 def fake_retrieve(outcome: RetrievalOutcome):
-    """记下每次调用的线索，固定返回预置结果。"""
+    """记下每次调用的线索与 topk 覆盖，固定返回预置结果（签名对齐 retrieve_candidates）。"""
     calls: list[str] = []
+    topks: list[int | None] = []
 
-    async def _retrieve(session, cfg, clue, *, embedder=None, now=None):
+    async def _retrieve(session, cfg, clue, *, embedder=None, now=None, topk=None):
         calls.append(clue.hotspot_raw)
+        topks.append(topk)
         return outcome
 
     _retrieve.calls = calls  # type: ignore[attr-defined]
+    _retrieve.topks = topks  # type: ignore[attr-defined]
     return _retrieve
 
 
@@ -141,6 +144,7 @@ class TestRunAnalysis:
         assert result.prompt_versions == {"hotspot_clue": 1, "material_select": 1,
                                           "copy_draft": 1}
         assert retrieve.calls == ["某明星打羽毛球"]
+        assert retrieve.topks == [None]        # 没传 run_id / topk 时不做覆盖
         assert len(result.hotspots) == 1
 
         entry = result.hotspots[0]
@@ -150,14 +154,17 @@ class TestRunAnalysis:
         assert entry["draft"]["body"] == "正文……"
         assert entry["coverage"]["ratio"] == 1.0
 
-        state_path = Path(result.report_paths["markdown"]).parent / "state.json"
-        state = json.loads(state_path.read_text(encoding="utf-8"))
-        assert [step["name"] for step in state["steps"]] == list(NODE_STEPS)
-        assert all(step["status"] == "succeeded" for step in state["steps"])
-        assert state["pending"] == []
-        assert set(state["artifacts"]) >= {"report.md", "report.html"}
-        assert state["totals"]["llm_calls"] == 3
-        assert state["totals"]["cost_cny"] == pytest.approx(0.0003)
+        # ADR 0011：运行状态以数据库为准，产物目录只留 trace.jsonl 与报告（不再有 state.json）
+        run_dir = Path(result.report_paths["markdown"]).parent
+        assert not (run_dir / "state.json").exists()
+        events = [json.loads(line) for line
+                  in (run_dir / "trace.jsonl").read_text(encoding="utf-8").splitlines()]
+        steps = [event["payload"]["name"] for event in events if event["event"] == "step_started"]
+        assert steps == list(NODE_STEPS)
+        assert events[-1]["event"] == "run_finished"
+        assert events[-1]["payload"]["status"] == "succeeded"
+        assert events[-1]["payload"]["totals"]["llm_calls"] == 3
+        assert events[-1]["payload"]["totals"]["cost_cny"] == pytest.approx(0.0003)
 
     @pytest.mark.asyncio
     async def test_report_contains_hotspot_and_vector_coverage(self, cfg, monkeypatch):
@@ -241,3 +248,32 @@ class TestRunAnalysis:
                                     caller=StructuredCaller(provider=FakeProvider()))
         assert result.run_id == store.run_id
         assert Path(result.report_paths["markdown"]).parent == Path(store.dir)
+
+    @pytest.mark.asyncio
+    async def test_explicit_topk_is_forwarded_to_retrieval(self, cfg, monkeypatch):
+        """显式 topk 会透传到检索层（收口 runs.topk：提交时传的上限必须真的生效）。"""
+        retrieve = fake_retrieve(make_outcome())
+        monkeypatch.setattr(workflow, "retrieve_candidates", retrieve)
+        await run_analysis(["热点"], cfg=cfg, session=None, topk=3,
+                           caller=StructuredCaller(provider=FakeProvider()))
+        assert retrieve.topks == [3]
+
+    @pytest.mark.asyncio
+    async def test_preset_clue_skips_extraction(self, cfg, tmp_path):
+        """线索复用：state 预置 clue 时拆解节点不调模型，但步骤照记（数据契约 §3.2）。"""
+        store = RunStore(str(tmp_path / "runs"), "复用")
+        provider = FakeProvider()
+        fake = fake_retrieve(make_outcome())
+
+        async def retrieve(clue):
+            return await fake(None, None, clue)   # build_graph 的 retrieve 只吃线索
+
+        graph = workflow.build_graph(caller=StructuredCaller(provider=provider),
+                                     retrieve=retrieve, store=store)
+        state = await graph.ainvoke({"hotspot_raw": "某明星打羽毛球", "clue": CLUE_PAYLOAD})
+        assert "hotspot_clue" not in provider.tasks
+        assert provider.tasks == ["material_select", "copy_draft"]
+        assert state["clue"] == CLUE_PAYLOAD
+        steps = store.state["steps"]
+        assert [step["name"] for step in steps] == list(NODE_STEPS)
+        assert steps[0]["detail"] == "复用已有线索"
