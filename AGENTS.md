@@ -25,6 +25,8 @@
 | `src/xhs_agent/workflows/` | 把各步骤串成一次完整运行                                  | 底层算法实现     |
 | `src/xhs_agent/db/`        | SQLAlchemy ORM 模型、会话工厂与引擎（表结构以数据契约为准）        | 业务流程、查询逻辑 |
 | `src/xhs_agent/services/`  | 用例层：一次场景化操作（素材索引同步、分析、报告）；编排 tools/db/agents | 底层算法、HTTP 接口 |
+| `src/xhs_agent/api/`       | FastAPI 路由、依赖注入与错误响应（统一 `/api` 前缀，ADR 0009）        | 业务逻辑、数据访问 |
+| `src/xhs_agent/core/`      | 配置、日志、异常与常量（跨层共用）                                | 业务流程、HTTP 路由 |
 | `src/xhs_agent/prompts/` | prompt 资产：一任务一份 Markdown，五段结构（契约见 `docs/contracts/prompt契约.md`） | 代码、逻辑实现 |
 | `alembic/`                 | 数据库迁移脚本（唯一建表路径；`alembic.ini` 在工程根）              | 业务代码、手工改库 |
 | `tests/`                   | 单元测试与集成测试                                     | 运行产物、真实素材  |
@@ -96,8 +98,8 @@
 
 | 类型 | 规则 | 当前状态 |
 | --- | --- | --- |
-| 运行时依赖 | 必须走第 6 节流程才能引入；引入后同步更新 `docs/技术栈.md` | pydantic 2.x + pydantic-settings 2.x + python-dotenv（S1.1 / S1.2）、sqlalchemy[asyncio] + asyncpg + pgvector + alembic（S2.9 / S2.2 / S2.3）、langgraph（S3.1，见 `docs/技术栈.md`） |
-| 开发依赖 | 允许测试与代码质量工具 | `pytest`、`pytest-cov`、`pytest-asyncio`、`testcontainers[redis]`、`ruff`、`mypy`、`pre-commit`（版本见 `docs/技术栈.md`） |
+| 运行时依赖 | 必须走第 6 节流程才能引入；引入后同步更新 `docs/技术栈.md` | pydantic 2.x + pydantic-settings 2.x + python-dotenv（S1.1 / S1.2）、sqlalchemy[asyncio] + asyncpg + pgvector + alembic（S2.9 / S2.2 / S2.3）、langgraph（S3.1）、fastapi + uvicorn（S3.2，见 `docs/技术栈.md`） |
+| 开发依赖 | 允许测试与代码质量工具 | `pytest`、`pytest-cov`、`pytest-asyncio`、`testcontainers[redis]`、`httpx`（S3.2 起供 `TestClient`，S3.5 转运行时）、`ruff`、`mypy`、`pre-commit`（版本见 `docs/技术栈.md`） |
 | 系统级依赖 | 仅指外部程序依赖；缺失时只影响对应能力 | `ffmpeg` / `ffprobe` |
 | 前端依赖 | 由 `frontend/package.json` 管理；直接依赖需在提交信息写明理由，禁止引入第二套组件库或状态管理方案 | pnpm 11.25.0 + Node 25.3.0 |
 
@@ -192,7 +194,7 @@
 
 1. 测试通过：`uv run pytest` 全绿；新增功能带用例，涉及外部依赖的补集成用例；
 2. 契约一致：实现与 `docs/contracts/` 无偏差；有偏差先改契约文件并在提交信息中说明原因；
-3. 质量门通过：`uv run ruff check .` 零告警、`uv run mypy` 零错误（mypy 严格模式目前只覆盖 `schemas.py`、`config.py`、`probe.py`，存量模块逐阶段收紧）；
+3. 质量门通过：`uv run ruff check .` 零告警、`uv run mypy` 零错误（严格模式的覆盖范围见 `pyproject.toml` 的 `[tool.mypy].files`，存量模块逐阶段收紧）；
 4. 文档同步：行为变化更新 `README.md` 与 `docs/项目结构.md`；规则变化更新本文件；
 5. 成本可查：涉及模型调用的改动，在 `runs` 记录与报告里能看到 token 与成本；
 6. 提交规范：一次提交只做一件事，信息前缀符合第 7 节约定。
@@ -201,7 +203,7 @@
 
 ## 当前项目状态（规范的诚实边界）
 
-- 已完成：数据契约（S1.1）、配置加载与启动前置检查（S1.2）、质量门与覆盖率（S1.3–S1.5）、爆点词典、模型调用层、素材扫描与索引、要素级匹配与规则解释、报告渲染、运行追踪；P2 已全部完成（S2.0–S2.9：本地依赖编排、集成测试基座、ORM 与会话、Alembic 迁移、评测集 v1、素材索引入库、向量回填、双通道召回与 RRF、离线链路清理、检索层基线对比）；E3 已完成 prompt 契约（S3.0）、LangGraph 五节点状态图与三条 agent prompt 正文（S3.1）与 prompt 版本落库（S3.9）。
+- 已完成：数据契约（S1.1）、配置加载与启动前置检查（S1.2）、质量门与覆盖率（S1.3–S1.5）、爆点词典、模型调用层、素材扫描与索引、要素级匹配与规则解释、报告渲染、运行追踪；P2 已全部完成（S2.0–S2.9：本地依赖编排、集成测试基座、ORM 与会话、Alembic 迁移、评测集 v1、素材索引入库、向量回填、双通道召回与 RRF、离线链路清理、检索层基线对比）；E3 已完成 prompt 契约（S3.0）、LangGraph 五节点状态图与三条 agent prompt 正文（S3.1）、FastAPI 应用骨架（S3.2：`/api` 路由树 + 契约一致的错误响应 + `X-Request-ID`）与 prompt 版本落库（S3.9）。
 - 运行时降级已取消（ADR 0001）：`tools/offline.py` 与 `OfflineProvider` 已在 S2.7 删除，不存在"无密钥也能跑"的路径；缺密钥、缺依赖一律失败并报错。
-- 尚未实现：FastAPI 服务入口与 Celery 异步任务（S3.2–S3.8）、`runs` / `run_hotspots` / `run_matches` 的落库接线（S3.4a）、前端（E5）。当前可直接运行 `docker compose up -d --wait`、`uv run python -m xhs_agent.probe`、`uv run python scripts/index_materials.py`、`uv run python scripts/backfill_embeddings.py`、`uv run python scripts/eval_retrieval.py`；五节点工作流是可直接调用的服务（`xhs_agent.workflows.run_analysis`），但还没有 HTTP 入口。
+- 尚未实现：五个业务接口的实现（S3.3）、Celery 异步任务（S3.4b）、`runs` / `run_hotspots` / `run_matches` 的落库接线（S3.4a）、前端（E5）。当前可直接运行 `docker compose up -d --wait`、`uv run python -m xhs_agent.probe`、`uv run python scripts/index_materials.py`、`uv run python scripts/backfill_embeddings.py`、`uv run python scripts/eval_retrieval.py`、`uv run uvicorn xhs_agent.api.main:app`（HTTP 骨架已能启动，`/api` 下还没有业务接口）。
 - 记录以上状态是为了让 AI 与合作者先看清事实，不要把"计划要实现的东西"当成"已经有的东西"。

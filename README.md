@@ -43,12 +43,13 @@
 | 双通道召回 + RRF + 要素加权（素材检索服务） | ✅ 已完成（S2.6） |
 | 检索层基线对比评测（纯字面基线 vs 混合召回，报告落 `evals/reports/`） | ✅ 已完成（S2.8） |
 | LangGraph 五节点状态图（拆解 → 检索 → 缺口 → 撰稿 → 报告）与三条 agent prompt 正文 | ✅ 已完成（S3.1） |
+| FastAPI 应用骨架（`/api` 路由树、统一错误响应、`X-Request-ID`） | ✅ 已完成（S3.2） |
 | Alembic 数据库迁移（唯一建表路径） | ✅ 已完成（S2.3） |
 | 评测集 v1 与示例素材包（七维度口径、版本冻结） | ✅ 已完成（S2.0） |
 | 服务入口（FastAPI）与编排层 | ⬜ 未实现 |
 | 前端单页应用（Vue 3 + Vite） | ⬜ 未实现 |
 
-当前可运行的是本地依赖编排、启动前置检查、素材索引入库、向量回填与检索层评测（`docker compose up -d --wait`、`uv run python -m xhs_agent.probe`、`uv run python scripts/index_materials.py`、`uv run python scripts/backfill_embeddings.py`、`uv run python scripts/eval_retrieval.py`）；素材检索与五节点工作流都是可调用的服务（`xhs_agent.services.retrieve_candidates`、`xhs_agent.workflows.run_analysis`），但还没有 HTTP 入口与异步任务，业务链路尚未打通。路线图见文末。
+当前可运行的是本地依赖编排、启动前置检查、素材索引入库、向量回填、检索层评测与 HTTP 服务骨架（`docker compose up -d --wait`、`uv run python -m xhs_agent.probe`、`uv run python scripts/index_materials.py`、`uv run python scripts/backfill_embeddings.py`、`uv run python scripts/eval_retrieval.py`、`uv run uvicorn xhs_agent.api.main:app`）；素材检索与五节点工作流都是可调用的服务（`xhs_agent.services.retrieve_candidates`、`xhs_agent.workflows.run_analysis`），但 `/api` 下还没有业务接口、也还没有异步任务，业务链路尚未打通。路线图见文末。
 
 ---
 
@@ -60,8 +61,8 @@
 | --- | --- |
 | 语言 | Python ≥ 3.11 |
 | 包管理与构建 | uv + `pyproject.toml`（hatchling 后端，src 布局） |
-| 运行时依赖 | pydantic v2、pydantic-settings、python-dotenv、SQLAlchemy 2.0 async + asyncpg、pgvector、alembic、langgraph |
-| 开发依赖 | pytest、pytest-cov、pytest-asyncio、testcontainers、ruff、mypy、pre-commit |
+| 运行时依赖 | pydantic v2、pydantic-settings、python-dotenv、SQLAlchemy 2.0 async + asyncpg、pgvector、alembic、langgraph、fastapi + uvicorn |
+| 开发依赖 | pytest、pytest-cov、pytest-asyncio、testcontainers、httpx、ruff、mypy、pre-commit |
 | 文本模型接入 | OpenAI 兼容 `/chat/completions` 协议（默认 DeepSeek），标准库 `urllib` 直连，JSON mode 结构化输出 + 解析失败自修 |
 | 多模态接入 | 通义千问 VL（`qwen-vl-max`），关键帧 base64 内联 |
 | 音视频处理 | ffmpeg / ffprobe（用于探测与抽帧；缺失时跳过抽帧，属能力裁剪） |
@@ -137,6 +138,10 @@ uv run python -m xhs_agent.probe
 # 10. （可选）跑检索层基线对比评测：临时库只装 demo_pack，真实回填向量后两臂对照
 #     结果落 evals/reports/retrieval-v1-<日期>.md；需要 Docker 与真实 DASHSCOPE_API_KEY
 uv run python scripts/eval_retrieval.py
+
+# 11. 起 HTTP 服务（骨架：/api 路由树 + 统一错误响应 + X-Request-ID；业务接口在 S3.3）
+uv run uvicorn xhs_agent.api.main:app --port 8000
+#    文档页：http://127.0.0.1:8000/api/docs（挂在 /api 下，非 /api 路径留给前端单页应用）
 ```
 
 网络受限时：`uv sync --no-dev` 只装运行时环境（pydantic / pydantic-settings / python-dotenv / SQLAlchemy async + asyncpg / pgvector / alembic）；不过 `import xhs_agent` 仍然需要安装或设置 `PYTHONPATH=src`（src 布局）。
