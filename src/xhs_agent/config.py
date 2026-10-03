@@ -103,8 +103,10 @@ class LLMConfig(_Section):
     model: str = "deepseek-flash"
     api_key_env: str = "DEEPSEEK_API_KEY"
     temperature: float = Field(0.6, ge=0, le=2)
-    max_tokens: int = Field(2000, ge=1, le=32768)
-    timeout_s: int = Field(60, ge=1, le=600)
+    # max_tokens 是含推理 token 的总输出预算：推理模型先扣 reasoning_tokens，给不足会拿到
+    # 截断或空 content（S3.5 验收实测 reasoning 1.8k–4.1k；见《配置契约》§3.1）
+    max_tokens: int = Field(16000, ge=1, le=32768)
+    timeout_s: int = Field(120, ge=1, le=600)
     max_retries: int = Field(2, ge=0, le=10)
     # 成本估算单价（人民币元/百万 token）＝ DeepSeek 高价时段单价（$0.3 / $1.2）× 汇率 7.2
     price_in_per_m: float = Field(2.16, ge=0)

@@ -208,6 +208,10 @@ class TestAppConfigSurface:
         cfg = AppConfig()
         assert cfg.llm.provider == "openai_compatible"
         assert cfg.llm.api_key_env == "DEEPSEEK_API_KEY"
+        # max_tokens 是含推理 token 的总输出预算（配置契约 §3.1）：推理模型先扣思考量，
+        # 默认值必须留足余量，否则 content 会被截断或为空
+        assert cfg.llm.max_tokens == 16000
+        assert cfg.llm.timeout_s == 120
         assert cfg.vision.enabled is False
         # 向量召回是产品主线，S2.5 起默认启用（配置契约 §3.3）
         assert cfg.embedding.enabled is True

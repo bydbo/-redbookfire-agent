@@ -14,8 +14,12 @@ base_url = "https://api.deepseek.com/v1"
 model = "deepseek-flash"            # 2026-07-24 起 deepseek-chat 已停用；现役名称 deepseek-flash / deepseek-v4-pro
 api_key_env = "DEEPSEEK_API_KEY"    # 密钥变量名：值写在 config/.env 或环境变量里，本文件不放密钥
 temperature = 0.6
-max_tokens = 2000
-timeout_s = 60
+# max_tokens 是**含推理 token 的总输出预算**（completion_tokens = reasoning_tokens + 正文）。
+# deepseek-flash 是推理模型：实测同一 prompt 的 reasoning_tokens 在 1.8k–4.1k 之间波动，
+# 2000 会被思考量吃光（finish_reason=length，content 为空或被截断）。模型侧上限 393216。
+max_tokens = 16000
+# 推理耗时随 token 上升（实测单次 10–20 秒），留两倍余量，避免被当成上游错误重试
+timeout_s = 120
 max_retries = 2
 # 成本估算单价（人民币元/百万 token），仅用于成本估算
 # 由 DeepSeek deepseek-flash 官方美元价 × 汇率 7.2 折算，取高价时段以免低估
