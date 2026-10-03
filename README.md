@@ -48,6 +48,7 @@
 | 分析结果写回（`run_matches` / 统计 / `prompt_versions` 落库，RunStore 退化为产物目录） | ✅ 已完成（S3.4a） |
 | 分析主链路 HTTP 异步化（文本模型与向量共用 httpx 连接池，去掉 `asyncio.to_thread`） | ✅ 已完成（S3.5） |
 | Celery worker 接线（`POST /api/analyze` 真投递 → 消费 → 索引新鲜度 → 分析 → 写回） | ✅ 已完成（S3.4b） |
+| Walking Skeleton 端到端联调（一键脚本：起进程 → 投热点 → 验候选与报告 → 落样例报告） | ✅ 已完成（S3.6） |
 | Alembic 数据库迁移（唯一建表路径） | ✅ 已完成（S2.3） |
 | 评测集 v1 与示例素材包（七维度口径、版本冻结） | ✅ 已完成（S2.0） |
 | 服务入口（FastAPI）与编排层 | ⬜ 未实现 |
@@ -160,6 +161,14 @@ curl -s -X POST http://127.0.0.1:8000/api/analyze -H "Content-Type: application/
   -d '{"hotspots": ["某明星打羽毛球场被拍，反差感拉满"], "topk": 5}'
 #    拿返回的 job_id 轮询 /api/jobs/{job_id}，succeeded 后用 run_id 取 /api/runs/{run_id}
 #    与 /api/runs/{run_id}/report?format=html
+
+# 14. 一键跑通 Walking Skeleton（推荐先用它验证环境）
+#     自己起 uvicorn + Celery worker、素材库为空时种入示例素材包、投 case-01 的热点、
+#     轮询到终态、核对"至少 1 条候选且带命中要素与理由"与完整 HTML 报告，跑完回收进程。
+#     **真实调用模型**（一个热点约 3 次调用，成本几分钱）；样例报告落
+#     evals/reports/skeleton-<日期>.html|md，这次运行会留在库里可回看。
+uv run python scripts/smoke_skeleton.py
+#     只驱动已起的服务：--api-url http://127.0.0.1:8000；不种素材：--no-seed
 ```
 
 > **`[frontend]` 段怎么起作用**：`serve = true`（默认）且 `frontend/dist` 存在且非空时，FastAPI 会把 dist 挂在根路径，并把 `/api` 之外的未命中路径（无扩展名的）回落成 `index.html`——前端 history 路由刷新不会 404；带扩展名的未命中仍返回 404，API 的 404 也照旧是 `not_found` 的 JSON。dist 不存在时 API 照常启动、`/` 返回 404 JSON（"dist 缺失即中止启动"归 S3.8）。本地纯后端开发可以把 `[frontend].serve` 设为 `false`；前端源码与 `pnpm build` 属 E5。
