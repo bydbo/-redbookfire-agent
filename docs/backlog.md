@@ -18,9 +18,9 @@
 | E1 工程骨架 | 建立契约与质量基线，行为不变 | 7.5 | ✅ 已完成 | M2 |
 | E2 数据与检索 | 持久化 + 语义召回，产出评测数字 | 20 | 🔄 进行中 | M3 |
 | E3 编排与服务 | 服务化与异步，端到端可演示 | 20.5 | ✅ 已完成（S3.0–S3.10） | M4 |
-| E4 可观测与交付 | 可运维、可交付 | 7.5 | ⬜ 未开始 | M5 |
+| E4 可观测与交付 | 可运维、可交付 | 8 | ⬜ 未开始 | M5 |
 | E5 前端工程 | 把演示页升级为可交互的单页应用 | 17 | ⬜ 未开始 | M6 |
-| **合计** | | **76** | | |
+| **合计** | | **76.5** | | |
 
 全职投入约 9 周；按每天 3 小时的业余节奏约 5 个月。总量比初版（41.5）增加 26 人日：前端 Epic 17、API 前缀与静态挂载 1、完整 preflight 1.5、mypy 收紧 0.5、E2 净增 5（集成测试基座 +3、评测集与示例素材包 +3、对比脚本精简 −1）、E1 落地时的范围调整 1（S1.2 配置段全量 +0.5、S1.4 覆盖 8 个模块 +0.5）。
 
@@ -88,10 +88,10 @@
 
 | 编号 | Story | 依赖 | 验收标准 | 人日 | 状态 |
 | --- | --- | --- | --- | --- | --- |
-| S4.1 | structlog + run_id 贯穿 | S3.2 | 每条日志带 run_id 与 request_id；JSON 输出可被检索 | 1 | ⬜ |
+| S4.1 | structlog + run_id 贯穿 + 陈旧 run 对账 | S3.2 | 每条日志带 run_id 与 request_id；JSON 输出可被检索；**并做 stale run 对账**——把 `running` 且 `started_at` 超过 `task_time_limit_s × 2` 的行标成 `failed`（worker 启动时或 beat 定时），覆盖 worker 崩溃吞任务与硬超时 SIGKILL 的窄场景（E3 审查建议 3） | 1.5 | ⬜ |
 | S4.2 | Langfuse 接入 | S4.1 | 模型调用可看到 token、成本、延迟；`LANGFUSE_*` 不齐时只告警不阻断 | 1 | ⬜ |
 | S4.3 | OpenTelemetry 追踪 | S4.1 | 一次请求可从 API 追到数据库与模型调用 | 1.5 | ⬜ |
-| S4.4 | 多阶段 Dockerfile + 全栈 compose | S3.4b | `docker compose up` 一条命令起 api / worker / postgres / redis | 2 | ⬜ |
+| S4.4 | 多阶段 Dockerfile + 全栈 compose | S3.4b | `docker compose up` 一条命令起 api / worker / postgres / redis；**lifespan 关闭时释放进程级资源**（`await get_engine().dispose()` 并清 `get_config` 缓存），保证 SIGTERM 优雅停机（E3 审查建议 6） | 2 | ⬜ |
 | S4.5 | GitHub Actions CI | S1.3, S1.4 | lint + typecheck + test 三关通过（推送后生效） | 1 | ⬜ |
 | S4.6 | 契约一致性校验进 CI | S4.5, S3.3 | FastAPI 导出的 schema 与 `openapi.yaml` 不一致时 CI 失败 | 1 | ⬜ |
 
@@ -152,9 +152,10 @@ GET /api/runs/{run_id}/report → 返回完整 HTML 报告
 | Celery 同步模型与 async 代码的阻抗 | S3.4b 出现难排查的阻塞 | **已缓解（2026-10-03）**：统一定为"任务入口同步函数 + `asyncio.run`，engine 与 httpx 客户端都在任务内建、任务内关，禁止进程级连接池"，已写进 `docs/开发规范.md` §一 04；实现见 `src/xhs_agent/tasks/analysis.py` |
 | `deepseek-flash` 是推理模型：输出预算被 `reasoning_tokens` 吃光 | 真实分析链路拿到空 content 或截断的 JSON | **已缓解（2026-10-03）**：`[llm].max_tokens` 2000 → **16000**、`timeout_s` 60 → **120**，并把"含推理 token 的总输出预算"这一口径写进《配置契约》§3.1。依据：同一 prompt 四次采样 `reasoning_tokens` = 1823 / 2215 / 4027 / 4061、正文约 1.6k token；`reasoning_effort` / `effort` 参数被端点**静默忽略**，所以只能抬预算（模型 `max_output_tokens` 393216，契约上限 32768） |
 | 报告里的关键帧缩略图渲染不出来（显示"无预览"占位） | 演示效果打折：产品方案 §8.1 的"素材匹配榜附关键帧缩略图"落不了地（HTML 里 `<img>` 数为 0，尽管 `runs/_index/keyframes/` 里确实有 33 个关键帧） | **S3.6 联调发现（2026-10-03），未修**：两处缺口——① `services/runs.py` 的候选素材投影只带 id/path/type/title/description/tags，把契约 `MaterialSummary` 里**已声明**的 `keyframes` 丢了（实现与契约漂移）；② 即便带上，`tools/report.py` 用 `os.path.relpath(path, PROJECT_ROOT)` 生成 `runs/_index/keyframes/…` 的 `src`，而 API 不服务 `runs/`、样例报告也不在那个目录下。要修得先定"图片怎么引用"（内联 base64 / 新增取帧接口 / 渲染时复制到报告目录），属独立决策——建议排在 E5 出前端之前 |
-| 端到端单热点成本约 0.09–0.12 元，**超过**产品方案 §10.2 的 `≤ 0.05 元/热点` 目标值 | S3.10 的 prompt 回归报告里「成本」这一维度会常年亮红灯（其余六项都过），它同时也是 `prompt契约` §六 的准入硬门槛之一——不解决就无法用这套回归流程判定"准入" | **S3.10 实测发现（2026-10-03），未修**：单个热点 3 次 `deepseek-flash` 调用，每次 2k–4k 推理 token（`max_tokens=16000` 是 S3.5/S3.8 为解决"空 content"抬上去的），按 `price_in_per_m=2.16` / `price_out_per_m=8.64` 折算约 0.10 元。三个方向需决策：① 调低 `[llm].max_tokens`（有回到"截断/空 content"的风险，除非同时换非推理模型）；② 换更便宜或非推理的模型（要同步配置契约与成本单价）；③ 修订 §10.2 的目标值把推理模型的实际单价写进去（属契约变更）。**建议与 E3 收尾一起决策**，别让它默默把 prompt 回归的门槛变成永远红 |
+| ~~端到端单热点成本 0.09–0.12 元，超过 §10.2 的 0.05 元目标值~~ | **已决策（ADR 0012，2026-10-03）**：门槛按实测上调为 **≤ 0.15 元/热点**，并同步修订产品方案 §10.2 / §12.2、评测集七维度与预算默认值、prompt 契约 §六、README。原 0.05 是图落地前按 2 次调用估的，实测为 3 次调用且输出含推理 token（0.0926 元）。若日后要压回 0.05，须真正换模型或调 token 预算（保留为后续方向） |
 | 20 组评测用例的标注耗时被低估 | M3 延期 | 已拆出 S2.0 提前开工，标注标准先写进产品方案 §10.1 |
 | 评测集由作者自建自评 | 数字说服力弱 | 标注标准先写进产品方案 §10.1，再按标准标注；必要时请他人复核 |
 | 前端依赖数量多、审计成本高 | 供应链风险与构建不稳定 | 锁文件入库；直接依赖在提交信息说明理由；定期更新 |
 | 前端类型与契约漂移 | 前后端联调返工 | 由 `openapi-typescript` 生成类型，并在 CI 中校验生成结果无变化 |
+| 本机代理（TUN/透明模式）拦截 loopback HTTP | `tests/integration/test_http_pool.py` 的 2 条用例在真实终端下拿 502（服务端 0 请求），看起来像代码坏了 | 给代理加 loopback 直连规则或跑用例前关代理；判据见 `docs/AI开发说明.md` §六 |
 | 集成测试依赖 Docker，CI 上需可用 | E2／E3 的 DoD 无法达成 | GitHub Actions 自带 Docker；本地跑集成用例前先启动 Docker Desktop |

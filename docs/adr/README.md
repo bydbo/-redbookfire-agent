@@ -55,3 +55,4 @@
 | [0009](0009-api-prefix.md) | API 路径统一加 /api 前缀 | 已采纳 |
 | [0010](0010-literal-recall-word-similarity.md) | 字面召回改用 word_similarity 并重标定阈值 | 已采纳 |
 | [0011](0011-run-record-authority.md) | 运行记录权威源是数据库，RunStore 退化为产物目录 | 已采纳 |
+| [0012](0012-end-to-end-cost-threshold.md) | 端到端单热点成本门槛由 0.05 上调至 0.15 元 | 已采纳 |
