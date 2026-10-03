@@ -34,6 +34,7 @@ info:
     | `bad_request` | 400 | 请求格式或参数不合法 |
     | `validation_error` | 422 | 字段级校验失败（如 topk 越界） |
     | `not_found` | 404 | job_id 或 run_id 不存在 |
+    | `conflict` | 409 | 当前状态不允许该操作（如运行尚未完成就取结果） |
     | `dependency_unavailable` | 503 | 数据库、Redis 或模型服务不可用 |
     | `upstream_error` | 502 | 上游模型返回错误或连续重试失败 |
     | `internal_error` | 500 | 未分类的内部错误 |
@@ -734,6 +735,7 @@ components:
             - bad_request
             - validation_error
             - not_found
+            - conflict
             - dependency_unavailable
             - upstream_error
             - internal_error

@@ -93,12 +93,14 @@ def assert_error_envelope(response, *, status: int, code: str) -> dict[str, Any]
 
 class TestApiPrefix:
     def test_unregistered_path_returns_contract_404(self, client: TestClient) -> None:
-        body = assert_error_envelope(client.get(f"{API_PREFIX}/health"),
+        # 注意：/api/health 自 S3.3 起是真接口，这里换一个仍未注册的路径
+        body = assert_error_envelope(client.get(f"{API_PREFIX}/nope"),
                                     status=404, code=NOT_FOUND)
         assert body["detail"]["original_status"] == 404
 
     def test_prefix_is_required(self, client: TestClient) -> None:
         assert client.get("/health").status_code == 404
+        assert client.get("/runs/x").status_code == 404
         assert client.get("/openapi.json").status_code == 404   # 文档也挂在 /api 下
 
     def test_probe_route_is_mounted_under_api(self, client: TestClient) -> None:

@@ -14,11 +14,12 @@ from typing import Any
 BAD_REQUEST = "bad_request"
 VALIDATION_ERROR = "validation_error"
 NOT_FOUND = "not_found"
+CONFLICT = "conflict"
 DEPENDENCY_UNAVAILABLE = "dependency_unavailable"
 UPSTREAM_ERROR = "upstream_error"
 INTERNAL_ERROR = "internal_error"
 
-ERROR_CODES: tuple[str, ...] = (BAD_REQUEST, VALIDATION_ERROR, NOT_FOUND,
+ERROR_CODES: tuple[str, ...] = (BAD_REQUEST, VALIDATION_ERROR, NOT_FOUND, CONFLICT,
                                 DEPENDENCY_UNAVAILABLE, UPSTREAM_ERROR, INTERNAL_ERROR)
 
 # 错误码 → HTTP 状态（与契约表一一对应）
@@ -26,6 +27,7 @@ CODE_STATUS: dict[str, int] = {
     BAD_REQUEST: 400,
     VALIDATION_ERROR: 422,
     NOT_FOUND: 404,
+    CONFLICT: 409,
     DEPENDENCY_UNAVAILABLE: 503,
     UPSTREAM_ERROR: 502,
     INTERNAL_ERROR: 500,
@@ -46,6 +48,7 @@ DEFAULT_MESSAGE: dict[str, str] = {
     BAD_REQUEST: "请求不合法",
     VALIDATION_ERROR: "字段校验失败",
     NOT_FOUND: "资源不存在",
+    CONFLICT: "当前状态不允许该操作",
     DEPENDENCY_UNAVAILABLE: "依赖服务不可用",
     UPSTREAM_ERROR: "上游服务返回错误",
     INTERNAL_ERROR: "服务内部错误",
@@ -84,6 +87,12 @@ class NotFoundError(ApiError):
     """job_id / run_id 等资源不存在（404）。"""
 
     code = NOT_FOUND
+
+
+class ConflictError(ApiError):
+    """资源状态不允许当前操作（409），例如运行尚未完成不能读结果或报告。"""
+
+    code = CONFLICT
 
 
 class DependencyUnavailableError(ApiError):

@@ -31,7 +31,8 @@ COLUMN_SPECS: dict[str, dict[str, str]] = {
         "id": "uuid", "raw_text": "text", "clue": "jsonb", "created_at": "timestamptz",
     },
     "runs": {
-        "id": "uuid", "job_id": "text", "status": "text", "created_at": "timestamptz",
+        "id": "uuid", "job_id": "text", "status": "text", "topk": "int4",
+        "request_id": "text", "created_at": "timestamptz",
         "started_at": "timestamptz", "finished_at": "timestamptz", "llm_calls": "int4",
         "prompt_tokens": "int4", "completion_tokens": "int4", "cost_cny": "numeric",
         "latency_ms": "int4", "prompt_versions": "jsonb", "error": "text",
@@ -50,7 +51,7 @@ COLUMN_SPECS: dict[str, dict[str, str]] = {
 NULLABLE_COLUMNS: dict[str, set[str]] = {
     "materials": {"mtime", "fingerprint", "embedding", "embedding_model"},
     "hotspots": set(),
-    "runs": {"started_at", "finished_at", "error"},
+    "runs": {"started_at", "finished_at", "error", "request_id"},
     "run_hotspots": {"draft", "error"},
     "run_matches": set(),
 }

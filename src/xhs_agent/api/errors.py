@@ -15,11 +15,14 @@ from fastapi import FastAPI, Request
 from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
+from sqlalchemy.exc import InterfaceError, OperationalError
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
+from ..config import ConfigError
 from ..core.errors import (
     CODE_STATUS,
     DEFAULT_MESSAGE,
+    DEPENDENCY_UNAVAILABLE,
     INTERNAL_ERROR,
     VALIDATION_ERROR,
     ApiError,
@@ -64,6 +67,23 @@ def register_exception_handlers(app: FastAPI) -> None:
         # exc.errors() 里可能带不可序列化的 ctx（如 ValueError 实例），统一过 jsonable_encoder
         detail = {"request_id": request_id_of(request), "errors": jsonable_encoder(exc.errors())}
         return json_error(VALIDATION_ERROR, "字段校验失败", detail)
+
+    @app.exception_handler(ConfigError)
+    async def _handle_config_error(request: Request, exc: ConfigError) -> JSONResponse:
+        # 缺 DSN、缺密钥这类"依赖没配好"按依赖不可用处理（503），而不是 500
+        detail = {"request_id": request_id_of(request), "fix": exc.fix}
+        return json_error(DEPENDENCY_UNAVAILABLE, exc.message, detail)
+
+    async def _handle_db_unavailable(request: Request, exc: Exception) -> JSONResponse:
+        # 连接级数据库错误：堆栈进日志，对外只给 503
+        request_id = request_id_of(request)
+        logger.exception("数据库不可用（request_id=%s）", request_id)
+        return json_error(DEPENDENCY_UNAVAILABLE, "数据库不可用",
+                          {"request_id": request_id,
+                           "error": f"{type(exc).__name__}: {exc}"[:200]})
+
+    for exc_type in (OperationalError, InterfaceError):
+        app.add_exception_handler(exc_type, _handle_db_unavailable)
 
     @app.exception_handler(StarletteHTTPException)
     async def _handle_http_exception(request: Request,

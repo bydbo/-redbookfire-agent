@@ -123,6 +123,8 @@ class Run(Base):
     id: Mapped[uuid.UUID] = _pk()
     job_id: Mapped[str] = mapped_column(Text, nullable=False, unique=True)
     status: Mapped[str] = mapped_column(Text, nullable=False, server_default=text("'queued'"))
+    topk: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("5"))
+    request_id: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = _created_at()
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
@@ -141,6 +143,7 @@ class Run(Base):
         CheckConstraint("status IN ('queued', 'running', 'succeeded', 'failed')",
                         name="status_allowed"),
         CheckConstraint("cost_cny >= 0", name="cost_non_negative"),
+        CheckConstraint("topk >= 1 AND topk <= 20", name="topk_in_range"),
         Index("ix_runs_status", "status"),
         Index("ix_runs_created_at", "created_at"),
     )
