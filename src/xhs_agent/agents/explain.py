@@ -22,8 +22,8 @@ TASK_ID = "material_select"
 _LIST_KEYS = ("candidates", "matches", "results", "items", "explanations")
 
 
-def explain_candidates(clue: HotspotClue, candidates: list[MatchCandidate],
-                       caller: StructuredCaller) -> AgentOutcome:
+async def explain_candidates(clue: HotspotClue, candidates: list[MatchCandidate],
+                             caller: StructuredCaller) -> AgentOutcome:
     """为整批候选补上模型版 `reasons` / `usage`（覆盖检索层的规则解释）。"""
     if not candidates:
         return AgentOutcome(value=[], task_id=TASK_ID, version=None)
@@ -35,7 +35,7 @@ def explain_candidates(clue: HotspotClue, candidates: list[MatchCandidate],
         candidates_json=json.dumps([_candidate_payload(item) for item in candidates],
                                    ensure_ascii=False),
     )
-    explanations, _result = caller.call(
+    explanations, _result = await caller.call(
         TASK_ID, rendered.system, rendered.user,
         parse=lambda payload: _parse_explanations(payload, candidates),
     )
@@ -46,7 +46,7 @@ def explain_candidates(clue: HotspotClue, candidates: list[MatchCandidate],
     return AgentOutcome(value=updated, task_id=TASK_ID, version=rendered.version)
 
 
-def _candidate_payload(candidate: MatchCandidate) -> dict:
+def _candidate_payload(candidate: MatchCandidate) -> dict[str, Any]:
     """交给模型的候选摘要：只给判断需要的字段，不把整条素材塞进去（控制 token）。"""
     material = candidate.material
     return {
@@ -72,8 +72,10 @@ def _as_str_list(value: Any) -> list[str]:
     return [str(item).strip() for item in items if str(item or "").strip()]
 
 
-def _parse_explanations(payload: Any, candidates: list[MatchCandidate]) -> list[dict]:
+def _parse_explanations(payload: Any,
+                        candidates: list[MatchCandidate]) -> list[dict[str, Any]]:
     """折成「与候选一一对应、每条都有非空 reasons 与 usage」的列表。"""
+    items: Any
     if isinstance(payload, dict) and "material_id" in payload:
         items = [payload]
     elif isinstance(payload, dict):
@@ -84,7 +86,7 @@ def _parse_explanations(payload: Any, candidates: list[MatchCandidate]) -> list[
     if not isinstance(items, list):
         raise LLMError("material_select 返回结构异常：期望候选数组，或含候选数组的对象")
 
-    by_id: dict[str, dict] = {}
+    by_id: dict[str, dict[str, Any]] = {}
     for item in items:
         if not isinstance(item, dict):
             continue

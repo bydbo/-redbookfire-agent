@@ -46,6 +46,7 @@
 | FastAPI 应用骨架（`/api` 路由树、统一错误响应、`X-Request-ID`） | ✅ 已完成（S3.2） |
 | 五个接口实现（`/api` 前缀：health / analyze / jobs / runs / report） | ✅ 已完成（S3.3） |
 | 分析结果写回（`run_matches` / 统计 / `prompt_versions` 落库，RunStore 退化为产物目录） | ✅ 已完成（S3.4a） |
+| 分析主链路 HTTP 异步化（文本模型与向量共用 httpx 连接池，去掉 `asyncio.to_thread`） | ✅ 已完成（S3.5） |
 | Alembic 数据库迁移（唯一建表路径） | ✅ 已完成（S2.3） |
 | 评测集 v1 与示例素材包（七维度口径、版本冻结） | ✅ 已完成（S2.0） |
 | 服务入口（FastAPI）与编排层 | ⬜ 未实现 |
@@ -63,8 +64,8 @@
 | --- | --- |
 | 语言 | Python ≥ 3.11 |
 | 包管理与构建 | uv + `pyproject.toml`（hatchling 后端，src 布局） |
-| 运行时依赖 | pydantic v2、pydantic-settings、python-dotenv、SQLAlchemy 2.0 async + asyncpg、pgvector、alembic、langgraph、fastapi + uvicorn、redis |
-| 开发依赖 | pytest、pytest-cov、pytest-asyncio、testcontainers、httpx、ruff、mypy、pre-commit |
+| 运行时依赖 | pydantic v2、pydantic-settings、python-dotenv、SQLAlchemy 2.0 async + asyncpg、pgvector、alembic、langgraph、fastapi + uvicorn、redis、httpx |
+| 开发依赖 | pytest、pytest-cov、pytest-asyncio、testcontainers、ruff、mypy、pre-commit |
 | 文本模型接入 | OpenAI 兼容 `/chat/completions` 协议（默认 DeepSeek），标准库 `urllib` 直连，JSON mode 结构化输出 + 解析失败自修 |
 | 多模态接入 | 通义千问 VL（`qwen-vl-max`），关键帧 base64 内联 |
 | 音视频处理 | ffmpeg / ffprobe（用于探测与抽帧；缺失时跳过抽帧，属能力裁剪） |
@@ -78,7 +79,7 @@
 | 层面 | 选型 |
 | --- | --- |
 | Web 服务 | FastAPI + Uvicorn |
-| HTTP 客户端 | httpx（异步、连接池、重试） |
+| HTTP 客户端 | httpx（异步 + 连接池；文本模型与向量的统一传输，S3.5） |
 | Agent 编排 | LangGraph（状态图 + 检查点 + 失败重试） |
 | 数据库与缓存 | PostgreSQL 16 + pgvector 0.8.6、Redis 7.4.11（本地 `docker compose` 起，tag 固定） |
 | 数据访问 | SQLAlchemy 2.0 async ORM + asyncpg + pgvector（已落地，模型见 `src/xhs_agent/db/`）；Alembic 迁移待落地（S2.3） |

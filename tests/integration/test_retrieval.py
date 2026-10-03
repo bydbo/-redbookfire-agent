@@ -30,7 +30,7 @@ class FakeEmbedder:
     def __init__(self) -> None:
         self.calls: list[list[str]] = []
 
-    def embed(self, texts: list[str]) -> EmbeddingResult:
+    async def embed(self, texts: list[str]) -> EmbeddingResult:
         self.calls.append(list(texts))
         return EmbeddingResult(vectors=[list(E0) for _ in texts], model=MODEL,
                                prompt_tokens=1, attempts=1)
@@ -40,7 +40,7 @@ class FailingEmbedder:
     def __init__(self) -> None:
         self.calls = 0
 
-    def embed(self, texts: list[str]) -> EmbeddingResult:
+    async def embed(self, texts: list[str]) -> EmbeddingResult:
         self.calls += 1
         raise EmbeddingError("假失败：上游不可用")
 

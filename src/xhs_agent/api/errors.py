@@ -24,12 +24,15 @@ from ..core.errors import (
     DEFAULT_MESSAGE,
     DEPENDENCY_UNAVAILABLE,
     INTERNAL_ERROR,
+    UPSTREAM_ERROR,
     VALIDATION_ERROR,
     ApiError,
     InternalError,
     code_for_status,
 )
 from ..core.logging import current_request_id
+from ..tools.embedding import EmbeddingError
+from ..tools.llm import LLMError
 
 logger = logging.getLogger("xhs_agent.api")
 
@@ -84,6 +87,19 @@ def register_exception_handlers(app: FastAPI) -> None:
 
     for exc_type in (OperationalError, InterfaceError):
         app.add_exception_handler(exc_type, _handle_db_unavailable)
+
+    async def _handle_upstream_error(request: Request, exc: Exception) -> JSONResponse:
+        # 上游模型 / 向量服务失败（重试后仍失败）：按契约折成 502 upstream_error。
+        # 现在没有 API 请求会同步调上游（分析在 worker 里跑），这条映射是给
+        # S3.4b/S3.6 的调用链备好的——先按契约落位，不等到报 500 才补。
+        request_id = request_id_of(request)
+        logger.warning("上游调用失败（request_id=%s）：%s", request_id, exc)
+        return json_error(UPSTREAM_ERROR, DEFAULT_MESSAGE[UPSTREAM_ERROR],
+                          {"request_id": request_id,
+                           "error": f"{type(exc).__name__}: {exc}"[:200]})
+
+    for upstream_type in (LLMError, EmbeddingError):
+        app.add_exception_handler(upstream_type, _handle_upstream_error)
 
     @app.exception_handler(StarletteHTTPException)
     async def _handle_http_exception(request: Request,

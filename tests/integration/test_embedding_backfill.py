@@ -47,7 +47,7 @@ class FakeEmbedder:
         self.fail_on = fail_on
         self.batches: list[list[str]] = []
 
-    def embed(self, texts: list[str]) -> EmbeddingResult:
+    async def embed(self, texts: list[str]) -> EmbeddingResult:
         self.batches.append(list(texts))
         if self.fail_on is not None and len(self.batches) == self.fail_on:
             raise EmbeddingError("假失败：模拟上游不可用")

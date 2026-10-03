@@ -12,6 +12,7 @@ dependencies = [
     "alembic>=1.16,<2",
     "asyncpg>=0.30,<1",
     "fastapi>=0.142.2",
+    "httpx>=0.28.1",
     "langgraph>=1.2,<2",
     "pgvector>=0.5,<1",
     "pydantic>=2.9,<3",
@@ -25,7 +26,6 @@ dependencies = [
 # 开发依赖：测试与代码质量工具
 [dependency-groups]
 dev = [
-    "httpx>=0.28.1",
     "mypy>=2.3.1",
     "pre-commit>=4.6.2",
     "pytest>=8.0",
@@ -86,6 +86,10 @@ files = [
     "src/xhs_agent/tools/retrieval.py",
     "src/xhs_agent/tools/embedding.py",
     "src/xhs_agent/tools/prompt.py",
+    # S3.5 把模型调用层与 agents 改成异步 httpx——对外错误与重试口径的核心
+    "src/xhs_agent/tools/llm.py",
+    "src/xhs_agent/tools/http.py",
+    "src/xhs_agent/agents",
     # S3.4a 改写了运行记录落盘（停写 state.json）——运行产物与事件流的核心，纳入严格范围
     "src/xhs_agent/tools/trace.py",
     # E3 新增的 HTTP 层与核心层（S3.2）：对外错误语义与请求上下文，类型错误代价高

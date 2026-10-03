@@ -6,11 +6,13 @@ import re
 from pathlib import Path
 
 import pytest
+from fastapi import APIRouter
+from fastapi.testclient import TestClient
 from pydantic import ValidationError
 from sqlalchemy.ext.asyncio import create_async_engine
 
 from xhs_agent.api.deps import QueueNotConfigured
-from xhs_agent.api.main import create_app
+from xhs_agent.api.main import API_PREFIX, create_app
 from xhs_agent.api.routers import ops
 from xhs_agent.api.routers.analysis import AnalyzeRequest
 from xhs_agent.config import AppConfig, EnvView, load_config
@@ -18,9 +20,12 @@ from xhs_agent.core.errors import (
     CODE_STATUS,
     CONFLICT,
     ERROR_CODES,
+    UPSTREAM_ERROR,
     ConflictError,
     DependencyUnavailableError,
 )
+from xhs_agent.tools.embedding import EmbeddingError
+from xhs_agent.tools.llm import LLMError
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 CONTRACT = PROJECT_ROOT / "docs" / "contracts" / "openapi.yaml"
@@ -120,3 +125,37 @@ class TestConflictError:
         assert error.code == CONFLICT
         assert error.status == 409
         assert error.detail == {"run_id": "x"}
+
+
+class TestUpstreamErrorMapping:
+    """S3.5：模型的 `LLMError` 与向量的 `EmbeddingError` 折成契约的 `upstream_error`(502)。
+
+    现在没有 API 请求会同步调上游（分析在 worker 里跑），所以用探针路由把映射钉住。
+    """
+
+    @pytest.fixture
+    def client(self) -> TestClient:
+        router = APIRouter()
+
+        @router.get("/probe/llm-error")
+        async def llm_failure():
+            raise LLMError("上游 503")
+
+        @router.get("/probe/embedding-error")
+        async def embedding_failure():
+            raise EmbeddingError("向量维度不符")
+
+        app = create_app()
+        app.include_router(router, prefix=API_PREFIX)
+        return TestClient(app, raise_server_exceptions=False)
+
+    @pytest.mark.parametrize("path", ["/api/probe/llm-error", "/api/probe/embedding-error"])
+    def test_upstream_failures_map_to_502(self, client: TestClient, path: str):
+        response = client.get(path)
+        assert response.status_code == CODE_STATUS[UPSTREAM_ERROR] == 502
+        body = response.json()
+        assert set(body) == {"code", "message", "detail"}
+        assert body["code"] == UPSTREAM_ERROR
+        assert body["code"] in ERROR_CODES
+        assert body["detail"]["request_id"]
+        assert "Error" in body["detail"]["error"]

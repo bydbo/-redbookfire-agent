@@ -1,15 +1,83 @@
-"""模型调用层单测：全部用假 provider，不联网、不读密钥。"""
+"""模型调用层单测：全部用假 provider / `httpx.MockTransport`，不联网、不读密钥。"""
 
 from __future__ import annotations
 
 import importlib
 import inspect
+import json
+from collections.abc import AsyncIterator, Callable
+from typing import Any
 
+import httpx
 import pytest
+import pytest_asyncio
 
-from xhs_agent.config import LLMConfig
+from xhs_agent.config import EnvView, LLMConfig
 from xhs_agent.tools import llm
 from xhs_agent.tools.llm import LLMError, LLMResult, StructuredCaller
+
+Handler = Callable[[dict[str, Any], int], httpx.Response]
+
+
+class MockAPI:
+    """用 `httpx.MockTransport` 顶替真实端点：记录每次请求，handler 决定响应。"""
+
+    def __init__(self, handler: Handler) -> None:
+        self.handler = handler
+        self.calls: list[dict[str, Any]] = []
+        self.client = httpx.AsyncClient(transport=httpx.MockTransport(self._handle))
+
+    def _handle(self, request: httpx.Request) -> httpx.Response:
+        payload = json.loads(request.content.decode("utf-8"))
+        self.calls.append({
+            "url": str(request.url),
+            "payload": payload,
+            "authorization": request.headers.get("authorization"),
+            "timeout": request.extensions["timeout"]["read"],
+        })
+        return self.handler(payload, len(self.calls))
+
+    async def aclose(self) -> None:
+        await self.client.aclose()
+
+
+@pytest_asyncio.fixture
+async def make_api() -> AsyncIterator[Callable[[Handler], MockAPI]]:
+    """按用例给的 handler 造 MockAPI，用例结束统一关闭客户端。"""
+    created: list[MockAPI] = []
+
+    def _make(handler: Handler) -> MockAPI:
+        api = MockAPI(handler)
+        created.append(api)
+        return api
+
+    yield _make
+    for api in created:
+        await api.aclose()
+
+
+@pytest_asyncio.fixture
+async def idle_client() -> AsyncIterator[httpx.AsyncClient]:
+    """只用于构造 provider 的空客户端；一旦真被使用就报错。"""
+    def no_request(_request: httpx.Request) -> httpx.Response:
+        raise AssertionError("本用例不应发起任何请求")
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(no_request)) as client:
+        yield client
+
+
+@pytest.fixture
+def no_backoff(monkeypatch: pytest.MonkeyPatch) -> None:
+    """重试退避在测试里立即返回，避免用例真的等 1.5s / 3s。"""
+    monkeypatch.setattr(llm, "backoff_seconds", lambda _attempt: 0.0)
+
+
+def chat_response(text: str = '{"value": 7}', prompt_tokens: int = 100,
+                  completion_tokens: int = 50) -> httpx.Response:
+    return httpx.Response(200, json={
+        "choices": [{"message": {"content": text}}],
+        "usage": {"prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens},
+    })
 
 
 class FakeProvider(llm.BaseProvider):
@@ -22,7 +90,7 @@ class FakeProvider(llm.BaseProvider):
         self.texts = list(texts)
         self.prompts = []
 
-    def complete(self, call):
+    async def complete(self, call):
         self.prompts.append(call.user)
         text = self.texts.pop(0) if self.texts else ""
         return LLMResult(text=text, provider=self.name, model=self.model)
@@ -59,53 +127,136 @@ class TestLLMResult:
 
 
 class TestStructuredCaller:
-    def test_parses_json_on_first_try(self):
+    @pytest.mark.asyncio
+    async def test_parses_json_on_first_try(self):
         caller = StructuredCaller(provider=FakeProvider(['{"value": 7}']))
-        parsed, result = caller.call("task", "system", "user", parse=lambda data: data["value"])
+        parsed, result = await caller.call("task", "system", "user",
+                                           parse=lambda data: data["value"])
         assert parsed == 7
         assert result.text == '{"value": 7}'
         assert len(caller.records) == 1
 
-    def test_repairs_by_feeding_error_back(self):
+    @pytest.mark.asyncio
+    async def test_repairs_by_feeding_error_back(self):
         provider = FakeProvider(["不是 JSON", '{"value": 7}'])
         caller = StructuredCaller(provider=provider)
-        parsed, _result = caller.call("task", "system", "user", parse=lambda data: data["value"])
+        parsed, _result = await caller.call("task", "system", "user",
+                                            parse=lambda data: data["value"])
         assert parsed == 7
         assert len(provider.prompts) == 2
         assert "上一次输出无法被解析" in provider.prompts[1]
 
-    def test_raises_after_repair_budget_is_used_up(self):
+    @pytest.mark.asyncio
+    async def test_raises_after_repair_budget_is_used_up(self):
         caller = StructuredCaller(provider=FakeProvider(["坏输出", "还是坏输出"]))
         with pytest.raises(LLMError):
-            caller.call("task", "system", "user", parse=lambda data: data["value"])
+            await caller.call("task", "system", "user", parse=lambda data: data["value"])
 
-    def test_provider_error_is_surfaced(self):
+    @pytest.mark.asyncio
+    async def test_provider_error_is_surfaced(self):
         class FailingProvider(FakeProvider):
-            def complete(self, call):
+            async def complete(self, call):
                 return LLMResult(text="", provider=self.name, error="连接失败")
 
         caller = StructuredCaller(provider=FailingProvider([]))
         with pytest.raises(LLMError) as info:
-            caller.call("task", "system", "user", parse=lambda data: data)
+            await caller.call("task", "system", "user", parse=lambda data: data)
         assert "连接失败" in str(info.value)
 
 
+class TestOpenAICompatibleProvider:
+    """S3.5：模型调用走注入的 httpx 客户端，请求体与重试口径与旧实现一致。"""
+
+    @pytest.mark.asyncio
+    async def test_sends_payload_and_reads_usage(self, make_api):
+        api = make_api(lambda _payload, _n: chat_response())
+        provider = llm.build_provider(FakeConfig(), client=api.client)
+        result = await provider.complete(llm.LLMCall(task="hotspot_clue", system="系统",
+                                                     user="用户"))
+
+        call = api.calls[0]
+        assert call["url"] == "https://example.test/v1/chat/completions"
+        assert call["timeout"] == 7
+        assert call["authorization"] == "Bearer sk-test"
+        assert call["payload"]["model"] == "deepseek-flash"
+        assert call["payload"]["messages"] == [{"role": "system", "content": "系统"},
+                                               {"role": "user", "content": "用户"}]
+        assert call["payload"]["response_format"] == {"type": "json_object"}
+        assert call["payload"]["temperature"] == 0.6
+        assert call["payload"]["max_tokens"] == 2000
+
+        assert result.text == '{"value": 7}'
+        assert (result.prompt_tokens, result.completion_tokens) == (100, 50)
+        assert result.cost_cny == pytest.approx(100 / 1e6 * 2.0 + 50 / 1e6 * 8.0)
+        assert result.error == ""
+
+    @pytest.mark.asyncio
+    async def test_json_mode_off_omits_response_format(self, make_api):
+        api = make_api(lambda _payload, _n: chat_response())
+        provider = llm.build_provider(FakeConfig(), client=api.client)
+        await provider.complete(llm.LLMCall(task="t", system="s", user="u", json_mode=False))
+        assert "response_format" not in api.calls[0]["payload"]
+
+    @pytest.mark.asyncio
+    async def test_retries_transient_then_succeeds(self, make_api, no_backoff):
+        def handler(_payload, n):
+            if n == 1:
+                raise httpx.ConnectError("boom")
+            return chat_response()
+
+        api = make_api(handler)
+        provider = llm.build_provider(FakeConfig(), client=api.client)
+        result = await provider.complete(llm.LLMCall(task="t", system="s", user="u"))
+        assert len(api.calls) == 2
+        assert result.attempts == 2
+        assert result.error == ""
+
+    @pytest.mark.asyncio
+    async def test_all_attempts_fail_returns_error_result(self, make_api, no_backoff):
+        def handler(_payload, _n):
+            raise httpx.ConnectError("down")
+
+        api = make_api(handler)
+        provider = llm.build_provider(FakeConfig(), client=api.client)
+        result = await provider.complete(llm.LLMCall(task="t", system="s", user="u"))
+        assert len(api.calls) == 3          # 1 次 + max_retries=2
+        assert "ConnectError" in result.error
+        assert result.text == ""
+
+    @pytest.mark.asyncio
+    async def test_401_is_not_retried(self, make_api, no_backoff):
+        api = make_api(lambda _payload, _n: httpx.Response(401, json={"error": "bad key"}))
+        provider = llm.build_provider(FakeConfig(), client=api.client)
+        result = await provider.complete(llm.LLMCall(task="t", system="s", user="u"))
+        assert len(api.calls) == 1
+        assert "HTTP 401" in result.error
+
+
 class TestBuildProvider:
+    @pytest.mark.asyncio
     @pytest.mark.parametrize("name", ["openai_compatible", "openai", "deepseek", "qwen",
                                       "dashscope", "compatible"])
-    def test_compatible_aliases_share_one_implementation(self, name):
-        provider = llm.build_provider(FakeConfig(provider=name))
+    async def test_compatible_aliases_share_one_implementation(self, name, idle_client):
+        provider = llm.build_provider(FakeConfig(provider=name), client=idle_client)
         assert isinstance(provider, llm.OpenAICompatibleProvider)
 
-    def test_unknown_provider_is_rejected(self):
+    @pytest.mark.asyncio
+    async def test_unknown_provider_is_rejected(self, idle_client):
         # provider 的合法值由配置层校验（S1.2），这里用 model_construct 绕过校验，
         # 验证工具层自己的兜底分支仍然存在。
         with pytest.raises(LLMError):
-            llm.build_provider(FakeConfig(provider="bogus"))
+            llm.build_provider(FakeConfig(provider="bogus"), client=idle_client)
 
-    def test_empty_base_url_is_rejected(self):
+    @pytest.mark.asyncio
+    async def test_empty_base_url_is_rejected(self, idle_client):
         with pytest.raises(LLMError):
-            llm.build_provider(FakeConfig(base_url=""))
+            llm.build_provider(FakeConfig(base_url=""), client=idle_client)
+
+    def test_client_is_a_required_keyword_argument(self):
+        """S3.5：客户端由调用方按「一次运行一个」注入，provider 不自持。"""
+        parameter = inspect.signature(llm.build_provider).parameters["client"]
+        assert parameter.kind is inspect.Parameter.KEYWORD_ONLY
+        assert parameter.default is inspect.Parameter.empty
 
 
 class TestOfflinePathIsGone:
@@ -121,9 +272,10 @@ class TestOfflinePathIsGone:
     def test_build_provider_has_no_force_offline_parameter(self):
         assert "force_offline" not in inspect.signature(llm.build_provider).parameters
 
-    def test_offline_provider_name_is_rejected(self):
+    @pytest.mark.asyncio
+    async def test_offline_provider_name_is_rejected(self, idle_client):
         with pytest.raises(LLMError):
-            llm.build_provider(FakeConfig(provider="offline"))
+            llm.build_provider(FakeConfig(provider="offline"), client=idle_client)
 
 
 class TestExtractMessageText:
@@ -144,11 +296,15 @@ class TestExtractMessageText:
 
 
 class FakeConfig:
-    """只需要 provider / base_url / model 三个字段，避免测试依赖真实密钥。"""
+    """只需要 provider / base_url / model 等字段，避免测试依赖真实密钥。"""
 
     def __init__(self, **llm_overrides) -> None:
         # model_construct 跳过配置层校验，用来单独验证工具层的兜底分支
-        fields = {"provider": "openai_compatible", "base_url": "https://example.com",
-                  "model": "deepseek-flash", "api_key_env": "DEEPSEEK_API_KEY"}
+        fields = {"provider": "openai_compatible", "base_url": "https://example.test/v1",
+                  "model": "deepseek-flash", "api_key_env": "DEEPSEEK_API_KEY",
+                  "temperature": 0.6, "max_tokens": 2000, "timeout_s": 7, "max_retries": 2,
+                  "price_in_per_m": 2.0, "price_out_per_m": 8.0}
         fields.update(llm_overrides)
         self.llm = LLMConfig.model_construct(**fields)
+        # 假密钥：httpx 会校验请求头，空 key 的 "Bearer " 在真实连接上会被拒（LocalProtocolError）
+        self.llm._env = EnvView({}, {"DEEPSEEK_API_KEY": "sk-test"})

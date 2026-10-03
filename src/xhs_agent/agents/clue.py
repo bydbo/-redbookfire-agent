@@ -15,10 +15,10 @@ from .base import AgentOutcome
 TASK_ID = "hotspot_clue"
 
 
-def extract_clue(hotspot_raw: str, caller: StructuredCaller) -> AgentOutcome:
+async def extract_clue(hotspot_raw: str, caller: StructuredCaller) -> AgentOutcome:
     """调一次 `hotspot_clue`，返回通过契约校验的线索。"""
     rendered = prompt_tool.render(TASK_ID, hotspot_raw=hotspot_raw)
-    clue, result = caller.call(
+    clue, result = await caller.call(
         TASK_ID, rendered.system, rendered.user,
         parse=lambda payload: HotspotClue.from_dict(payload, hotspot_raw=hotspot_raw),
     )

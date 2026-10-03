@@ -55,6 +55,7 @@ from xhs_agent.services.materials import (
 from xhs_agent.services.retrieval import retrieve_candidates
 from xhs_agent.tools import matching
 from xhs_agent.tools.embedding import EmbeddingError, EmbeddingResult, build_embedder
+from xhs_agent.tools.http import build_http_client
 from xhs_agent.util import normalize_text
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -253,11 +254,11 @@ class RecordingEmbedder:
         self.calls = 0
         self.prompt_tokens = 0
 
-    def embed(self, texts: list[str]) -> EmbeddingResult:
+    async def embed(self, texts: list[str]) -> EmbeddingResult:
         vectors: list[list[float]] = []
         for content in texts:
             if content not in self.cache:
-                result = self.inner.embed([content])
+                result = await self.inner.embed([content])
                 self.cache[content] = list(result.vectors[0])
                 self.calls += 1
                 self.prompt_tokens += result.prompt_tokens
@@ -387,12 +388,27 @@ async def run_sweep(session, base_cfg: AppConfig, eval_cfg: EvalCfg, cases: list
 
 
 async def evaluate(cfg: AppConfig, args) -> dict:
-    """完整评测流程：临时库 → 装 demo_pack → 回填向量 → 两臂 → 阈值扫描。"""
-    client = build_embedder(cfg)
-    if client is None:
+    """完整评测流程：临时库 → 装 demo_pack → 回填向量 → 两臂 → 阈值扫描。
+
+    S3.5：整场评测共享一个 httpx 客户端（连接池）；`RecordingEmbedder` 缓存同一文本的向量，
+    阈值扫描复用同一批查询向量、不重复调接口。
+    """
+    if not cfg.embedding.enabled:
         raise ConfigError("向量召回未启用（[embedding].enabled = false）",
                           "评测需要向量通道：把 config/config.toml 的 [embedding].enabled 设为 true")
-    recording = RecordingEmbedder(client)
+    async with build_http_client(cfg.embedding.timeout_s) as http:
+        client = build_embedder(cfg, client=http)
+        if client is None:  # pragma: no cover - enabled 为真时不会返回 None
+            raise ConfigError("向量召回未启用（[embedding].enabled = false）",
+                              "评测需要向量通道：把 [embedding].enabled 设为 true")
+        return await _evaluate(cfg, args, client, RecordingEmbedder(client))
+
+
+async def _evaluate(cfg: AppConfig, args, client, recording: RecordingEmbedder) -> dict:
+    """评测主体；httpx 客户端由 `evaluate` 持有并在整场评测内复用。
+
+    `client` 用于装库时的向量回填（不需要缓存），`recording` 用于查询侧（同一文本只调一次）。
+    """
     cases = load_cases()
     if args.limit:
         cases = cases[: max(1, int(args.limit))]

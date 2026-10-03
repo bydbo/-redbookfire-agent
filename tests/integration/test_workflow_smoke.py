@@ -43,7 +43,7 @@ class FakeEmbedder:
     def __init__(self) -> None:
         self.calls = 0
 
-    def embed(self, texts: list[str]) -> EmbeddingResult:
+    async def embed(self, texts: list[str]) -> EmbeddingResult:
         self.calls += 1
         return EmbeddingResult(vectors=[list(E0) for _ in texts], model=MODEL,
                                prompt_tokens=12, attempts=1)
@@ -59,7 +59,7 @@ class FakeProvider(llm.BaseProvider):
         self.material_id = material_id
         self.tasks: list[str] = []
 
-    def complete(self, call):
+    async def complete(self, call):
         self.tasks.append(call.task)
         payloads = {
             "hotspot_clue": CLUE_PAYLOAD,

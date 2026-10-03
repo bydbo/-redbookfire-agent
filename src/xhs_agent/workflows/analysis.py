@@ -5,6 +5,9 @@
 输入：注入的 `caller`（结构化模型调用）、`retrieve`（异步检索可调用对象）、`RunStore`、基准目录。
 输出：`AnalysisState` 快照；`run_analysis` 返回 `RunResult`（含 `prompt_versions` 与报告路径）。
 
+传输层（S3.5）：`run_analysis` 起一个 httpx 客户端（连接池）并注入文本模型与向量客户端；
+`caller` / `embedder` 由调用方注入时以注入的为准（离线单测用）。
+
 不做降级：
 - 任一节点重试后仍失败即抛错，绝不返回半成品；
 - 单个热点失败**不阻断整批**，但会记进 `errors` 与报告（失败热点同样有一条 error 条目）；
@@ -28,6 +31,7 @@ from ..services.reporting import build_report_model, hotspot_entry, render_and_s
 from ..services.retrieval import RetrievalOutcome, retrieve_candidates
 from ..services.runs import RunRecorder
 from ..tools import gaps as gaps_tool
+from ..tools.http import build_http_client
 from ..tools.llm import StructuredCaller, build_provider
 from ..tools.prompt import PromptError
 from ..tools.trace import RunStore
@@ -110,7 +114,7 @@ def build_graph(*, caller: StructuredCaller, retrieve: Callable[[HotspotClue], A
             return {}
         with store.step(NODE_STEPS[0], detail=state.get("hotspot_raw", "")):
             before = len(caller.records)
-            outcome = extract_clue(state["hotspot_raw"], caller)
+            outcome = await extract_clue(state["hotspot_raw"], caller)
             _record_llm(before)
         return {"clue": outcome.value.to_dict(),
                 "prompt_versions": _merge_version(state, outcome)}
@@ -120,7 +124,7 @@ def build_graph(*, caller: StructuredCaller, retrieve: Callable[[HotspotClue], A
         with store.step(NODE_STEPS[1], detail=clue.hotspot_raw):
             outcome: RetrievalOutcome = await retrieve(clue)
             before = len(caller.records)
-            explained = explain_candidates(clue, list(outcome.candidates), caller)
+            explained = await explain_candidates(clue, list(outcome.candidates), caller)
             _record_llm(before)
         candidates = explained.value if explained.value else list(outcome.candidates)
         return {
@@ -147,7 +151,7 @@ def build_graph(*, caller: StructuredCaller, retrieve: Callable[[HotspotClue], A
         chosen = candidates[0].get("material") if candidates else None
         with store.step(NODE_STEPS[3], detail=clue.hotspot_raw):
             before = len(caller.records)
-            outcome = write_draft(clue, chosen, caller, style=style)
+            outcome = await write_draft(clue, chosen, caller, style=style)
             _record_llm(before)
         update: dict = {"draft": outcome.value.to_dict() if outcome.value is not None else None,
                         "prompt_versions": _merge_version(state, outcome)}
@@ -224,76 +228,82 @@ async def run_analysis(hotspots: list[str], *, cfg: AppConfig, session, store: R
                                                      meta={"hotspots": len(raws)},
                                                      run_id=str(run_id) if run_id else None)
     store.plan(list(NODE_STEPS))
-    caller = caller if caller is not None else StructuredCaller(provider=build_provider(cfg))
 
-    async def retrieve(clue: HotspotClue):
-        return await retrieve_candidates(session, cfg, clue, embedder=embedder, now=now,
-                                         topk=effective_topk)
+    # S3.5：一次运行共享一个 httpx 客户端（连接池），同时注入文本模型与向量客户端；
+    # 客户端由本函数持有并关闭——不做进程级单例，Celery 每个任务一个新事件循环。
+    async with build_http_client(max(cfg.llm.timeout_s, cfg.embedding.timeout_s)) as http:
+        caller = caller if caller is not None else StructuredCaller(
+            provider=build_provider(cfg, client=http))
 
-    graph = build_graph(caller=caller, retrieve=retrieve, store=store,
-                        style=style, retry_policy=retry_policy)
-    model = build_report_model(
-        run_id=store.run_id,
-        created_at=store.state["created_at"],
-        materials_count=0,
-        config={"llm": {"provider": cfg.llm.provider, "model": cfg.llm.model},
-                "materials_dir": cfg.materials_dir()},
-        hotspots=[], totals={}, errors=[],
-    )
-    versions: dict[str, int] = {}
-    errors: list[str] = []
-    failed: list[dict] = []
-    report_paths: dict[str, str] = {}
+        async def retrieve(clue: HotspotClue):
+            # http 透传给检索层：它要在造向量客户端时复用本次运行的连接池（S3.5）
+            return await retrieve_candidates(session, cfg, clue, embedder=embedder, now=now,
+                                             topk=effective_topk, http=http)
 
-    for position, raw in enumerate(raws, start=1):
-        initial: dict = {"hotspot_raw": raw, "report_model": model,
-                         "prompt_versions": versions, "errors": errors}
-        reused = await recorder.load_clue(raw) if recorder is not None else None
-        if reused:
-            initial["clue"] = reused      # 预置线索 → 拆解节点短路，不再付费
-        try:
-            result = await graph.ainvoke(initial)
-        except Exception as exc:  # 节点重试后仍失败：记进报告，不阻断整批
-            detail = f"{type(exc).__name__}: {exc}"
-            errors = [*errors, f"[{raw}] {detail}"]
-            failed.append(hotspot_entry(clue=reused or {}, coverage={}, candidates=[],
-                                        error=detail))
+        graph = build_graph(caller=caller, retrieve=retrieve, store=store,
+                            style=style, retry_policy=retry_policy)
+        model = build_report_model(
+            run_id=store.run_id,
+            created_at=store.state["created_at"],
+            materials_count=0,
+            config={"llm": {"provider": cfg.llm.provider, "model": cfg.llm.model},
+                    "materials_dir": cfg.materials_dir()},
+            hotspots=[], totals={}, errors=[],
+        )
+        versions: dict[str, int] = {}
+        errors: list[str] = []
+        failed: list[dict] = []
+        report_paths: dict[str, str] = {}
+
+        for position, raw in enumerate(raws, start=1):
+            initial: dict = {"hotspot_raw": raw, "report_model": model,
+                             "prompt_versions": versions, "errors": errors}
+            reused = await recorder.load_clue(raw) if recorder is not None else None
+            if reused:
+                initial["clue"] = reused      # 预置线索 → 拆解节点短路，不再付费
+            try:
+                result = await graph.ainvoke(initial)
+            except Exception as exc:  # 节点重试后仍失败：记进报告，不阻断整批
+                detail = f"{type(exc).__name__}: {exc}"
+                errors = [*errors, f"[{raw}] {detail}"]
+                failed.append(hotspot_entry(clue=reused or {}, coverage={}, candidates=[],
+                                            error=detail))
+                if recorder is not None:
+                    await recorder.hotspot_finished(position, clue=reused or {}, coverage={},
+                                                    candidates=[], draft=None,
+                                                    status="failed", error=detail)
+                continue
+            model = result.get("report_model") or model
+            versions = result.get("prompt_versions") or versions
+            errors = result.get("errors") or errors
+            report_paths = result.get("report_paths") or report_paths
             if recorder is not None:
-                await recorder.hotspot_finished(position, clue=reused or {}, coverage={},
-                                                candidates=[], draft=None,
-                                                status="failed", error=detail)
-            continue
-        model = result.get("report_model") or model
-        versions = result.get("prompt_versions") or versions
-        errors = result.get("errors") or errors
-        report_paths = result.get("report_paths") or report_paths
+                await recorder.hotspot_finished(
+                    position,
+                    clue=result.get("clue") or reused or {},
+                    coverage=(result.get("retrieval") or {}).get("coverage") or {},
+                    candidates=(result.get("retrieval") or {}).get("candidates") or [],
+                    draft=result.get("draft"),
+                    status="succeeded",
+                )
+
+        if failed:
+            model = {**model, "hotspots": [*(model.get("hotspots") or []), *failed],
+                     "errors": errors, "totals": dict(store.state["totals"])}
+            markdown_path, html_path = render_and_save(model, store, base_dir=PROJECT_ROOT)
+            report_paths = {"markdown": markdown_path, "html": html_path}
+
+        status = "succeeded" if not errors else "failed"
+        store.finalize(status=status, notes="；".join(errors))
         if recorder is not None:
-            await recorder.hotspot_finished(
-                position,
-                clue=result.get("clue") or reused or {},
-                coverage=(result.get("retrieval") or {}).get("coverage") or {},
-                candidates=(result.get("retrieval") or {}).get("candidates") or [],
-                draft=result.get("draft"),
-                status="succeeded",
-            )
-
-    if failed:
-        model = {**model, "hotspots": [*(model.get("hotspots") or []), *failed],
-                 "errors": errors, "totals": dict(store.state["totals"])}
-        markdown_path, html_path = render_and_save(model, store, base_dir=PROJECT_ROOT)
-        report_paths = {"markdown": markdown_path, "html": html_path}
-
-    status = "succeeded" if not errors else "failed"
-    store.finalize(status=status, notes="；".join(errors))
-    if recorder is not None:
-        await recorder.finish(status=status, totals=dict(store.state["totals"]),
-                              prompt_versions=versions, errors=errors)
-    return RunResult(
-        run_id=store.run_id,
-        status=status,
-        prompt_versions=dict(versions),
-        hotspots=list(model.get("hotspots") or []),
-        report_paths=report_paths,
-        totals=dict(store.state["totals"]),
-        errors=list(errors),
-    )
+            await recorder.finish(status=status, totals=dict(store.state["totals"]),
+                                  prompt_versions=versions, errors=errors)
+        return RunResult(
+            run_id=store.run_id,
+            status=status,
+            prompt_versions=dict(versions),
+            hotspots=list(model.get("hotspots") or []),
+            report_paths=report_paths,
+            totals=dict(store.state["totals"]),
+            errors=list(errors),
+        )

@@ -25,16 +25,16 @@ from xhs_agent.db.session import (
     database_url,
 )
 from xhs_agent.services.materials import backfill_embeddings
-from xhs_agent.tools.embedding import EmbeddingError, build_embedder
+from xhs_agent.tools.embedding import EmbeddingError
 
 
-async def _run(cfg: AppConfig, embedder, batch_size: int | None, limit: int | None) -> int:
+async def _run(cfg: AppConfig, batch_size: int | None, limit: int | None) -> int:
     engine = create_engine_from_config(cfg)
     try:
         factory = create_session_factory(engine)
         async with factory() as session:
-            report = await backfill_embeddings(session, cfg, embedder=embedder,
-                                               batch_size=batch_size, limit=limit)
+            # embedder 由服务层按配置自造（S3.5：httpx 异步客户端，连接池一次调用一个）
+            report = await backfill_embeddings(session, cfg, batch_size=batch_size, limit=limit)
         print(report.summary())
         return 0 if report.failed == 0 else 1
     finally:
@@ -62,16 +62,19 @@ def main(argv: list[str] | None = None) -> int:
     try:
         cfg = load_config()
         database_url(cfg)          # 缺 DATABASE_URL 提前报错（不降级）
-        embedder = build_embedder(cfg)  # 未启用或缺密钥提前报错（不降级）
-        if embedder is None:
+        if not cfg.embedding.enabled:
             raise ConfigError(
                 "向量召回未启用（[embedding].enabled = false）",
                 "把 config/config.toml 的 [embedding].enabled 设为 true 后再回填")
+        if not cfg.embedding.resolved_key():   # 缺密钥提前报错（不降级）
+            raise ConfigError(
+                f"[embedding].enabled = true 但密钥 {cfg.embedding.api_key_env} 为空",
+                "把密钥写进 config/.env（模板见 config/.env.example），或导出同名环境变量")
     except (ConfigError, EmbeddingError) as exc:
         return _report_failure(exc)
 
     try:
-        return asyncio.run(_run(cfg, embedder, args.batch_size, args.limit))
+        return asyncio.run(_run(cfg, args.batch_size, args.limit))
     except (ConfigError, EmbeddingError) as exc:
         return _report_failure(exc)
 

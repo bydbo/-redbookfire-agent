@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import json
+from typing import Any
 
 from ..schemas import Draft, HotspotClue
 from ..tools import prompt as prompt_tool
@@ -18,8 +19,9 @@ TASK_ID = "copy_draft"
 DEFAULT_STYLE = "真诚分享"
 
 
-def write_draft(clue: HotspotClue, material: dict | None, caller: StructuredCaller, *,
-                style: str = DEFAULT_STYLE) -> AgentOutcome:
+async def write_draft(clue: HotspotClue, material: dict[str, Any] | None,
+                      caller: StructuredCaller, *,
+                      style: str = DEFAULT_STYLE) -> AgentOutcome:
     """给首选素材写一版文案初稿。"""
     if material is None:
         return AgentOutcome(value=None, task_id=TASK_ID, version=None)
@@ -31,7 +33,7 @@ def write_draft(clue: HotspotClue, material: dict | None, caller: StructuredCall
         material_json=json.dumps(material, ensure_ascii=False),
         style=style or DEFAULT_STYLE,
     )
-    draft, result = caller.call(
+    draft, result = await caller.call(
         TASK_ID, rendered.system, rendered.user,
         parse=lambda payload: Draft.from_dict(
             payload, material_id=str(material.get("id") or ""),

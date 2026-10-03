@@ -2,32 +2,31 @@
 
 用途：给 `materials.embedding` 回填语义向量，供向量召回通道使用；一个工具只做「文本 → 向量」。
 输入：`EmbeddingConfig`（端点 / 模型 / 维度 / 批量 / 超时 / 重试 / 密钥）+ 一批文本；
-      HTTP 传输可注入（`transport`），便于离线测试。
+      调用方注入的 `httpx.AsyncClient`（连接池；一次运行共享一个，本模块不自持）。
 输出：`EmbeddingResult`（向量列表 / 模型名 / prompt_tokens / 耗时 / 尝试次数）；文本口径见
       `material_embedding_text`。
 边界：不做降级——调用在重试后仍失败抛 `EmbeddingError`；返回维度与 `cfg.dim` 不符也抛错
 （换模型必须补 ADR 并重建向量，见《检索契约》§九）。
+     重试口径不变（`max_retries + 1` 次、退避见 `tools/http.py`、400/401/403 不重试）。
 """
 
 from __future__ import annotations
 
+import asyncio
 import json
 import time
-import urllib.error
-import urllib.request
-from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
+import httpx
+
 from ..config import AppConfig, EmbeddingConfig
+from .http import backoff_seconds
 
 # 单请求批量上限：DashScope text-embedding-v3 兼容端点实测硬上限为 10
 # （11 条即 400 "batch size is invalid, it should not be larger than 10"）。
 # 换供应商必须复核这里，并同步《检索契约》§三 的说明。
 MAX_BATCH_PER_REQUEST = 10
-
-# 传输函数签名：POST JSON 并返回解析后的响应体。单独成函数便于测试注入与重试实现。
-Transport = Callable[[str, bytes, dict[str, str], int], Any]
 
 
 class EmbeddingError(RuntimeError):
@@ -75,18 +74,10 @@ def chunk_texts(texts: list[str], size: int) -> list[list[str]]:
     return [texts[i:i + step] for i in range(0, len(texts), step)]
 
 
-def _urlopen_json(url: str, body: bytes, headers: dict[str, str], timeout: int) -> Any:
-    """默认传输实现：POST JSON 并解析响应体。"""
-    request = urllib.request.Request(url, data=body, method="POST", headers=headers)
-    with urllib.request.urlopen(request, timeout=timeout) as response:
-        payload = response.read().decode("utf-8", errors="replace")
-    return json.loads(payload)
-
-
 class EmbeddingClient:
     """OpenAI 兼容 `/embeddings` 客户端：批量调用 + 重试 + 维度校验。"""
 
-    def __init__(self, cfg: EmbeddingConfig, *, transport: Transport | None = None) -> None:
+    def __init__(self, cfg: EmbeddingConfig, *, client: httpx.AsyncClient) -> None:
         self.cfg = cfg
         self.base_url = (cfg.base_url or "").rstrip("/")
         if not self.base_url:
@@ -94,13 +85,13 @@ class EmbeddingClient:
         self.api_key = cfg.resolved_key()
         self.model = cfg.model
         self.batch_size = max(1, min(int(cfg.batch_size), MAX_BATCH_PER_REQUEST))
-        self.transport: Transport = transport or _urlopen_json
+        self.client = client
 
     @property
     def label(self) -> str:
         return f"embedding:{self.model}"
 
-    def embed(self, texts: list[str]) -> EmbeddingResult:
+    async def embed(self, texts: list[str]) -> EmbeddingResult:
         """把 `texts` 全部向量化，返回值与入参一一对应（顺序一致）。
 
         内部按 `min(batch_size, MAX_BATCH_PER_REQUEST)` 切分请求；每批独立重试。
@@ -112,7 +103,7 @@ class EmbeddingClient:
         attempts = 0
         started = time.time()
         for batch in chunk_texts(list(texts), self.batch_size):
-            batch_vectors, batch_tokens, batch_attempts = self._embed_batch(batch)
+            batch_vectors, batch_tokens, batch_attempts = await self._embed_batch(batch)
             vectors.extend(batch_vectors)
             prompt_tokens += batch_tokens
             attempts += batch_attempts
@@ -124,12 +115,11 @@ class EmbeddingClient:
             attempts=attempts,
         )
 
-    def _embed_batch(self, batch: list[str]) -> tuple[list[list[float]], int, int]:
+    async def _embed_batch(self, batch: list[str]) -> tuple[list[list[float]], int, int]:
         """单个请求：失败按 `max_retries` 退避重试；400/401/403 与结构错误不重试。"""
         url = f"{self.base_url}/embeddings"
-        body = json.dumps({"model": self.model, "input": batch}, ensure_ascii=False).encode("utf-8")
+        payload = {"model": self.model, "input": batch}
         headers = {
-            "Content-Type": "application/json",
             "Authorization": f"Bearer {self.api_key}",
             "Accept": "application/json",
         }
@@ -138,27 +128,27 @@ class EmbeddingClient:
         for attempt in range(1, self.cfg.max_retries + 2):
             plain_attempts = attempt
             try:
-                data = self.transport(url, body, headers, self.cfg.timeout_s)
-                vectors = self._parse(data, len(batch))
-                usage = data.get("usage") if isinstance(data, dict) else None
-                return vectors, int((usage or {}).get("prompt_tokens") or 0), attempt
-            except urllib.error.HTTPError as exc:
-                detail = ""
-                try:
-                    detail = exc.read().decode("utf-8", errors="replace")[:300]
-                except Exception:  # pragma: no cover - 读取失败时忽略细节
-                    detail = ""
-                last_error = f"HTTP {exc.code}: {detail or exc.reason}"
-                if exc.code in (400, 401, 403):
-                    break
-            except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as exc:
-                last_error = f"{type(exc).__name__}: {exc}"
+                response = await self.client.post(url, json=payload, headers=headers,
+                                                  timeout=self.cfg.timeout_s)
+                if response.status_code >= 400:
+                    detail = response.text[:300]
+                    last_error = (f"HTTP {response.status_code}: "
+                                  f"{detail or response.reason_phrase}")
+                    if response.status_code in (400, 401, 403):
+                        break
+                else:
+                    data = response.json()
+                    vectors = self._parse(data, len(batch))
+                    usage = data.get("usage") if isinstance(data, dict) else None
+                    return vectors, int((usage or {}).get("prompt_tokens") or 0), attempt
             except EmbeddingError as exc:
                 # 返回结构或维度不符：重试拿不到不同结果，直接失败
                 last_error = str(exc)
                 break
+            except (httpx.HTTPError, json.JSONDecodeError) as exc:
+                last_error = f"{type(exc).__name__}: {exc}"
             if attempt <= self.cfg.max_retries:
-                time.sleep(min(8.0, 1.5 ** attempt))
+                await asyncio.sleep(backoff_seconds(attempt))
         raise EmbeddingError(f"向量化失败（已尝试 {plain_attempts} 次）：{last_error or '调用失败'}")
 
     def _parse(self, data: Any, expected: int) -> list[list[float]]:
@@ -185,7 +175,7 @@ class EmbeddingClient:
         return vectors
 
 
-def build_embedder(cfg: AppConfig, *, transport: Transport | None = None) -> EmbeddingClient | None:
+def build_embedder(cfg: AppConfig, *, client: httpx.AsyncClient) -> EmbeddingClient | None:
     """按配置造客户端。
 
     `[embedding].enabled = false` → 返回 `None`（能力未启用，属能力裁剪）；
@@ -197,4 +187,4 @@ def build_embedder(cfg: AppConfig, *, transport: Transport | None = None) -> Emb
         raise EmbeddingError(
             f"[embedding].enabled = true 但密钥 {cfg.embedding.api_key_env} 为空："
             "把密钥写进 config/.env（模板见 config/.env.example），或导出同名环境变量")
-    return EmbeddingClient(cfg.embedding, transport=transport)
+    return EmbeddingClient(cfg.embedding, client=client)

@@ -1,16 +1,20 @@
-"""Embedding 客户端单测：HTTP 传输注入假实现，全离线、不联网、不读真实密钥。"""
+"""Embedding 客户端单测：`httpx.MockTransport` 顶替真实端点，全离线、不联网、不读真实密钥。"""
 
 from __future__ import annotations
 
-import io
 import json
-import urllib.error
+from collections.abc import AsyncIterator, Callable
+from typing import Any
 
+import httpx
 import pytest
+import pytest_asyncio
 
-from xhs_agent.config import EmbeddingConfig, load_config
+from xhs_agent.config import EmbeddingConfig, EnvView, load_config
 from xhs_agent.schemas import Element
 from xhs_agent.tools import embedding
+
+Handler = Callable[[dict[str, Any], int], httpx.Response]
 
 
 def make_cfg(**overrides) -> EmbeddingConfig:
@@ -23,36 +27,64 @@ def make_cfg(**overrides) -> EmbeddingConfig:
         "max_retries": 2,
     }
     base.update(overrides)
-    return EmbeddingConfig(**base)
+    cfg = EmbeddingConfig(**base)
+    # 假密钥：httpx 会校验请求头，空 key 的 "Bearer " 在真实连接上会被拒（LocalProtocolError）
+    cfg._env = EnvView({}, {cfg.api_key_env: "sk-test"})
+    return cfg
 
 
 def vector(value: float = 0.1, dim: int = 1024) -> list[float]:
     return [float(value)] * dim
 
 
-def response_ok(n: int, value: float = 0.1) -> dict:
-    return {"data": [{"index": i, "embedding": vector(value)} for i in range(n)],
-            "usage": {"prompt_tokens": 12}}
+def response_ok(n: int, value: float = 0.1) -> httpx.Response:
+    return httpx.Response(200, json={
+        "data": [{"index": i, "embedding": vector(value)} for i in range(n)],
+        "usage": {"prompt_tokens": 12},
+    })
 
 
-class Recorder:
-    """假传输：记录每次请求，交给 handler 决定返回或抛错。"""
+class MockAPI:
+    """用 `httpx.MockTransport` 顶替真实端点：记录每次请求，handler 决定返回或抛错。"""
 
-    def __init__(self, handler) -> None:
+    def __init__(self, handler: Handler) -> None:
         self.handler = handler
-        self.calls: list[dict] = []
+        self.calls: list[dict[str, Any]] = []
+        self.client = httpx.AsyncClient(transport=httpx.MockTransport(self._handle))
 
-    def __call__(self, url, body, headers, timeout):
-        payload = json.loads(body.decode("utf-8"))
-        self.calls.append({"url": url, "payload": payload, "headers": headers,
-                           "timeout": timeout})
+    def _handle(self, request: httpx.Request) -> httpx.Response:
+        payload = json.loads(request.content.decode("utf-8"))
+        self.calls.append({
+            "url": str(request.url),
+            "payload": payload,
+            "authorization": request.headers.get("authorization"),
+            "timeout": request.extensions["timeout"]["read"],
+        })
         return self.handler(payload, len(self.calls))
+
+    async def aclose(self) -> None:
+        await self.client.aclose()
+
+
+@pytest_asyncio.fixture
+async def make_api() -> AsyncIterator[Callable[[Handler], MockAPI]]:
+    """按用例给的 handler 造 MockAPI，并在用例结束时统一关闭客户端。"""
+    created: list[MockAPI] = []
+
+    def _make(handler: Handler) -> MockAPI:
+        api = MockAPI(handler)
+        created.append(api)
+        return api
+
+    yield _make
+    for api in created:
+        await api.aclose()
 
 
 @pytest.fixture
-def no_sleep(monkeypatch: pytest.MonkeyPatch) -> None:
+def no_backoff(monkeypatch: pytest.MonkeyPatch) -> None:
     """重试退避在测试里变成立即返回，避免用例真的等 1.5s / 3s。"""
-    monkeypatch.setattr(embedding.time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(embedding, "backoff_seconds", lambda _attempt: 0.0)
 
 
 def write_config(tmp_path, body: str) -> str:
@@ -86,108 +118,120 @@ class TestMaterialEmbeddingText:
 
 
 class TestEmbed:
-    def test_request_shape_and_vector_order(self):
+    @pytest.mark.asyncio
+    async def test_request_shape_and_vector_order(self, make_api):
         def handler(payload, _n):
             count = len(payload["input"])
-            return {"data": [{"index": i, "embedding": vector(float(i))}
-                             for i in reversed(range(count))],
-                    "usage": {"prompt_tokens": 12}}
+            return httpx.Response(200, json={
+                "data": [{"index": i, "embedding": vector(float(i))}
+                         for i in reversed(range(count))],
+                "usage": {"prompt_tokens": 12}})
 
-        recorder = Recorder(handler)
-        result = embedding.EmbeddingClient(make_cfg(), transport=recorder).embed(["a", "b"])
-        call = recorder.calls[0]
+        api = make_api(handler)
+        result = await embedding.EmbeddingClient(make_cfg(), client=api.client).embed(["a", "b"])
+        call = api.calls[0]
         assert call["url"] == "https://example.test/v1/embeddings"
         assert call["payload"] == {"model": "text-embedding-v3", "input": ["a", "b"]}
-        assert call["headers"]["Authorization"] == "Bearer "
+        assert call["authorization"] == "Bearer sk-test"
         assert call["timeout"] == 5
         assert [item[0] for item in result.vectors] == [0.0, 1.0]  # index 乱序也要对回入参
         assert result.model == "text-embedding-v3"
         assert result.prompt_tokens == 12
         assert result.attempts == 1
 
-    def test_does_not_send_dimensions_parameter(self):
-        recorder = Recorder(lambda payload, _n: response_ok(len(payload["input"])))
-        embedding.EmbeddingClient(make_cfg(), transport=recorder).embed(["a"])
-        assert "dimensions" not in recorder.calls[0]["payload"]
+    @pytest.mark.asyncio
+    async def test_does_not_send_dimensions_parameter(self, make_api):
+        api = make_api(lambda payload, _n: response_ok(len(payload["input"])))
+        await embedding.EmbeddingClient(make_cfg(), client=api.client).embed(["a"])
+        assert "dimensions" not in api.calls[0]["payload"]
 
-    def test_dim_mismatch_raises_with_contract_hint(self):
-        recorder = Recorder(lambda payload, _n: {
-            "data": [{"index": 0, "embedding": vector(dim=768)}]})
+    @pytest.mark.asyncio
+    async def test_dim_mismatch_raises_with_contract_hint(self, make_api):
+        api = make_api(lambda _payload, _n: httpx.Response(200, json={
+            "data": [{"index": 0, "embedding": vector(dim=768)}]}))
         with pytest.raises(embedding.EmbeddingError, match="维度"):
-            embedding.EmbeddingClient(make_cfg(), transport=recorder).embed(["a"])
+            await embedding.EmbeddingClient(make_cfg(), client=api.client).embed(["a"])
 
-    def test_count_mismatch_raises(self):
-        recorder = Recorder(lambda payload, _n: {"data": [{"index": 0, "embedding": vector()}]})
+    @pytest.mark.asyncio
+    async def test_count_mismatch_raises(self, make_api):
+        api = make_api(lambda _payload, _n: httpx.Response(200, json={
+            "data": [{"index": 0, "embedding": vector()}]}))
         with pytest.raises(embedding.EmbeddingError, match="条数"):
-            embedding.EmbeddingClient(make_cfg(), transport=recorder).embed(["a", "b"])
+            await embedding.EmbeddingClient(make_cfg(), client=api.client).embed(["a", "b"])
 
-    def test_malformed_body_raises(self):
-        recorder = Recorder(lambda payload, _n: {"nope": 1})
+    @pytest.mark.asyncio
+    async def test_malformed_body_raises(self, make_api):
+        api = make_api(lambda _payload, _n: httpx.Response(200, json={"nope": 1}))
         with pytest.raises(embedding.EmbeddingError, match="返回结构异常"):
-            embedding.EmbeddingClient(make_cfg(), transport=recorder).embed(["a"])
+            await embedding.EmbeddingClient(make_cfg(), client=api.client).embed(["a"])
 
-    def test_empty_input_makes_no_request(self):
-        recorder = Recorder(lambda payload, _n: {})
-        result = embedding.EmbeddingClient(make_cfg(), transport=recorder).embed([])
-        assert recorder.calls == []
+    @pytest.mark.asyncio
+    async def test_empty_input_makes_no_request(self, make_api):
+        api = make_api(lambda _payload, _n: httpx.Response(200, json={}))
+        result = await embedding.EmbeddingClient(make_cfg(), client=api.client).embed([])
+        assert api.calls == []
         assert result.vectors == []
 
-    def test_retry_then_success(self, no_sleep):
+    @pytest.mark.asyncio
+    async def test_retry_then_success(self, make_api, no_backoff):
         def handler(payload, n):
             if n == 1:
-                raise urllib.error.URLError("boom")
+                raise httpx.ConnectError("boom")
             return response_ok(len(payload["input"]))
 
-        recorder = Recorder(handler)
-        result = embedding.EmbeddingClient(make_cfg(), transport=recorder).embed(["a"])
-        assert len(recorder.calls) == 2
+        api = make_api(handler)
+        result = await embedding.EmbeddingClient(make_cfg(), client=api.client).embed(["a"])
+        assert len(api.calls) == 2
         assert result.attempts == 2
 
-    def test_all_attempts_fail_raises(self, no_sleep):
+    @pytest.mark.asyncio
+    async def test_all_attempts_fail_raises(self, make_api, no_backoff):
         def handler(_payload, _n):
-            raise urllib.error.URLError("down")
+            raise httpx.ConnectError("down")
 
-        recorder = Recorder(handler)
+        api = make_api(handler)
         with pytest.raises(embedding.EmbeddingError, match="已尝试 3 次"):
-            embedding.EmbeddingClient(make_cfg(), transport=recorder).embed(["a"])
-        assert len(recorder.calls) == 3  # 1 次 + max_retries=2
+            await embedding.EmbeddingClient(make_cfg(), client=api.client).embed(["a"])
+        assert len(api.calls) == 3  # 1 次 + max_retries=2
 
-    def test_http_400_is_not_retried(self, no_sleep):
-        def handler(_payload, _n):
-            raise urllib.error.HTTPError("https://example.test", 400, "Bad Request", {},
-                                         io.BytesIO(b'{"error":{"message":"bad input"}}'))
-
-        recorder = Recorder(handler)
+    @pytest.mark.asyncio
+    async def test_http_400_is_not_retried(self, make_api, no_backoff):
+        api = make_api(lambda _payload, _n: httpx.Response(
+            400, json={"error": {"message": "bad input"}}))
         with pytest.raises(embedding.EmbeddingError, match="HTTP 400"):
-            embedding.EmbeddingClient(make_cfg(), transport=recorder).embed(["a"])
-        assert len(recorder.calls) == 1
+            await embedding.EmbeddingClient(make_cfg(), client=api.client).embed(["a"])
+        assert len(api.calls) == 1
 
-    def test_batching_splits_at_provider_cap(self):
-        def handler(payload, _n):
-            return response_ok(len(payload["input"]))
-
-        recorder = Recorder(handler)
-        client = embedding.EmbeddingClient(make_cfg(batch_size=16), transport=recorder)
-        result = client.embed([f"t{i}" for i in range(16)])
-        assert [len(call["payload"]["input"]) for call in recorder.calls] == [10, 6]
+    @pytest.mark.asyncio
+    async def test_batching_splits_at_provider_cap(self, make_api):
+        api = make_api(lambda payload, _n: response_ok(len(payload["input"])))
+        client = embedding.EmbeddingClient(make_cfg(batch_size=16), client=api.client)
+        result = await client.embed([f"t{i}" for i in range(16)])
+        assert [len(call["payload"]["input"]) for call in api.calls] == [10, 6]
         assert len(result.vectors) == 16
         assert result.attempts == 2
 
 
 class TestBuildEmbedder:
-    def test_disabled_returns_none(self, tmp_path):
+    @pytest.mark.asyncio
+    async def test_disabled_returns_none(self, tmp_path, make_api):
+        api = make_api(lambda _payload, _n: httpx.Response(200, json={}))
         cfg = load_config(write_config(tmp_path, "[embedding]\nenabled = false\n"))
-        assert embedding.build_embedder(cfg) is None
+        assert embedding.build_embedder(cfg, client=api.client) is None
 
-    def test_enabled_without_key_raises(self, tmp_path):
+    @pytest.mark.asyncio
+    async def test_enabled_without_key_raises(self, tmp_path, make_api):
+        api = make_api(lambda _payload, _n: httpx.Response(200, json={}))
         cfg = load_config(write_config(tmp_path, "[embedding]\nenabled = true\n"))
         with pytest.raises(embedding.EmbeddingError, match="DASHSCOPE_API_KEY"):
-            embedding.build_embedder(cfg)
+            embedding.build_embedder(cfg, client=api.client)
 
-    def test_enabled_with_key_builds_client(self, tmp_path):
+    @pytest.mark.asyncio
+    async def test_enabled_with_key_builds_client(self, tmp_path, make_api):
+        api = make_api(lambda _payload, _n: httpx.Response(200, json={}))
         path = write_config(tmp_path, "[embedding]\nenabled = true\n")
         (tmp_path / ".env").write_text("DASHSCOPE_API_KEY=sk-test\n", encoding="utf-8")
-        client = embedding.build_embedder(load_config(path))
+        client = embedding.build_embedder(load_config(path), client=api.client)
         assert isinstance(client, embedding.EmbeddingClient)
         assert client.batch_size == 10
         assert client.label == "embedding:text-embedding-v3"

@@ -1,4 +1,4 @@
-"""三个 agent 的单测：用假 provider + 真 prompt 资产，离线、不联网（S3.1）。"""
+"""三个 agent 的单测：用假 provider + 真 prompt 资产，离线、不联网（S3.1 / S3.5）。"""
 
 from __future__ import annotations
 
@@ -41,7 +41,7 @@ DRAFT_PAYLOAD = {
 
 
 class FakeProvider(llm.BaseProvider):
-    """按任务返回预置 JSON；`bad_json=True` 时返回不可解析文本。"""
+    """按任务返回预置 JSON；`bad_json=True` 时返回不可解析文本（S3.5 起 `complete` 是协程）。"""
 
     name = "fake"
 
@@ -51,7 +51,7 @@ class FakeProvider(llm.BaseProvider):
         self.error = error
         self.tasks: list[str] = []
 
-    def complete(self, call):
+    async def complete(self, call):
         self.tasks.append(call.task)
         if self.error:
             return LLMResult(text="", provider=self.name, model=self.model, error=self.error)
@@ -78,27 +78,31 @@ def candidate() -> MatchCandidate:
 
 
 class TestExtractClue:
-    def test_returns_validated_clue_with_version(self):
-        outcome = extract_clue("某明星打羽毛球", caller())
+    @pytest.mark.asyncio
+    async def test_returns_validated_clue_with_version(self):
+        outcome = await extract_clue("某明星打羽毛球", caller())
         assert outcome.task_id == "hotspot_clue"
         assert outcome.version == 1
         assert outcome.value.hotspot_raw == "某明星打羽毛球"  # 用输入，不信模型改写
         assert outcome.value.element_values == ["羽毛球"]
         assert outcome.value.provider == "fake" and outcome.value.model == "fake-1"
 
-    def test_provider_error_raises_without_repair(self):
+    @pytest.mark.asyncio
+    async def test_provider_error_raises_without_repair(self):
         with pytest.raises(LLMError):
-            extract_clue("热点", caller(error="上游 503"))
+            await extract_clue("热点", caller(error="上游 503"))
 
-    def test_two_bad_json_attempts_raise(self):
+    @pytest.mark.asyncio
+    async def test_two_bad_json_attempts_raise(self):
         with pytest.raises(LLMError):
-            extract_clue("热点", caller(bad_json=True))
+            await extract_clue("热点", caller(bad_json=True))
 
 
 class TestExplainCandidates:
-    def test_model_reasons_override_rule_reasons(self):
-        outcome = explain_candidates(extract_clue("热点", caller()).value, [candidate()],
-                                     caller())
+    @pytest.mark.asyncio
+    async def test_model_reasons_override_rule_reasons(self):
+        clue = (await extract_clue("热点", caller())).value
+        outcome = await explain_candidates(clue, [candidate()], caller())
         updated = outcome.value[0]
         assert outcome.version == 1
         assert updated.reasons == ["模型理由：命中主题「羽毛球」"]
@@ -106,59 +110,65 @@ class TestExplainCandidates:
         assert updated.rank == 1                      # 排序不动
         assert updated.finalize() is updated          # 仍是契约终态
 
-    def test_without_candidates_no_model_call(self):
+    @pytest.mark.asyncio
+    async def test_without_candidates_no_model_call(self):
         fake = FakeProvider()
-        outcome = explain_candidates(extract_clue("热点", caller()).value, [],
-                                     StructuredCaller(provider=fake))
+        clue = (await extract_clue("热点", caller())).value
+        outcome = await explain_candidates(clue, [], StructuredCaller(provider=fake))
         assert outcome.value == []
         assert outcome.version is None
         assert fake.tasks == []
 
-    def test_missing_entry_is_rejected(self):
+    @pytest.mark.asyncio
+    async def test_missing_entry_is_rejected(self):
         class Partial(FakeProvider):
-            def complete(self, call):
+            async def complete(self, call):
                 if call.task == "material_select":
                     return LLMResult(text=json.dumps({"candidates": []}), provider=self.name,
                                      model=self.model)
-                return super().complete(call)
+                return await super().complete(call)
 
+        clue = (await extract_clue("热点", caller())).value
         with pytest.raises(LLMError):
-            explain_candidates(extract_clue("热点", caller()).value, [candidate()],
-                               StructuredCaller(provider=Partial()))
+            await explain_candidates(clue, [candidate()], StructuredCaller(provider=Partial()))
 
-    def test_missing_reasons_is_rejected(self):
+    @pytest.mark.asyncio
+    async def test_missing_reasons_is_rejected(self):
         class NoReasons(FakeProvider):
-            def complete(self, call):
+            async def complete(self, call):
                 if call.task == "material_select":
                     payload = {"candidates": [{"material_id": MATERIAL_ID, "usage": "放开头"}]}
                     return LLMResult(text=json.dumps(payload), provider=self.name,
                                      model=self.model)
-                return super().complete(call)
+                return await super().complete(call)
 
+        clue = (await extract_clue("热点", caller())).value
         with pytest.raises(LLMError):
-            explain_candidates(extract_clue("热点", caller()).value, [candidate()],
-                               StructuredCaller(provider=NoReasons()))
+            await explain_candidates(clue, [candidate()],
+                                     StructuredCaller(provider=NoReasons()))
 
-    def test_unknown_material_is_rejected(self):
+    @pytest.mark.asyncio
+    async def test_unknown_material_is_rejected(self):
         class Ghost(FakeProvider):
-            def complete(self, call):
+            async def complete(self, call):
                 if call.task == "material_select":
                     payload = {"candidates": [
                         {"material_id": "m_ghost", "reasons": ["r"], "usage": "u"},
                         *EXPLAIN_PAYLOAD["candidates"]]}
                     return LLMResult(text=json.dumps(payload), provider=self.name,
                                      model=self.model)
-                return super().complete(call)
+                return await super().complete(call)
 
+        clue = (await extract_clue("热点", caller())).value
         with pytest.raises(LLMError):
-            explain_candidates(extract_clue("热点", caller()).value, [candidate()],
-                               StructuredCaller(provider=Ghost()))
+            await explain_candidates(clue, [candidate()], StructuredCaller(provider=Ghost()))
 
 
 class TestWriteDraft:
-    def test_returns_draft_with_inputs_attached(self):
-        clue = extract_clue("热点", caller()).value
-        outcome = write_draft(clue, material().to_dict(), caller())
+    @pytest.mark.asyncio
+    async def test_returns_draft_with_inputs_attached(self):
+        clue = (await extract_clue("热点", caller())).value
+        outcome = await write_draft(clue, material().to_dict(), caller())
         draft = outcome.value
         assert outcome.version == 1
         assert draft.material_id == MATERIAL_ID
@@ -167,22 +177,24 @@ class TestWriteDraft:
         assert draft.tags == ["#羽毛球", "#运动"]      # 契约会补 #
         assert draft.provider == "fake"
 
-    def test_without_material_no_model_call(self):
+    @pytest.mark.asyncio
+    async def test_without_material_no_model_call(self):
         fake = FakeProvider()
-        clue = extract_clue("热点", caller()).value
-        outcome = write_draft(clue, None, StructuredCaller(provider=fake))
+        clue = (await extract_clue("热点", caller())).value
+        outcome = await write_draft(clue, None, StructuredCaller(provider=fake))
         assert outcome.value is None
         assert outcome.version is None
         assert fake.tasks == []
 
-    def test_missing_body_is_rejected(self):
+    @pytest.mark.asyncio
+    async def test_missing_body_is_rejected(self):
         class NoBody(FakeProvider):
-            def complete(self, call):
+            async def complete(self, call):
                 if call.task == "copy_draft":
                     return LLMResult(text=json.dumps({"titles": []}), provider=self.name,
                                      model=self.model)
-                return super().complete(call)
+                return await super().complete(call)
 
-        clue = extract_clue("热点", caller()).value
+        clue = (await extract_clue("热点", caller())).value
         with pytest.raises(LLMError):
-            write_draft(clue, material().to_dict(), StructuredCaller(provider=NoBody()))
+            await write_draft(clue, material().to_dict(), StructuredCaller(provider=NoBody()))

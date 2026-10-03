@@ -15,20 +15,24 @@
 
 from __future__ import annotations
 
-import asyncio
 import uuid
+from contextlib import AsyncExitStack
 from dataclasses import dataclass, field, replace
 from typing import Any
 
+import httpx
+from pgvector.sqlalchemy import Vector
 from sqlalchemy import Text, bindparam, select, text
 from sqlalchemy.dialects.postgresql import ARRAY
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..config import AppConfig
+from ..db.models import EMBEDDING_DIM
 from ..db.models import Material as MaterialRow
 from ..schemas import Coverage, HotspotClue, MatchCandidate
 from ..tools import retrieval as retrieval_tool
 from ..tools.embedding import EmbeddingClient, build_embedder
+from ..tools.http import build_http_client
 from .materials import row_to_material
 
 # 通道 A 的文本表达式必须与数据契约 §4.1 的索引表达式逐字一致，
@@ -105,14 +109,18 @@ async def vector_recall(session: AsyncSession, query_vector: list[float], model:
 
     只取 `embedding_model` 等于当前模型的行——混代向量的距离不可比（§九）。
     """
-    literal = "[" + ",".join(repr(float(value)) for value in query_vector) + "]"
-    rows = (await session.execute(text(
+    # 向量以 pgvector 的 `Vector` 类型绑定（不再手工 repr(float) 拼字面量）：序列化交给库，
+    # 与 ORM 写 `materials.embedding` 的口径统一（S3.5）。
+    statement = text(
         "SELECT id::text AS material_id, (embedding <=> CAST(:v AS vector)) AS distance "
         "FROM materials "
         "WHERE embedding IS NOT NULL AND embedding_model = CAST(:model AS text) "
         "AND (embedding <=> CAST(:v AS vector)) <= CAST(:max_distance AS real) "
         "ORDER BY distance ASC, path ASC LIMIT CAST(:limit AS integer)"
-    ), {"v": literal, "model": model, "max_distance": max_distance, "limit": limit})).all()
+    ).bindparams(bindparam("v", type_=Vector(EMBEDDING_DIM)))
+    rows = (await session.execute(statement,
+                                  {"v": list(query_vector), "model": model,
+                                   "max_distance": max_distance, "limit": limit})).all()
     return [(row.material_id, float(row.distance)) for row in rows]
 
 
@@ -153,12 +161,15 @@ def _ranks(hits: list[tuple[str, float]]) -> dict[str, int]:
 async def retrieve_candidates(session: AsyncSession, cfg: AppConfig, clue: HotspotClue, *,
                               embedder: EmbeddingClient | None = None,
                               now: float | None = None,
-                              topk: int | None = None) -> RetrievalOutcome:
+                              topk: int | None = None,
+                              http: httpx.AsyncClient | None = None) -> RetrievalOutcome:
     """一次检索：双通道召回 → 映射成内存素材 → 融合排序 → 返回结果。
 
     输入：`session`、`cfg`（读 `[retrieval]` / `[match]` / `[embedding]`）、`clue`；
     `embedder`（可注入的向量化对象，None = 按配置现造）、`now`（时间基准，Unix 秒，可选）。
     `topk`（可选覆盖：worker 传 `runs.topk`；None = 用 `cfg.match.topk`）。
+    `http`（可选 httpx 客户端：`embedder` 未注入时用它造向量客户端，让一次运行复用同一个
+    连接池；None = 这里临时起一个）。
     异常：向量召回已启用但查询向量化失败时抛 `EmbeddingError`（不降级）。
     """
     params = retrieval_tool.RetrievalParams.from_config(cfg)
@@ -173,12 +184,19 @@ async def retrieve_candidates(session: AsyncSession, cfg: AppConfig, clue: Hotsp
 
     vector_hits: list[tuple[str, float]] = []
     if cfg.embedding.enabled:
-        client = embedder if embedder is not None else build_embedder(cfg)
-        if client is None:  # pragma: no cover - enabled 为真时 build_embedder 不会返回 None
-            raise RuntimeError("向量召回已启用但没有可用的 embedding 客户端")
-        # embed 是同步 urllib 调用，放线程里执行以免阻塞事件循环；S3.5 换 httpx 后改回原生异步
-        query_vector = (await asyncio.to_thread(
-            client.embed, [retrieval_tool.vector_query_text(clue)])).vectors[0]
+        # 注入的 embedder 用自己的生命周期；没注入时起一个短生命周期客户端（独立调用路径）。
+        async with AsyncExitStack() as stack:
+            client: EmbeddingClient | None = embedder
+            if client is None:
+                shared = http
+                if shared is None:
+                    shared = await stack.enter_async_context(
+                        build_http_client(cfg.embedding.timeout_s))
+                client = build_embedder(cfg, client=shared)
+            if client is None:  # pragma: no cover - enabled 为真时 build_embedder 不会返回 None
+                raise RuntimeError("向量召回已启用但没有可用的 embedding 客户端")
+            embedded = await client.embed([retrieval_tool.vector_query_text(clue)])
+        query_vector = embedded.vectors[0]
         vector_hits = await vector_recall(session, query_vector, cfg.embedding.model,
                                           limit=params.recall_limit,
                                           max_distance=params.max_cosine_distance)

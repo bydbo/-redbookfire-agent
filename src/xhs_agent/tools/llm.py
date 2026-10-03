@@ -2,7 +2,7 @@
 
 用途：把「调一次聊天模型并拿到结构化 JSON」包成可替换的 provider，供上层编排使用。
 输入：`LLMConfig`（provider / base_url / model / 密钥 / 超时 / 重试）+ `LLMCall`
-      （task / system / user / json_mode）。
+      （task / system / user / json_mode）+ 调用方注入的 `httpx.AsyncClient`（连接池）。
 输出：`LLMResult`（text / provider / model / token / 耗时 / 成本 / error）。
       结构化输出统一走 `StructuredCaller`：解析失败时把错误回灌给模型自修一次。
 
@@ -10,20 +10,27 @@
   （DeepSeek、通义千问、智谱、Kimi、SiliconFlow…）
 - StructuredCaller：强制模型返回结构化 JSON，解析失败自动修复重试
 
+传输层用 httpx 异步客户端（S3.5）：客户端由调用方按「一次运行一个」注入，本模块不自持；
+重试口径不变（`max_retries + 1` 次、退避见 `tools/http.py`、400/401/403 不重试）。
 运行时降级已取消（ADR 0001）：没有密钥就是配置错误，启动前置检查会拦住，不存在"离线接管"。
 """
 
 from __future__ import annotations
 
+import asyncio
 import json
 import time
-import urllib.error
-import urllib.request
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from typing import Any, TypeVar
+
+import httpx
 
 from ..config import LLM_PROVIDERS, AppConfig, LLMConfig
 from ..util import extract_json
+from .http import backoff_seconds
+
+T = TypeVar("T")
 
 
 class LLMError(RuntimeError):
@@ -35,7 +42,7 @@ class LLMCall:
     task: str
     system: str
     user: str
-    context: dict = field(default_factory=dict)
+    context: dict[str, Any] = field(default_factory=dict)
     json_mode: bool = True
 
 
@@ -51,7 +58,7 @@ class LLMResult:
     attempts: int = 1
     error: str = ""
 
-    def record(self, task: str) -> dict:
+    def record(self, task: str) -> dict[str, Any]:
         return {
             "task": task,
             "provider": self.provider,
@@ -76,7 +83,7 @@ class BaseProvider:
     def __init__(self, model: str = "") -> None:
         self.model = model
 
-    def complete(self, call: LLMCall) -> LLMResult:  # pragma: no cover - 接口定义
+    async def complete(self, call: LLMCall) -> LLMResult:  # pragma: no cover - 接口定义
         raise NotImplementedError
 
     @property
@@ -87,15 +94,16 @@ class BaseProvider:
 class OpenAICompatibleProvider(BaseProvider):
     name = "openai_compatible"
 
-    def __init__(self, cfg: LLMConfig) -> None:
+    def __init__(self, cfg: LLMConfig, *, client: httpx.AsyncClient) -> None:
         super().__init__(model=cfg.model)
         self.cfg = cfg
         self.base_url = (cfg.base_url or "").rstrip("/")
         self.api_key = cfg.resolved_key()
+        self.client = client
         if not self.base_url:
             raise LLMError("缺少 base_url，无法调用在线模型")
 
-    def complete(self, call: LLMCall) -> LLMResult:
+    async def complete(self, call: LLMCall) -> LLMResult:
         payload = {
             "model": self.cfg.model,
             "messages": [
@@ -108,56 +116,50 @@ class OpenAICompatibleProvider(BaseProvider):
         if call.json_mode:
             payload["response_format"] = {"type": "json_object"}
 
-        body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         url = f"{self.base_url}/chat/completions"
+        headers = {
+            "Authorization": f"Bearer {self.api_key}",
+            "Accept": "application/json",
+        }
         last_error = ""
         started = time.time()
 
         for attempt in range(1, self.cfg.max_retries + 2):
-            request = urllib.request.Request(
-                url,
-                data=body,
-                method="POST",
-                headers={
-                    "Content-Type": "application/json",
-                    "Authorization": f"Bearer {self.api_key}",
-                    "Accept": "application/json",
-                },
-            )
             try:
-                with urllib.request.urlopen(request, timeout=self.cfg.timeout_s) as response:
-                    data = json.loads(response.read().decode("utf-8", errors="replace"))
-                text = _extract_message_text(data)
-                usage = data.get("usage") or {}
-                prompt_tokens = int(usage.get("prompt_tokens") or estimate_tokens(call.system + call.user))
-                completion_tokens = int(usage.get("completion_tokens") or estimate_tokens(text))
-                cost = (
-                    prompt_tokens / 1_000_000 * self.cfg.price_in_per_m
-                    + completion_tokens / 1_000_000 * self.cfg.price_out_per_m
-                )
-                return LLMResult(
-                    text=text,
-                    provider=self.name,
-                    model=self.cfg.model,
-                    prompt_tokens=prompt_tokens,
-                    completion_tokens=completion_tokens,
-                    latency_ms=int((time.time() - started) * 1000),
-                    cost_cny=cost,
-                    attempts=attempt,
-                )
-            except urllib.error.HTTPError as exc:  # 4xx/5xx
-                detail = ""
-                try:
-                    detail = exc.read().decode("utf-8", errors="replace")[:300]
-                except Exception:  # pragma: no cover
-                    detail = ""
-                last_error = f"HTTP {exc.code}: {detail or exc.reason}"
-                if exc.code in (401, 403, 400):
-                    break
-            except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as exc:
+                response = await self.client.post(url, json=payload, headers=headers,
+                                                  timeout=self.cfg.timeout_s)
+                if response.status_code >= 400:   # 4xx/5xx
+                    detail = response.text[:300]
+                    last_error = (f"HTTP {response.status_code}: "
+                                  f"{detail or response.reason_phrase}")
+                    if response.status_code in (401, 403, 400):
+                        break
+                else:
+                    data = response.json()
+                    text = _extract_message_text(data)
+                    usage = data.get("usage") or {}
+                    prompt_tokens = int(usage.get("prompt_tokens")
+                                        or estimate_tokens(call.system + call.user))
+                    completion_tokens = int(usage.get("completion_tokens")
+                                            or estimate_tokens(text))
+                    cost = (
+                        prompt_tokens / 1_000_000 * self.cfg.price_in_per_m
+                        + completion_tokens / 1_000_000 * self.cfg.price_out_per_m
+                    )
+                    return LLMResult(
+                        text=text,
+                        provider=self.name,
+                        model=self.cfg.model,
+                        prompt_tokens=prompt_tokens,
+                        completion_tokens=completion_tokens,
+                        latency_ms=int((time.time() - started) * 1000),
+                        cost_cny=cost,
+                        attempts=attempt,
+                    )
+            except (httpx.HTTPError, json.JSONDecodeError) as exc:
                 last_error = f"{type(exc).__name__}: {exc}"
             if attempt <= self.cfg.max_retries:
-                time.sleep(min(8.0, 1.5 ** attempt))
+                await asyncio.sleep(backoff_seconds(attempt))
 
         return LLMResult(
             text="",
@@ -169,7 +171,7 @@ class OpenAICompatibleProvider(BaseProvider):
         )
 
 
-def _extract_message_text(data: dict) -> str:
+def _extract_message_text(data: dict[str, Any]) -> str:
     try:
         choices = data["choices"]
     except (KeyError, TypeError) as exc:
@@ -185,12 +187,12 @@ def _extract_message_text(data: dict) -> str:
     return str(content)
 
 
-def build_provider(cfg: AppConfig) -> BaseProvider:
+def build_provider(cfg: AppConfig, *, client: httpx.AsyncClient) -> BaseProvider:
     """按配置造 provider：只支持 OpenAI 兼容端点，未知值抛 `LLMError`（无效配置在启动前置检查就拦）。"""
     provider_name = cfg.llm.resolved_provider()
     # 白名单与配置层共用一份（config.LLM_PROVIDERS），避免两处漂移
     if provider_name in LLM_PROVIDERS:
-        return OpenAICompatibleProvider(cfg.llm)
+        return OpenAICompatibleProvider(cfg.llm, client=client)
     raise LLMError(f"未知的 provider：{provider_name}")
 
 
@@ -200,22 +202,23 @@ class StructuredCaller:
 
     provider: BaseProvider
     max_repairs: int = 1
-    records: list = field(default_factory=list)
+    records: list[dict[str, Any]] = field(default_factory=list)
 
-    def call(
+    async def call(
         self,
         task: str,
         system: str,
         user: str,
-        parse: Callable[[dict], object],
-        context: dict | None = None,
+        parse: Callable[[Any], T],
+        context: dict[str, Any] | None = None,
         json_mode: bool = True,
-    ):
+    ) -> tuple[T, LLMResult]:
         prompt = user
         last_error = ""
         for _attempt in range(self.max_repairs + 1):
-            result = self.provider.complete(LLMCall(task=task, system=system, user=prompt,
-                                                    context=context or {}, json_mode=json_mode))
+            result = await self.provider.complete(
+                LLMCall(task=task, system=system, user=prompt,
+                        context=context or {}, json_mode=json_mode))
             self.records.append(result.record(task))
             if result.error:
                 last_error = result.error

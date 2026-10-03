@@ -50,7 +50,7 @@ class FakeProvider(llm.BaseProvider):
         self.fail_times = fail_times
         self.tasks: list[str] = []
 
-    def complete(self, call):
+    async def complete(self, call):
         self.tasks.append(call.task)
         if self.fail_times > 0:
             self.fail_times -= 1
@@ -90,7 +90,7 @@ def fake_retrieve(outcome: RetrievalOutcome):
     calls: list[str] = []
     topks: list[int | None] = []
 
-    async def _retrieve(session, cfg, clue, *, embedder=None, now=None, topk=None):
+    async def _retrieve(session, cfg, clue, *, embedder=None, now=None, topk=None, http=None):
         calls.append(clue.hotspot_raw)
         topks.append(topk)
         return outcome

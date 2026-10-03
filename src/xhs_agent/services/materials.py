@@ -21,9 +21,9 @@
 
 from __future__ import annotations
 
-import asyncio
 import os
 from collections.abc import Callable, Sequence
+from contextlib import AsyncExitStack
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from decimal import Decimal
@@ -42,6 +42,7 @@ from ..tools.embedding import (
     build_embedder,
     material_embedding_text,
 )
+from ..tools.http import build_http_client
 
 
 @dataclass
@@ -303,12 +304,6 @@ async def backfill_embeddings(session: AsyncSession, cfg: AppConfig, *,
             "向量召回未启用（[embedding].enabled = false）",
             "把 config/config.toml 的 [embedding].enabled 设为 true 后再回填；"
             "索引同步不会隐式调用模型")
-    client = embedder if embedder is not None else build_embedder(cfg)
-    if client is None:
-        raise ConfigError(
-            "向量召回未启用（[embedding].enabled = false）",
-            "把 config/config.toml 的 [embedding].enabled 设为 true 后再回填")
-
     model = cfg.embedding.model
     statement = (
         select(MaterialRow)
@@ -330,26 +325,36 @@ async def backfill_embeddings(session: AsyncSession, cfg: AppConfig, *,
         else:
             report.skipped_empty += 1
 
-    for batch in _chunks(todo, batch_size or cfg.embedding.batch_size):
-        try:
-            # embed 是同步 urllib 调用，放线程里跑，避免阻塞事件循环（S3.5 换 httpx 后改回原生异步）
-            result = await asyncio.to_thread(
-                client.embed, [text for _row, text in batch])
-        except EmbeddingError as exc:
-            # 失败批尚未写入任何行，直接停止；已提交的批保留，重跑只补未完成的行
-            report.failed = len(batch)
-            report.error = str(exc)
-            break
-        if len(result.vectors) != len(batch):
-            report.failed = len(batch)
-            report.error = f"返回向量条数 {len(result.vectors)} 与请求 {len(batch)} 不符"
-            break
-        for (row, _text), vector in zip(batch, result.vectors, strict=True):
-            row.embedding = vector
-            row.embedding_model = model
-        await session.commit()
-        report.batches += 1
-        report.embedded += len(batch)
-        report.prompt_tokens += result.prompt_tokens
+    # S3.5：未注入 embedder 时起一个客户端（连接池）并在这里关闭；注入的用自己的生命周期。
+    async with AsyncExitStack() as stack:
+        client: EmbeddingClient | None = embedder
+        if client is None:
+            http = await stack.enter_async_context(
+                build_http_client(cfg.embedding.timeout_s))
+            client = build_embedder(cfg, client=http)
+        if client is None:
+            raise ConfigError(
+                "向量召回未启用（[embedding].enabled = false）",
+                "把 config/config.toml 的 [embedding].enabled 设为 true 后再回填")
+
+        for batch in _chunks(todo, batch_size or cfg.embedding.batch_size):
+            try:
+                result = await client.embed([text for _row, text in batch])
+            except EmbeddingError as exc:
+                # 失败批尚未写入任何行，直接停止；已提交的批保留，重跑只补未完成的行
+                report.failed = len(batch)
+                report.error = str(exc)
+                break
+            if len(result.vectors) != len(batch):
+                report.failed = len(batch)
+                report.error = f"返回向量条数 {len(result.vectors)} 与请求 {len(batch)} 不符"
+                break
+            for (row, _text), vector in zip(batch, result.vectors, strict=True):
+                row.embedding = vector
+                row.embedding_model = model
+            await session.commit()
+            report.batches += 1
+            report.embedded += len(batch)
+            report.prompt_tokens += result.prompt_tokens
 
     return report

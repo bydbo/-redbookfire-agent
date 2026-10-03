@@ -60,7 +60,7 @@ class FakeEmbedder:
     def __init__(self) -> None:
         self.calls = 0
 
-    def embed(self, texts: list[str]) -> EmbeddingResult:
+    async def embed(self, texts: list[str]) -> EmbeddingResult:
         self.calls += 1
         return EmbeddingResult(vectors=[list(E0) for _ in texts], model=MODEL,
                                prompt_tokens=12, attempts=1)
@@ -76,7 +76,7 @@ class FakeProvider(llm.BaseProvider):
         self.tasks: list[str] = []
         self.fail_on_marker = fail_on_marker
 
-    def complete(self, call):
+    async def complete(self, call):
         self.tasks.append(call.task)
         if self.fail_on_marker and self.fail_on_marker in call.user:
             return LLMResult(text="", provider=self.name, model=self.model, error="假上游失败")
