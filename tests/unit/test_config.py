@@ -54,6 +54,12 @@ class TestLayerPrecedence:
         cfg = load_config(write_config(tmp_path, '[llm]\nmodel = "from-toml"\n'))
         assert cfg.llm.model == "from-env"
 
+    def test_frontend_serve_can_be_overridden_by_env(self, tmp_path, clean_contract_env):
+        """S3.8：没有前端产物时用 XHS_FRONTEND_SERVE=false 跑 API-only（契约 §2.2）。"""
+        clean_contract_env.setenv("XHS_FRONTEND_SERVE", "false")
+        cfg = load_config(write_config(tmp_path, "[frontend]\nserve = true\n"))
+        assert cfg.frontend.serve is False
+
     def test_empty_override_does_not_wipe_value(self, tmp_path, clean_contract_env):
         clean_contract_env.setenv("XHS_LLM_MODEL", "")
         cfg = load_config(write_config(tmp_path, '[llm]\nmodel = "from-toml"\n'))

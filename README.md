@@ -49,12 +49,13 @@
 | 分析主链路 HTTP 异步化（文本模型与向量共用 httpx 连接池，去掉 `asyncio.to_thread`） | ✅ 已完成（S3.5） |
 | Celery worker 接线（`POST /api/analyze` 真投递 → 消费 → 索引新鲜度 → 分析 → 写回） | ✅ 已完成（S3.4b） |
 | Walking Skeleton 端到端联调（一键脚本：起进程 → 投热点 → 验候选与报告 → 落样例报告） | ✅ 已完成（S3.6） |
+| 完整启动前置检查（配置契约 §四 的 7 步 + 接入 lifespan + `python -m xhs_agent.serve`） | ✅ 已完成（S3.8） |
 | Alembic 数据库迁移（唯一建表路径） | ✅ 已完成（S2.3） |
 | 评测集 v1 与示例素材包（七维度口径、版本冻结） | ✅ 已完成（S2.0） |
 | 服务入口（FastAPI）与编排层 | ⬜ 未实现 |
 | 前端单页应用（Vue 3 + Vite） | ⬜ 未实现 |
 
-业务链路**已端到端跑通**：`docker compose up -d --wait` 起依赖 → `uv run celery -A xhs_agent.tasks.worker:app worker` 起 worker → `uv run uvicorn xhs_agent.api.main:app` 起接口 → `POST /api/analyze` 投递 → worker 自动消费（索引新鲜度 → 五节点分析 → 逐热点写回）→ `/api/jobs/{job_id}` 轮询 → `/api/runs/{run_id}` 取结构化结果、`/report` 取报告。另可运行 `uv run python -m xhs_agent.probe`、`uv run python scripts/index_materials.py`、`uv run python scripts/backfill_embeddings.py`、`uv run python scripts/eval_retrieval.py`。路线图见文末。
+业务链路**已端到端跑通**：`docker compose up -d --wait` 起依赖 → `uv run celery -A xhs_agent.tasks.worker:app worker` 起 worker → `uv run python -m xhs_agent.serve` 起接口（先跑 7 步启动前置检查）→ `POST /api/analyze` 投递 → worker 自动消费（索引新鲜度 → 五节点分析 → 逐热点写回）→ `/api/jobs/{job_id}` 轮询 → `/api/runs/{run_id}` 取结构化结果、`/report` 取报告。另可运行 `uv run python -m xhs_agent.probe`、`uv run python scripts/index_materials.py`、`uv run python scripts/backfill_embeddings.py`、`uv run python scripts/eval_retrieval.py`、`uv run python scripts/smoke_skeleton.py`。路线图见文末。
 
 ---
 
@@ -140,7 +141,8 @@ docker compose ps
 # 8. 验证配置读取（输出不应包含任何密钥）
 uv run python -c "from xhs_agent.config import load_config; print(load_config().describe())"
 
-# 9. 跑启动前置检查（缺必填项会打印 E_CONFIG_MISSING 并以退出码 2 结束）
+# 9. 跑启动前置检查（《配置契约》§四 的 7 步：配置 → DB → 扩展 → 迁移 → Redis → 前端 dist）
+#    退出码：0 = 通过；2 = 配置错误；3 = 依赖不可用（每一步都打印能照做的修复提示）
 uv run python -m xhs_agent.probe
 
 # 10. （可选）跑检索层基线对比评测：临时库只装 demo_pack，真实回填向量后两臂对照
@@ -153,7 +155,10 @@ uv run celery -A xhs_agent.tasks.worker:app worker --loglevel=info
 #    Linux 的 prefork worker 上生效）
 
 # 12. 起 HTTP 服务（另开一个终端）
-uv run uvicorn xhs_agent.api.main:app --port 8000
+#    推荐用带前置检查的入口（先查 7 步、失败按契约退 2/3，再交给 uvicorn）：
+uv run python -m xhs_agent.serve --host 127.0.0.1 --port 8000
+#    等价写法：uv run uvicorn xhs_agent.api.main:app --port 8000（lifespan 也会查，
+#    但那条路径启动失败时 uvicorn 固定退 3）
 #    文档页：http://127.0.0.1:8000/api/docs（挂在 /api 下，非 /api 路径留给前端单页应用）
 
 # 13. 投一个热点并轮询（完整链路：队列 → worker → 索引新鲜度 → 五节点分析 → 落库）
@@ -171,7 +176,9 @@ uv run python scripts/smoke_skeleton.py
 #     只驱动已起的服务：--api-url http://127.0.0.1:8000；不种素材：--no-seed
 ```
 
-> **`[frontend]` 段怎么起作用**：`serve = true`（默认）且 `frontend/dist` 存在且非空时，FastAPI 会把 dist 挂在根路径，并把 `/api` 之外的未命中路径（无扩展名的）回落成 `index.html`——前端 history 路由刷新不会 404；带扩展名的未命中仍返回 404，API 的 404 也照旧是 `not_found` 的 JSON。dist 不存在时 API 照常启动、`/` 返回 404 JSON（"dist 缺失即中止启动"归 S3.8）。本地纯后端开发可以把 `[frontend].serve` 设为 `false`；前端源码与 `pnpm build` 属 E5。
+> **`[frontend]` 段怎么起作用**：`serve = true`（默认）且 `frontend/dist` 存在且非空时，FastAPI 会把 dist 挂在根路径，并把 `/api` 之外的未命中路径（无扩展名的）回落成 `index.html`——前端 history 路由刷新不会 404；带扩展名的未命中仍返回 404，API 的 404 也照旧是 `not_found` 的 JSON。
+>
+> **还没有前端产物（E5 之前）时**：`serve = true` + 缺 dist 属于配置错误，启动前置检查会**拒绝启动**（退出码 2）。本地纯后端开发用环境变量覆盖即可只跑 API：`XHS_FRONTEND_SERVE=false`（等价于把 `[frontend].serve` 设为 `false`）——`scripts/smoke_skeleton.py` 已经默认这么做了。前端源码与 `pnpm build` 属 E5。
 
 网络受限时：`uv sync --no-dev` 只装运行时环境（pydantic / pydantic-settings / python-dotenv / SQLAlchemy async + asyncpg / pgvector / alembic）；不过 `import xhs_agent` 仍然需要安装或设置 `PYTHONPATH=src`（src 布局）。
 

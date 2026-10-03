@@ -12,7 +12,7 @@ from fastapi.testclient import TestClient
 
 from xhs_agent.api import deps
 from xhs_agent.api.main import API_PREFIX, create_app
-from xhs_agent.config import ConfigError
+from xhs_agent.config import ConfigError, load_config
 from xhs_agent.core.errors import (
     BAD_REQUEST,
     CODE_STATUS,
@@ -32,8 +32,16 @@ from xhs_agent.core.errors import (
     code_for_status,
 )
 from xhs_agent.core.logging import configure_logging, current_request_id
+from xhs_agent.probe import E_CONFIG_MISSING, PreflightFailed, PreflightReport, Problem
 
 ACCESS_LOGGER = "xhs_agent.api.access"
+
+
+def async_return(value):
+    """把一个值包成 async 函数（替换 `run_startup_checks` 这类协程依赖用）。"""
+    async def _call(*_args, **_kwargs):
+        return value
+    return _call
 
 
 def probe_router() -> APIRouter:
@@ -247,3 +255,46 @@ class TestAppFactory:
                 deps.get_config()
         finally:
             deps.get_config.cache_clear()
+
+
+class TestStartupCheckWiring:
+    """S3.8：启动前置检查接进 lifespan，`check_startup` 可显式关掉。"""
+
+    @staticmethod
+    def _config(tmp_path):
+        path = tmp_path / "config.toml"
+        path.write_text("", encoding="utf-8")
+        return load_config(str(path))
+
+    def test_flag_defaults_to_true(self) -> None:
+        assert create_app().state.check_startup is True
+
+    def test_flag_can_be_disabled(self, tmp_path) -> None:
+        app = create_app(self._config(tmp_path), check_startup=False)
+        assert app.state.check_startup is False
+
+    def test_lifespan_aborts_startup_when_checks_fail(self, tmp_path, monkeypatch,
+                                                      capsys) -> None:
+        from xhs_agent.api import main as api_main
+
+        report = PreflightReport(problems=[
+            Problem(E_CONFIG_MISSING, "DEEPSEEK_API_KEY", "缺密钥", "写进 config/.env", step=1)])
+        monkeypatch.setattr(api_main, "run_startup_checks", async_return(report))
+        app = create_app(self._config(tmp_path))
+
+        with pytest.raises(PreflightFailed), TestClient(app, raise_server_exceptions=False):
+            pass
+        err = capsys.readouterr().err
+        assert "E_CONFIG_MISSING" in err
+        assert "启动前置检查未通过" in err
+
+    def test_disabled_check_is_not_run(self, tmp_path, monkeypatch) -> None:
+        from xhs_agent.api import main as api_main
+
+        called: list[str] = []
+        monkeypatch.setattr(api_main, "run_startup_checks",
+                            lambda *_a, **_k: called.append("checked"))
+        app = create_app(self._config(tmp_path), check_startup=False)
+        with TestClient(app, raise_server_exceptions=False) as client:
+            assert client.get("/api/openapi.json").status_code == 200
+        assert called == []

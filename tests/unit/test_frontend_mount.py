@@ -49,7 +49,10 @@ def make_dist(root: Path) -> Path:
 def serving_client(tmp_path: Path) -> Iterator[TestClient]:
     dist = make_dist(tmp_path)
     cfg = write_config(tmp_path, serve=True, dist_dir=str(dist))
-    with TestClient(create_app(cfg), raise_server_exceptions=False) as client:
+    # check_startup=False：这些用例只验挂载，不去连真实库/Redis（前置检查的用例在
+    # test_probe.py 与集成用例里）
+    with TestClient(create_app(cfg, check_startup=False),
+                    raise_server_exceptions=False) as client:
         yield client
 
 
@@ -91,7 +94,8 @@ class TestServeDisabled:
     def test_only_api_is_served(self, tmp_path: Path) -> None:
         dist = make_dist(tmp_path)
         cfg = write_config(tmp_path, serve=False, dist_dir=str(dist))
-        with TestClient(create_app(cfg), raise_server_exceptions=False) as client:
+        with TestClient(create_app(cfg, check_startup=False),
+                        raise_server_exceptions=False) as client:
             root = client.get("/")
             assert root.status_code == 404
             assert root.json()["code"] == "not_found"
@@ -154,7 +158,7 @@ class TestLifespanPath:
         cfg = write_config(tmp_path, serve=True, dist_dir=str(dist))
         monkeypatch.setattr(api_main, "get_config", lambda: cfg)
 
-        app = api_main.create_app()
+        app = api_main.create_app(check_startup=False)
         assert not getattr(app.state, "frontend_mounted", False)   # 建应用时没读配置
         with TestClient(app, raise_server_exceptions=False) as client:
             assert client.get("/").status_code == 200

@@ -50,6 +50,7 @@ FLAT_OVERRIDE_TARGETS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("xhs_llm_base_url", ("llm", "base_url")),
     ("xhs_llm_model", ("llm", "model")),
     ("xhs_embedding_model", ("embedding", "model")),
+    ("xhs_frontend_serve", ("frontend", "serve")),
     ("xhs_log_level", ("log_level",)),
 )
 
@@ -418,6 +419,7 @@ class _FlatOverrides(BaseSettings):
     xhs_llm_base_url: str = Field("", validation_alias="XHS_LLM_BASE_URL")
     xhs_llm_model: str = Field("", validation_alias="XHS_LLM_MODEL")
     xhs_embedding_model: str = Field("", validation_alias="XHS_EMBEDDING_MODEL")
+    xhs_frontend_serve: str = Field("", validation_alias="XHS_FRONTEND_SERVE")
     xhs_log_level: str = Field("", validation_alias="XHS_LOG_LEVEL")
 
 

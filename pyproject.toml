@@ -81,6 +81,8 @@ files = [
     "src/xhs_agent/schemas.py",
     "src/xhs_agent/config.py",
     "src/xhs_agent/probe.py",
+    # S3.8 的推荐启动入口（先 preflight 再起 uvicorn）
+    "src/xhs_agent/serve.py",
     # E2 新增的 db / services / 检索与向量化工具——async + ORM + SQL 交互，类型风险最高
     "src/xhs_agent/db",
     "src/xhs_agent/services",

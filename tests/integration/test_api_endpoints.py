@@ -53,7 +53,8 @@ def write_config(tmp_path: Path) -> AppConfig:
 def build_client(db_engine: AsyncEngine, cfg: AppConfig, dispatcher,
                  monkeypatch: pytest.MonkeyPatch) -> TestClient:
     """建应用并把三个依赖指向容器与假投递器（health 的 db 探针也要指过去）。"""
-    app = create_app()
+    # check_startup=False：接口用例只验接口与错误语义，不去打真实依赖的启动检查
+    app = create_app(check_startup=False)
     app.dependency_overrides[get_config] = lambda: cfg
 
     async def _session() -> AsyncIterator[AsyncSession]:

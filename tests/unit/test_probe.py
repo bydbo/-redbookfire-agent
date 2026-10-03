@@ -1,17 +1,33 @@
 """启动前置检查的契约测试（S1.2）。
 
 用注入的 EnvView 构造「缺失」与「齐全」两种情形，不读真实 config/.env。
+第 3–7 步（DB / 扩展 / 迁移 / Redis / dist）的用例用**不可达端点与临时目录**，离线可跑。
 """
 
 from __future__ import annotations
+
+import socket
+
+import pytest
+from sqlalchemy.ext.asyncio import create_async_engine
+from sqlalchemy.pool import NullPool
 
 from xhs_agent.config import AppConfig, EnvView, load_config
 from xhs_agent.probe import (
     CURRENT_STAGE,
     E_CONFIG_INVALID,
     E_CONFIG_MISSING,
+    E_DB_UNAVAILABLE,
+    E_FRONTEND_DIST_MISSING,
+    E_REDIS_UNAVAILABLE,
+    PreflightReport,
+    Problem,
+    check_database,
+    check_frontend,
+    check_redis,
     main,
     preflight,
+    run_startup_checks,
 )
 
 
@@ -39,6 +55,34 @@ REDIS_DSN = "redis://localhost:6379/0"
 
 def names(report) -> list[str]:
     return [problem.name for problem in report.problems]
+
+
+def stub_dependency_checks(monkeypatch) -> None:
+    """把第 3–7 步全部 stub 掉：用例不去连真实库 / Redis / 目录。"""
+    from xhs_agent import probe as probe_module
+
+    async def _no_problem_async(*_args, **_kwargs):
+        return None
+
+    for name in ("check_database", "check_extensions", "check_migration", "check_redis"):
+        monkeypatch.setattr(probe_module, name, _no_problem_async)
+    # check_frontend 是同步函数（纯判断），单独 stub
+    monkeypatch.setattr(probe_module, "check_frontend", lambda *_a, **_k: None)
+
+
+def free_port() -> int:
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        return int(sock.getsockname()[1])
+
+
+def ready_cfg(tmp_path, **env_values: str) -> AppConfig:
+    """第 1–2 步能过的配置：注入完整 env（不读真实 config/.env）。"""
+    cfg = make_config(tmp_path)
+    values = {"DEEPSEEK_API_KEY": "sk-x", "DATABASE_URL": DSN, "REDIS_URL": REDIS_DSN}
+    values.update(env_values)
+    cfg._env = EnvView({}, values)
+    return cfg
 
 
 class TestRequiredVariables:
@@ -159,12 +203,14 @@ class TestObservabilityWarning:
 
 
 class TestCommandLine:
-    def test_main_returns_zero_when_ready(self, tmp_path, clean_contract_env, capsys):
+    def test_main_returns_zero_when_ready(self, tmp_path, clean_contract_env, capsys,
+                                          monkeypatch):
         clean_contract_env.setenv("XHS_CONFIG_PATH", str(tmp_path / "config.toml"))
         (tmp_path / "config.toml").write_text("[embedding]\nenabled = false\n", encoding="utf-8")
         clean_contract_env.setenv("DEEPSEEK_API_KEY", "sk-test-value")
         clean_contract_env.setenv("DATABASE_URL", DSN)
         clean_contract_env.setenv("REDIS_URL", REDIS_DSN)
+        stub_dependency_checks(monkeypatch)      # 第 3–7 步的实查在集成用例里做
         assert main([]) == 0
         out = capsys.readouterr().out
         assert "配置摘要（已脱敏）" in out
@@ -203,3 +249,105 @@ class TestCommandLine:
     def test_report_defaults_to_current_stage(self, tmp_path):
         report = preflight(make_config(tmp_path), env=view(DEEPSEEK_API_KEY="sk-x"))
         assert report.stage == CURRENT_STAGE
+
+
+class TestExitCodes:
+    """退出码由**首个问题的 kind** 推出：config → 2、dependency → 3、无问题 → 0。"""
+
+    def test_no_problem_is_zero(self):
+        assert PreflightReport().exit_code == 0
+
+    def test_config_problem_is_two(self):
+        report = PreflightReport(problems=[Problem(E_CONFIG_MISSING, "X", "m", "f", step=1)])
+        assert report.exit_code == 2
+
+    def test_dependency_problem_is_three(self):
+        report = PreflightReport(problems=[
+            Problem(E_REDIS_UNAVAILABLE, "X", "m", "f", step=6, kind="dependency")])
+        assert report.exit_code == 3
+
+    def test_first_problem_decides(self):
+        report = PreflightReport(problems=[
+            Problem(E_FRONTEND_DIST_MISSING, "A", "m", "f", step=7),
+            Problem(E_REDIS_UNAVAILABLE, "B", "m", "f", step=6, kind="dependency"),
+        ])
+        assert report.exit_code == 2
+
+
+class TestDependencyChecks:
+    """第 3–7 步：用不可达端点与临时目录，完全不碰真实依赖。"""
+
+    @pytest.mark.asyncio
+    async def test_database_unavailable_is_masked_dependency_problem(self, tmp_path):
+        dsn = "postgresql+asyncpg://xhs:xhs@127.0.0.1:1/xhs"
+        cfg = ready_cfg(tmp_path, DATABASE_URL=dsn)
+        engine = create_async_engine(dsn, poolclass=NullPool)
+        try:
+            problem = await check_database(cfg, engine)
+        finally:
+            await engine.dispose()
+        assert problem is not None
+        assert (problem.code, problem.step, problem.kind) == (E_DB_UNAVAILABLE, 3, "dependency")
+        assert "xhs:xhs@" not in problem.message        # 密码已脱敏
+        assert "***" in problem.message
+
+    @pytest.mark.asyncio
+    async def test_redis_unavailable_is_dependency_problem(self, tmp_path):
+        cfg = ready_cfg(tmp_path, REDIS_URL=f"redis://127.0.0.1:{free_port()}/0")
+        problem = await check_redis(cfg)
+        assert problem is not None
+        assert (problem.code, problem.step, problem.kind) == (E_REDIS_UNAVAILABLE, 6, "dependency")
+
+    def test_missing_dist_is_config_problem(self, tmp_path):
+        cfg = make_config(tmp_path, '[frontend]\nserve = true\ndist_dir = "nowhere/dist"\n')
+        problem = check_frontend(cfg)
+        assert problem is not None
+        assert (problem.code, problem.step, problem.kind) == (E_FRONTEND_DIST_MISSING, 7, "config")
+        assert "pnpm build" in problem.fix              # 修复提示要能照做
+
+    def test_serve_disabled_skips_dist_check(self, tmp_path):
+        cfg = make_config(tmp_path, '[frontend]\nserve = false\ndist_dir = "nowhere/dist"\n')
+        assert check_frontend(cfg) is None
+
+    def test_existing_dist_passes(self, tmp_path):
+        dist = tmp_path / "dist"
+        dist.mkdir()
+        (dist / "index.html").write_text("x", encoding="utf-8")
+        cfg = make_config(tmp_path,
+                          f'[frontend]\nserve = true\ndist_dir = "{dist.as_posix()}"\n')
+        assert check_frontend(cfg) is None
+
+
+class TestRunStartupChecks:
+    @pytest.mark.asyncio
+    async def test_stops_at_the_first_failure(self, tmp_path, monkeypatch):
+        """第 3 步失败就不再往下查（Redis / dist 一律不碰）。"""
+        from xhs_agent import probe as probe_module
+
+        cfg = ready_cfg(tmp_path, DATABASE_URL="postgresql+asyncpg://xhs:xhs@127.0.0.1:1/xhs")
+        touched: list[str] = []
+        monkeypatch.setattr(probe_module, "check_redis",
+                            lambda *_a, **_k: (touched.append("redis"), None)[1])
+        monkeypatch.setattr(probe_module, "check_frontend",
+                            lambda *_a, **_k: (touched.append("frontend"), None)[1])
+
+        report = await run_startup_checks(cfg)
+
+        assert [problem.code for problem in report.problems] == [E_DB_UNAVAILABLE]
+        assert report.exit_code == 3
+        assert touched == []
+
+    @pytest.mark.asyncio
+    async def test_config_problems_short_circuit_before_io(self, tmp_path, monkeypatch):
+        """第 1–2 步没过时连数据库都不该碰。"""
+        from xhs_agent import probe as probe_module
+
+        called: list[str] = []
+        monkeypatch.setattr(probe_module, "check_database",
+                            lambda *_a, **_k: called.append("db"))
+
+        report = await run_startup_checks(make_config(tmp_path))   # 缺三个必填项
+
+        assert not report.ok
+        assert report.exit_code == 2
+        assert called == []

@@ -248,6 +248,9 @@ def poll_job(client: httpx.Client, base_url: str, job_id: str, *, timeout: float
 
 def run_skeleton(args: argparse.Namespace) -> int:
     """按 backlog 第四节的关键路径跑一遍，逐步骤打印。"""
+    # 本机与 CI 大概率没有 frontend/dist：显式按 API-only 起，避免 S3.8 第 7 步硬失败
+    # （setdefault：调用方显式设过就听他的）
+    os.environ.setdefault("XHS_FRONTEND_SERVE", "false")
     cfg = load_config()
     started_at = time.monotonic()
 

@@ -170,7 +170,8 @@ async def session(db_engine: AsyncEngine) -> AsyncIterator[AsyncSession]:
 @pytest.fixture
 def client(db_engine: AsyncEngine, cfg: AppConfig) -> Iterator[TestClient]:
     """真投递器（不覆盖 get_dispatcher）：接口会把消息发到容器的 Redis。"""
-    app = create_app()
+    # check_startup=False：集成用例只验接口与 worker 链路，不去打真实依赖的启动检查
+    app = create_app(check_startup=False)
     app.dependency_overrides[get_config] = lambda: cfg
 
     async def _session() -> AsyncIterator[AsyncSession]:
