@@ -1,25 +1,25 @@
-"""素材库：扫描、打标签、建索引。
+"""素材库：扫描、旁车解析与单文件构造。
 
-用途：把本地素材目录变成一份可检索的索引（JSON），一个工具只负责「素材目录 → 索引」这件事。
-输入：素材目录路径 + 索引目录路径；可选注入视觉打标可调用对象、关键帧目录与各种上限。
-输出：`IndexResult`（素材列表 + 新增/更新/复用计数 + 索引文件路径），索引文件结构见 `save_index`。
+用途：把「一个素材文件」变成 `Material`——扫描目录、读旁车说明、按文件名兜底、
+      探测媒体信息、抽关键帧、可选视觉打标；增量与落库由 `services/materials.py` 负责
+      （S2.4 起数据库是唯一索引源，S2.10 起 JSON 索引已退役）。
+输入：素材文件路径 + 素材根目录 + 关键帧目录；可选注入视觉打标可调用对象与抽帧参数。
+输出：`Material`（`build_material`）或扫描到的媒体文件列表（`scan_materials`）。
 
 索引约定（非常重要，决定了匹配质量的上下限）：
 1. 同目录下 `素材名.mp4.txt` / `素材名.md` 会被当成人工说明，优先级最高；
 2. 文件名里的 `-` `_` 分隔词会被当作标签；
-3. 抽帧与视觉打标是分开的两件事：默认每条新增/更新素材抽关键帧（报告要缩略图，
-   `frame_count` / `frame_max_width` 可传参，也能用 `extract_frames=False` 整体跳过），
-   开启视觉模型后才会把这些帧送去补描述；
-4. 索引按 路径+修改时间+大小 做增量，改动的素材才会重新识别。
+3. 抽帧与视觉打标是分开的两件事：抽帧默认开启（报告要缩略图，`frame_count` /
+   `frame_max_width` 可传参，也能用 `extract_frames=False` 整体跳过），
+   开启视觉模型后才会把这些帧送去补描述。
 """
 
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass
 
 from ..schemas import Element, Material
-from ..util import now_iso, read_json, read_text, short_hash, write_json
+from ..util import now_iso, read_json, read_text
 from . import lexicon, media
 
 SIDECAR_EXT = {".txt", ".md", ".json"}
@@ -119,97 +119,6 @@ def fingerprint(path: str) -> str:
     except OSError:
         return ""
     return f"{int(stat.st_mtime)}-{stat.st_size}"
-
-
-@dataclass
-class IndexResult:
-    materials: list
-    added: int = 0
-    updated: int = 0
-    reused: int = 0
-    index_path: str = ""
-
-    def summary(self) -> str:
-        return (f"素材 {len(self.materials)} 条：新增 {self.added}、更新 {self.updated}、"
-                f"复用缓存 {self.reused}")
-
-
-def index_path_for(index_dir: str, materials_dir: str) -> str:
-    return os.path.join(index_dir, f"materials-{short_hash(os.path.abspath(materials_dir), 8)}.json")
-
-
-def load_index(index_dir: str, materials_dir: str) -> tuple:
-    path = index_path_for(index_dir, materials_dir)
-    data = read_json(path, None)
-    if not isinstance(data, dict):
-        return [], path
-    items = [Material.from_dict(item) for item in (data.get("materials") or [])]
-    return items, path
-
-
-def save_index(index_dir: str, materials_dir: str, materials: list) -> str:
-    path = index_path_for(index_dir, materials_dir)
-    write_json(path, {
-        "materials_dir": os.path.abspath(materials_dir),
-        "updated_at": now_iso(),
-        "count": len(materials),
-        "materials": [m.to_dict() for m in materials],
-    })
-    return path
-
-
-def build_index(materials_dir: str, index_dir: str, vision=None,
-                keyframes_dir: str | None = None, force: bool = False,
-                max_vision_items: int = 50, extract_frames: bool = True,
-                frame_count: int = 3, frame_max_width: int = 720) -> IndexResult:
-    """一次索引流程：扫描 → 解析说明与标签 → 可选视觉打标 → 增量判断 → 落盘。
-
-    输入：`materials_dir`（素材目录）、`index_dir`（索引与关键帧落盘目录）。
-    可注入点：`vision`（`(frames, hint) -> dict | None` 的可调用对象，None = 不做视觉打标）、
-    `keyframes_dir`（默认 `index_dir/keyframes`）、`max_vision_items`（本次最多打标多少条，
-    用于控制成本）、`force`（忽略缓存全量重建）、`extract_frames`（是否抽关键帧）、
-    `frame_count` / `frame_max_width`（抽帧数量与缩放宽度，默认 3 / 720；工作流接入时
-    从 `[vision].max_frames` / `[vision].max_width` 传入，索引只负责执行）。
-    输出：`IndexResult`（materials / added / updated / reused / index_path）。
-    依赖：ffmpeg / ffprobe 缺失时只跳过抽帧与探测（能力裁剪），不报错。
-    """
-    files = scan_materials(materials_dir)
-    keyframes_dir = keyframes_dir or os.path.join(index_dir, "keyframes")
-    cached, path = load_index(index_dir, materials_dir)
-    cache_by_path = {} if force else {os.path.abspath(m.path): m for m in cached}
-
-    result = IndexResult(materials=[], index_path=path)
-    vision_used = 0
-
-    for file_path in files:
-        fp = fingerprint(file_path)
-        cached_item = cache_by_path.get(os.path.abspath(file_path))
-        if cached_item and cached_item.fingerprint == fp and fp:
-            result.materials.append(cached_item)
-            result.reused += 1
-            continue
-
-        # 视觉打标有成本上限：预算用完后把 `vision` 置 None，build_material 就不打标了。
-        allow_vision = vision if vision_used < max_vision_items else None
-        material = build_material(
-            file_path,
-            materials_dir,
-            keyframes_dir,
-            vision=allow_vision,
-            extract_frames=extract_frames,
-            frame_count=frame_count,
-            frame_max_width=frame_max_width,
-        )
-        if allow_vision is not None and material.source == "vision":
-            vision_used += 1
-        result.materials.append(material)
-        if cached_item:
-            result.updated += 1
-        else:
-            result.added += 1
-
-    save_index(index_dir, materials_dir, result.materials)
-    return result
 
 
 def build_material(file_path: str, materials_dir: str, keyframes_dir: str, *,

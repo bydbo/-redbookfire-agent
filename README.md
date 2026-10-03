@@ -68,7 +68,7 @@
 | 音视频处理 | ffmpeg / ffprobe（用于探测与抽帧；缺失时跳过抽帧，属能力裁剪） |
 | 检索算法 | 双通道召回（pg_trgm 字面 + pgvector 余弦）→ RRF 融合 → 要素类型加权终分 → Top-K 截断；同分按 material_id 升序 |
 | 配置 | pydantic-settings + TOML：环境变量 > `.env` > config.toml > 代码默认值；启动前置检查见 `uv run python -m xhs_agent.probe` |
-| 数据落地 | PostgreSQL `materials` 表（素材索引，增量同步）+ JSONL 轨迹 + Markdown 与单文件 HTML 报告；旧 JSON 索引保留但标为 legacy |
+| 数据落地 | PostgreSQL `materials` 表（素材索引，增量同步）+ JSONL 轨迹 + Markdown 与单文件 HTML 报告；JSON 索引已在 S2.10 退役 |
 | 测试 | pytest |
 
 ### 最终技术栈（企业级，已确定待落地）
