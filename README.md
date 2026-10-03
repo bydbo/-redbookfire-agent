@@ -162,6 +162,8 @@ curl -s -X POST http://127.0.0.1:8000/api/analyze -H "Content-Type: application/
 #    与 /api/runs/{run_id}/report?format=html
 ```
 
+> **`[frontend]` 段怎么起作用**：`serve = true`（默认）且 `frontend/dist` 存在且非空时，FastAPI 会把 dist 挂在根路径，并把 `/api` 之外的未命中路径（无扩展名的）回落成 `index.html`——前端 history 路由刷新不会 404；带扩展名的未命中仍返回 404，API 的 404 也照旧是 `not_found` 的 JSON。dist 不存在时 API 照常启动、`/` 返回 404 JSON（"dist 缺失即中止启动"归 S3.8）。本地纯后端开发可以把 `[frontend].serve` 设为 `false`；前端源码与 `pnpm build` 属 E5。
+
 网络受限时：`uv sync --no-dev` 只装运行时环境（pydantic / pydantic-settings / python-dotenv / SQLAlchemy async + asyncpg / pgvector / alembic）；不过 `import xhs_agent` 仍然需要安装或设置 `PYTHONPATH=src`（src 布局）。
 
 ---

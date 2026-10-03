@@ -353,6 +353,10 @@ class AppConfig(_Section):
     def index_dir(self) -> str:
         return self.paths.resolved(self.paths.index_dir)
 
+    def frontend_dist_dir(self) -> str:
+        """前端构建产物目录（相对路径以工程根为基准，口径同 `[paths]`）。"""
+        return self.paths.resolved(self.frontend.dist_dir)
+
     def describe(self) -> dict[str, Any]:
         """脱敏配置摘要：只出现布尔值与掩码，可安全写进启动日志。"""
         public, secret, host = self.langfuse_keys
