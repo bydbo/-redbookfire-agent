@@ -19,7 +19,7 @@
 | E2 数据与检索 | 持久化 + 语义召回，产出评测数字 | 20 | ✅ 进行中 | M3 |
 | E3 编排与服务 | 服务化与异步，端到端可演示 | 20.5 | ✅ 已完成（S3.0–S3.10） | M4 |
 | E4 可观测与交付 | 可运维、可交付 | 8 | ✅ 已完成（S4.1–S4.6） | M5 |
-| E5 前端工程 | 把演示页升级为可交互的单页应用 | 17 | 🔄 进行中（S5.1） | M6 |
+| E5 前端工程 | 把演示页升级为可交互的单页应用 | 17 | 🔄 进行中（S5.1–S5.2） | M6 |
 | **合计** | | **76.5** | | |
 
 全职投入约 9 周；按每天 3 小时的业余节奏约 5 个月。总量比初版（41.5）增加 26 人日：前端 Epic 17、API 前缀与静态挂载 1、完整 preflight 1.5、mypy 收紧 0.5、E2 净增 5（集成测试基座 +3、评测集与示例素材包 +3、对比脚本精简 −1）、E1 落地时的范围调整 1（S1.2 配置段全量 +0.5、S1.4 覆盖 8 个模块 +0.5）。
@@ -112,7 +112,19 @@
 - 说明：HomeView 是脚手架验证页（Naive 组件 + Tailwind 类 + Pinia 读状态 + 环境变量回显），S5.3 替换为分析台。
 
 </details>
-| S5.2 | 契约生成接口类型 | S5.1 | `openapi-typescript` 生成 `schema.d.ts` 并入库；CI 校验生成结果无变化 | 1 | ⬜ |
+| S5.2 | 契约生成接口类型 | S5.1 | `openapi-typescript` 生成 `schema.d.ts` 并入库；CI 校验生成结果无变化 | 1 | ✅ |
+
+<details>
+<summary>S5.2 实测记录（2026-10-04）</summary>
+
+- 生成链路：`frontend/package.json` 新增 devDependency `openapi-typescript ^7.0.0`（锁定 7.13.0）与两条脚本——`gen:api`（从 `../docs/contracts/openapi.yaml` 生成 `src/api/schema.d.ts`）与 `check:api`（重新生成 + `git diff --exit-code -- src/api/schema.d.ts`，有差异即非零）。生成物 **504 行**已入库，头部自带 `Do not make direct changes to the file` 警告。
+- 确定性保障：`.gitattributes` 的 `* text=auto eol=lf` 保证 Windows 与 CI 生成物字节一致；openapi-typescript v7 对同一份契约输出确定。
+- CI 新增第 5 个 job `frontend`：checkout → `pnpm/action-setup@v6.1.0`（version 11.25.0）→ `actions/setup-node@v7.0.0`（Node 25.3.0 + cache: pnpm，**action 顺序不能换**——setup-node 要在 pnpm 装好后才能命中 pnpm 缓存）→ `pnpm install --frozen-lockfile`（对齐后端 UV_FROZEN 口径）→ `pnpm run check:api`；所有 step 的 `working-directory` 都是 `frontend`。
+- 防漂移**反向自测**（第五次尝试才拿到真阳性，前四次假阳性的教训记录在案）：① 手改 `schema.d.ts` 无效——`gen:api` 全量覆盖，diff 恒空，必须从**契约侧**注入漂移；② Windows Python 不认 git bash 的 `/d/...` 路径（FileNotFoundError），脚本里要用 `D:/...`；③ 改契约的 `title` 不进生成物（drift_exit=0 假阴性），改 `description` 才进 JSDoc——最终用 description 注入漂移，`pnpm run check:api` 正确返回非零（drift_exit=1）；还原契约与生成物后重跑归零（restored_exit=0）。
+- 静态守卫：`tests/unit/test_ci_workflow.py` 从 11 条扩到 **12 条**——新增 `test_frontend_job_pins_node_and_pnpm_and_checks_schema`，断言 action 顺序与钉版、Node/pnpm 版本输入、两条 run 命令、全部 run step 的 `working-directory == frontend`。
+- 回归全绿：`uv run pytest` **748 passed**；ruff 零告警；mypy 44 文件零错误；`pnpm run type-check` 零错误；`pnpm build` 通过（2685 模块）。
+
+</details>
 | S5.3 | 分析台页面 | S5.2, S3.4b | 可输入多个热点、提交、轮询进度并跳转结果 | 2.5 | ⬜ |
 | S5.4 | 结果详情页 | S5.3 | 要素标签、候选素材（含关键帧）、覆盖缺口、文案初稿四块齐全，文案可一键复制 | 3 | ⬜ |
 | S5.5 | 数据可视化 | S5.4 | 覆盖度、得分分布、成本与耗时用 ECharts 呈现 | 2 | ⬜ |

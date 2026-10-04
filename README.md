@@ -64,6 +64,7 @@
 | 评测集 v1 与示例素材包（七维度口径、版本冻结） | ✅ 已完成（S2.0） |
 | 服务入口（FastAPI 五个接口 + LangGraph 编排，S3.1–S3.3） | ✅ 已完成 |
 | 前端工程脚手架（Vue 3 + Vite + TS + Router + Pinia + Naive UI + Tailwind，S5.1：别名 / 环境变量 / 代理 / 构建配置） | ✅ 已完成（S5.1） |
+| 接口类型生成（S5.2：`openapi-typescript` 从 `docs/contracts/openapi.yaml` 生成 `frontend/src/api/schema.d.ts` 入库；`pnpm run check:api` + CI `frontend` job 防漂移） | ✅ 已完成（S5.2） |
 
 业务链路**已端到端跑通**：`docker compose up -d --wait` 起依赖 → `uv run celery -A xhs_agent.tasks.worker:app worker` 起 worker → `uv run python -m xhs_agent.serve` 起接口（先跑 7 步启动前置检查）→ `POST /api/analyze` 投递 → worker 自动消费（索引新鲜度 → 五节点分析 → 逐热点写回）→ `/api/jobs/{job_id}` 轮询 → `/api/runs/{run_id}` 取结构化结果、`/report` 取报告。另可运行 `uv run python -m xhs_agent.probe`、`uv run python scripts/index_materials.py`、`uv run python scripts/backfill_embeddings.py`、`uv run python scripts/eval_retrieval.py`、`uv run python scripts/smoke_skeleton.py`。路线图见文末。
 
@@ -104,7 +105,7 @@
 | 代码质量 / 测试 | ruff + mypy + pre-commit + pytest-cov + pytest-asyncio + testcontainers（均已落地） |
 | 前端 | Vue 3 + Vite + TypeScript + Pinia + Vue Router（S5.1 已落地） |
 | UI 与可视化 | Naive UI + Tailwind CSS（S5.1 已落地）+ ECharts（S5.5） |
-| 接口类型 | `openapi-typescript` 从契约生成 TS 类型（S5.2） |
+| 接口类型 | `openapi-typescript` 从契约生成 TS 类型（S5.2 已落地：生成物入库 + CI 防漂移） |
 
 以上组件**尚未落地**，落地顺序见 `docs/技术栈.md` 第四节。**简历只写已经落地的技术栈。**
 
@@ -250,6 +251,8 @@ pnpm install          # 首次；pnpm-lock.yaml 入库，node_modules 不入库
 pnpm dev              # 开发服务器 http://localhost:5173，/api 代理到 127.0.0.1:8000（配置契约 §五）
 pnpm run type-check   # vue-tsc 零错误才算过
 pnpm build            # 类型检查 + 构建，产物落 frontend/dist（由 FastAPI 挂载，ADR 0009）
+pnpm run gen:api      # 契约变了才跑：从 ../docs/contracts/openapi.yaml 重新生成 src/api/schema.d.ts
+pnpm run check:api    # 防漂移自检：重新生成 + git diff，有差异即非零（CI 的 frontend job 跑这条）
 ```
 
 `pnpm dev` 与 `uv run python -m xhs_agent.serve --port 8000`（或 `XHS_FRONTEND_SERVE=false` 的等价入口）同时运行，即可在 http://localhost:5173 全栈调试：页面走 Vite，接口经代理进本地 API。
