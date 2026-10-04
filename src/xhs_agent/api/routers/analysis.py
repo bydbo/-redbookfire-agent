@@ -15,6 +15,7 @@ from fastapi import APIRouter, Request
 from pydantic import BaseModel, ConfigDict, Field, StringConstraints
 
 from ...core.errors import NotFoundError
+from ...core.logging import bind_run_id
 from ...services.runs import load_job, submit_analysis
 from ..deps import DispatcherDep, SessionDep
 from ..errors import request_id_of
@@ -36,10 +37,17 @@ class AnalyzeRequest(BaseModel):
 @router.post("/analyze", status_code=202)
 async def create_analysis(payload: AnalyzeRequest, request: Request,
                           session: SessionDep, dispatcher: DispatcherDep) -> dict[str, str]:
-    """提交一个或多个热点：落库后立即返回 `job_id` 与 `run_id`。"""
+    """提交一个或多个热点：落库后立即返回 `job_id` 与 `run_id`。
+
+    S4.1：提交成功后把 `run_id` 绑进本次请求的日志上下文（该请求后续每条日志都带它），
+    并记在 `request.state.run_id` 上——`RequestIdMiddleware` 的访问日志从那里取（BaseHTTPMiddleware
+    下 ContextVar 不会回传到父任务，只有 `request.state` 跨得过这个边界）。
+    """
     submission = await submit_analysis(session, payload.hotspots, topk=payload.topk,
                                        request_id=request_id_of(request),
                                        enqueue=dispatcher.enqueue)
+    request.state.run_id = submission.run_id
+    bind_run_id(submission.run_id)
     return {"job_id": submission.job_id, "run_id": submission.run_id}
 
 

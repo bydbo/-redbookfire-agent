@@ -7,7 +7,7 @@ import uuid
 from typing import Any
 
 import pytest
-from fastapi import APIRouter
+from fastapi import APIRouter, Request
 from fastapi.testclient import TestClient
 
 from xhs_agent.api import deps
@@ -31,10 +31,16 @@ from xhs_agent.core.errors import (
     UpstreamError,
     code_for_status,
 )
-from xhs_agent.core.logging import configure_logging, current_request_id
+from xhs_agent.core.logging import (
+    bind_run_id,
+    configure_logging,
+    current_request_id,
+    current_run_id,
+)
 from xhs_agent.probe import E_CONFIG_MISSING, PreflightFailed, PreflightReport, Problem
 
 ACCESS_LOGGER = "xhs_agent.api.access"
+SUBMIT_LOGGER = "xhs_agent.test.submit"
 
 
 def async_return(value):
@@ -75,6 +81,14 @@ def probe_router() -> APIRouter:
     @router.get("/probe/validate")
     async def validate(topk: int) -> dict[str, Any]:
         return {"topk": topk}
+
+    @router.get("/probe/with-run-id")
+    async def with_run_id(request: Request) -> dict[str, str]:
+        """模拟 `POST /api/analyze`：拿到 run_id 后写 `request.state` 并绑日志上下文（S4.1）。"""
+        request.state.run_id = "run-abc"
+        bind_run_id("run-abc")
+        logging.getLogger(SUBMIT_LOGGER).info("提交完成")
+        return {"run_id": "run-abc"}
 
     return router
 
@@ -197,6 +211,25 @@ class TestAccessLog:
             client.get(f"{API_PREFIX}/probe/boom", headers={"X-Request-ID": "req-boom"})
         errors = [item for item in caplog.records if item.levelno >= logging.ERROR]
         assert any(item.request_id == "req-boom" for item in errors)   # 堆栈进日志
+
+    def test_run_id_flows_into_handler_and_access_logs(self, client: TestClient,
+                                                       caplog) -> None:
+        """S4.1：处理函数里绑的 run_id 既进自己的日志，也经 request.state 进访问日志。"""
+        configure_logging("INFO")
+        with caplog.at_level(logging.INFO):
+            response = client.get(f"{API_PREFIX}/probe/with-run-id",
+                                  headers={"X-Request-ID": "req-run"})
+        assert response.status_code == 200
+        handled = [item for item in caplog.records if item.name == SUBMIT_LOGGER]
+        assert handled and handled[-1].run_id == "run-abc"        # 下游上下文里带着
+        assert handled[-1].request_id == "req-run"
+        access = [item for item in caplog.records if item.name == ACCESS_LOGGER]
+        assert access and access[-1].run_id == "run-abc"          # 跨 BaseHTTPMiddleware 边界
+        assert access[-1].request_id == "req-run"
+
+    def test_run_id_context_is_reset_after_request(self, client: TestClient) -> None:
+        client.get(f"{API_PREFIX}/probe/with-run-id")
+        assert current_run_id() == ""                             # 不泄漏到请求之外
 
 
 class TestErrorModel:

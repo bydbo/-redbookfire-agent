@@ -26,6 +26,7 @@ from langgraph.types import RetryPolicy
 
 from ..agents import DEFAULT_STYLE, explain_candidates, extract_clue, write_draft
 from ..config import PROJECT_ROOT, AppConfig
+from ..core.logging import bind_run_id, reset_run_id
 from ..schemas import HotspotClue
 from ..services.reporting import build_report_model, hotspot_entry, render_and_save
 from ..services.retrieval import RetrievalOutcome, retrieve_candidates
@@ -201,6 +202,29 @@ async def run_analysis(hotspots: list[str], *, cfg: AppConfig, session, store: R
                        retry_policy: RetryPolicy | None = None,
                        run_id: str | uuid.UUID | None = None,
                        topk: int | None = None) -> RunResult:
+    """公共入口：`run_id` 模式下先把 run_id 绑进日志上下文（S4.1），再跑 `_run_analysis`。
+
+    这样 worker 之外的调用方（脚本 / 集成用例）只要传了 `run_id`，该次运行的所有日志都带它。
+    """
+    if run_id is None:
+        return await _run_analysis(hotspots, cfg=cfg, session=session, store=store, caller=caller,
+                                   embedder=embedder, now=now, style=style,
+                                   retry_policy=retry_policy, topk=topk)
+    token = bind_run_id(str(run_id))
+    try:
+        return await _run_analysis(hotspots, cfg=cfg, session=session, store=store, caller=caller,
+                                   embedder=embedder, now=now, style=style,
+                                   retry_policy=retry_policy, run_id=run_id, topk=topk)
+    finally:
+        reset_run_id(token)
+
+
+async def _run_analysis(hotspots: list[str], *, cfg: AppConfig, session, store: RunStore | None = None,
+                        caller: StructuredCaller | None = None, embedder=None,
+                        now: float | None = None, style: str = DEFAULT_STYLE,
+                        retry_policy: RetryPolicy | None = None,
+                        run_id: str | uuid.UUID | None = None,
+                        topk: int | None = None) -> RunResult:
     """跑一批热点：循环调用五节点图，返回 `RunResult`。
 
     输入：热点原文列表、`AppConfig`、异步会话；`store` / `caller` / `embedder` 可注入（测试用）。

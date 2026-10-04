@@ -42,6 +42,7 @@ DEFAULT_CONFIG_PATH = os.path.join(PROJECT_ROOT, "config", "config.toml")
 # OpenAI 兼容端点的合法 provider 别名；auto / offline 的降级语义已取消（ADR 0001）。
 LLM_PROVIDERS = ("openai_compatible", "openai", "deepseek", "qwen", "dashscope", "compatible")
 LOG_LEVELS = ("DEBUG", "INFO", "WARNING", "ERROR")
+LOG_FORMATS = ("console", "json")
 
 # 环境变量覆盖表：扁平变量名 -> 配置里的位置（契约 §2.2 的可选项）。
 # 密钥类变量不在这里——它们由 EnvView 按 api_key_env 动态解析。
@@ -52,6 +53,7 @@ FLAT_OVERRIDE_TARGETS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("xhs_embedding_model", ("embedding", "model")),
     ("xhs_frontend_serve", ("frontend", "serve")),
     ("xhs_log_level", ("log_level",)),
+    ("xhs_log_format", ("log_format",)),
 )
 
 
@@ -318,6 +320,7 @@ class AppConfig(_Section):
     queue: QueueConfig = Field(default_factory=QueueConfig)
     frontend: FrontendConfig = Field(default_factory=FrontendConfig)
     log_level: str = "INFO"
+    log_format: str = "console"
 
     _env: EnvView = PrivateAttr(default_factory=EnvView)
     _config_path: str = PrivateAttr(default=DEFAULT_CONFIG_PATH)
@@ -328,6 +331,15 @@ class AppConfig(_Section):
         text = str(value or "INFO").strip().upper()
         if text not in LOG_LEVELS:
             raise ValueError("log_level 只能是 " + " / ".join(LOG_LEVELS))
+        return text
+
+    @field_validator("log_format", mode="before")
+    @classmethod
+    def _norm_log_format(cls, value: Any) -> str:
+        """日志输出格式：`console` 本机可读，`json` 一行一个 JSON 对象（容器 / CI）。"""
+        text = str(value or "console").strip().lower()
+        if text not in LOG_FORMATS:
+            raise ValueError("log_format 只能是 " + " / ".join(LOG_FORMATS))
         return text
 
     @property
@@ -364,6 +376,7 @@ class AppConfig(_Section):
         return {
             "config_path": self.config_path,
             "log_level": self.log_level,
+            "log_format": self.log_format,
             "llm": {
                 "provider": self.llm.provider,
                 "model": self.llm.model,
@@ -421,6 +434,7 @@ class _FlatOverrides(BaseSettings):
     xhs_embedding_model: str = Field("", validation_alias="XHS_EMBEDDING_MODEL")
     xhs_frontend_serve: str = Field("", validation_alias="XHS_FRONTEND_SERVE")
     xhs_log_level: str = Field("", validation_alias="XHS_LOG_LEVEL")
+    xhs_log_format: str = Field("", validation_alias="XHS_LOG_FORMAT")
 
 
 def _mask_dsn(value: str) -> str:

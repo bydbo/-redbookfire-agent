@@ -21,6 +21,7 @@ dependencies = [
     "python-dotenv>=1.0,<2",
     "redis>=8,<9",
     "sqlalchemy[asyncio]>=2.0,<2.1",
+    "structlog>=26.1,<27",
     "uvicorn>=0.54.0",
 ]
 

@@ -4,8 +4,10 @@
 # 优先级：环境变量 > config/.env > 本文件 > 代码内默认值。
 # 启动前置检查：uv run python -m xhs_agent.probe（配置不合法会以退出码 2 失败）
 
-# 顶层键必须写在第一个表头之前；log_level 也可用环境变量 XHS_LOG_LEVEL 覆盖
+# 顶层键必须写在第一个表头之前；两项都可用环境变量覆盖（XHS_LOG_LEVEL / XHS_LOG_FORMAT）
 log_level = "INFO"
+# 日志输出格式：console（本机可读）| json（一行一个 JSON 对象，容器 / CI 与日志检索用）
+log_format = "console"
 
 [llm]
 # 只支持 OpenAI 兼容端点；auto / offline 的降级语义已取消，缺密钥直接启动失败

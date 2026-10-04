@@ -22,7 +22,7 @@ from starlette.responses import Response
 from starlette.types import ASGIApp
 
 from ..core.errors import InternalError
-from ..core.logging import request_id_var
+from ..core.logging import request_id_var, run_id_var
 from .errors import error_response, request_id_of
 
 HEADER = "X-Request-ID"
@@ -40,8 +40,12 @@ class RequestIdMiddleware(BaseHTTPMiddleware):
                        call_next: Callable[[Request], Awaitable[Response]]) -> Response:
         incoming = (request.headers.get(self.header) or "").strip()
         request_id = incoming or str(uuid.uuid4())
-        token = request_id_var.set(request_id)
+        request_token = request_id_var.set(request_id)
+        # run_id 由处理函数在拿到它之后写进 request.state（如 POST /api/analyze）；这里先把
+        # 上一个请求可能残留的值清掉，避免跨请求串味。
+        run_token = run_id_var.set("")
         request.state.request_id = request_id
+        request.state.run_id = ""
         started = time.perf_counter()
         try:
             try:
@@ -51,8 +55,12 @@ class RequestIdMiddleware(BaseHTTPMiddleware):
                 response = error_response(InternalError(), request_id_of(request))
             latency_ms = int((time.perf_counter() - started) * 1000)
             response.headers[self.header] = request_id
+            # run_id 从 request.state 读：BaseHTTPMiddleware 下处理函数里的 ContextVar 变更
+            # 不会回传到中间件所在的上下文
             self.logger.info("request %s %s -> %s（%s ms）", request.method, request.url.path,
-                             response.status_code, latency_ms)
+                             response.status_code, latency_ms,
+                             extra={"run_id": getattr(request.state, "run_id", "")})
             return response
         finally:
-            request_id_var.reset(token)
+            run_id_var.reset(run_token)
+            request_id_var.reset(request_token)

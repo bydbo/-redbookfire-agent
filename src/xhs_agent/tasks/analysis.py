@@ -21,12 +21,14 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from contextvars import Token
 from typing import Any
 
 from celery.exceptions import SoftTimeLimitExceeded
 from sqlalchemy.exc import InterfaceError, OperationalError
 
 from ..config import AppConfig
+from ..core.logging import bind_run_id, reset_run_id
 from ..db.session import create_engine_from_config, create_session_factory
 from ..services.materials import backfill_embeddings, sync_materials
 from ..services.runs import load_job, mark_run_failed, planned_hotspots
@@ -56,8 +58,13 @@ async def run_job(job_id: str, cfg: AppConfig, *, caller: Any = None, embedder: 
 
     `sync_index=False` 只给离线测试用（跳过素材同步与向量回填）。
     异常原样上抛——重试与失败兜底由 `execute` 决定（那是任务层的事，不是本函数的事）。
+
+    S4.1：查到 run 后把 `run_id` 绑进日志上下文（本函数之后的每条日志都带它），
+    作用域随 `asyncio.run` 的上下文结束——`execute` 里的重试 / 超时日志只有 `job_id`（边界见
+    `docs/开发规范.md`）。
     """
     engine = create_engine_from_config(cfg)
+    token: Token[str] | None = None
     try:
         factory = create_session_factory(engine)
         async with factory() as session:
@@ -72,6 +79,7 @@ async def run_job(job_id: str, cfg: AppConfig, *, caller: Any = None, embedder: 
                 logger.info("job %s 已是终态 %s，跳过（重复投递幂等）", job_id, job["status"])
                 return str(job["status"])
 
+            token = bind_run_id(job["run_id"])
             if sync_index:
                 # 索引新鲜度：素材目录有变化就先增量入库，再把新/变更行的向量补齐——
                 # 否则向量通道会静默缺数据（宁可整任务失败，也不带病的库去分析）
@@ -86,12 +94,15 @@ async def run_job(job_id: str, cfg: AppConfig, *, caller: Any = None, embedder: 
                                         embedder=embedder)
             return result.status
     finally:
+        if token is not None:
+            reset_run_id(token)
         await engine.dispose()
 
 
 async def _write_failed(cfg: AppConfig, job_id: str, detail: str) -> None:
     """用独立引擎/会话把 run 标成 failed（不复用可能已损坏的原会话）。"""
     engine = create_engine_from_config(cfg)
+    token: Token[str] | None = None
     try:
         factory = create_session_factory(engine)
         async with factory() as session:
@@ -99,8 +110,11 @@ async def _write_failed(cfg: AppConfig, job_id: str, detail: str) -> None:
             if job is None:   # 脏投递：没有行可标，直接算了
                 logger.warning("job %s 不存在，无法标记 failed", job_id)
                 return
+            token = bind_run_id(job["run_id"])
             await mark_run_failed(session, job["run_id"], detail)
     finally:
+        if token is not None:
+            reset_run_id(token)
         await engine.dispose()
 
 

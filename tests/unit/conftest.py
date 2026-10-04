@@ -17,6 +17,8 @@ from xhs_agent.tools import media
 CONTRACT_ENV_NAMES = (
     "XHS_CONFIG_PATH",
     "XHS_LOG_LEVEL",
+    "XHS_LOG_FORMAT",
+    "XHS_FRONTEND_SERVE",
     "XHS_LLM_PROVIDER",
     "XHS_LLM_BASE_URL",
     "XHS_LLM_MODEL",

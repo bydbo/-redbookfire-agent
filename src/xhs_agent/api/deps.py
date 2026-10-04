@@ -28,9 +28,9 @@ from ..db.session import create_engine_from_config, create_session_factory
 
 @lru_cache(maxsize=1)
 def get_config() -> AppConfig:
-    """加载并缓存配置（进程级）；顺带把日志级别配好。"""
+    """加载并缓存配置（进程级）；顺带把日志级别与输出格式配好。"""
     cfg = load_config()
-    configure_logging(cfg.log_level)
+    configure_logging(cfg.log_level, cfg.log_format)
     return cfg
 
 

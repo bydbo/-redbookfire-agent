@@ -68,7 +68,7 @@
 | --- | --- |
 | 语言 | Python ≥ 3.11 |
 | 包管理与构建 | uv + `pyproject.toml`（hatchling 后端，src 布局） |
-| 运行时依赖 | pydantic v2、pydantic-settings、python-dotenv、SQLAlchemy 2.0 async + asyncpg、pgvector、alembic、langgraph、fastapi + uvicorn、redis、httpx、celery |
+| 运行时依赖 | pydantic v2、pydantic-settings、python-dotenv、SQLAlchemy 2.0 async + asyncpg、pgvector、alembic、langgraph、fastapi + uvicorn、redis、httpx、celery、structlog |
 | 开发依赖 | pytest、pytest-cov、pytest-asyncio、testcontainers、ruff、mypy、pre-commit |
 | 文本模型接入 | OpenAI 兼容 `/chat/completions` 协议（默认 DeepSeek），标准库 `urllib` 直连，JSON mode 结构化输出 + 解析失败自修 |
 | 多模态接入 | 通义千问 VL（`qwen-vl-max`），关键帧 base64 内联 |
@@ -90,7 +90,7 @@
 | 检索 | 混合召回：pg_trgm 字面 + pgvector 语义，RRF 融合后套要素加权 |
 | Embedding | 默认通义 text-embedding-v3（API）；本地小模型为可选实现 |
 | 队列与缓存 | Redis + Celery |
-| 可观测 | Langfuse Cloud + structlog，run_id 贯穿全链路 |
+| 可观测 | structlog（`console` / `json`）+ run_id 贯穿全链路；Langfuse Cloud 待 S4.2 |
 | 容器化 / CI | Docker Compose（api / worker / postgres / redis）；GitHub Actions |
 | 代码质量 / 测试 | ruff + mypy + pre-commit + pytest-cov + pytest-asyncio + testcontainers（均已落地） |
 | 前端 | Vue 3 + Vite + TypeScript + Pinia + Vue Router |

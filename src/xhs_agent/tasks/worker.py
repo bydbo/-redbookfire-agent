@@ -21,7 +21,7 @@ from .analysis import register_analyze_task
 from .celery_app import build_celery_app
 
 config = load_config()
-configure_logging(config.log_level)
+configure_logging(config.log_level, config.log_format)
 
 app: Celery = build_celery_app(config)
 

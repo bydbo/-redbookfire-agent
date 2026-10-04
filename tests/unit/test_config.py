@@ -38,6 +38,7 @@ class TestLayerPrecedence:
         assert cfg.llm.provider == "openai_compatible"
         assert cfg.match.topk == 5
         assert cfg.vision.enabled is False
+        assert cfg.log_format == "console"
 
     def test_toml_overrides_code_defaults(self, tmp_path):
         cfg = load_config(write_config(tmp_path, "[match]\ntopk = 3\n"))
@@ -67,10 +68,16 @@ class TestLayerPrecedence:
 
     def test_flat_overrides_are_normalized(self, tmp_path, clean_contract_env):
         clean_contract_env.setenv("XHS_LOG_LEVEL", "debug")
+        clean_contract_env.setenv("XHS_LOG_FORMAT", "JSON")
         clean_contract_env.setenv("XHS_LLM_PROVIDER", "deepseek")
         cfg = load_config(write_config(tmp_path, ""))
         assert cfg.log_level == "DEBUG"
+        assert cfg.log_format == "json"          # 值归一化成小写
         assert cfg.llm.provider == "deepseek"
+
+    def test_log_format_can_be_set_in_toml(self, tmp_path):
+        cfg = load_config(write_config(tmp_path, 'log_format = "json"\n'))
+        assert cfg.log_format == "json"
 
     def test_xhs_config_path_selects_another_file(self, tmp_path, clean_contract_env):
         path = write_config(tmp_path, '[llm]\nmodel = "from-env-path"\n')
@@ -99,6 +106,7 @@ class TestValidation:
         ('[llm]\ntimeout_s = "abc"\n', "llm.timeout_s"),
         ("[queue]\ntask_soft_time_limit_s = 600\ntask_time_limit_s = 100\n", "task_time_limit_s"),
         ('log_level = "TRACE"\n', "log_level"),
+        ('log_format = "xml"\n', "log_format"),
         ('[llm]\napi_key = "sk-should-not-be-here"\n', "llm.api_key"),
         ('[vision]\napi_key = "sk-should-not-be-here"\n', "vision.api_key"),
     ])
