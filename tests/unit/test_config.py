@@ -195,6 +195,23 @@ class TestRedaction:
         assert config_to_dict(cfg)["langfuse_secret_key"] == "***"
         assert "lf-secret" not in json.dumps(config_to_dict(cfg), ensure_ascii=False)
 
+    def test_describe_reports_langfuse_switches(self, tmp_path, clean_contract_env):
+        """S4.2：脱敏摘要给出追踪开关与正文开关，但不含密钥本身。"""
+        clean_contract_env.setenv("LANGFUSE_PUBLIC_KEY", "pk-lf-secret")
+        clean_contract_env.setenv("LANGFUSE_SECRET_KEY", "sk-lf-secret")
+        clean_contract_env.setenv("LANGFUSE_HOST", "https://cloud.langfuse.com")
+        clean_contract_env.setenv("LANGFUSE_CAPTURE_CONTENT", "true")
+        described = load_config(write_config(tmp_path, "")).describe()
+        assert described["langfuse"]["enabled"] is True
+        assert described["langfuse"]["capture_content"] is True
+        assert "pk-lf-secret" not in json.dumps(described, ensure_ascii=False)
+        assert "sk-lf-secret" not in json.dumps(described, ensure_ascii=False)
+
+    def test_describe_defaults_to_tracing_disabled(self, tmp_path, clean_contract_env):
+        described = load_config(write_config(tmp_path, "")).describe()
+        assert described["langfuse"]["enabled"] is False
+        assert described["langfuse"]["capture_content"] is False
+
     def test_langfuse_is_env_only(self, tmp_path):
         with pytest.raises(ConfigError):
             load_config(write_config(tmp_path, 'langfuse_secret_key = "lf-secret"\n'))

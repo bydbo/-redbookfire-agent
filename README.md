@@ -53,6 +53,7 @@
 | Prompt 变更回归报告（两臂对照 + prompt 契约 §六 七维度门槛，落 `evals/reports/prompt-*.md`） | ✅ 已完成（S3.10） |
 | 结构化日志（structlog，`console` / `json` 一键切换）与 run_id 全链路贯穿 | ✅ 已完成（S4.1） |
 | 陈旧 run 对账（worker 启动时把卡住的 `running` 标成 `failed`） | ✅ 已完成（S4.1） |
+| Langfuse 调用追踪（运行 / 热点 / 模型调用三级，看得到 token·成本·延迟；缺键只告警不阻断） | ✅ 已完成（S4.2） |
 | Alembic 数据库迁移（唯一建表路径） | ✅ 已完成（S2.3） |
 | 评测集 v1 与示例素材包（七维度口径、版本冻结） | ✅ 已完成（S2.0） |
 | 服务入口（FastAPI 五个接口 + LangGraph 编排，S3.1–S3.3） | ✅ 已完成 |
@@ -70,7 +71,7 @@
 | --- | --- |
 | 语言 | Python ≥ 3.11 |
 | 包管理与构建 | uv + `pyproject.toml`（hatchling 后端，src 布局） |
-| 运行时依赖 | pydantic v2、pydantic-settings、python-dotenv、SQLAlchemy 2.0 async + asyncpg、pgvector、alembic、langgraph、fastapi + uvicorn、redis、httpx、celery、structlog |
+| 运行时依赖 | pydantic v2、pydantic-settings、python-dotenv、SQLAlchemy 2.0 async + asyncpg、pgvector、alembic、langgraph、fastapi + uvicorn、redis、httpx、celery、structlog、langfuse |
 | 开发依赖 | pytest、pytest-cov、pytest-asyncio、testcontainers、ruff、mypy、pre-commit |
 | 文本模型接入 | OpenAI 兼容 `/chat/completions` 协议（默认 DeepSeek），标准库 `urllib` 直连，JSON mode 结构化输出 + 解析失败自修 |
 | 多模态接入 | 通义千问 VL（`qwen-vl-max`），关键帧 base64 内联 |
@@ -92,7 +93,7 @@
 | 检索 | 混合召回：pg_trgm 字面 + pgvector 语义，RRF 融合后套要素加权 |
 | Embedding | 默认通义 text-embedding-v3（API）；本地小模型为可选实现 |
 | 队列与缓存 | Redis + Celery |
-| 可观测 | structlog（`console` / `json`）+ run_id 贯穿全链路；Langfuse Cloud 待 S4.2 |
+| 可观测 | structlog（`console` / `json`）+ run_id 贯穿全链路 + Langfuse Cloud 调用追踪（默认只上报元数据，`LANGFUSE_CAPTURE_CONTENT=true` 才连提示词与正文） |
 | 容器化 / CI | Docker Compose（api / worker / postgres / redis）；GitHub Actions |
 | 代码质量 / 测试 | ruff + mypy + pre-commit + pytest-cov + pytest-asyncio + testcontainers（均已落地） |
 | 前端 | Vue 3 + Vite + TypeScript + Pinia + Vue Router |
@@ -179,6 +180,11 @@ XHS_LOG_FORMAT=json uv run python -m xhs_agent.serve --port 8000
 # 13.2 陈旧 run 对账（S4.1）：worker 启动时会自动跑一次；也可手动补跑
 #      把 running 且 started_at 超过 [queue].task_time_limit_s × 2（默认 1800 秒）的行标成 failed
 uv run python -m xhs_agent.tasks.reconcile
+
+# 13.3 调用追踪（S4.2）：把 LANGFUSE_PUBLIC_KEY / LANGFUSE_SECRET_KEY / LANGFUSE_HOST
+#      三行写进 config/.env 即启用（缺任一：只打一条 warning 并关闭追踪，分析照常跑）；
+#      默认只上报元数据（模型名 / task / run_id / token / 成本 / 延迟 / 错误），
+#      需要连提示词与产出正文一起上报时再加 LANGFUSE_CAPTURE_CONTENT=true（ADR 0005 口径）。
 
 # 14. 一键跑通 Walking Skeleton（推荐先用它验证环境）
 #     自己起 uvicorn + Celery worker、素材库为空时种入示例素材包、投 case-01 的热点、

@@ -12,10 +12,14 @@
 
 from __future__ import annotations
 
+from typing import Any
+
 from celery import Celery
+from celery.signals import worker_shutting_down
 
 from ..config import load_config
 from ..core.logging import configure_logging
+from ..core.tracing import flush_tracer, warn_if_disabled
 from ..tools.vision import make_describer
 from .analysis import register_analyze_task
 from .celery_app import build_celery_app, install_logging
@@ -23,6 +27,7 @@ from .reconcile import install_worker_ready_reconcile
 
 config = load_config()
 configure_logging(config.log_level, config.log_format)
+warn_if_disabled(config)      # S4.2：缺 Langfuse 三件套只 warning，不阻断 worker 启动
 
 app: Celery = build_celery_app(config)
 
@@ -34,6 +39,12 @@ install_logging(config)
 
 # S4.1：worker 启动时做一次陈旧 run 对账（崩溃吞任务 / 硬超时 SIGKILL 的窄场景）
 install_worker_ready_reconcile(config)
+
+
+@worker_shutting_down.connect   # type: ignore[untyped-decorator]
+def _flush_tracing(**_kwargs: Any) -> None:
+    """S4.2：退出前把缓冲里的 span 刷出去（未启用追踪时是空操作）。"""
+    flush_tracer()
 
 
 if __name__ == "__main__":   # pragma: no cover - 手工启动别名（等价于 celery ... worker）

@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import json
+from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
 from langgraph.types import RetryPolicy
 
 from xhs_agent.config import load_config
+from xhs_agent.core.tracing import Generation, NullTracer, TracingProvider
 from xhs_agent.schemas import Coverage, Element, MatchCandidate, Material, SchemaError
 from xhs_agent.services.retrieval import RetrievalOutcome, VectorCoverage
 from xhs_agent.tools import llm
@@ -60,6 +62,44 @@ class FakeProvider(llm.BaseProvider):
         return LLMResult(text=json.dumps(payload, ensure_ascii=False), provider=self.name,
                          model=self.model, prompt_tokens=100, completion_tokens=50,
                          cost_cny=0.0001)
+
+
+class FakeTracer:
+    """记录 run / hotspot / generation 三类事件的假追踪器（S4.2，离线用）。"""
+
+    enabled = True
+
+    def __init__(self) -> None:
+        self.events: list[tuple[str, dict]] = []
+        self.finished: dict = {}
+        self.flushes = 0
+
+    @contextmanager
+    def run(self, *, name, metadata):
+        self.events.append(("run", {"name": name, **metadata}))
+        yield None
+
+    @contextmanager
+    def hotspot(self, *, index, metadata, content=""):
+        self.events.append(("hotspot", {"index": index, **metadata}))
+        yield None
+
+    @contextmanager
+    def generation(self, *, name, model, metadata):
+        fields = Generation(metadata=dict(metadata))
+        self.events.append(("generation", {"name": name, "model": model, **metadata}))
+        yield fields
+        event = self.events[-1][1]
+        event["usage"] = dict(fields.usage_details)
+        event["cost"] = dict(fields.cost_details)
+        event["level"] = fields.level
+
+    def finish_run(self, *, status, totals, run_id="", prompt_versions=None, error=""):
+        self.finished = {"status": status, "totals": dict(totals), "run_id": run_id,
+                         "prompt_versions": dict(prompt_versions or {}), "error": error}
+
+    def flush(self):
+        self.flushes += 1
 
 
 def make_outcome(*, with_candidate: bool = True) -> RetrievalOutcome:
@@ -131,6 +171,46 @@ class TestRetryJudgement:
 
 
 class TestRunAnalysis:
+    @pytest.mark.asyncio
+    async def test_reports_trace_spans_and_generations(self, cfg, monkeypatch):
+        """S4.2：一次运行 = 1 个 run + N 个 hotspot + 每个热点 3 个 generation。"""
+        monkeypatch.setattr(workflow, "retrieve_candidates", fake_retrieve(make_outcome()))
+        tracer = FakeTracer()
+        caller = StructuredCaller(provider=TracingProvider(
+            FakeProvider(), tracer, price_in_per_m=2.16, price_out_per_m=8.64))
+
+        result = await run_analysis(["热点一", "热点二"], cfg=cfg, session=None, caller=caller,
+                                    tracer=tracer, trace_metadata={"job_id": "job-1"})
+
+        kinds = [kind for kind, _payload in tracer.events]
+        assert kinds == ["run", "hotspot", "generation", "generation", "generation",
+                         "hotspot", "generation", "generation", "generation"]
+        run_event = tracer.events[0][1]
+        assert run_event["name"] == "analyze" and run_event["hotspots"] == 2
+        assert run_event["job_id"] == "job-1"
+        first_generation = tracer.events[2][1]
+        assert first_generation["name"] == "hotspot_clue"
+        assert first_generation["usage"] == {"input": 100, "output": 50, "total": 150}
+        assert first_generation["cost"]["total"] == pytest.approx(100 / 1e6 * 2.16
+                                                                 + 50 / 1e6 * 8.64)
+        assert tracer.finished["status"] == "succeeded"
+        assert tracer.finished["totals"]["llm_calls"] == 6
+        assert tracer.finished["run_id"] == result.run_id
+        assert tracer.finished["prompt_versions"] == {"hotspot_clue": 1, "material_select": 1,
+                                                     "copy_draft": 1}
+        assert tracer.flushes == 1
+
+    @pytest.mark.asyncio
+    async def test_tracing_disabled_keeps_pipeline_working(self, cfg, monkeypatch):
+        """缺键（NullTracer）时整批照常跑通——追踪是旁路组件。"""
+        monkeypatch.setattr(workflow, "retrieve_candidates", fake_retrieve(make_outcome()))
+        monkeypatch.setattr(workflow, "get_tracer", lambda _cfg: NullTracer())
+        result = await run_analysis(["某明星打羽毛球"], cfg=cfg, session=None,
+                                    caller=StructuredCaller(provider=FakeProvider()))
+        assert result.status == "succeeded"
+        assert result.prompt_versions == {"hotspot_clue": 1, "material_select": 1,
+                                          "copy_draft": 1}
+
     @pytest.mark.asyncio
     async def test_walks_five_nodes_and_collects_prompt_versions(self, cfg, monkeypatch):
         retrieve = fake_retrieve(make_outcome())

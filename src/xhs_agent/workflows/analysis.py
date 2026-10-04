@@ -20,6 +20,7 @@ from __future__ import annotations
 import uuid
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
+from typing import Any
 
 from langgraph.graph import END, START, StateGraph
 from langgraph.types import RetryPolicy
@@ -27,6 +28,13 @@ from langgraph.types import RetryPolicy
 from ..agents import DEFAULT_STYLE, explain_candidates, extract_clue, write_draft
 from ..config import PROJECT_ROOT, AppConfig
 from ..core.logging import bind_run_id, reset_run_id
+from ..core.tracing import (
+    TRACE_NAME,
+    Tracer,
+    TracingProvider,
+    capture_content,
+    get_tracer,
+)
 from ..schemas import HotspotClue
 from ..services.reporting import build_report_model, hotspot_entry, render_and_save
 from ..services.retrieval import RetrievalOutcome, retrieve_candidates
@@ -201,22 +209,39 @@ async def run_analysis(hotspots: list[str], *, cfg: AppConfig, session, store: R
                        now: float | None = None, style: str = DEFAULT_STYLE,
                        retry_policy: RetryPolicy | None = None,
                        run_id: str | uuid.UUID | None = None,
-                       topk: int | None = None) -> RunResult:
-    """公共入口：`run_id` 模式下先把 run_id 绑进日志上下文（S4.1），再跑 `_run_analysis`。
+                       topk: int | None = None,
+                       tracer: Tracer | None = None,
+                       trace_metadata: dict[str, Any] | None = None) -> RunResult:
+    """公共入口：绑 `run_id` 日志上下文（S4.1）+ 开一条 Langfuse trace（S4.2），再跑 `_run_analysis`。
 
-    这样 worker 之外的调用方（脚本 / 集成用例）只要传了 `run_id`，该次运行的所有日志都带它。
+    - 日志：worker 之外的调用方（脚本 / 集成用例）只要传了 `run_id`，该次运行的所有日志都带它。
+    - 追踪：一次运行 = 一条 trace（`analyze`），热点与模型调用是它的子 span；缺键时
+      `get_tracer` 返回 `NullTracer`（只警告一次），整批照常跑完。`tracer` 可注入（测试）。
     """
-    if run_id is None:
-        return await _run_analysis(hotspots, cfg=cfg, session=session, store=store, caller=caller,
-                                   embedder=embedder, now=now, style=style,
-                                   retry_policy=retry_policy, topk=topk)
-    token = bind_run_id(str(run_id))
+    active = tracer if tracer is not None else get_tracer(cfg)
+    raws = [str(item).strip() for item in hotspots if str(item or "").strip()]
+    metadata: dict[str, Any] = {"hotspots": len(raws), **(trace_metadata or {})}
+    token = bind_run_id(str(run_id)) if run_id is not None else None
     try:
-        return await _run_analysis(hotspots, cfg=cfg, session=session, store=store, caller=caller,
-                                   embedder=embedder, now=now, style=style,
-                                   retry_policy=retry_policy, run_id=run_id, topk=topk)
+        with active.run(name=TRACE_NAME, metadata=metadata):
+            try:
+                result = await _run_analysis(
+                    hotspots, cfg=cfg, session=session, store=store, caller=caller,
+                    embedder=embedder, now=now, style=style, retry_policy=retry_policy,
+                    run_id=run_id, topk=topk, tracer=active)
+            except BaseException as exc:   # 整批崩掉（热点级失败在 _run_analysis 内已兜住）
+                active.finish_run(status="failed", totals={}, run_id=str(run_id or ""),
+                                  error=f"{type(exc).__name__}: {exc}")
+                active.flush()
+                raise
+            active.finish_run(status=result.status, totals=result.totals, run_id=result.run_id,
+                              prompt_versions=result.prompt_versions,
+                              error="；".join(result.errors))
+            active.flush()
+            return result
     finally:
-        reset_run_id(token)
+        if token is not None:
+            reset_run_id(token)
 
 
 async def _run_analysis(hotspots: list[str], *, cfg: AppConfig, session, store: RunStore | None = None,
@@ -224,7 +249,8 @@ async def _run_analysis(hotspots: list[str], *, cfg: AppConfig, session, store: 
                         now: float | None = None, style: str = DEFAULT_STYLE,
                         retry_policy: RetryPolicy | None = None,
                         run_id: str | uuid.UUID | None = None,
-                        topk: int | None = None) -> RunResult:
+                        topk: int | None = None,
+                        tracer: Tracer | None = None) -> RunResult:
     """跑一批热点：循环调用五节点图，返回 `RunResult`。
 
     输入：热点原文列表、`AppConfig`、异步会话；`store` / `caller` / `embedder` 可注入（测试用）。
@@ -237,6 +263,7 @@ async def _run_analysis(hotspots: list[str], *, cfg: AppConfig, session, store: 
     raws = [str(item).strip() for item in hotspots if str(item or "").strip()]
     if not raws:
         raise ValueError("至少需要一个非空的热点原文")
+    tracer = tracer if tracer is not None else get_tracer(cfg)
 
     recorder = RunRecorder(session, run_id) if run_id is not None else None
     effective_topk = topk
@@ -256,8 +283,13 @@ async def _run_analysis(hotspots: list[str], *, cfg: AppConfig, session, store: 
     # S3.5：一次运行共享一个 httpx 客户端（连接池），同时注入文本模型与向量客户端；
     # 客户端由本函数持有并关闭——不做进程级单例，Celery 每个任务一个新事件循环。
     async with build_http_client(max(cfg.llm.timeout_s, cfg.embedding.timeout_s)) as http:
-        caller = caller if caller is not None else StructuredCaller(
-            provider=build_provider(cfg, client=http))
+        if caller is None:
+            # S4.2：自己造的 provider 外面套一层追踪（调用方注入 caller 时不插手，离线单测零影响）
+            provider = TracingProvider(build_provider(cfg, client=http), tracer,
+                                       capture=capture_content(cfg),
+                                       price_in_per_m=cfg.llm.price_in_per_m,
+                                       price_out_per_m=cfg.llm.price_out_per_m)
+            caller = StructuredCaller(provider=provider)
 
         async def retrieve(clue: HotspotClue):
             # http 透传给检索层：它要在造向量客户端时复用本次运行的连接池（S3.5）
@@ -285,31 +317,32 @@ async def _run_analysis(hotspots: list[str], *, cfg: AppConfig, session, store: 
             reused = await recorder.load_clue(raw) if recorder is not None else None
             if reused:
                 initial["clue"] = reused      # 预置线索 → 拆解节点短路，不再付费
-            try:
-                result = await graph.ainvoke(initial)
-            except Exception as exc:  # 节点重试后仍失败：记进报告，不阻断整批
-                detail = f"{type(exc).__name__}: {exc}"
-                errors = [*errors, f"[{raw}] {detail}"]
-                failed.append(hotspot_entry(clue=reused or {}, coverage={}, candidates=[],
-                                            error=detail))
+            with tracer.hotspot(index=position, metadata={"chars": len(raw)}, content=raw):
+                try:
+                    result = await graph.ainvoke(initial)
+                except Exception as exc:  # 节点重试后仍失败：记进报告，不阻断整批
+                    detail = f"{type(exc).__name__}: {exc}"
+                    errors = [*errors, f"[{raw}] {detail}"]
+                    failed.append(hotspot_entry(clue=reused or {}, coverage={}, candidates=[],
+                                                error=detail))
+                    if recorder is not None:
+                        await recorder.hotspot_finished(position, clue=reused or {}, coverage={},
+                                                        candidates=[], draft=None,
+                                                        status="failed", error=detail)
+                    continue
+                model = result.get("report_model") or model
+                versions = result.get("prompt_versions") or versions
+                errors = result.get("errors") or errors
+                report_paths = result.get("report_paths") or report_paths
                 if recorder is not None:
-                    await recorder.hotspot_finished(position, clue=reused or {}, coverage={},
-                                                    candidates=[], draft=None,
-                                                    status="failed", error=detail)
-                continue
-            model = result.get("report_model") or model
-            versions = result.get("prompt_versions") or versions
-            errors = result.get("errors") or errors
-            report_paths = result.get("report_paths") or report_paths
-            if recorder is not None:
-                await recorder.hotspot_finished(
-                    position,
-                    clue=result.get("clue") or reused or {},
-                    coverage=(result.get("retrieval") or {}).get("coverage") or {},
-                    candidates=(result.get("retrieval") or {}).get("candidates") or [],
-                    draft=result.get("draft"),
-                    status="succeeded",
-                )
+                    await recorder.hotspot_finished(
+                        position,
+                        clue=result.get("clue") or reused or {},
+                        coverage=(result.get("retrieval") or {}).get("coverage") or {},
+                        candidates=(result.get("retrieval") or {}).get("candidates") or [],
+                        draft=result.get("draft"),
+                        status="succeeded",
+                    )
 
         if failed:
             model = {**model, "hotspots": [*(model.get("hotspots") or []), *failed],

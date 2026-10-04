@@ -412,6 +412,10 @@ class AppConfig(_Section):
             "redis_url": _mask_dsn(self._env.get("REDIS_URL")),
             "langfuse": {
                 "configured": bool(public and secret and host),
+                "enabled": bool(public and secret and host),
+                # 正文开关只从环境变量读（口径见《配置契约》§2.2 与 core/tracing.py）
+                "capture_content": (self._env.get("LANGFUSE_CAPTURE_CONTENT").strip().lower()
+                                    in ("1", "true", "yes", "on")),
                 "has_public_key": bool(public),
                 "has_secret_key": bool(secret),
                 "has_host": bool(host),

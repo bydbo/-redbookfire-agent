@@ -91,7 +91,8 @@ async def run_job(job_id: str, cfg: AppConfig, *, caller: Any = None, embedder: 
             raws = [raw for _position, raw in await planned_hotspots(session, job["run_id"])]
             result = await run_analysis(raws, cfg=cfg, session=session,
                                         run_id=job["run_id"], caller=caller,
-                                        embedder=embedder)
+                                        embedder=embedder,
+                                        trace_metadata={"job_id": job_id})
             return result.status
     finally:
         if token is not None:
