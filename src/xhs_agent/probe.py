@@ -73,7 +73,10 @@ _STAGED_VARIABLES: tuple[tuple[str, str, tuple[str, ...]], ...] = (
     ("REDIS_URL", "P3", ("redis://", "rediss://")),
 )
 
+# Host 接受 Langfuse 官方 SDK 的两个变量名（与 `AppConfig.langfuse_keys` 同一口径）：
+# `LANGFUSE_HOST` 为主名，`LANGFUSE_BASE_URL` 是等价别名。
 _LANGFUSE_NAMES = ("LANGFUSE_PUBLIC_KEY", "LANGFUSE_SECRET_KEY", "LANGFUSE_HOST")
+_LANGFUSE_HOST_ALIASES = ("LANGFUSE_HOST", "LANGFUSE_BASE_URL")
 
 # 契约 §四 第 4 步：这两个扩展必须就位，且 pgvector 版本不低于这个线
 REQUIRED_EXTENSIONS = ("vector", "pg_trgm")
@@ -192,6 +195,9 @@ def preflight(cfg: AppConfig, env: EnvView | None = None,
 
     # 4) 可观测三件套：不齐只告警，不阻断启动
     values = {name: env.get(name) for name in _LANGFUSE_NAMES}
+    if not values["LANGFUSE_HOST"]:
+        values["LANGFUSE_HOST"] = next((env.get(name) for name in _LANGFUSE_HOST_ALIASES
+                                        if env.get(name)), "")
     if any(values.values()) and not all(values.values()):
         missing = "、".join(name for name in _LANGFUSE_NAMES if not values[name])
         report.warnings.append(f"调用追踪已关闭：{missing} 未配置，LANGFUSE_* 需要三者齐全")

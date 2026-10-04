@@ -183,6 +183,9 @@ uv run python -m xhs_agent.tasks.reconcile
 
 # 13.3 调用追踪（S4.2）：把 LANGFUSE_PUBLIC_KEY / LANGFUSE_SECRET_KEY / LANGFUSE_HOST
 #      三行写进 config/.env 即启用（缺任一：只打一条 warning 并关闭追踪，分析照常跑）；
+#      LANGFUSE_HOST 也接受官方 SDK 的别名 LANGFUSE_BASE_URL；EU 区用 cloud.langfuse.com、
+#      US 区用 us.cloud.langfuse.com。每次运行结束日志里会有一条带 trace 链接的
+#      “调用追踪：run … 的 trace …”，按 run_id 就能回放。
 #      默认只上报元数据（模型名 / task / run_id / token / 成本 / 延迟 / 错误），
 #      需要连提示词与产出正文一起上报时再加 LANGFUSE_CAPTURE_CONTENT=true（ADR 0005 口径）。
 

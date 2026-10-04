@@ -352,10 +352,14 @@ class AppConfig(_Section):
 
     @property
     def langfuse_keys(self) -> tuple[str, str, str]:
-        """可观测三件套：只从环境变量 / `.env` 读，不进 config.toml。"""
+        """可观测三件套：只从环境变量 / `.env` 读，不进 config.toml。
+
+        Host 接受 Langfuse 官方 SDK 的两个变量名：`LANGFUSE_HOST`（契约里的主名）与
+        `LANGFUSE_BASE_URL`（新别名，SDK 两者都认）。
+        """
         return (self._env.get("LANGFUSE_PUBLIC_KEY"),
                 self._env.get("LANGFUSE_SECRET_KEY"),
-                self._env.get("LANGFUSE_HOST"))
+                self._env.get("LANGFUSE_HOST") or self._env.get("LANGFUSE_BASE_URL"))
 
     def materials_dir(self) -> str:
         return self.paths.resolved(self.paths.materials_dir)

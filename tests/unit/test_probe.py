@@ -201,6 +201,13 @@ class TestObservabilityWarning:
         report = preflight(make_config(tmp_path), env=env, stage="P1")
         assert report.ok and report.warnings == []
 
+    def test_base_url_alias_counts_as_host(self, tmp_path):
+        """`LANGFUSE_BASE_URL` 是官方 SDK 认的等价别名：给了它就不该再报"缺 host"。"""
+        env = view(DEEPSEEK_API_KEY="sk-x", LANGFUSE_PUBLIC_KEY="pk",
+                   LANGFUSE_SECRET_KEY="sk", LANGFUSE_BASE_URL="https://cloud.langfuse.com")
+        report = preflight(make_config(tmp_path), env=env, stage="P1")
+        assert report.ok and report.warnings == []
+
 
 class TestCommandLine:
     def test_main_returns_zero_when_ready(self, tmp_path, clean_contract_env, capsys,

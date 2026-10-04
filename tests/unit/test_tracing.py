@@ -140,6 +140,14 @@ class TestAvailability:
         assert enabled is False
         assert missing in reason and "config/.env" in reason
 
+    def test_base_url_is_an_accepted_alias_for_host(self, tmp_path):
+        """Langfuse 官方 SDK 同时认 LANGFUSE_HOST 与 LANGFUSE_BASE_URL，两个名字都给通。"""
+        env = {k: v for k, v in KEYS.items() if k != "LANGFUSE_HOST"}
+        env["LANGFUSE_BASE_URL"] = "https://cloud.langfuse.com"
+        cfg = make_config(tmp_path, env)
+        assert availability(cfg) == (True, "")
+        assert cfg.langfuse_keys[2] == "https://cloud.langfuse.com"
+
     @pytest.mark.parametrize(("value", "expected"), [
         ("", False), ("false", False), ("0", False), ("TRUE", True), ("yes", True),
         ("On", True), ("1", True),
