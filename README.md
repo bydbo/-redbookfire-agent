@@ -63,7 +63,7 @@
 | Alembic 数据库迁移（唯一建表路径） | ✅ 已完成（S2.3） |
 | 评测集 v1 与示例素材包（七维度口径、版本冻结） | ✅ 已完成（S2.0） |
 | 服务入口（FastAPI 五个接口 + LangGraph 编排，S3.1–S3.3） | ✅ 已完成 |
-| 前端单页应用（Vue 3 + Vite） | ⬜ 未实现 |
+| 前端工程脚手架（Vue 3 + Vite + TS + Router + Pinia + Naive UI + Tailwind，S5.1：别名 / 环境变量 / 代理 / 构建配置） | ✅ 已完成（S5.1） |
 
 业务链路**已端到端跑通**：`docker compose up -d --wait` 起依赖 → `uv run celery -A xhs_agent.tasks.worker:app worker` 起 worker → `uv run python -m xhs_agent.serve` 起接口（先跑 7 步启动前置检查）→ `POST /api/analyze` 投递 → worker 自动消费（索引新鲜度 → 五节点分析 → 逐热点写回）→ `/api/jobs/{job_id}` 轮询 → `/api/runs/{run_id}` 取结构化结果、`/report` 取报告。另可运行 `uv run python -m xhs_agent.probe`、`uv run python scripts/index_materials.py`、`uv run python scripts/backfill_embeddings.py`、`uv run python scripts/eval_retrieval.py`、`uv run python scripts/smoke_skeleton.py`。路线图见文末。
 
@@ -102,9 +102,9 @@
 | 可观测 | structlog（`console` / `json`）+ run_id 贯穿全链路 + Langfuse Cloud 调用追踪 + OpenTelemetry（ASGI 服务端 span、`xhs_agent.db` DB span、W3C 跨进程传播；默认只上报元数据，`LANGFUSE_CAPTURE_CONTENT=true` 才连提示词与正文） |
 | 容器化 / CI | Docker Compose（api / worker / postgres / redis 五服务）；GitHub Actions 四个 job（lint / typecheck / test / image） |
 | 代码质量 / 测试 | ruff + mypy + pre-commit + pytest-cov + pytest-asyncio + testcontainers（均已落地） |
-| 前端 | Vue 3 + Vite + TypeScript + Pinia + Vue Router |
-| UI 与可视化 | Naive UI + Tailwind CSS + ECharts |
-| 接口类型 | `openapi-typescript` 从契约生成 TS 类型 |
+| 前端 | Vue 3 + Vite + TypeScript + Pinia + Vue Router（S5.1 已落地） |
+| UI 与可视化 | Naive UI + Tailwind CSS（S5.1 已落地）+ ECharts（S5.5） |
+| 接口类型 | `openapi-typescript` 从契约生成 TS 类型（S5.2） |
 
 以上组件**尚未落地**，落地顺序见 `docs/技术栈.md` 第四节。**简历只写已经落地的技术栈。**
 
@@ -112,7 +112,7 @@
 
 ## 快速开始
 
-前置条件：Python ≥ 3.11、`uv`、`ffmpeg` / `ffprobe`（用于抽帧）。
+前置条件：Python ≥ 3.11、`uv`、`ffmpeg` / `ffprobe`（用于抽帧）。前端开发另需 Node 25.3.0 + pnpm 11.25.0（见步骤 15）。
 
 > **注意**：两种跑法都支持——（A）**一条命令起全栈**：`docker compose up -d --wait`（下面第一段）；（B）本地开发：`docker compose up -d --wait postgres redis` 只起依赖，API 与 worker 用 `uv run` 直接跑（第二段起）。
 
@@ -146,7 +146,8 @@ docker compose down             # 停全栈（保留 pgdata / redisdata 卷）
 # 迁移由一次性 migrate 服务自动跑；需要手动补跑时：docker compose run --rm migrate
 
 # 容器口径：DATABASE_URL / REDIS_URL 指向 compose 服务名；api 以 XHS_FRONTEND_SERVE=false 启动
-# （前端 dist 归 E5 / S5.9，在那之前根路径只有 API）；镜像以非 root（uid 1000）运行，
+# （dist 进镜像归 S5.9，在那之前容器里只跑 API；本地已可用 frontend/pnpm build 产出 dist），
+# 镜像以非 root（uid 1000）运行，
 # ./data/materials 与 ./runs 是 bind mount——Linux 宿主上若 uid 不同，需要先 chown。
 
 # ============ （B）本地开发：只起依赖，代码用 uv 跑 ============
@@ -241,11 +242,21 @@ uv run python -m xhs_agent.tasks.reconcile
 #     evals/reports/skeleton-<日期>.html|md，这次运行会留在库里可回看。
 uv run python scripts/smoke_skeleton.py
 #     只驱动已起的服务：--api-url http://127.0.0.1:8000；不种素材：--no-seed
+
+# 15. 前端开发与构建（S5.1 起；工程在 frontend/，Node 25.3.0 + pnpm 11.25.0，
+#     版本固定在 package.json 的 engines / packageManager 与 .node-version）
+cd frontend
+pnpm install          # 首次；pnpm-lock.yaml 入库，node_modules 不入库
+pnpm dev              # 开发服务器 http://localhost:5173，/api 代理到 127.0.0.1:8000（配置契约 §五）
+pnpm run type-check   # vue-tsc 零错误才算过
+pnpm build            # 类型检查 + 构建，产物落 frontend/dist（由 FastAPI 挂载，ADR 0009）
 ```
+
+`pnpm dev` 与 `uv run python -m xhs_agent.serve --port 8000`（或 `XHS_FRONTEND_SERVE=false` 的等价入口）同时运行，即可在 http://localhost:5173 全栈调试：页面走 Vite，接口经代理进本地 API。
 
 > **`[frontend]` 段怎么起作用**：`serve = true`（默认）且 `frontend/dist` 存在且非空时，FastAPI 会把 dist 挂在根路径，并把 `/api` 之外的未命中路径（无扩展名的）回落成 `index.html`——前端 history 路由刷新不会 404；带扩展名的未命中仍返回 404，API 的 404 也照旧是 `not_found` 的 JSON。
 >
-> **还没有前端产物（E5 之前）时**：`serve = true` + 缺 dist 属于配置错误，启动前置检查会**拒绝启动**（退出码 2）。本地纯后端开发用环境变量覆盖即可只跑 API：`XHS_FRONTEND_SERVE=false`（等价于把 `[frontend].serve` 设为 `false`）——`scripts/smoke_skeleton.py` 已经默认这么做了。前端源码与 `pnpm build` 属 E5。
+> **还没有前端产物时**：`serve = true` + 缺 dist 属于配置错误，启动前置检查会**拒绝启动**（退出码 2）。本地纯后端开发用环境变量覆盖即可只跑 API：`XHS_FRONTEND_SERVE=false`（等价于把 `[frontend].serve` 设为 `false`）——`scripts/smoke_skeleton.py` 已经默认这么做了。前端工程已落地（S5.1），本地 `cd frontend && pnpm build` 即可产出 dist。
 
 网络受限时：`uv sync --no-dev` 只装运行时环境（pydantic / pydantic-settings / python-dotenv / SQLAlchemy async + asyncpg / pgvector / alembic）；不过 `import xhs_agent` 仍然需要安装或设置 `PYTHONPATH=src`（src 布局）。
 

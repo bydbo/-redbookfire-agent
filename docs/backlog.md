@@ -19,7 +19,7 @@
 | E2 数据与检索 | 持久化 + 语义召回，产出评测数字 | 20 | ✅ 进行中 | M3 |
 | E3 编排与服务 | 服务化与异步，端到端可演示 | 20.5 | ✅ 已完成（S3.0–S3.10） | M4 |
 | E4 可观测与交付 | 可运维、可交付 | 8 | ✅ 已完成（S4.1–S4.6） | M5 |
-| E5 前端工程 | 把演示页升级为可交互的单页应用 | 17 | ⬜ 未开始 | M6 |
+| E5 前端工程 | 把演示页升级为可交互的单页应用 | 17 | 🔄 进行中（S5.1） | M6 |
 | **合计** | | **76.5** | | |
 
 全职投入约 9 周；按每天 3 小时的业余节奏约 5 个月。总量比初版（41.5）增加 26 人日：前端 Epic 17、API 前缀与静态挂载 1、完整 preflight 1.5、mypy 收紧 0.5、E2 净增 5（集成测试基座 +3、评测集与示例素材包 +3、对比脚本精简 −1）、E1 落地时的范围调整 1（S1.2 配置段全量 +0.5、S1.4 覆盖 8 个模块 +0.5）。
@@ -99,7 +99,19 @@
 
 | 编号 | Story | 依赖 | 验收标准 | 人日 | 状态 |
 | --- | --- | --- | --- | --- | --- |
-| S5.1 | Vite 工程脚手架 | S3.7 | Vue 3 + TS + Router + Pinia + Naive UI + Tailwind 可跑起来；目录结构符合 `docs/项目结构.md` | 2 | ⬜ |
+| S5.1 | Vite 工程脚手架 | S3.7 | Vue 3 + TS + Router + Pinia + Naive UI + Tailwind 可跑起来；目录结构符合 `docs/项目结构.md` | 2 | ✅ |
+
+<details>
+<summary>S5.1 实测记录（2026-10-04）</summary>
+
+- 工具链：Node **25.3.0** + pnpm **11.25.0**（系统 npm 全局目录需管理员权限，pnpm 装在用户目录 shim 调用；版本按配置契约 §五固定进 `package.json` 的 `engines` / `packageManager` 与 `.node-version`）。
+- 依赖解析：vue 3.5.43 / vue-router 4.6.4 / pinia 3.0.4 / naive-ui 2.45.3 / vite 7.3.6 / typescript 5.9.3 / tailwindcss 3.4.19（+ postcss / autoprefixer）/ vue-tsc 3.3.12 / @types/node 25；`pnpm-lock.yaml` 入库。直接依赖理由：vue / vue-router / pinia / naive-ui / tailwindcss 是 ADR 0008 既定选型；vite + @vitejs/plugin-vue + typescript + vue-tsc 是构建工具链必需；postcss + autoprefixer 是 Tailwind 3.x 的官方编译通道（不加则 Tailwind 指令无法编译）。
+- 踩坑两则（均记录在案）：① pnpm 11 默认拦截依赖安装脚本，需 `pnpm-workspace.yaml` 的 `allowBuilds: esbuild: true` 放行（package.json `pnpm` 字段与 `.npmrc` 在 pnpm 11 下均不再被读取——配置中心已迁移）；② pnpm 默认的符号链接布局（junction）在本机受限环境下链接大面积失效，改 `nodeLinker: hoisted`（硬链接/复制布局）后 `install` 10 秒完成、esbuild postinstall 通过。两处配置都写进 `pnpm-workspace.yaml` 并带注释，CI 与其他机器行为一致。
+- 配置要点：`@` → src 别名（vite.config.ts 与 tsconfig paths 对齐）；`VITE_API_BASE_URL` 环境变量默认 `/api`（对齐配置契约 §五，`.env.development` / `.env.production` 无密钥入库）；dev server 5173 端口 + `/api` 代理到 127.0.0.1:8000；`pnpm build` = vue-tsc 零错误 + vite build 产 `frontend/dist`。
+- 验证：`pnpm run type-check` 两个 tsconfig project 零错误；`pnpm build` 2685 模块、11.9s 产出 dist（index.html + assets JS 216KB / CSS 5.6KB + favicon）；`pnpm dev` 冒烟——`GET /` 200（title 正确）、SFC 编译返回正常、Tailwind 编译生效、`/api` 代理正确转发到 127.0.0.1:8000（后端未启动时 ECONNREFUSED，机制验证通过）。后端零影响：ruff 零告警、mypy 44 文件零错误、`pytest` **747 passed**。
+- 说明：HomeView 是脚手架验证页（Naive 组件 + Tailwind 类 + Pinia 读状态 + 环境变量回显），S5.3 替换为分析台。
+
+</details>
 | S5.2 | 契约生成接口类型 | S5.1 | `openapi-typescript` 生成 `schema.d.ts` 并入库；CI 校验生成结果无变化 | 1 | ⬜ |
 | S5.3 | 分析台页面 | S5.2, S3.4b | 可输入多个热点、提交、轮询进度并跳转结果 | 2.5 | ⬜ |
 | S5.4 | 结果详情页 | S5.3 | 要素标签、候选素材（含关键帧）、覆盖缺口、文案初稿四块齐全，文案可一键复制 | 3 | ⬜ |
