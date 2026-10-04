@@ -29,7 +29,7 @@ from fastapi import FastAPI
 
 from ..config import AppConfig
 from ..core.logging import configure_logging
-from ..core.tracing import warn_if_disabled
+from ..core.tracing import flush_tracer, get_tracer, install_fastapi_instrumentation
 from ..probe import PreflightFailed, report_lines, run_startup_checks
 from .deps import get_config
 from .errors import register_exception_handlers
@@ -58,6 +58,8 @@ def create_app(cfg: AppConfig | None = None, *, check_startup: bool = True) -> F
         lifespan=_lifespan,
     )
     app.add_middleware(RequestIdMiddleware)
+    # S4.3：ASGI 服务端 span（最后加 = 最外层，覆盖整条请求；没有 provider 时是空操作）
+    install_fastapi_instrumentation(app)
     register_exception_handlers(app)
     for router in (ops.router, analysis.router, result.router):
         app.include_router(router, prefix=API_PREFIX)
@@ -82,8 +84,9 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     # S4.1：日志格式与级别在这里落地——`create_app(cfg=...)` 这条路径不会走 `get_config()`，
     # 少了这一句 `XHS_LOG_FORMAT=json` 就只在"没传配置"的分支才生效（幂等，重复调用无害）
     configure_logging(cfg.log_level, cfg.log_format)
-    # S4.2：追踪是旁路组件——缺 LANGFUSE_* 只打一条 warning，不影响启动
-    warn_if_disabled(cfg)
+    # S4.2 / S4.3：追踪是旁路组件——缺 LANGFUSE_* 只打一条 warning（在 get_tracer 里）；
+    # API 进程也要建一次客户端，否则 ASGI 服务端 span 没有导出通道
+    get_tracer(cfg)
     if getattr(app.state, "check_startup", True):
         report = await run_startup_checks(cfg)
         if not report.ok:
@@ -94,7 +97,11 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
             raise PreflightFailed(report)
     if not getattr(app.state, "frontend_mounted", False):
         mount_frontend(app, cfg, api_prefix=API_PREFIX)
-    yield
+    try:
+        yield
+    finally:
+        # S4.3：退出前把缓冲里的 span 刷出去（S4.4 的进程级资源释放也在这里收口）
+        flush_tracer()
 
 
 app = create_app()

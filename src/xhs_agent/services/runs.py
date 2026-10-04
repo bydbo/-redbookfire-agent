@@ -30,6 +30,7 @@ from sqlalchemy import delete, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..config import AppConfig
+from ..core.tracing import traced_db
 from ..db.models import Hotspot, Material, Run, RunHotspot, RunMatch
 from ..schemas import SchemaError
 from ..tools import gaps as gaps_tool
@@ -71,6 +72,8 @@ def _normalize(hotspots: Sequence[str]) -> list[str]:
     return out
 
 
+@traced_db("db.submit_analysis", operation="insert",
+           tables=("hotspots", "runs", "run_hotspots"))
 async def submit_analysis(session: AsyncSession, hotspots: Sequence[str], *,
                           topk: int = 5, request_id: str = "",
                           enqueue: Callable[[str], Awaitable[None]] | None = None) -> Submission:
@@ -125,6 +128,8 @@ async def _run_row(session: AsyncSession, run_id: uuid.UUID) -> Run | None:
     return (await session.execute(select(Run).where(Run.id == run_id))).scalar_one_or_none()
 
 
+@traced_db("db.load_job", operation="select",
+           tables=("runs", "run_hotspots", "hotspots"))
 async def load_job(session: AsyncSession, job_id: str) -> dict[str, Any] | None:
     """`JobStatus` 形状：状态、进度（已完成热点数 / 热点总数）与失败原因。"""
     run = (await session.execute(
@@ -189,6 +194,8 @@ async def _matches_by_run_hotspot(session: AsyncSession,
     return grouped
 
 
+@traced_db("db.load_run", operation="select",
+           tables=("runs", "run_hotspots", "hotspots", "run_matches", "materials"))
 async def load_run(session: AsyncSession, run_id: uuid.UUID) -> dict[str, Any] | None:
     """`RunDetail` 形状：运行汇总 + 每个热点的线索、覆盖度、候选与文稿。"""
     run = await _run_row(session, run_id)
@@ -225,6 +232,8 @@ async def load_run(session: AsyncSession, run_id: uuid.UUID) -> dict[str, Any] |
     }
 
 
+@traced_db("db.load_report_model", operation="select",
+           tables=("runs", "run_hotspots", "hotspots", "run_matches", "materials"))
 async def load_report_model(session: AsyncSession, cfg: AppConfig,
                             run_id: uuid.UUID) -> dict[str, Any] | None:
     """报告 model（`tools/report.py` 的输入形状）；查不到返回 `None`。
@@ -349,6 +358,7 @@ class RunRecorder:
         """本次运行的截断上限（来自提交时的 `topk`）。"""
         return int((await self._run()).topk)
 
+    @traced_db("db.run_recorder.start", operation="update", tables=("runs",))
     async def start(self) -> None:
         """开跑：`runs.status='running'` 并记 `started_at`。"""
         run = await self._run()
@@ -366,6 +376,8 @@ class RunRecorder:
             .limit(1))).scalar_one_or_none()
         return dict(clue) if clue else None
 
+    @traced_db("db.run_recorder.hotspot_finished", operation="write",
+               tables=("hotspots", "run_hotspots", "run_matches"))
     async def hotspot_finished(self, position: int, *, clue: dict[str, Any],
                                coverage: dict[str, Any],
                                candidates: list[dict[str, Any]],
@@ -398,6 +410,7 @@ class RunRecorder:
                                       **values))
         await self._commit()
 
+    @traced_db("db.run_recorder.finish", operation="update", tables=("runs",))
     async def finish(self, *, status: str, totals: dict[str, Any],
                      prompt_versions: dict[str, int],
                      errors: list[str]) -> None:

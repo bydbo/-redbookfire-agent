@@ -140,6 +140,50 @@ class TestCeleryDispatcher:
         with pytest.raises(ConfigError):
             CeleryDispatcher(make_config(tmp_path)).app()
 
+    @pytest.mark.asyncio
+    async def test_enqueue_passes_trace_headers_to_celery(self, tmp_path, otel_exporter):
+        """S4.3：有活动 span 时把 W3C traceparent 放进消息头，worker 才能接住同一条 trace。"""
+        from opentelemetry import trace
+
+        from xhs_agent.api.deps import CeleryDispatcher
+
+        recorded: dict = {}
+
+        class RecordingApp:
+            def send_task(self, *args, **kwargs):
+                recorded["args"] = args
+                recorded["kwargs"] = kwargs
+
+        cfg = make_config(tmp_path)
+        cfg._env = EnvView({}, {"REDIS_URL": "redis://127.0.0.1:6379/0"})
+        dispatcher = CeleryDispatcher(cfg)
+        dispatcher._app = RecordingApp()        # type: ignore[assignment]
+
+        tracer = trace.get_tracer("xhs_agent.test")
+        with tracer.start_as_current_span("POST /api/analyze"):
+            await dispatcher.enqueue("job-1")
+
+        headers = recorded["kwargs"]["headers"]
+        assert headers["traceparent"].startswith("00-")
+        assert recorded["kwargs"]["args"] == ["job-1"]
+
+    @pytest.mark.asyncio
+    async def test_enqueue_without_span_sends_no_trace_headers(self, tmp_path):
+        from xhs_agent.api.deps import CeleryDispatcher
+
+        recorded: dict = {}
+
+        class RecordingApp:
+            def send_task(self, *args, **kwargs):
+                recorded["kwargs"] = kwargs
+
+        cfg = make_config(tmp_path)
+        cfg._env = EnvView({}, {"REDIS_URL": "redis://127.0.0.1:6379/0"})
+        dispatcher = CeleryDispatcher(cfg)
+        dispatcher._app = RecordingApp()        # type: ignore[assignment]
+        await dispatcher.enqueue("job-1")
+        assert recorded["kwargs"]["headers"] == {}
+
 
 class TestConflictError:
     def test_conflict_maps_to_409(self):

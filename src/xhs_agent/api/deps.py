@@ -84,10 +84,14 @@ class CeleryDispatcher:
     async def enqueue(self, job_id: str) -> None:
         from kombu.exceptions import KombuError
 
+        from ..core.tracing import current_trace_headers
         from ..tasks.analysis import ANALYZE_TASK_NAME
 
+        # S4.3：把本次请求的 W3C traceparent 放进消息头，worker 接着这条 trace 往下走
+        headers = current_trace_headers()
         try:
-            await asyncio.to_thread(self.app().send_task, ANALYZE_TASK_NAME, args=[job_id])
+            await asyncio.to_thread(self.app().send_task, ANALYZE_TASK_NAME, args=[job_id],
+                                    headers=headers)
         except (KombuError, OSError) as exc:
             raise DependencyUnavailableError(
                 "分析队列不可用：投递失败",

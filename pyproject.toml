@@ -16,6 +16,8 @@ dependencies = [
     "httpx>=0.28.1",
     "langfuse>=4.16,<5",
     "langgraph>=1.2,<2",
+    "opentelemetry-api>=1.45,<2",
+    "opentelemetry-instrumentation-fastapi>=0.66b0,<0.67",
     "pgvector>=0.5,<1",
     "pydantic>=2.9,<3",
     "pydantic-settings>=2.6,<3",
@@ -30,6 +32,7 @@ dependencies = [
 [dependency-groups]
 dev = [
     "mypy>=2.3.1",
+    "opentelemetry-sdk>=1.45,<2",
     "pre-commit>=4.6.2",
     "pytest>=8.0",
     "pytest-asyncio>=1.4,<2",

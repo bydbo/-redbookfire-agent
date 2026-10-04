@@ -29,6 +29,7 @@ from sqlalchemy.exc import InterfaceError, OperationalError
 
 from ..config import AppConfig
 from ..core.logging import bind_run_id, reset_run_id
+from ..core.tracing import CARRIER_KEYS, use_trace_carrier
 from ..db.session import create_engine_from_config, create_session_factory
 from ..services.materials import backfill_embeddings, sync_materials
 from ..services.runs import load_job, mark_run_failed, planned_hotspots
@@ -53,7 +54,8 @@ logger = logging.getLogger("xhs_agent.tasks")
 
 
 async def run_job(job_id: str, cfg: AppConfig, *, caller: Any = None, embedder: Any = None,
-                  vision: Any = None, sync_index: bool = True) -> str:
+                  vision: Any = None, sync_index: bool = True,
+                  carrier: dict[str, str] | None = None) -> str:
     """任务体（异步）：查状态 → 索引新鲜度 → 分析，返回终态字符串。
 
     `sync_index=False` 只给离线测试用（跳过素材同步与向量回填）。
@@ -62,7 +64,17 @@ async def run_job(job_id: str, cfg: AppConfig, *, caller: Any = None, embedder: 
     S4.1：查到 run 后把 `run_id` 绑进日志上下文（本函数之后的每条日志都带它），
     作用域随 `asyncio.run` 的上下文结束——`execute` 里的重试 / 超时日志只有 `job_id`（边界见
     `docs/开发规范.md`）。
+    S4.3：`carrier` 是投递方传下来的 W3C 上下文（含 `traceparent`）；接上以后本次运行的
+    `analyze` 及其子 span 会挂在 API 请求那一条 trace 下。
     """
+    with use_trace_carrier(carrier):
+        return await _run_job(job_id, cfg, caller=caller, embedder=embedder, vision=vision,
+                              sync_index=sync_index)
+
+
+async def _run_job(job_id: str, cfg: AppConfig, *, caller: Any = None, embedder: Any = None,
+                   vision: Any = None, sync_index: bool = True) -> str:
+    """`run_job` 的实现体（拆出来只是为了让 trace 上下文包住整段）。"""
     engine = create_engine_from_config(cfg)
     token: Token[str] | None = None
     try:
@@ -100,8 +112,14 @@ async def run_job(job_id: str, cfg: AppConfig, *, caller: Any = None, embedder: 
         await engine.dispose()
 
 
-async def _write_failed(cfg: AppConfig, job_id: str, detail: str) -> None:
+async def _write_failed(cfg: AppConfig, job_id: str, detail: str,
+                        carrier: dict[str, str] | None = None) -> None:
     """用独立引擎/会话把 run 标成 failed（不复用可能已损坏的原会话）。"""
+    with use_trace_carrier(carrier):
+        await _write_failed_inner(cfg, job_id, detail)
+
+
+async def _write_failed_inner(cfg: AppConfig, job_id: str, detail: str) -> None:
     engine = create_engine_from_config(cfg)
     token: Token[str] | None = None
     try:
@@ -119,24 +137,33 @@ async def _write_failed(cfg: AppConfig, job_id: str, detail: str) -> None:
         await engine.dispose()
 
 
-def mark_failed(job_id: str, cfg: AppConfig, detail: str) -> None:
+def mark_failed(job_id: str, cfg: AppConfig, detail: str,
+                carrier: dict[str, str] | None = None) -> None:
     """兜底标记失败；这一步再失败只记日志，不掩盖原始异常。"""
     try:
-        asyncio.run(_write_failed(cfg, job_id, detail))
+        asyncio.run(_write_failed(cfg, job_id, detail, carrier))
     except Exception:   # noqa: BLE001 - 兜底路径不能再抛，否则原始异常会被吞掉
         logger.exception("把 job %s 标记为 failed 时又失败（原始错误：%s）", job_id, detail)
+
+
+def _carrier_from_task(task: Any) -> dict[str, str]:
+    """从 Celery 任务请求头里取出 W3C 上下文（只有投递方带了才会有）。"""
+    headers = getattr(getattr(task, "request", None), "headers", None) or {}
+    return {str(key): str(value) for key, value in headers.items()
+            if key in CARRIER_KEYS and value}
 
 
 def execute(task: Any, job_id: str, cfg: AppConfig, *, caller: Any = None,
             embedder: Any = None, vision: Any = None) -> str:
     """Celery 任务的同步外壳：`asyncio.run` + 重试/失败语义（`task` 是绑定的 Task）。"""
+    carrier = _carrier_from_task(task)
     try:
         return asyncio.run(run_job(job_id, cfg, caller=caller, embedder=embedder,
-                                   vision=vision))
+                                   vision=vision, carrier=carrier))
     except SoftTimeLimitExceeded as exc:
         detail = f"软超时（{cfg.queue.task_soft_time_limit_s}s 上限）：{exc}"
         logger.error("job %s %s，标记 failed（不重试）", job_id, detail)
-        mark_failed(job_id, cfg, detail)
+        mark_failed(job_id, cfg, detail, carrier=carrier)
         raise
     except TRANSIENT_ERRORS as exc:
         detail = f"{type(exc).__name__}: {exc}"
@@ -148,11 +175,11 @@ def execute(task: Any, job_id: str, cfg: AppConfig, *, caller: Any = None,
             raise task.retry(exc=exc,
                              countdown=min(MAX_RETRY_COUNTDOWN_S, 2 ** (retries + 1))) from exc
         logger.error("job %s 重试 %s 次仍失败，标记 failed：%s", job_id, budget, detail)
-        mark_failed(job_id, cfg, detail)
+        mark_failed(job_id, cfg, detail, carrier=carrier)
         raise
     except Exception as exc:
         # 分析类失败（或任何非基础设施错误）：不重试，直接标 failed 再上抛
-        mark_failed(job_id, cfg, f"{type(exc).__name__}: {exc}")
+        mark_failed(job_id, cfg, f"{type(exc).__name__}: {exc}", carrier=carrier)
         raise
 
 

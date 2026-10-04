@@ -43,6 +43,8 @@ def clean_contract_env(monkeypatch: pytest.MonkeyPatch) -> pytest.MonkeyPatch:
     return monkeypatch
 
 
+
+
 def _minimal_png(width: int, height: int) -> bytes:
     """最小 PNG：签名 + IHDR 头，够 `materials._image_size` 读出宽高（不需要真图片）。"""
     body = b"\x89PNG\r\n\x1a\n" + struct.pack(">I", 13) + b"IHDR"

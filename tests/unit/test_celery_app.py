@@ -117,6 +117,38 @@ class TestTaskRegistration:
         assert registered.max_retries == 3
 
 
+class TestTraceCarrier:
+    """S4.3：worker 从 Celery 消息头里接住 API 传下来的 W3C 上下文。"""
+
+    TRACEPARENT = "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01"
+
+    def _task(self, headers: dict[str, str]):
+        task = FakeTask(retries=0, max_retries=2)
+        task.request.headers = headers          # type: ignore[attr-defined]
+        return task
+
+    def test_carrier_is_read_from_task_headers(self):
+        task = self._task({"traceparent": self.TRACEPARENT, "id": "celery-1",
+                           "task": "xhs_agent.analyze_run"})
+        assert analysis._carrier_from_task(task) == {"traceparent": self.TRACEPARENT}
+
+    def test_carrier_is_empty_without_trace_headers(self):
+        assert analysis._carrier_from_task(FakeTask()) == {}
+
+    def test_execute_forwards_carrier_into_run_job(self, tmp_path, monkeypatch):
+        cfg = make_config(tmp_path)
+        task = self._task({"traceparent": self.TRACEPARENT})
+        seen: dict = {}
+
+        async def fake_run_job(job_id, cfg, **kwargs):
+            seen.update(kwargs)
+            return "succeeded"
+
+        monkeypatch.setattr(analysis, "run_job", fake_run_job)
+        assert execute(task, "job-1", cfg) == "succeeded"
+        assert seen["carrier"] == {"traceparent": self.TRACEPARENT}
+
+
 class TestStaleRunReconcile:
     """S4.1 的对账接线：阈值来自 `[queue].task_time_limit_s × 2`，由 worker_ready 触发一次。"""
 
@@ -198,7 +230,7 @@ class TestExecuteSemantics:
         marked: list[tuple[str, str]] = []
         monkeypatch.setattr(analysis, "run_job", _boom(ConnectionError))
         monkeypatch.setattr(analysis, "mark_failed",
-                            lambda job_id, _cfg, detail: marked.append((job_id, detail)))
+                            lambda job_id, _cfg, detail, **_kw: marked.append((job_id, detail)))
 
         with pytest.raises(ConnectionError):
             execute(task, "job-1", cfg)
@@ -212,7 +244,7 @@ class TestExecuteSemantics:
         marked: list[str] = []
         monkeypatch.setattr(analysis, "run_job", _boom(LLMError))
         monkeypatch.setattr(analysis, "mark_failed",
-                            lambda _job_id, _cfg, detail: marked.append(detail))
+                            lambda _job_id, _cfg, detail, **_kw: marked.append(detail))
 
         with pytest.raises(LLMError):
             execute(task, "job-1", cfg)
@@ -225,7 +257,7 @@ class TestExecuteSemantics:
         marked: list[str] = []
         monkeypatch.setattr(analysis, "run_job", _boom(SoftTimeLimitExceeded))
         monkeypatch.setattr(analysis, "mark_failed",
-                            lambda _job_id, _cfg, detail: marked.append(detail))
+                            lambda _job_id, _cfg, detail, **_kw: marked.append(detail))
 
         with pytest.raises(SoftTimeLimitExceeded):
             execute(task, "job-1", cfg)

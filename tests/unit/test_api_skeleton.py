@@ -331,3 +331,22 @@ class TestStartupCheckWiring:
         with TestClient(app, raise_server_exceptions=False) as client:
             assert client.get("/api/openapi.json").status_code == 200
         assert called == []
+
+
+class TestOtelServerSpans:
+    """S4.3：FastAPI 自动埋点产出 ASGI 服务端 span；健康探针被排除。"""
+
+    def test_request_produces_a_server_span(self, client: TestClient, otel_exporter) -> None:
+        otel_exporter.clear()
+        client.get(f"{API_PREFIX}/probe/not-found")
+
+        spans = [item for item in otel_exporter.get_finished_spans() if "GET" in item.name]
+        assert spans, "没有产出 ASGI 服务端 span"
+        attributes = dict(spans[-1].attributes or {})
+        assert (attributes.get("http.status_code")
+                or attributes.get("http.response.status_code")) == 404
+
+    def test_health_probe_is_excluded(self, client: TestClient, otel_exporter) -> None:
+        otel_exporter.clear()
+        client.get(f"{API_PREFIX}/health")
+        assert otel_exporter.get_finished_spans() == ()

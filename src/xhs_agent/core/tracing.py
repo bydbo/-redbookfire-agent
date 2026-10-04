@@ -1,7 +1,10 @@
-"""调用追踪门面：把一次分析上报到 Langfuse（S4.2）。
+"""调用追踪门面：把一次请求 + 它触发的分析串成一条 trace（S4.2 / S4.3）。
 
 用途：`get_tracer(cfg)` 拿进程级追踪器（缺键时是 `NullTracer`）；`run_analysis` 用它开
       「运行 → 热点 → 模型调用」三层结构，`TracingProvider` 负责每次文本模型调用的 generation。
+      S4.3 再加三件：`install_fastapi_instrumentation(app)` 给 API 装 ASGI 服务端 span、
+      `db_span(...)` 记数据库操作（**不含 SQL 语句**）、`current_trace_headers()` /
+      `use_trace_carrier(...)` 用 W3C traceparent 把 API 与 Celery worker 连成一条 trace。
 输入：`AppConfig`——Langfuse 三件套从环境变量 / `config/.env` 读（《配置契约》§2.2）；
       正文开关读 `LANGFUSE_CAPTURE_CONTENT`。
 输出：无返回值（上报是副作用）；`availability()` / `capture_content()` 供启动时打印口径。
@@ -16,16 +19,24 @@
   `opentelemetry.trace.set_tracer_provider()`（进程内只能设一次），所以客户端不能每次运行新建；
   懒建同时保证 Celery prefork 时客户端只在真正干活的子进程里创建，不跨 fork 继承。
 - **业务代码不直接 `import langfuse`**：一律走本模块的 `Tracer` 协议，离线测试注入假实现。
+- **span 也不散落**（S4.3）：数据库 span 用 `db_span`，跨进程传播用 `current_trace_headers` /
+  `use_trace_carrier`，业务代码不直接 import 任何 `opentelemetry.instrumentation.*`。
 """
 
 from __future__ import annotations
 
+import functools
+import json
 import logging
 import threading
-from collections.abc import Iterator
+from collections.abc import Awaitable, Callable, Iterator, Mapping, Sequence
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from dataclasses import dataclass, field
-from typing import Any, Protocol
+from typing import Any, ParamSpec, Protocol, TypeVar
+
+from opentelemetry import context as otel_context
+from opentelemetry import propagate
+from opentelemetry import trace as otel_trace
 
 from ..config import AppConfig
 
@@ -37,6 +48,21 @@ TRACE_NAME = "analyze"
 TRUTHY: tuple[str, ...] = ("1", "true", "yes", "on")
 LEVEL_DEFAULT = "DEFAULT"
 LEVEL_ERROR = "ERROR"
+
+# ---- S4.3：OpenTelemetry ----
+# 自建 DB span 的 instrumentation scope（Langfuse 的导出过滤器按这个前缀放行）
+DB_TRACER_NAME = "xhs_agent.db"
+# 放行的 scope 前缀：本应用自己的 span + 官方自动埋点（ASGI / FastAPI）
+EXPORT_SCOPE_PREFIXES: tuple[str, ...] = ("xhs_agent", "opentelemetry.instrumentation.")
+# W3C 上下文传播只认这几个 key（Celery 消息头里还有很多它自己的字段）
+CARRIER_KEYS: tuple[str, ...] = ("traceparent", "tracestate", "baggage")
+# Langfuse 读元数据的约定前缀（见 langfuse._client.attributes）
+_LANGFUSE_METADATA_PREFIX = "langfuse.observation.metadata."
+# 健康探针与文档页不产生 span（每几秒一次的探活会把 trace 列表冲满）
+EXCLUDED_URLS = "/api/health,/api/docs,/api/openapi.json"
+
+P = ParamSpec("P")
+R = TypeVar("R")
 
 
 def availability(cfg: AppConfig) -> tuple[bool, str]:
@@ -54,6 +80,108 @@ def availability(cfg: AppConfig) -> tuple[bool, str]:
 def capture_content(cfg: AppConfig) -> bool:
     """是否上报提示词与产出正文（默认 false，符合 ADR 0005）。"""
     return str(cfg.env_view.get("LANGFUSE_CAPTURE_CONTENT") or "").strip().lower() in TRUTHY
+
+
+# ---------- S4.3：OpenTelemetry span、埋点与跨进程传播 ----------
+def should_export_span(span: Any) -> bool:
+    """Langfuse 导出过滤器：默认规则 + 本应用 / 官方埋点的 span（S4.3）。
+
+    为什么必须显式给：Langfuse 的 `should_export_span` 是**替换**默认过滤器
+    （`langfuse._client.span_processor` 里 `should_export_span or is_default_export_span`），
+    不放宽的话 ASGI 与我们的 `xhs_agent.db` span 会被静默丢弃。
+    """
+    from langfuse import is_default_export_span
+
+    scope = getattr(getattr(span, "instrumentation_scope", None), "name", "") or ""
+    if scope.startswith(EXPORT_SCOPE_PREFIXES):
+        return True
+    return bool(is_default_export_span(span))
+
+
+def install_fastapi_instrumentation(app: Any) -> bool:
+    """给 FastAPI 应用装 ASGI 服务端 span（S4.3）；返回本次是否真的装上。
+
+    幂等（`app.state` 记标记）；没有 TracerProvider 时 OTel 自动降级为空操作，所以
+    `create_app()` 可以无条件调用。`exclude_spans` 去掉 ASGI 内部的 receive/send 子 span，
+    一次请求只留一个服务端 span。必须在应用启动前调用（中间件只能在启动前挂）。
+    """
+    if getattr(app.state, "otel_instrumented", False):
+        return False
+    from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
+
+    FastAPIInstrumentor.instrument_app(app, excluded_urls=EXCLUDED_URLS,
+                                       exclude_spans=["receive", "send"])
+    app.state.otel_instrumented = True
+    return True
+
+
+@contextmanager
+def db_span(name: str, *, operation: str, tables: Sequence[str]) -> Iterator[None]:
+    """一次数据库操作的 span：只记操作与表名，**不上报 SQL 语句**（ADR 0005 口径）。
+
+    用 OTel API 直接建 span（scope `xhs_agent.db`），因此没有 provider 时也就是空操作，
+    既能在本项目的 Langfuse 后端里看到，也能被任何其它 OTLP 后端接走。
+    """
+    tracer = otel_trace.get_tracer(DB_TRACER_NAME)
+    with tracer.start_as_current_span(name) as span:
+        if span.is_recording():
+            _annotate_db_span(span, operation=operation, tables=tables)
+        yield None
+
+
+def _annotate_db_span(span: Any, *, operation: str, tables: Sequence[str]) -> None:
+    """DB span 的属性：semconv 的标准键 + Langfuse 读得懂的原样元数据键。"""
+    span.set_attribute("db.system", "postgresql")
+    span.set_attribute("db.operation", operation)
+    metadata: dict[str, Any] = {"db.system": "postgresql", "db.operation": operation,
+                                "db.tables": list(tables)}
+    for key, value in metadata.items():
+        span.set_attribute(f"{_LANGFUSE_METADATA_PREFIX}{key}",
+                           json.dumps(value, ensure_ascii=False))
+
+
+def traced_db(name: str, *, operation: str,
+              tables: Sequence[str]) -> Callable[[Callable[P, Awaitable[R]]],
+                                                 Callable[P, Awaitable[R]]]:
+    """给异步函数套一层 DB span 的装饰器（免去在每个调用点手写 `with`）。"""
+    def decorator(func: Callable[P, Awaitable[R]]) -> Callable[P, Awaitable[R]]:
+        @functools.wraps(func)
+        async def wrapper(*args: P.args, **kwargs: P.kwargs) -> R:
+            with db_span(name, operation=operation, tables=tables):
+                return await func(*args, **kwargs)
+
+        return wrapper
+
+    return decorator
+
+
+def current_trace_headers() -> dict[str, str]:
+    """当前 span 的 W3C 传播头；没有活动 span（含追踪关闭）时返回空 dict。
+
+    调用方（Celery 投递）拿到空 dict 也照常投递——worker 会自己开一条新 trace。
+    """
+    carrier: dict[str, str] = {}
+    try:
+        propagate.inject(carrier)
+    except Exception:   # noqa: BLE001 - 传播失败不影响业务
+        logger.warning("W3C traceparent 注入失败（不影响分析）", exc_info=True)
+        return {}
+    return {key: str(value) for key, value in carrier.items() if value}
+
+
+@contextmanager
+def use_trace_carrier(carrier: Mapping[str, Any] | None) -> Iterator[None]:
+    """把上游的 trace 上下文接进当前进程（S4.3：worker 接住 API 传下来的 traceparent）。"""
+    headers = {key: str(value) for key, value in (carrier or {}).items()
+               if key in CARRIER_KEYS and value}
+    if not headers:
+        yield None
+        return
+    token = otel_context.attach(propagate.extract(headers))
+    try:
+        yield None
+    finally:
+        otel_context.detach(token)
 
 
 @dataclass
@@ -117,7 +245,9 @@ def build_client(cfg: AppConfig) -> Any:
     from langfuse import Langfuse
 
     public, secret, host = cfg.langfuse_keys
-    return Langfuse(public_key=public, secret_key=secret, host=host)
+    # S4.3：放宽导出过滤器，否则 ASGI 服务端 span 与我们自建的 DB span 会被静默丢弃
+    return Langfuse(public_key=public, secret_key=secret, host=host,
+                    should_export_span=should_export_span)
 
 
 class LangfuseTracer:
