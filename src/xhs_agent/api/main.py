@@ -21,6 +21,7 @@
 
 from __future__ import annotations
 
+import logging
 import sys
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -31,7 +32,7 @@ from ..config import AppConfig
 from ..core.logging import configure_logging
 from ..core.tracing import flush_tracer, get_tracer, install_fastapi_instrumentation
 from ..probe import PreflightFailed, report_lines, run_startup_checks
-from .deps import get_config
+from .deps import dispose_engine, get_config
 from .errors import register_exception_handlers
 from .frontend import mount_frontend
 from .middleware import RequestIdMiddleware
@@ -40,6 +41,8 @@ from .routers import analysis, ops, result
 API_PREFIX = "/api"
 TITLE = "小红书热点搭子 · 热点相关性 API"
 DESCRIPTION = "输入热点，在本地素材库中检索可蹭素材并产出文案初稿（契约见 docs/contracts/openapi.yaml）。"
+
+logger = logging.getLogger("xhs_agent.api")
 
 
 def create_app(cfg: AppConfig | None = None, *, check_startup: bool = True) -> FastAPI:
@@ -100,8 +103,11 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     try:
         yield
     finally:
-        # S4.3：退出前把缓冲里的 span 刷出去（S4.4 的进程级资源释放也在这里收口）
+        # S4.3：退出前把缓冲里的 span 刷出去
         flush_tracer()
+        # S4.4：释放进程级连接池并清配置缓存（E3 审查建议 6），停机在日志里可见
+        await dispose_engine()
+        logger.info("API 退出：释放连接池与配置缓存")
 
 
 app = create_app()

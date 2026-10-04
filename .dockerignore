@@ -1,0 +1,46 @@
+# 镜像构建上下文（S4.4）：只保留构建镜像真正需要的东西。
+# 规则与 .gitignore 同源，但更狠——密钥、素材、运行产物、文档、测试都不进上下文。
+
+# 版本控制与工作区杂项
+.git
+.gitignore
+.gitattributes
+.github
+.workbuddy
+.stage
+.commitmsg.txt
+
+# Python 环境与缓存
+.venv
+venv
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# 密钥与本地配置（.env.example 要留下，它是模板）
+config/.env
+config/.env.*
+*.env
+!config/.env.example
+
+# 运行数据与产物：容器里用 bind mount 提供
+data/
+runs/
+evals/
+
+# 前端与文档（前端 dist 归 E5 / S5.9）
+frontend/
+docs/
+tests/
+
+# 容器与编排文件本身
+Dockerfile
+.dockerignore
+docker-compose.yml

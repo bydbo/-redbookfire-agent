@@ -54,6 +54,20 @@ async def get_session() -> AsyncIterator[AsyncSession]:
         yield session
 
 
+async def dispose_engine() -> None:
+    """进程退出时释放进程级资源（S4.4）：dispose 引擎并清掉三个 `lru_cache`。
+
+    为什么必须做：优雅停机（docker compose 的 SIGTERM / uvicorn 收尾）之后进程要退出，
+    进程级连接池不 dispose 就会在数据库侧留下一批半开连接；清缓存则保证进程若被复用
+    （测试、`uvicorn --reload`）时重新按最新配置建引擎与会话。
+    """
+    if get_engine.cache_info().currsize:
+        await get_engine().dispose()
+    get_session_factory.cache_clear()
+    get_engine.cache_clear()
+    get_config.cache_clear()
+
+
 class Dispatcher(Protocol):
     """任务投递器：只要能把 `job_id` 投出去即可（S3.4b 的 Celery 实现也满足它）。"""
 

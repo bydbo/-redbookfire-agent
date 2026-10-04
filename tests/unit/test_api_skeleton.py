@@ -350,3 +350,40 @@ class TestOtelServerSpans:
         otel_exporter.clear()
         client.get(f"{API_PREFIX}/health")
         assert otel_exporter.get_finished_spans() == ()
+
+
+class TestLifespanResourceRelease:
+    """S4.4：退出 lifespan 时释放进程级连接池并清配置缓存（E3 审查建议 6）。"""
+
+    @staticmethod
+    def _config(tmp_path):
+        path = tmp_path / "config.toml"
+        path.write_text("[frontend]\nserve = false\n", encoding="utf-8")
+        return load_config(str(path))
+
+    def test_disposes_engine_and_clears_caches(self, tmp_path, monkeypatch) -> None:
+        from xhs_agent.api import deps as api_deps
+
+        class FakeEngine:
+            def __init__(self) -> None:
+                self.disposed = 0
+
+            async def dispose(self) -> None:
+                self.disposed += 1
+
+        fake = FakeEngine()
+        monkeypatch.setattr(api_deps, "create_engine_from_config", lambda _cfg: fake)
+        api_deps.get_engine.cache_clear()
+        api_deps.get_session_factory.cache_clear()
+        api_deps.get_config.cache_clear()
+
+        app = create_app(self._config(tmp_path), check_startup=False)
+        with TestClient(app, raise_server_exceptions=False) as client:
+            assert client.get(f"{API_PREFIX}/openapi.json").status_code == 200
+            assert api_deps.get_engine() is fake            # 模拟"首个请求把引擎建出来"
+            assert api_deps.get_engine.cache_info().currsize == 1
+
+        assert fake.disposed == 1                            # 退出 lifespan 时 dispose 过一次
+        assert api_deps.get_engine.cache_info().currsize == 0
+        assert api_deps.get_session_factory.cache_info().currsize == 0
+        assert api_deps.get_config.cache_info().currsize == 0

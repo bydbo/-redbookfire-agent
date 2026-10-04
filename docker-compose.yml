@@ -1,8 +1,32 @@
-# 本地开发依赖：PostgreSQL 16 + pgvector、Redis。
-# 只服务本地开发与集成测试；api / worker / Dockerfile 属于 E4（S4.4）。
+# 本地开发 + 全栈演示：PostgreSQL 16 + pgvector、Redis，以及 api / worker（同一个镜像，命令不同）。
 # 镜像 tag 一律固定（不写 latest），升级时同步改 docs/技术栈.md。
-# 用法：docker compose up -d --wait ／ docker compose ps ／ docker compose down
+# 用法：docker compose up -d --wait ／ docker compose ps ／ docker compose logs -f api ／ docker compose down
 name: xhs-agent
+
+# api 与 worker（以及一次性 migrate）共享的部分：镜像、配置与挂载，避免多处漂移
+x-app: &app
+  build:
+    context: .
+    dockerfile: Dockerfile
+  image: xhs-agent:0.1.0
+  env_file:
+    # 密钥（DEEPSEEK / DASHSCOPE / LANGFUSE_*）来自宿主的 config/.env；
+    # 缺文件不在这里报错——启动前置检查会明确报"缺哪个密钥"，不做静默降级
+    - path: config/.env
+      required: false
+  environment:
+    # 容器内走 compose 网络：覆盖 config/.env 里为宿主机写的 localhost 地址
+    DATABASE_URL: postgresql+asyncpg://xhs:${POSTGRES_PASSWORD:-xhs}@postgres:5432/xhs
+    REDIS_URL: redis://redis:6379/0
+    # 前端 dist 归 E5 / S5.9；在那之前只跑 API（serve=true 且缺 dist 会被前置检查拒绝启动）
+    XHS_FRONTEND_SERVE: "false"
+    XHS_LOG_FORMAT: json
+    TZ: Asia/Shanghai
+  volumes:
+    # bind mount 宿主机目录：素材直接用宿主那份，报告与 trace.jsonl 在宿主上就能打开
+    - ./data/materials:/app/data/materials
+    - ./runs:/app/runs
+  restart: unless-stopped
 
 services:
   postgres:
@@ -41,6 +65,62 @@ services:
       timeout: 3s
       retries: 20
     restart: unless-stopped
+
+  # 一次性迁移：api / worker 等它成功后才起（`up -d --wait` 对正常退出的它退 0）
+  migrate:
+    <<: *app
+    command: ["alembic", "upgrade", "head"]
+    restart: "no"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  api:
+    <<: *app
+    command: ["python", "-m", "xhs_agent.serve", "--host", "0.0.0.0", "--port", "8000"]
+    ports:
+      - "127.0.0.1:8000:8000"
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+    # 探活用标准库 urllib（镜像里不装 curl）；/api/health 里 db / redis / llm 任一 down 即 unhealthy
+    healthcheck:
+      test:
+        - "CMD-SHELL"
+        - "python -c \"import sys,urllib.request; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/api/health', timeout=5).status == 200 else 1)\""
+      interval: 10s
+      timeout: 10s
+      retries: 6
+      start_period: 30s
+    stop_grace_period: 30s
+
+  worker:
+    <<: *app
+    # 每个任务一个事件循环 + 自带连接池，2 个并发够用且不白占内存（见 docs/开发规范.md）
+    command:
+      - "celery"
+      - "-A"
+      - "xhs_agent.tasks.worker:app"
+      - "worker"
+      - "--loglevel=info"
+      - "--concurrency=2"
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test:
+        - "CMD-SHELL"
+        - "celery -A xhs_agent.tasks.worker:app inspect ping -d celery@$$HOSTNAME --timeout 5"
+      interval: 15s
+      timeout: 15s
+      retries: 6
+      start_period: 30s
+    # 单热点分析实测可到 90s 上下：给 SIGTERM 留足在飞任务收尾与 span flush 的时间
+    stop_grace_period: 180s
 
 volumes:
   pgdata:

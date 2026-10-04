@@ -55,6 +55,7 @@
 | 陈旧 run 对账（worker 启动时把卡住的 `running` 标成 `failed`） | ✅ 已完成（S4.1） |
 | Langfuse 调用追踪（运行 / 热点 / 模型调用三级，看得到 token·成本·延迟；缺键只告警不阻断） | ✅ 已完成（S4.2） |
 | OpenTelemetry 追踪（API 请求 → 数据库 → worker 模型调用连成一条 trace） | ✅ 已完成（S4.3） |
+| 多阶段 Docker 镜像 + 全栈 compose（`docker compose up` 一条命令起 api / worker / postgres / redis，含一次性迁移服务） | ✅ 已完成（S4.4） |
 | Alembic 数据库迁移（唯一建表路径） | ✅ 已完成（S2.3） |
 | 评测集 v1 与示例素材包（七维度口径、版本冻结） | ✅ 已完成（S2.0） |
 | 服务入口（FastAPI 五个接口 + LangGraph 编排，S3.1–S3.3） | ✅ 已完成 |
@@ -109,14 +110,37 @@
 
 前置条件：Python ≥ 3.11、`uv`、`ffmpeg` / `ffprobe`（用于抽帧）。
 
-> **注意**：下面是当前代码可运行的步骤。本地依赖（PostgreSQL 16 + pgvector、Redis）由 `docker-compose.yml` 提供；FastAPI 与 Celery worker 都可直接跑（容器镜像归 S4.4）。
+> **注意**：两种跑法都支持——（A）**一条命令起全栈**：`docker compose up -d --wait`（下面第一段）；（B）本地开发：`docker compose up -d --wait postgres redis` 只起依赖，API 与 worker 用 `uv run` 直接跑（第二段起）。
 
 ```powershell
+# ============ （A）容器一条命令起全栈（S4.4）============
+# 前置：Docker Desktop 已启动、config/.env 已填好密钥（DEEPSEEK_API_KEY / DASHSCOPE_API_KEY）
+docker compose up -d --wait      # 首次构建镜像约 2–5 分钟；之后秒起
+docker compose ps                # 期望：api / worker / postgres / redis healthy，migrate 为 exited(0)
+
+# 健康检查（db / redis / llm 三项都 ok 才是 200）
+curl -i http://127.0.0.1:8000/api/health
+
+# 投一个热点并轮询（完整链路：队列 → worker → 索引新鲜度 → 五节点分析 → 落库）
+curl -s -X POST http://127.0.0.1:8000/api/analyze -H "Content-Type: application/json" `
+  -d '{"hotspots": ["某明星打羽毛球被拍"], "topk": 5}'
+# 用返回的 job_id 轮询 /api/jobs/{job_id}；succeeded 后用 run_id 取 /api/runs/{run_id}
+
+ls runs/                # 报告 / trace.jsonl 直接落在宿主（bind mount），容器里外同一份
+docker compose logs -f api      # JSON 结构化日志（XHS_LOG_FORMAT=json）
+docker compose down             # 停全栈（保留 pgdata / redisdata 卷）
+# 迁移由一次性 migrate 服务自动跑；需要手动补跑时：docker compose run --rm migrate
+
+# 容器口径：DATABASE_URL / REDIS_URL 指向 compose 服务名；api 以 XHS_FRONTEND_SERVE=false 启动
+# （前端 dist 归 E5 / S5.9，在那之前根路径只有 API）；镜像以非 root（uid 1000）运行，
+# ./data/materials 与 ./runs 是 bind mount——Linux 宿主上若 uid 不同，需要先 chown。
+
+# ============ （B）本地开发：只起依赖，代码用 uv 跑 ============
 # 1. 安装环境（首次需要网络）
 uv sync
 
 # 2. 起本地依赖（PostgreSQL 16 + pgvector、Redis；镜像 tag 固定在 docker-compose.yml）
-docker compose up -d --wait
+docker compose up -d --wait postgres redis
 
 # 3. 准备配置（必须填必填项：项目不做无密钥降级）
 Copy-Item config/.env.example config/.env
@@ -155,6 +179,7 @@ uv run python -m xhs_agent.probe
 uv run python scripts/eval_retrieval.py
 
 # 11. 起 Celery worker（S3.4b：消费 POST /api/analyze 投递的 job）
+#     （走容器全栈时跳过这一步——compose 的 worker 服务已经在跑）
 uv run celery -A xhs_agent.tasks.worker:app worker --loglevel=info
 #    Windows 本地开发建议加 --pool=solo（prefork 在 Windows 上不稳；软超时只在
 #    Linux 的 prefork worker 上生效）
