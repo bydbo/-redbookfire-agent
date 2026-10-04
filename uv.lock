@@ -2606,6 +2606,7 @@ dev = [
     { name = "pytest" },
     { name = "pytest-asyncio" },
     { name = "pytest-cov" },
+    { name = "pyyaml" },
     { name = "ruff" },
     { name = "testcontainers", extra = ["redis"] },
 ]
@@ -2639,6 +2640,7 @@ dev = [
     { name = "pytest", specifier = ">=8.0" },
     { name = "pytest-asyncio", specifier = ">=1.4,<2" },
     { name = "pytest-cov", specifier = ">=7.1,<8" },
+    { name = "pyyaml", specifier = ">=6,<7" },
     { name = "ruff", specifier = ">=0.16.9" },
     { name = "testcontainers", extras = ["redis"], specifier = ">=4.15,<5" },
 ]

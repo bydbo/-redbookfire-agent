@@ -37,6 +37,7 @@ dev = [
     "pytest>=8.0",
     "pytest-asyncio>=1.4,<2",
     "pytest-cov>=7.1,<8",
+    "pyyaml>=6,<7",
     "ruff>=0.16.9",
     "testcontainers[redis]>=4.15,<5",
 ]
@@ -70,6 +71,10 @@ branch = true
 [tool.coverage.report]
 show_missing = true
 skip_covered = true
+# 覆盖率门槛（S4.5 起进 CI）：当前单测覆盖 81%，留 3 个点余量避免小重构踩线。
+# 只在带 --cov 的跑法下生效（CI 的 test job）；本地 `uv run pytest` 与 pre-commit 钩子不带
+# --cov，所以提交仍然是快的。改这个数字时同步 tests/unit/test_ci_workflow.py 的断言。
+fail_under = 78
 
 # 代码质量门（S1.3）：规则集显式写死，避免 ruff 默认集随版本漂移。
 # 本次不启用 ruff format；formatter 与 line-length 留到单独一次提交（docs/backlog.md S1.3）。

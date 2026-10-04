@@ -1,5 +1,7 @@
 # 小红书热点搭子
 
+[![CI](https://github.com/bydbo/-redbookfire-agent/actions/workflows/ci.yml/badge.svg)](https://github.com/bydbo/-redbookfire-agent/actions/workflows/ci.yml)
+
 > Hotspot-to-Material Relevance Agent
 > 输入一个热点，在**你自己的素材库**里找出能蹭上它的镜头，并说清为什么能蹭。
 
@@ -56,6 +58,7 @@
 | Langfuse 调用追踪（运行 / 热点 / 模型调用三级，看得到 token·成本·延迟；缺键只告警不阻断） | ✅ 已完成（S4.2） |
 | OpenTelemetry 追踪（API 请求 → 数据库 → worker 模型调用连成一条 trace） | ✅ 已完成（S4.3） |
 | 多阶段 Docker 镜像 + 全栈 compose（`docker compose up` 一条命令起 api / worker / postgres / redis，含一次性迁移服务） | ✅ 已完成（S4.4） |
+| GitHub Actions CI（lint / typecheck / test + 镜像构建；覆盖率门槛 78%） | ✅ 已完成（S4.5） |
 | Alembic 数据库迁移（唯一建表路径） | ✅ 已完成（S2.3） |
 | 评测集 v1 与示例素材包（七维度口径、版本冻结） | ✅ 已完成（S2.0） |
 | 服务入口（FastAPI 五个接口 + LangGraph 编排，S3.1–S3.3） | ✅ 已完成 |
@@ -96,7 +99,7 @@
 | Embedding | 默认通义 text-embedding-v3（API）；本地小模型为可选实现 |
 | 队列与缓存 | Redis + Celery |
 | 可观测 | structlog（`console` / `json`）+ run_id 贯穿全链路 + Langfuse Cloud 调用追踪 + OpenTelemetry（ASGI 服务端 span、`xhs_agent.db` DB span、W3C 跨进程传播；默认只上报元数据，`LANGFUSE_CAPTURE_CONTENT=true` 才连提示词与正文） |
-| 容器化 / CI | Docker Compose（api / worker / postgres / redis）；GitHub Actions |
+| 容器化 / CI | Docker Compose（api / worker / postgres / redis 五服务）；GitHub Actions 四个 job（lint / typecheck / test / image） |
 | 代码质量 / 测试 | ruff + mypy + pre-commit + pytest-cov + pytest-asyncio + testcontainers（均已落地） |
 | 前端 | Vue 3 + Vite + TypeScript + Pinia + Vue Router |
 | UI 与可视化 | Naive UI + Tailwind CSS + ECharts |
@@ -113,6 +116,14 @@
 > **注意**：两种跑法都支持——（A）**一条命令起全栈**：`docker compose up -d --wait`（下面第一段）；（B）本地开发：`docker compose up -d --wait postgres redis` 只起依赖，API 与 worker 用 `uv run` 直接跑（第二段起）。
 
 ```powershell
+# ============ CI 跑什么（S4.5）：推 main 自动跑，本地可逐条复现 ============
+#   lint        uv run ruff check .
+#   typecheck   uv run mypy
+#   test        uv run pytest -q --cov --cov-report=term-missing   # 覆盖率门槛 78%
+#               uv run pytest -m integration -q                    # 真容器（runner 自带 Docker）
+#   image       docker compose config --quiet && docker build -t xhs-agent:ci .
+# Python 3.12 / uv 0.12.7 / UV_FROZEN=1；不依赖任何密钥。
+
 # ============ （A）容器一条命令起全栈（S4.4）============
 # 前置：Docker Desktop 已启动、config/.env 已填好密钥（DEEPSEEK_API_KEY / DASHSCOPE_API_KEY）
 docker compose up -d --wait      # 首次构建镜像约 2–5 分钟；之后秒起
