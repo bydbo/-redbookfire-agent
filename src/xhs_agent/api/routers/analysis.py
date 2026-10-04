@@ -9,32 +9,32 @@
 
 from __future__ import annotations
 
-from typing import Annotated, Any
+from typing import Any
 
-from fastapi import APIRouter, Request
-from pydantic import BaseModel, ConfigDict, Field, StringConstraints
+from fastapi import APIRouter, Depends, Request
 
 from ...core.errors import NotFoundError
 from ...core.logging import bind_run_id
 from ...services.runs import load_job, submit_analysis
-from ..deps import DispatcherDep, SessionDep
+from ..deps import DispatcherDep, SessionDep, request_id_header
 from ..errors import request_id_of
+from ..models import AnalyzeAccepted, AnalyzeRequest, JobStatus, error_response
 
-router = APIRouter(tags=["分析"])
+router = APIRouter(tags=["分析"], dependencies=[Depends(request_id_header)])
 
-
-class AnalyzeRequest(BaseModel):
-    """`POST /api/analyze` 的请求体（对齐 `AnalyzeRequest`，未知字段一律拒绝）。"""
-
-    model_config = ConfigDict(extra="forbid")
-
-    hotspots: list[Annotated[str, StringConstraints(strip_whitespace=True, min_length=1,
-                                                    max_length=500)]] = Field(
-        min_length=1, max_length=10)
-    topk: int = Field(default=5, ge=1, le=20)
+REQUEST_ID_HEADER = {"X-Request-ID": {"description": "本次请求的标识",
+                                      "schema": {"type": "string"}}}
 
 
-@router.post("/analyze", status_code=202)
+@router.post("/analyze", status_code=202, response_model=AnalyzeAccepted,
+             responses={
+                 202: {"model": AnalyzeAccepted, "description": "任务已接受",
+                       "headers": REQUEST_ID_HEADER},
+                 400: error_response("请求格式或参数不合法"),
+                 422: error_response("字段级校验失败"),
+                 502: error_response("上游服务错误"),
+                 503: error_response("依赖不可用（不做降级，直接返回错误）"),
+             })
 async def create_analysis(payload: AnalyzeRequest, request: Request,
                           session: SessionDep, dispatcher: DispatcherDep) -> dict[str, str]:
     """提交一个或多个热点：落库后立即返回 `job_id` 与 `run_id`。
@@ -51,7 +51,9 @@ async def create_analysis(payload: AnalyzeRequest, request: Request,
     return {"job_id": submission.job_id, "run_id": submission.run_id}
 
 
-@router.get("/jobs/{job_id}")
+@router.get("/jobs/{job_id}", response_model=JobStatus,
+            responses={404: error_response("资源不存在"),
+                       503: error_response("依赖不可用（不做降级，直接返回错误）")})
 async def get_job(job_id: str, session: SessionDep) -> dict[str, Any]:
     """轮询任务状态：succeeded 后凭 `run_id` 取结果，failed 时 `error` 给出原因。"""
     payload = await load_job(session, job_id)

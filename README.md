@@ -59,6 +59,7 @@
 | OpenTelemetry 追踪（API 请求 → 数据库 → worker 模型调用连成一条 trace） | ✅ 已完成（S4.3） |
 | 多阶段 Docker 镜像 + 全栈 compose（`docker compose up` 一条命令起 api / worker / postgres / redis，含一次性迁移服务） | ✅ 已完成（S4.4） |
 | GitHub Actions CI（lint / typecheck / test + 镜像构建；覆盖率门槛 78%） | ✅ 已完成（S4.5） |
+| 契约一致性校验（`scripts/check_openapi.py`：FastAPI 导出的 OpenAPI 必须覆盖 `docs/contracts/openapi.yaml`，跑在 CI 的 test job 里） | ✅ 已完成（S4.6） |
 | Alembic 数据库迁移（唯一建表路径） | ✅ 已完成（S2.3） |
 | 评测集 v1 与示例素材包（七维度口径、版本冻结） | ✅ 已完成（S2.0） |
 | 服务入口（FastAPI 五个接口 + LangGraph 编排，S3.1–S3.3） | ✅ 已完成 |
@@ -122,6 +123,8 @@
 #   test        uv run pytest -q --cov --cov-report=term-missing   # 覆盖率门槛 78%
 #               uv run pytest -m integration -q                    # 真容器（runner 自带 Docker）
 #   image       docker compose config --quiet && docker build -t xhs-agent:ci .
+# test job 里还包含契约一致性校验（tests/unit/test_openapi_contract.py →
+#   scripts/check_openapi.py），本地可单独跑：uv run python scripts/check_openapi.py
 # Python 3.12 / uv 0.12.7 / UV_FROZEN=1；不依赖任何密钥。
 
 # ============ （A）容器一条命令起全栈（S4.4）============

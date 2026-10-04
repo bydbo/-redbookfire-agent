@@ -15,14 +15,15 @@ import time
 from typing import Any
 
 import redis.asyncio as aioredis
-from fastapi import APIRouter
+from fastapi import APIRouter, Depends
 from fastapi.responses import JSONResponse
 from sqlalchemy import text
 
 from ...config import AppConfig
-from ..deps import ConfigDep, get_engine
+from ..deps import ConfigDep, get_engine, request_id_header
+from ..models import Health
 
-router = APIRouter(tags=["运维"])
+router = APIRouter(tags=["运维"], dependencies=[Depends(request_id_header)])
 
 _PROBE_TIMEOUT_S = 2.0
 
@@ -76,7 +77,8 @@ def check_llm(cfg: AppConfig) -> dict[str, Any]:
     return {"status": "ok", "detail": f"{cfg.llm.provider} / {cfg.llm.model}"}
 
 
-@router.get("/health")
+@router.get("/health", response_model=Health,
+            responses={503: {"model": Health, "description": "存在不可用依赖"}})
 async def get_health(cfg: ConfigDep) -> JSONResponse:
     """健康检查：三项都 ok 返回 200，否则 503（响应体形状不变）。"""
     checks = {

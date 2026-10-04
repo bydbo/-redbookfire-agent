@@ -13,16 +13,17 @@ from __future__ import annotations
 import uuid
 from typing import Annotated, Any
 
-from fastapi import APIRouter, Query
+from fastapi import APIRouter, Depends, Query
 from fastapi.responses import Response
 
 from ...config import PROJECT_ROOT
 from ...core.errors import ConflictError, NotFoundError
 from ...services.runs import UNFINISHED_STATUSES, load_report_model, load_run
 from ...tools.report import render_html, render_markdown
-from ..deps import ConfigDep, SessionDep
+from ..deps import ConfigDep, SessionDep, request_id_header
+from ..models import ReportFormat, RunDetail, UuidPath, error_response
 
-router = APIRouter(tags=["结果"])
+router = APIRouter(tags=["结果"], dependencies=[Depends(request_id_header)])
 
 
 def _run_uuid(run_id: str) -> uuid.UUID:
@@ -39,8 +40,11 @@ def _require_finished(payload: dict[str, Any]) -> None:
                                              "status": payload["status"]})
 
 
-@router.get("/runs/{run_id}")
-async def get_run(run_id: str, session: SessionDep) -> dict[str, Any]:
+@router.get("/runs/{run_id}", response_model=RunDetail,
+            responses={404: error_response("资源不存在"),
+                       409: error_response("运行尚未完成"),
+                       503: error_response("依赖不可用（不做降级，直接返回错误）")})
+async def get_run(run_id: UuidPath, session: SessionDep) -> dict[str, Any]:
     """读取运行结果：线索、候选素材、覆盖缺口与文稿。"""
     payload = await load_run(session, _run_uuid(run_id))
     if payload is None:
@@ -49,9 +53,14 @@ async def get_run(run_id: str, session: SessionDep) -> dict[str, Any]:
     return payload
 
 
-@router.get("/runs/{run_id}/report")
-async def get_run_report(run_id: str, session: SessionDep, cfg: ConfigDep,
-                         format: Annotated[str, Query(pattern="^(html|md)$")] = "html") -> Response:
+@router.get("/runs/{run_id}/report",
+            responses={200: {"description": "报告内容",
+                             "content": {"text/html": {"schema": {"type": "string"}},
+                                         "text/markdown": {"schema": {"type": "string"}}}},
+                       404: error_response("资源不存在"),
+                       409: error_response("运行尚未完成")})
+async def get_run_report(run_id: UuidPath, session: SessionDep, cfg: ConfigDep,
+                         format: Annotated[ReportFormat, Query()] = "html") -> Response:
     """读取报告：`format=html`（默认）返回单文件 HTML，`format=md` 返回 Markdown 文本。"""
     run_uuid = _run_uuid(run_id)
     payload = await load_run(session, run_uuid)

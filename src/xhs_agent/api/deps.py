@@ -17,7 +17,7 @@ from collections.abc import AsyncIterator
 from functools import lru_cache
 from typing import Annotated, Any, Protocol
 
-from fastapi import Depends
+from fastapi import Depends, Header
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
 from ..config import AppConfig, load_config
@@ -66,6 +66,17 @@ async def dispose_engine() -> None:
     get_session_factory.cache_clear()
     get_engine.cache_clear()
     get_config.cache_clear()
+
+
+async def request_id_header(
+    x_request_id: Annotated[str, Header(alias="X-Request-ID")] = "",
+) -> None:
+    """只为了在 OpenAPI 里声明契约的 `X-Request-ID` 请求头（S4.6）。
+
+    取值仍由 `api/middleware.py` 的中间件处理（它把 id 写进 `request.state.request_id`
+    与日志上下文）；这个依赖本身不使用参数，用途只是让 FastAPI 把它导出进 schema。
+    默认空串 = 非必填，导出形状与契约 `components.parameters.RequestId` 一致。
+    """
 
 
 class Dispatcher(Protocol):
