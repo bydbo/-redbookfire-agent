@@ -19,7 +19,7 @@
 | E2 数据与检索 | 持久化 + 语义召回，产出评测数字 | 20 | ✅ 进行中 | M3 |
 | E3 编排与服务 | 服务化与异步，端到端可演示 | 20.5 | ✅ 已完成（S3.0–S3.10） | M4 |
 | E4 可观测与交付 | 可运维、可交付 | 8 | ✅ 已完成（S4.1–S4.6） | M5 |
-| E5 前端工程 | 把演示页升级为可交互的单页应用 | 17 | 🔄 进行中（S5.1–S5.2） | M6 |
+| E5 前端工程 | 把演示页升级为可交互的单页应用 | 17 | 🔄 进行中（S5.1–S5.3） | M6 |
 | **合计** | | **76.5** | | |
 
 全职投入约 9 周；按每天 3 小时的业余节奏约 5 个月。总量比初版（41.5）增加 26 人日：前端 Epic 17、API 前缀与静态挂载 1、完整 preflight 1.5、mypy 收紧 0.5、E2 净增 5（集成测试基座 +3、评测集与示例素材包 +3、对比脚本精简 −1）、E1 落地时的范围调整 1（S1.2 配置段全量 +0.5、S1.4 覆盖 8 个模块 +0.5）。
@@ -125,7 +125,18 @@
 - 回归全绿：`uv run pytest` **748 passed**；ruff 零告警；mypy 44 文件零错误；`pnpm run type-check` 零错误；`pnpm build` 通过（2685 模块）。
 
 </details>
-| S5.3 | 分析台页面 | S5.2, S3.4b | 可输入多个热点、提交、轮询进度并跳转结果 | 2.5 | ⬜ |
+| S5.3 | 分析台页面 | S5.2, S3.4b | 可输入多个热点、提交、轮询进度并跳转结果 | 2.5 | ✅ |
+
+<details>
+<summary>S5.3 实测记录（2026-10-04）</summary>
+
+- 交付：`src/api/client.ts`（fetch 封装：JSON 编解码、非 2xx 解析 ErrorResponse 归一化为 ApiRequestError；基地址取 `VITE_API_BASE_URL` 默认 `/api`，path 传去掉前缀的契约路径）、`src/api/analysis.ts`（submitAnalysis / getJob / getRun，类型全部派生自 S5.2 生成物）、`src/stores/analysis.ts`（提交—轮询状态机：idle → submitting → polling → succeeded / failed，2 秒间隔轮询、终态自停、重提交自动停旧轮询）、`src/views/AnalysisView.vue`（n-dynamic-input 多热点输入 1–10 条、topk 1–20、进度条 + 步骤 + 耗时、排队超 30 秒提示查 worker、失败错误框）、`src/views/RunResultView.vue`（结果占位页：运行概况 + 报告入口，要素/候选/缺口/文案归 S5.4）；路由 `/` → 分析台、`/runs/:runId` → 结果占位；脚手架验证页 HomeView.vue 删除。
+- 真实冒烟（Playwright 驱动本机 Edge headless，全链路）：打开 http://127.0.0.1:5173 → 填 2 个热点 → 提交 → 页面依次出现「排队中 → 分析中 → 已完成」→ 自动跳转 `/runs/8860c661-…` → 结果页显示已完成、热点数 2、成本 ¥0.2202、耗时 102.9 秒、报告按钮 href 正确。API 侧日志佐证：`POST /api/analyze` 202（102ms）→ 51 次 `GET /api/jobs` 轮询（每次约 10ms）→ `GET /api/runs/{id}` 200 → 报告 200。
+- 佐证数据：run `8860c661-bccb-4246-ba8b-1da6bb63f5de`（6 次模型调用 = 2 热点 × 3，prompt 17426 / completion 21141 token，成本 0.2202 元 = 0.11 元/热点，低于 ADR 0012 的 0.15 上限；worker 执行 105.6s）。冒烟截图落 `runs/_smoke_s53/`（不入库）。
+- 环境备注：本机 `config/.env` 与 `.env.example` 均缺 `REDIS_URL`（P3 起必填），本次以环境变量覆盖启动 serve 与 worker——模板与示例的缺口建议另行补上（不在本 Story 范围）。
+- 回归：`pnpm type-check` 零错误、`pnpm build` 2690 模块通过；后端 ruff 零告警、mypy 44 文件零错误、`uv run pytest` 748 全绿（Python 零改动）。
+
+</details>
 | S5.4 | 结果详情页 | S5.3 | 要素标签、候选素材（含关键帧）、覆盖缺口、文案初稿四块齐全，文案可一键复制 | 3 | ⬜ |
 | S5.5 | 数据可视化 | S5.4 | 覆盖度、得分分布、成本与耗时用 ECharts 呈现 | 2 | ⬜ |
 | S5.6 | 运行历史 | S5.2 | 列出历史运行，可回看结果并下载报告 | 1.5 | ⬜ |

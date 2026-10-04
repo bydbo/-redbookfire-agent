@@ -65,6 +65,7 @@
 | 服务入口（FastAPI 五个接口 + LangGraph 编排，S3.1–S3.3） | ✅ 已完成 |
 | 前端工程脚手架（Vue 3 + Vite + TS + Router + Pinia + Naive UI + Tailwind，S5.1：别名 / 环境变量 / 代理 / 构建配置） | ✅ 已完成（S5.1） |
 | 接口类型生成（S5.2：`openapi-typescript` 从 `docs/contracts/openapi.yaml` 生成 `frontend/src/api/schema.d.ts` 入库；`pnpm run check:api` + CI `frontend` job 防漂移） | ✅ 已完成（S5.2） |
+| 分析台页面（S5.3：多热点输入 → 提交 → 2 秒轮询进度 → 自动跳转结果占位页；`/` 为分析台、`/runs/:runId` 为结果页） | ✅ 已完成（S5.3） |
 
 业务链路**已端到端跑通**：`docker compose up -d --wait` 起依赖 → `uv run celery -A xhs_agent.tasks.worker:app worker` 起 worker → `uv run python -m xhs_agent.serve` 起接口（先跑 7 步启动前置检查）→ `POST /api/analyze` 投递 → worker 自动消费（索引新鲜度 → 五节点分析 → 逐热点写回）→ `/api/jobs/{job_id}` 轮询 → `/api/runs/{run_id}` 取结构化结果、`/report` 取报告。另可运行 `uv run python -m xhs_agent.probe`、`uv run python scripts/index_materials.py`、`uv run python scripts/backfill_embeddings.py`、`uv run python scripts/eval_retrieval.py`、`uv run python scripts/smoke_skeleton.py`。路线图见文末。
 
