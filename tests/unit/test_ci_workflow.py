@@ -1,8 +1,9 @@
-"""CI workflow 的静态校验（S4.5）。
+"""CI workflow 的静态校验（S4.5；S5.2 起含 frontend job）。
 
-真实验收是"推送 main 后 GitHub Actions 三个 job 与镜像 job 全绿"（见 `docs/backlog.md` 的 S4.5）；
-这里守住几条改 workflow 时最容易悄悄坏掉的回归：少了一关、action 没钉版本、混进密钥、
-覆盖率门槛与 CI 跑法不匹配。
+真实验收是"推送 main 后 GitHub Actions 的 Python 三关、镜像 job 与前端契约校验 job 全绿"
+（见 `docs/backlog.md` 的 S4.5 / S5.2）；这里守住几条改 workflow 时最容易悄悄坏掉的回归：
+少了一关、action 没钉版本、混进密钥、覆盖率门槛与 CI 跑法不匹配、
+前端类型生成物的防漂移校验缺席。
 """
 
 from __future__ import annotations
@@ -26,6 +27,11 @@ PYTHON_JOBS = {
 UV_VERSION = "0.12.7"
 PYTHON_VERSION = "3.12"
 COVERAGE_GATE = 78
+# frontend job（S5.2）：Node / pnpm 版本必须与 frontend/package.json 的
+# engines / packageManager 以及 frontend/.node-version 一致
+FRONTEND_DIR = "frontend"
+FRONTEND_NODE_VERSION = "25.3.0"
+PNPM_VERSION = "11.25.0"
 
 
 def load_workflow() -> dict[str, Any]:
@@ -52,6 +58,13 @@ def setup_uv_input(job: dict[str, Any]) -> dict[str, Any]:
     raise AssertionError("该 job 没有用 astral-sh/setup-uv")
 
 
+def step_inputs(job: dict[str, Any], uses_prefix: str) -> dict[str, Any]:
+    for step in job["steps"]:
+        if str(step.get("uses", "")).startswith(uses_prefix):
+            return dict(step.get("with") or {})
+    raise AssertionError(f"该 job 没有用 {uses_prefix}")
+
+
 class TestTriggers:
     def test_workflow_exists_and_parses(self):
         assert WORKFLOW.is_file()
@@ -70,8 +83,8 @@ class TestTriggers:
 
 
 class TestJobs:
-    def test_has_the_three_gates_plus_image(self):
-        assert set(load_workflow()["jobs"]) == {"lint", "typecheck", "test", "image"}
+    def test_has_python_gates_image_and_frontend(self):
+        assert set(load_workflow()["jobs"]) == {"lint", "typecheck", "test", "image", "frontend"}
 
     def test_python_jobs_pin_actions_python_and_uv(self):
         for name, command in PYTHON_JOBS.items():
@@ -97,6 +110,28 @@ class TestJobs:
         assert "docker compose config --quiet" in commands
         assert "docker build -t xhs-agent:ci ." in commands
         assert job_uses(job) == ["actions/checkout@v7.0.1"]     # 镜像 job 不需要 Python
+
+    def test_frontend_job_pins_node_and_pnpm_and_checks_schema(self):
+        """S5.2：Node / pnpm 版本钉死（与 frontend/package.json 一致），
+        跑防漂移校验（重新生成 schema.d.ts 并 git diff，契约改了类型没重生成就红）。"""
+        job = load_workflow()["jobs"]["frontend"]
+        assert job_uses(job) == [
+            "actions/checkout@v7.0.1",
+            "pnpm/action-setup@v6.1.0",
+            "actions/setup-node@v7.0.0",
+        ]
+        pnpm_inputs = step_inputs(job, "pnpm/action-setup@")
+        assert pnpm_inputs["version"] == PNPM_VERSION
+        assert pnpm_inputs["run_install"] is False
+        node_inputs = step_inputs(job, "actions/setup-node@")
+        assert node_inputs["node-version"] == FRONTEND_NODE_VERSION
+        assert node_inputs["cache"] == "pnpm"
+        assert node_inputs["cache-dependency-path"] == f"{FRONTEND_DIR}/pnpm-lock.yaml"
+        commands = job_commands(job)
+        assert "pnpm install --frozen-lockfile" in commands
+        assert "pnpm run check:api" in commands
+        run_steps = [step for step in job["steps"] if "run" in step]
+        assert all(step.get("working-directory") == FRONTEND_DIR for step in run_steps)
 
     def test_uv_frozen_is_set_for_every_job(self):
         assert load_workflow()["env"]["UV_FROZEN"] == "1"
