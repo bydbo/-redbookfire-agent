@@ -16,9 +16,9 @@
 | --- | --- | --- | --- | --- |
 | E0 契约与决策 | 把方案变成可开工的契约与决策记录 | 3.5 | ✅ 已完成 | M1 |
 | E1 工程骨架 | 建立契约与质量基线，行为不变 | 7.5 | ✅ 已完成 | M2 |
-| E2 数据与检索 | 持久化 + 语义召回，产出评测数字 | 20 | 🔄 进行中 | M3 |
+| E2 数据与检索 | 持久化 + 语义召回，产出评测数字 | 20 | ✅ 进行中 | M3 |
 | E3 编排与服务 | 服务化与异步，端到端可演示 | 20.5 | ✅ 已完成（S3.0–S3.10） | M4 |
-| E4 可观测与交付 | 可运维、可交付 | 8 | ⬜ 未开始 | M5 |
+| E4 可观测与交付 | 可运维、可交付 | 8 | 🔄 进行中（S4.1 已完成） | M5 |
 | E5 前端工程 | 把演示页升级为可交互的单页应用 | 17 | ⬜ 未开始 | M6 |
 | **合计** | | **76.5** | | |
 
@@ -88,7 +88,7 @@
 
 | 编号 | Story | 依赖 | 验收标准 | 人日 | 状态 |
 | --- | --- | --- | --- | --- | --- |
-| S4.1 | structlog + run_id 贯穿 + 陈旧 run 对账 | S3.2 | 每条日志带 run_id 与 request_id；JSON 输出可被检索；**并做 stale run 对账**——把 `running` 且 `started_at` 超过 `task_time_limit_s × 2` 的行标成 `failed`（worker 启动时或 beat 定时），覆盖 worker 崩溃吞任务与硬超时 SIGKILL 的窄场景（E3 审查建议 3） | 1.5 | ⬜ |
+| S4.1 | structlog + run_id 贯穿 + 陈旧 run 对账 | S3.2 | 每条日志带 run_id 与 request_id；JSON 输出可被检索；**并做 stale run 对账**——把 `running` 且 `started_at` 超过 `task_time_limit_s × 2` 的行标成 `failed`（worker 启动时或 beat 定时），覆盖 worker 崩溃吞任务与硬超时 SIGKILL 的窄场景（E3 审查建议 3）（实测：引入 structlog 26.1.0，**调用点仍是标准库 logging**——structlog 只做渲染管线（`ProcessorFormatter` + `JSONRenderer` / `ConsoleRenderer`），不调 `structlog.get_logger()`，因此与 uvicorn / pytest 各自的日志装配不打架，全仓库 `logger.info("…%s", x)` 语法零改动；新增顶层 `log_format`（`console` 默认 / `json`，`XHS_LOG_FORMAT` 可覆盖；契约 §2.2 与 §3.10、`config/config.toml`、`describe()` 同步），`json` 时一行一个 JSON 对象可直接 `jq` 检索，`request_id` 与 `run_id` **两键恒在**（不在上下文里为空串），异常栈只进日志的 `exception` 字段、不进 HTTP 响应。`run_id` 三个注入点：`tasks/analysis.run_job`（查到 run 后绑定 + `finally` 复位，覆盖索引新鲜度 / 五节点 / 写回的全部日志）、`workflows.run_analysis`（`run_id` 模式包装 `_run_analysis`）、`POST /api/analyze`（提交成功后写 `request.state.run_id` 并绑上下文；访问日志的 `run_id` **从 `request.state` 取**——BaseHTTPMiddleware 下 ContextVar 不会回传父任务，这是唯一正确的取法）。对账：`services.runs.reconcile_stale_runs`（只碰 `running` 且 `started_at` 非空的行，阈值 `[queue].task_time_limit_s × 2`、默认 1800 秒，天然幂等）+ `tasks/reconcile.py`（同步外壳 `run_reconcile`、`worker_ready` 信号挂载 `install_worker_ready_reconcile`、手动入口 `uv run python -m xhs_agent.tasks.reconcile`）；对账失败只记日志、**不阻断 worker 启动**；**不引入 Celery beat**（第二个常驻进程与容器编排归 S4.4）。新增 12 条日志单测、3 条对账单测与 5 条对账集成用例（真容器造 queued / 老 running / 新 running / 老 succeeded / 无 started_at 五行，只标老 running；正好等于截止点不算陈旧；跑第二次返回空；同步外壳经 `asyncio.to_thread` 真连库标记成功），单测 658 / 集成 104 全绿——其中 `tests/integration/test_http_pool.py` 的 2 条用例属**本机代理拦截 loopback HTTP** 的已知环境问题（见风险表），与本 Story 无关） | 1.5 | ✅ |
 | S4.2 | Langfuse 接入 | S4.1 | 模型调用可看到 token、成本、延迟；`LANGFUSE_*` 不齐时只告警不阻断 | 1 | ⬜ |
 | S4.3 | OpenTelemetry 追踪 | S4.1 | 一次请求可从 API 追到数据库与模型调用 | 1.5 | ⬜ |
 | S4.4 | 多阶段 Dockerfile + 全栈 compose | S3.4b | `docker compose up` 一条命令起 api / worker / postgres / redis；**lifespan 关闭时释放进程级资源**（`await get_engine().dispose()` 并清 `get_config` 缓存），保证 SIGTERM 优雅停机（E3 审查建议 6） | 2 | ⬜ |
@@ -150,6 +150,7 @@ GET /api/runs/{run_id}/report → 返回完整 HTML 报告
 | 依赖安装需要网络，当前环境受限 | E1–E4 每阶段都被阻塞 | 提前统一授权安装类命令，避免每个 Story 卡一次 |
 | embedding 模型实际输出维度与契约写的 1024 不一致 | S2.3 起全链路返工（维度在建表时固化） | 已升格为 E2 开工前置条件（见第三节的 DoR 说明），不再只是一句口头承诺 |
 | Celery 同步模型与 async 代码的阻抗 | S3.4b 出现难排查的阻塞 | **已缓解（2026-10-03）**：统一定为"任务入口同步函数 + `asyncio.run`，engine 与 httpx 客户端都在任务内建、任务内关，禁止进程级连接池"，已写进 `docs/开发规范.md` §一 04；实现见 `src/xhs_agent/tasks/analysis.py` |
+| worker 崩溃 / 硬超时 SIGKILL 会吞掉手上的任务，`runs` 永远停在 `running` | 轮询接口一直返回 409，看不出是"还在跑"还是"已经死了" | **已缓解（2026-10-04，S4.1）**：worker 启动时（`worker_ready` 信号）做一次陈旧 run 对账，把超过 `[queue].task_time_limit_s × 2`（默认 1800 秒）仍未收尾的 `running` 行标成 `failed` 并写清原因；实现见 `src/xhs_agent/tasks/reconcile.py`，手动入口 `uv run python -m xhs_agent.tasks.reconcile`。**断点续跑仍未做**：重跑同一 run 会重跑所有热点（只保证写回幂等） |
 | `deepseek-flash` 是推理模型：输出预算被 `reasoning_tokens` 吃光 | 真实分析链路拿到空 content 或截断的 JSON | **已缓解（2026-10-03）**：`[llm].max_tokens` 2000 → **16000**、`timeout_s` 60 → **120**，并把"含推理 token 的总输出预算"这一口径写进《配置契约》§3.1。依据：同一 prompt 四次采样 `reasoning_tokens` = 1823 / 2215 / 4027 / 4061、正文约 1.6k token；`reasoning_effort` / `effort` 参数被端点**静默忽略**，所以只能抬预算（模型 `max_output_tokens` 393216，契约上限 32768） |
 | 报告里的关键帧缩略图渲染不出来（显示"无预览"占位） | 演示效果打折：产品方案 §8.1 的"素材匹配榜附关键帧缩略图"落不了地（HTML 里 `<img>` 数为 0，尽管 `runs/_index/keyframes/` 里确实有 33 个关键帧） | **S3.6 联调发现（2026-10-03），未修**：两处缺口——① `services/runs.py` 的候选素材投影只带 id/path/type/title/description/tags，把契约 `MaterialSummary` 里**已声明**的 `keyframes` 丢了（实现与契约漂移）；② 即便带上，`tools/report.py` 用 `os.path.relpath(path, PROJECT_ROOT)` 生成 `runs/_index/keyframes/…` 的 `src`，而 API 不服务 `runs/`、样例报告也不在那个目录下。要修得先定"图片怎么引用"（内联 base64 / 新增取帧接口 / 渲染时复制到报告目录），属独立决策——建议排在 E5 出前端之前 |
 | ~~端到端单热点成本 0.09–0.12 元，超过 §10.2 的 0.05 元目标值~~ | **已决策（ADR 0012，2026-10-03）**：门槛按实测上调为 **≤ 0.15 元/热点**，并同步修订产品方案 §10.2 / §12.2、评测集七维度与预算默认值、prompt 契约 §六、README。原 0.05 是图落地前按 2 次调用估的，实测为 3 次调用且输出含推理 token（0.0926 元）。若日后要压回 0.05，须真正换模型或调 token 预算（保留为后续方向） |
@@ -157,5 +158,5 @@ GET /api/runs/{run_id}/report → 返回完整 HTML 报告
 | 评测集由作者自建自评 | 数字说服力弱 | 标注标准先写进产品方案 §10.1，再按标准标注；必要时请他人复核 |
 | 前端依赖数量多、审计成本高 | 供应链风险与构建不稳定 | 锁文件入库；直接依赖在提交信息说明理由；定期更新 |
 | 前端类型与契约漂移 | 前后端联调返工 | 由 `openapi-typescript` 生成类型，并在 CI 中校验生成结果无变化 |
-| 本机代理（TUN/透明模式）拦截 loopback HTTP | `tests/integration/test_http_pool.py` 的 2 条用例在真实终端下拿 502（服务端 0 请求），看起来像代码坏了 | 给代理加 loopback 直连规则或跑用例前关代理；判据见 `docs/AI开发说明.md` §六 |
+| 本机代理（TUN/透明模式）拦截 loopback HTTP | `tests/integration/test_http_pool.py` 的 2 条用例在真实终端下拿 502（服务端 0 请求），看起来像代码坏了 | 给代理加 loopback 直连规则或跑用例前关代理；判据见 `docs/AI开发说明.md` §六。**S4.1 复核（2026-10-04）**：用 S4.1 之前的提交建临时 worktree 跑同一用例，同样 2 条失败 → 确认与代码无关；判据是"裸 `httpx(trust_env=True)` POST 到进程内 uvicorn 拿 502、`trust_env=False` 立刻 200" |
 | 集成测试依赖 Docker，CI 上需可用 | E2／E3 的 DoD 无法达成 | GitHub Actions 自带 Docker；本地跑集成用例前先启动 Docker Desktop |

@@ -11,6 +11,7 @@ from sqlalchemy.exc import InterfaceError, OperationalError
 from xhs_agent.config import AppConfig, ConfigError, EnvView, load_config
 from xhs_agent.schemas import SchemaError
 from xhs_agent.tasks import analysis
+from xhs_agent.tasks import reconcile as reconcile_task
 from xhs_agent.tasks.analysis import (
     ANALYZE_TASK_NAME,
     TRANSIENT_ERRORS,
@@ -21,8 +22,10 @@ from xhs_agent.tasks.celery_app import (
     RETRY_POLICY,
     SOCKET_TIMEOUT_S,
     build_celery_app,
+    install_logging,
     redis_url,
 )
+from xhs_agent.tasks.reconcile import install_worker_ready_reconcile, stale_threshold_s
 from xhs_agent.tools.embedding import EmbeddingError
 from xhs_agent.tools.llm import LLMError
 
@@ -82,6 +85,24 @@ class TestBuildCeleryApp:
         assert options["socket_connect_timeout"] == SOCKET_TIMEOUT_S
         assert options["retry_policy"]["max_retries"] == RETRY_POLICY["max_retries"]
 
+    def test_takes_over_celery_logging(self, tmp_path, monkeypatch):
+        """S4.1：连上 `setup_logging` 信号等于声明"日志由我们配"（Celery 就不再套自己的 dictConfig）。"""
+        from celery.signals import setup_logging
+
+        from xhs_agent.tasks import celery_app as celery_app_module
+
+        cfg = make_config(tmp_path, 'log_level = "DEBUG"\nlog_format = "json"\n')
+        seen: list[tuple[str, str]] = []
+        monkeypatch.setattr(celery_app_module, "configure_logging",
+                            lambda level, log_format: seen.append((level, log_format)))
+
+        handler = install_logging(cfg)
+        try:
+            setup_logging.send(sender=None)
+        finally:
+            setup_logging.disconnect(handler)
+        assert seen == [("DEBUG", "json")]
+
 
 class TestTaskRegistration:
     def test_registers_named_task_with_queue_retry_budget(self, tmp_path):
@@ -94,6 +115,38 @@ class TestTaskRegistration:
         registered = app.tasks[ANALYZE_TASK_NAME]
         assert registered.name == ANALYZE_TASK_NAME
         assert registered.max_retries == 3
+
+
+class TestStaleRunReconcile:
+    """S4.1 的对账接线：阈值来自 `[queue].task_time_limit_s × 2`，由 worker_ready 触发一次。"""
+
+    def test_threshold_is_double_the_hard_limit(self, tmp_path):
+        cfg = make_config(tmp_path, "[queue]\ntask_soft_time_limit_s = 30\n"
+                                    "task_time_limit_s = 45\n")
+        assert stale_threshold_s(cfg) == 90
+
+    def test_worker_ready_reconcile_runs_once(self, tmp_path, monkeypatch):
+        from celery.signals import worker_ready
+
+        cfg = with_redis(make_config(tmp_path), "redis://127.0.0.1:6379/0")
+        seen: list[AppConfig] = []
+        monkeypatch.setattr(reconcile_task, "run_reconcile",
+                            lambda cfg, **_kwargs: seen.append(cfg) or [])
+
+        handler = install_worker_ready_reconcile(cfg)
+        try:
+            # Celery 真实发的是 sender=<Consumer>（不是 app）：按 app 过滤会让对账永不触发
+            worker_ready.send(sender=object())
+        finally:
+            worker_ready.disconnect(handler)
+        assert seen == [cfg]
+
+    def test_reconcile_failed_logs_and_returns_empty(self, tmp_path, monkeypatch):
+        """对账失败只记日志：绝不因为数据库抖动挡住 worker 启动。"""
+        cfg = make_config(tmp_path)
+        monkeypatch.setattr(reconcile_task, "_reconcile",
+                            _boom(RuntimeError, "数据库炸了"))
+        assert reconcile_task.run_reconcile(cfg) == []
 
 
 class TestTransientClassification:

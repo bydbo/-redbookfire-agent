@@ -10,8 +10,10 @@
   `load_job` / `load_run` / `load_report_model` 从库里组装契约形状。
 - S3.4a（写回）：`RunRecorder` 逐热点落库（`run_hotspots` / `run_matches` / `hotspots.clue`），
   收尾写 `runs` 的状态、统计与 `prompt_versions`；ADR 0011 的 RunStore 改造同期落地。
+- S4.1（对账）：`reconcile_stale_runs` 把卡住的 `running` 行标成 `failed`（worker 启动时调用，
+  阈值 `task_time_limit_s × 2`），覆盖 worker 崩溃吞任务与硬超时 SIGKILL 的窄场景。
 
-不在本模块：worker 接线、软/硬超时、索引新鲜度前置在 `tasks/`（S3.4b）；
+不在本模块：worker 接线、软/硬超时、索引新鲜度前置与对账的触发时机在 `tasks/`（S3.4b / S4.1）；
 "已成功热点即跳过"的断点续跑仍未实现。
 """
 
@@ -20,7 +22,7 @@ from __future__ import annotations
 import uuid
 from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from typing import Any
 
@@ -434,3 +436,48 @@ async def mark_run_failed(session: AsyncSession, run_id: uuid.UUID | str,
         await session.rollback()
         raise
     return True
+
+
+def stale_cutoff(now: datetime, threshold_s: int) -> datetime:
+    """陈旧运行的截止点：`started_at` 早于它就算陈旧（阈值 = `task_time_limit_s × 2`）。"""
+    return now - timedelta(seconds=int(threshold_s))
+
+
+def stale_error(threshold_s: int) -> str:
+    """陈旧运行的 `error` 文案（对账写回，供 `/api/jobs/{job_id}` 直接展示）。"""
+    return (f"陈旧运行对账：超过 {int(threshold_s)} 秒未收尾"
+            "（worker 崩溃或硬超时），已标记失败")
+
+
+async def reconcile_stale_runs(session: AsyncSession, *, threshold_s: int,
+                              now: datetime | None = None) -> list[dict[str, Any]]:
+    """把卡住不动的 `running` 行标成 `failed`（S4.1 的陈旧 run 对账）。
+
+    为什么需要：worker 被 SIGKILL / 硬超时打断时任务被吞，`runs` 会永远停在 `running`，
+    轮询接口就一直返回 409。对账按"`started_at` 早于 `now - threshold_s`"判定陈旧，
+    覆盖这一窄场景；阈值由调用方给（worker 启动时取 `[queue].task_time_limit_s × 2`）。
+
+    只碰 `running` 且 `started_at` 非空的行——`queued`（可能刚投递还没被消费）与终态一律不动；
+    自然幂等：跑第二次返回空清单。返回被标记的行（`run_id` / `job_id` / `started_at`）供日志。
+    """
+    moment = now or datetime.now(UTC)
+    cutoff = stale_cutoff(moment, threshold_s)
+    rows = (await session.execute(
+        select(Run).where(Run.status == RUNNING, Run.started_at.is_not(None),
+                          Run.started_at < cutoff))).scalars().all()
+    if not rows:
+        return []
+    detail = stale_error(threshold_s)
+    reconciled: list[dict[str, Any]] = []
+    for run in rows:
+        run.status = FAILED
+        run.finished_at = moment
+        run.error = detail
+        reconciled.append({"run_id": str(run.id), "job_id": run.job_id,
+                           "started_at": _iso(run.started_at)})
+    try:
+        await session.commit()
+    except BaseException:
+        await session.rollback()
+        raise
+    return reconciled

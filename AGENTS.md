@@ -25,6 +25,7 @@
 | `src/xhs_agent/workflows/` | 把各步骤串成一次完整运行                                  | 底层算法实现     |
 | `src/xhs_agent/db/`        | SQLAlchemy ORM 模型、会话工厂与引擎（表结构以数据契约为准）        | 业务流程、查询逻辑 |
 | `src/xhs_agent/services/`  | 用例层：一次场景化操作（素材索引同步、分析、报告）；编排 tools/db/agents | 底层算法、HTTP 接口 |
+| `src/xhs_agent/tasks/`     | Celery 任务层：worker 入口、任务体（重试 / 失败语义）与陈旧 run 对账 | 业务算法、HTTP 路由 |
 | `src/xhs_agent/api/`       | FastAPI 路由、依赖注入与错误响应（统一 `/api` 前缀，ADR 0009）        | 业务逻辑、数据访问 |
 | `src/xhs_agent/core/`      | 配置、日志、异常与常量（跨层共用）                                | 业务流程、HTTP 路由 |
 | `src/xhs_agent/prompts/` | prompt 资产：一任务一份 Markdown，五段结构（契约见 `docs/contracts/prompt契约.md`） | 代码、逻辑实现 |
@@ -203,7 +204,7 @@
 
 ## 当前项目状态（规范的诚实边界）
 
-- 已完成：数据契约（S1.1）、配置加载与启动前置检查（S1.2）、质量门与覆盖率（S1.3–S1.5）、爆点词典、模型调用层、素材扫描与索引、要素级匹配与规则解释、报告渲染、运行追踪；P2 已全部完成（S2.0–S2.9：本地依赖编排、集成测试基座、ORM 与会话、Alembic 迁移、评测集 v1、素材索引入库、向量回填、双通道召回与 RRF、离线链路清理、检索层基线对比）；**E3 已全部完成（S3.0–S3.10）**：prompt 契约、LangGraph 五节点状态图与三条 agent prompt 正文、FastAPI 骨架与五个接口、分析结果写回、httpx 异步化、Celery worker 接线、前端静态资源挂载、Walking Skeleton 一键联调、完整启动前置检查（契约 §四 的 7 步并入 lifespan）与 prompt 变更回归报告。
+- 已完成：数据契约（S1.1）、配置加载与启动前置检查（S1.2）、质量门与覆盖率（S1.3–S1.5）、爆点词典、模型调用层、素材扫描与索引、要素级匹配与规则解释、报告渲染、运行追踪；P2 已全部完成（S2.0–S2.9：本地依赖编排、集成测试基座、ORM 与会话、Alembic 迁移、评测集 v1、素材索引入库、向量回填、双通道召回与 RRF、离线链路清理、检索层基线对比）；**E3 已全部完成（S3.0–S3.10）**：prompt 契约、LangGraph 五节点状态图与三条 agent prompt 正文、FastAPI 骨架与五个接口、分析结果写回、httpx 异步化、Celery worker 接线、前端静态资源挂载、Walking Skeleton 一键联调、完整启动前置检查（契约 §四 的 7 步并入 lifespan）与 prompt 变更回归报告；**E4 的 S4.1 已完成**：structlog 结构化日志（`log_format` = `console` / `json`，`request_id` 与 `run_id` 两键恒在）、run_id 全链路贯穿与陈旧 run 对账（worker 启动时把卡住的 `running` 标成 `failed`）。
 - 运行时降级已取消（ADR 0001）：`tools/offline.py` 与 `OfflineProvider` 已在 S2.7 删除，不存在"无密钥也能跑"的路径；缺密钥、缺依赖一律失败并报错。
-- 尚未实现：前端（E5）、可观测与交付（E4：structlog / Langfuse / OpenTelemetry / 容器化 / CI）。**业务链路已端到端跑通**：`POST /api/analyze` 投 Celery → worker 消费 → 索引新鲜度（增量同步 + 向量回填）→ 五节点分析 → 逐热点写回数据库 → `GET /api/runs/{run_id}` 取结果。当前可直接运行 `docker compose up -d --wait`、`uv run celery -A xhs_agent.tasks.worker:app worker --loglevel=info`、`uv run python -m xhs_agent.serve`（推荐启动入口：先跑 7 步启动前置检查，失败按契约退 2/3）、`uv run python -m xhs_agent.probe`、`uv run python scripts/index_materials.py`、`uv run python scripts/backfill_embeddings.py`、`uv run python scripts/eval_retrieval.py`、`uv run python scripts/smoke_skeleton.py`、`uv run python scripts/eval_prompts.py`（`REDIS_URL` 自 P3 起必填）。
+- 尚未实现：前端（E5）、可观测与交付的其余部分（E4：Langfuse 归 S4.2、OpenTelemetry 归 S4.3、容器化归 S4.4、CI 归 S4.5 / S4.6）。**业务链路已端到端跑通**：`POST /api/analyze` 投 Celery → worker 消费 → 索引新鲜度（增量同步 + 向量回填）→ 五节点分析 → 逐热点写回数据库 → `GET /api/runs/{run_id}` 取结果。当前可直接运行 `docker compose up -d --wait`、`uv run celery -A xhs_agent.tasks.worker:app worker --loglevel=info`、`uv run python -m xhs_agent.serve`（推荐启动入口：先跑 7 步启动前置检查，失败按契约退 2/3）、`uv run python -m xhs_agent.probe`、`uv run python -m xhs_agent.tasks.reconcile`、`uv run python scripts/index_materials.py`、`uv run python scripts/backfill_embeddings.py`、`uv run python scripts/eval_retrieval.py`、`uv run python scripts/smoke_skeleton.py`、`uv run python scripts/eval_prompts.py`（`REDIS_URL` 自 P3 起必填；`XHS_LOG_FORMAT=json` 出可检索的结构化日志）。
 - 记录以上状态是为了让 AI 与合作者先看清事实，不要把"计划要实现的东西"当成"已经有的东西"。

@@ -51,9 +51,11 @@
 | Walking Skeleton 端到端联调（一键脚本：起进程 → 投热点 → 验候选与报告 → 落样例报告） | ✅ 已完成（S3.6） |
 | 完整启动前置检查（配置契约 §四 的 7 步 + 接入 lifespan + `python -m xhs_agent.serve`） | ✅ 已完成（S3.8） |
 | Prompt 变更回归报告（两臂对照 + prompt 契约 §六 七维度门槛，落 `evals/reports/prompt-*.md`） | ✅ 已完成（S3.10） |
+| 结构化日志（structlog，`console` / `json` 一键切换）与 run_id 全链路贯穿 | ✅ 已完成（S4.1） |
+| 陈旧 run 对账（worker 启动时把卡住的 `running` 标成 `failed`） | ✅ 已完成（S4.1） |
 | Alembic 数据库迁移（唯一建表路径） | ✅ 已完成（S2.3） |
 | 评测集 v1 与示例素材包（七维度口径、版本冻结） | ✅ 已完成（S2.0） |
-| 服务入口（FastAPI）与编排层 | ⬜ 未实现 |
+| 服务入口（FastAPI 五个接口 + LangGraph 编排，S3.1–S3.3） | ✅ 已完成 |
 | 前端单页应用（Vue 3 + Vite） | ⬜ 未实现 |
 
 业务链路**已端到端跑通**：`docker compose up -d --wait` 起依赖 → `uv run celery -A xhs_agent.tasks.worker:app worker` 起 worker → `uv run python -m xhs_agent.serve` 起接口（先跑 7 步启动前置检查）→ `POST /api/analyze` 投递 → worker 自动消费（索引新鲜度 → 五节点分析 → 逐热点写回）→ `/api/jobs/{job_id}` 轮询 → `/api/runs/{run_id}` 取结构化结果、`/report` 取报告。另可运行 `uv run python -m xhs_agent.probe`、`uv run python scripts/index_materials.py`、`uv run python scripts/backfill_embeddings.py`、`uv run python scripts/eval_retrieval.py`、`uv run python scripts/smoke_skeleton.py`。路线图见文末。
@@ -167,6 +169,16 @@ curl -s -X POST http://127.0.0.1:8000/api/analyze -H "Content-Type: application/
   -d '{"hotspots": ["某明星打羽毛球场被拍，反差感拉满"], "topk": 5}'
 #    拿返回的 job_id 轮询 /api/jobs/{job_id}，succeeded 后用 run_id 取 /api/runs/{run_id}
 #    与 /api/runs/{run_id}/report?format=html
+
+# 13.1 结构化日志（S4.1）：默认 console 可读；容器 / CI 与日志检索用 json
+#      json 时一行一个 JSON 对象，每条都带 request_id 与 run_id（不在上下文里为空串）：
+XHS_LOG_FORMAT=json uv run python -m xhs_agent.serve --port 8000
+#      worker 同理：XHS_LOG_FORMAT=json uv run celery -A xhs_agent.tasks.worker:app worker
+#      检索示例（只挑某次运行的日志）：… | jq -c 'select(.run_id=="<run_id>")'
+
+# 13.2 陈旧 run 对账（S4.1）：worker 启动时会自动跑一次；也可手动补跑
+#      把 running 且 started_at 超过 [queue].task_time_limit_s × 2（默认 1800 秒）的行标成 failed
+uv run python -m xhs_agent.tasks.reconcile
 
 # 14. 一键跑通 Walking Skeleton（推荐先用它验证环境）
 #     自己起 uvicorn + Celery worker、素材库为空时种入示例素材包、投 case-01 的热点、

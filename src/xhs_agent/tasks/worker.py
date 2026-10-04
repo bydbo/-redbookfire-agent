@@ -18,7 +18,8 @@ from ..config import load_config
 from ..core.logging import configure_logging
 from ..tools.vision import make_describer
 from .analysis import register_analyze_task
-from .celery_app import build_celery_app
+from .celery_app import build_celery_app, install_logging
+from .reconcile import install_worker_ready_reconcile
 
 config = load_config()
 configure_logging(config.log_level, config.log_format)
@@ -27,6 +28,12 @@ app: Celery = build_celery_app(config)
 
 # 视觉打标走能力裁剪：没有 ffmpeg / 没开 [vision] 时 make_describer 返回 None
 analyze_run = register_analyze_task(app, config, vision=make_describer(config))
+
+# S4.1：接管 Celery 自己的日志装配，让 `XHS_LOG_FORMAT=json` 在 worker 里也生效
+install_logging(config)
+
+# S4.1：worker 启动时做一次陈旧 run 对账（崩溃吞任务 / 硬超时 SIGKILL 的窄场景）
+install_worker_ready_reconcile(config)
 
 
 if __name__ == "__main__":   # pragma: no cover - 手工启动别名（等价于 celery ... worker）

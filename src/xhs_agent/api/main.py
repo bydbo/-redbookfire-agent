@@ -28,6 +28,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 
 from ..config import AppConfig
+from ..core.logging import configure_logging
 from ..probe import PreflightFailed, report_lines, run_startup_checks
 from .deps import get_config
 from .errors import register_exception_handlers
@@ -77,6 +78,9 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     检查不过就打印问题清单并抛 `PreflightFailed`，uvicorn 会中止启动（那条路径恒退 3）。
     """
     cfg = getattr(app.state, "config", None) or get_config()
+    # S4.1：日志格式与级别在这里落地——`create_app(cfg=...)` 这条路径不会走 `get_config()`，
+    # 少了这一句 `XHS_LOG_FORMAT=json` 就只在"没传配置"的分支才生效（幂等，重复调用无害）
+    configure_logging(cfg.log_level, cfg.log_format)
     if getattr(app.state, "check_startup", True):
         report = await run_startup_checks(cfg)
         if not report.ok:

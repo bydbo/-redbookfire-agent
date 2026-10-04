@@ -14,9 +14,13 @@
 
 from __future__ import annotations
 
+from typing import Any
+
 from celery import Celery
+from celery.signals import setup_logging
 
 from ..config import AppConfig, ConfigError
+from ..core.logging import configure_logging
 
 # 连接与重试都调紧：broker 不可达时要尽快失败（API 拿 503，而不是等默认的几十秒重试）
 SOCKET_TIMEOUT_S = 1
@@ -52,3 +56,17 @@ def build_celery_app(cfg: AppConfig) -> Celery:
         enable_utc=True,
     )
     return app
+
+
+def install_logging(cfg: AppConfig) -> Any:
+    """接管 Celery worker 的日志装配（S4.1）；返回接收者，便于调用方/测试解绑。
+
+    为什么必须挂在 `setup_logging` 信号上：Celery 只在**没有任何接收者**时才配置自己的 dictConfig
+    （`celery/app/log.py` 里的 `if not receivers:`）——连上这个信号等于声明"日志由我们配"。
+    否则 worker 启动时会把我们的 handler 换掉，`XHS_LOG_FORMAT=json` 在 worker 里就静默失效。
+    """
+    @setup_logging.connect(weak=False)   # type: ignore[untyped-decorator]
+    def _configure(**kwargs: Any) -> None:
+        configure_logging(cfg.log_level, cfg.log_format)
+
+    return _configure
