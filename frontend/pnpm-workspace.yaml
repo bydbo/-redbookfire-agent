@@ -1,0 +1,7 @@
+# pnpm 11 配置中心：默认阻止依赖安装脚本；esbuild 需 postinstall 放置平台二进制，显式放行。
+# 单包项目（非 monorepo），此文件仅承载 pnpm 设置。
+allowBuilds:
+  esbuild: true
+# 扁平布局（npm 同构）：pnpm 默认的 .pnpm 虚拟 store 依赖符号链接，
+# 在部分 Windows 环境（权限策略/网盘/沙箱）下链接易失效；hoisted 用硬链接/复制，可靠性优先。
+nodeLinker: hoisted

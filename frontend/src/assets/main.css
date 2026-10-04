@@ -1,0 +1,15 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* 样式边界（ADR 0008）：Tailwind 只管布局、间距与视觉定制；
+   复杂交互组件的样式归 Naive UI，禁止用 Tailwind 覆盖组件内部结构。 */
+html,
+body,
+#app {
+  height: 100%;
+}
+
+body {
+  margin: 0;
+}
