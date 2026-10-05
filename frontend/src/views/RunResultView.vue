@@ -6,6 +6,7 @@ import { useRoute } from 'vue-router'
 import { ApiRequestError, apiUrl } from '@/api/client'
 import type { Element, RunDetail } from '@/api/analysis'
 import { getKeyframeUrl, getRun } from '@/api/analysis'
+import RunCharts from '@/components/RunCharts.vue'
 
 const route = useRoute()
 const runId = computed(() => String(route.params.runId))
@@ -182,6 +183,10 @@ async function copyDraft(draft: Draft, hotspotId: string): Promise<void> {
             </n-button>
           </div>
         </div>
+      </n-card>
+
+      <n-card v-if="run" title="数据可视化">
+        <RunCharts :run="run" />
       </n-card>
 
       <template v-for="(hotspot, idx) in run?.hotspots ?? []" :key="hotspot.hotspot_id">
