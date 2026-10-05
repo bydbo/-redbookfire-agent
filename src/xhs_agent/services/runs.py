@@ -232,6 +232,17 @@ async def load_run(session: AsyncSession, run_id: uuid.UUID) -> dict[str, Any] |
     }
 
 
+@traced_db("db.load_material_frames", operation="select", tables=("materials",))
+async def load_material_frames(session: AsyncSession,
+                              material_id: uuid.UUID) -> list[str] | None:
+    """素材登记的关键帧绝对路径列表（取帧接口用）；素材不存在返回 `None`。"""
+    row = await session.execute(select(Material.keyframes).where(Material.id == material_id))
+    keyframes = row.scalar_one_or_none()
+    if keyframes is None:
+        return None
+    return list(keyframes)
+
+
 @traced_db("db.load_report_model", operation="select",
            tables=("runs", "run_hotspots", "hotspots", "run_matches", "materials"))
 async def load_report_model(session: AsyncSession, cfg: AppConfig,

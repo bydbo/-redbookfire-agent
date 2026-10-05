@@ -212,6 +212,43 @@ paths:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
 
+  /api/materials/{material_id}/keyframes/{index}:
+    get:
+      tags:
+        - 结果
+      summary: 读取素材关键帧图片
+      description: |
+        返回候选素材登记的关键帧图片（JPEG），供结果详情页缩略图使用。
+        帧路径来自素材库的关键帧缓存目录；素材不存在、下标越界或文件缺失一律 404，
+        不区分原因（避免暴露素材库内部布局）。
+      operationId: getMaterialKeyframe
+      parameters:
+        - $ref: '#/components/parameters/RequestId'
+        - name: material_id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+        - name: index
+          in: path
+          required: true
+          schema:
+            type: integer
+            minimum: 0
+      responses:
+        '200':
+          description: 关键帧图片（JPEG）
+          content:
+            image/jpeg:
+              schema:
+                type: string
+                format: binary
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '503':
+          $ref: '#/components/responses/DependencyUnavailable'
+
 components:
   parameters:
     RequestId:

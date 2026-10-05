@@ -1,8 +1,10 @@
-"""结果接口（openapi tag：结果）：读取运行结果与报告。
+"""结果接口（openapi tag：结果）：读取运行结果与报告、素材关键帧。
 
 - `GET /api/runs/{run_id}`：契约 `RunDetail`；不存在 → 404；尚未完成 → 409。
 - `GET /api/runs/{run_id}/report?format=html|md`：从库里即时渲染（ADR 0011：DB 是权威源），
   返回 `text/html` 或 `text/markdown`；不存在 → 404；尚未完成 → 409。
+- `GET /api/materials/{material_id}/keyframes/{index}`（S5.4）：返回关键帧 JPEG，
+  帧路径必须解析到关键帧缓存目录内（防路径穿越）；不存在/越界/缺失一律 404。
 
 路径参数在契约里是 `format: uuid`，但契约只列出 404/409/503 三种响应——
 因此非法 uuid 按 **404 资源不存在** 处理，不引入 422。
@@ -11,14 +13,20 @@
 from __future__ import annotations
 
 import uuid
+from pathlib import Path
 from typing import Annotated, Any
 
 from fastapi import APIRouter, Depends, Query
-from fastapi.responses import Response
+from fastapi.responses import FileResponse, Response
 
 from ...config import PROJECT_ROOT
 from ...core.errors import ConflictError, NotFoundError
-from ...services.runs import UNFINISHED_STATUSES, load_report_model, load_run
+from ...services.runs import (
+    UNFINISHED_STATUSES,
+    load_material_frames,
+    load_report_model,
+    load_run,
+)
 from ...tools.report import render_html, render_markdown
 from ..deps import ConfigDep, SessionDep, request_id_header
 from ..models import ReportFormat, RunDetail, UuidPath, error_response
@@ -74,3 +82,32 @@ async def get_run_report(run_id: UuidPath, session: SessionDep, cfg: ConfigDep,
         return Response(content=render_markdown(model), media_type="text/markdown; charset=utf-8")
     return Response(content=render_html(model, base_dir=PROJECT_ROOT),
                     media_type="text/html; charset=utf-8")
+
+
+@router.get("/materials/{material_id}/keyframes/{index}",
+            responses={200: {"description": "关键帧图片（JPEG）",
+                             "content": {"image/jpeg": {"schema": {"type": "string",
+                                                                   "format": "binary"}}}},
+                       404: error_response("资源不存在"),
+                       503: error_response("依赖不可用（不做降级，直接返回错误）")})
+async def get_material_keyframe(material_id: UuidPath, index: int,
+                                session: SessionDep, cfg: ConfigDep) -> FileResponse:
+    """返回素材关键帧图片（S5.4 结果详情页缩略图）。
+
+    素材不存在、下标越界或文件缺失一律 404，不区分原因（避免暴露素材库内部布局）；
+    帧路径解析后必须位于关键帧缓存目录内，否则同样 404——挡住任何路径穿越。
+    """
+    frames = await load_material_frames(session, _run_uuid(material_id))
+    if frames is None or index < 0 or index >= len(frames):
+        raise NotFoundError(f"关键帧不存在：{material_id}[{index}]",
+                            {"material_id": material_id, "index": index})
+    root = Path(cfg.index_dir(), "keyframes").resolve()
+    try:
+        target = Path(frames[index]).resolve()
+    except OSError as exc:  # 非法路径字符等
+        raise NotFoundError(f"关键帧不存在：{material_id}[{index}]",
+                            {"material_id": material_id, "index": index}) from exc
+    if root not in target.parents or not target.is_file():
+        raise NotFoundError(f"关键帧不存在：{material_id}[{index}]",
+                            {"material_id": material_id, "index": index})
+    return FileResponse(target, media_type="image/jpeg")
