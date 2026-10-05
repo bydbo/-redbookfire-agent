@@ -46,7 +46,7 @@
 | 检索层基线对比评测（纯字面基线 vs 混合召回，报告落 `evals/reports/`） | ✅ 已完成（S2.8） |
 | LangGraph 五节点状态图（拆解 → 检索 → 缺口 → 撰稿 → 报告）与三条 agent prompt 正文 | ✅ 已完成（S3.1） |
 | FastAPI 应用骨架（`/api` 路由树、统一错误响应、`X-Request-ID`） | ✅ 已完成（S3.2） |
-| 五个接口实现（`/api` 前缀：health / analyze / jobs / runs / report） | ✅ 已完成（S3.3） |
+| 接口实现（`/api` 前缀：health / analyze / jobs / runs / runs/{id} / report / material-frames；S5.6 起七个） | ✅ 已完成（S3.3；S5.4 / S5.6 各加一个） |
 | 分析结果写回（`run_matches` / 统计 / `prompt_versions` 落库，RunStore 退化为产物目录） | ✅ 已完成（S3.4a） |
 | 分析主链路 HTTP 异步化（文本模型与向量共用 httpx 连接池，去掉 `asyncio.to_thread`） | ✅ 已完成（S3.5） |
 | Celery worker 接线（`POST /api/analyze` 真投递 → 消费 → 索引新鲜度 → 分析 → 写回） | ✅ 已完成（S3.4b） |
@@ -62,12 +62,13 @@
 | 契约一致性校验（`scripts/check_openapi.py`：FastAPI 导出的 OpenAPI 必须覆盖 `docs/contracts/openapi.yaml`，跑在 CI 的 test job 里） | ✅ 已完成（S4.6） |
 | Alembic 数据库迁移（唯一建表路径） | ✅ 已完成（S2.3） |
 | 评测集 v1 与示例素材包（七维度口径、版本冻结） | ✅ 已完成（S2.0） |
-| 服务入口（FastAPI 五个接口 + LangGraph 编排，S3.1–S3.3） | ✅ 已完成 |
+| 服务入口（FastAPI 七个接口 + LangGraph 编排，S3.1–S3.3；S5.4 / S5.6 扩充） | ✅ 已完成 |
 | 前端工程脚手架（Vue 3 + Vite + TS + Router + Pinia + Naive UI + Tailwind，S5.1：别名 / 环境变量 / 代理 / 构建配置） | ✅ 已完成（S5.1） |
 | 接口类型生成（S5.2：`openapi-typescript` 从 `docs/contracts/openapi.yaml` 生成 `frontend/src/api/schema.d.ts` 入库；`pnpm run check:api` + CI `frontend` job 防漂移） | ✅ 已完成（S5.2） |
 | 分析台页面（S5.3：多热点输入 → 提交 → 2 秒轮询进度 → 自动跳转结果占位页；`/` 为分析台、`/runs/:runId` 为结果页） | ✅ 已完成（S5.3） |
 | 结果详情页（S5.4：爆点要素 / 候选素材含关键帧缩略图 / 覆盖缺口 / 文案初稿四块齐全，文案一键复制；新增关键帧取帧接口 `GET /api/materials/{id}/keyframes/{n}`） | ✅ 已完成（S5.4） |
 | 数据可视化（S5.5：结果详情页新增「数据可视化」卡片——要素覆盖度含 60% 目标线 / 候选得分分布五档 / 成本与耗时含按热点预算线，数据全部来自 RunDetail，无新增接口） | ✅ 已完成（S5.5） |
+| 运行历史（S5.6：契约新增 `GET /api/runs`（RunSummary / RunList，limit 1–100 + offset 分页）；前端 `/runs` 页倒序列表 / 回看结果 / 下载 HTML·MD 报告，分析台加入口） | ✅ 已完成（S5.6） |
 
 业务链路**已端到端跑通**：`docker compose up -d --wait` 起依赖 → `uv run celery -A xhs_agent.tasks.worker:app worker` 起 worker → `uv run python -m xhs_agent.serve` 起接口（先跑 7 步启动前置检查）→ `POST /api/analyze` 投递 → worker 自动消费（索引新鲜度 → 五节点分析 → 逐热点写回）→ `/api/jobs/{job_id}` 轮询 → `/api/runs/{run_id}` 取结构化结果、`/report` 取报告。另可运行 `uv run python -m xhs_agent.probe`、`uv run python scripts/index_materials.py`、`uv run python scripts/backfill_embeddings.py`、`uv run python scripts/eval_retrieval.py`、`uv run python scripts/smoke_skeleton.py`。路线图见文末。
 
@@ -376,7 +377,7 @@ Docker 不可用时会直接报错并说明原因（不静默跳过）。
 | --- | --- |
 | P1 工程骨架 | 契约重构、配置加载、质量门与首批单测 |
 | P2 数据与检索 | Postgres + pgvector、混合召回、评测集 |
-| P3 编排与服务 | LangGraph、FastAPI 五个接口（/api）、Celery |
+| P3 编排与服务 | LangGraph、FastAPI 接口（/api 前缀）、Celery |
 | P4 可观测与交付 | 结构化日志与调用追踪、容器化、CI |
 | P5 前端工程 | Vue 3 单页应用：分析台、结果详情、运行历史 + ECharts 可视化 |
 | v1.1 及以后 | 多热点横向对比、历史回看、自动抓热榜、效果回流 |

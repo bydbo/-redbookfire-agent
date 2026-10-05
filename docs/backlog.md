@@ -19,7 +19,7 @@
 | E2 数据与检索  | 持久化 + 语义召回，产出评测数字 | 20       | ✅ 进行中             | M3  |
 | E3 编排与服务  | 服务化与异步，端到端可演示     | 20.5     | ✅ 已完成（S3.0–S3.10） | M4  |
 | E4 可观测与交付 | 可运维、可交付           | 8        | ✅ 已完成（S4.1–S4.6）  | M5  |
-| E5 前端工程   | 把演示页升级为可交互的单页应用   | 17       | 🔄 进行中（S5.1–S5.5） | M6  |
+| E5 前端工程   | 把演示页升级为可交互的单页应用   | 17       | 🔄 进行中（S5.1–S5.6） | M6  |
 | **合计**    |                   | **76.5** |                   |     |
 
 全职投入约 9 周；按每天 3 小时的业余节奏约 5 个月。总量比初版（41.5）增加 26 人日：前端 Epic 17、API 前缀与静态挂载 1、完整 preflight 1.5、mypy 收紧 0.5、E2 净增 5（集成测试基座 +3、评测集与示例素材包 +3、对比脚本精简 −1）、E1 落地时的范围调整 1（S1.2 配置段全量 +0.5、S1.4 覆盖 8 个模块 +0.5）。
@@ -119,10 +119,22 @@
 
 </details>
 | S5.5 | 数据可视化      | S5.4        | 覆盖度、得分分布、成本与耗时用 ECharts 呈现                                                   | 2   | ✅  |
-| S5.6 | 运行历史       | S5.2        | 列出历史运行，可回看结果并下载报告                                                            | 1.5 | ⬜  |
+| S5.6 | 运行历史       | S5.2        | 列出历史运行，可回看结果并下载报告                                                            | 1.5 | ✅  |
 | S5.7 | 视觉打磨       | S5.5        | 三页共用同一套主题 token 与组件库；暗色主题下正文文本对比度 ≥ 4.5:1；375px 宽度无横向滚动；Lighthouse 性能分 ≥ 80  | 2   | ⬜  |
 | S5.8 | 前端测试       | S5.4        | Vitest 覆盖工具函数与关键组件；`pnpm build` 产物可被服务端挂载                                    | 1.5 | ⬜  |
 | S5.9 | 前端进 CI 与镜像 | S5.8, S4.4  | CI 增加前端 lint、测试与构建；多阶段镜像内含 dist                                              | 1.5 | ⬜  |
+
+<details>
+<summary>S5.6 实测记录（2026-10-05）</summary>
+
+- 决策（S5.6 依赖之外多出来的接口）：验收要求「列出历史运行」，但契约原本只有按 run_id 取单条，**按契约先行新增 `GET /api/runs`**（openapi.yaml 先改，S4.6 的 check_openapi 强制实现覆盖）；只读既有 `runs` / `run_hotspots` / `hotspots` 三表——不改数据契约、不加迁移。
+- 契约与后端：`RunSummary`（run_id / status / created_at / finished_at / hotspot_count / hotspot_preview / topk / totals / error）+ `RunList`（items + total）；`list_runs` 按 `created_at` 倒序、平局按 id 倒序（幂等），`total` 走独立 count，页内用两条批量查询补齐热点数与 position=1 的首条热点预览（超 60 字截断加省略号）避免 N+1；`load_run` 的 totals 投影抽成 `_totals()` 供两条读路径共用。参数 `Query(ge=1, le=100)` / `Query(ge=0)`，越界 422 落在 check_openapi 的实现侧白名单里。
+- 前端：`listRuns({limit, offset})` 类型派生自生成物；`/runs` 历史页（状态标签 / 短 id / 首条热点预览 / 创建时间 / 热点数 / topk / 成本 / 耗时 / 调用数 + 「查看结果」「报告 HTML」「报告 MD」），顶部「刷新」「返回分析台」，加载 / 失败 / 空态齐全；queued·running 的「查看结果」置灰并给 tooltip（详情必然 409）且不给报告入口，failed 可回看（数据契约 §3.3）；报告用 `<a download>` 指向既有报告接口，零后端改动；路由 `/runs`（列表）与 `/runs/:runId`（详情）并存，分析台页头加入口，结果详情页未动（统一顶部导航留 S5.7）。
+- 真实冒烟（Playwright 驱动本机 Edge headless，截图落 `runs/_smoke_s56/`）：18 条断言全过——真实链路 8 行与 API 的倒序、热点预览逐项一致；已完成行的「查看结果」可用、报告 href 与 download 文件名正确；点「查看结果」跳详情页并渲染出 S5.5 图表卡片；「返回分析台」与分析台入口可用；再用拦截的 25 条合成数据验分页：首屏 20 行 + `limit=20&offset=0`，点第 2 页发 `offset=20` 且剩 5 行；控制台零 error。
+- 回归：check_openapi 通过；ruff 零告警；mypy 44 文件零错误；单测 748 passed；集成 113 passed / 2 failed（`test_http_pool.py` 那 2 条仍是本机代理拦 loopback 的已知环境问题，与本 Story 无关），其中新增 TestRunList 5 条全绿；前端 type-check / build / check:api 全过。
+- 环境备注：冒烟前 8000 端口被 S5.5 遗留的旧 API 占着（`/api/runs` 返回 404），已停掉旧进程后用当前代码重起；主包体积（gzip 334 kB）仍是 S5.7 的调优项。
+
+</details>
 
 <details>
 <summary>S5.5 实测记录（2026-10-05）</summary>
