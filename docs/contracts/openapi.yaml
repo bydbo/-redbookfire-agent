@@ -136,6 +136,40 @@ paths:
         '503':
           $ref: '#/components/responses/DependencyUnavailable'
 
+  /api/runs:
+    get:
+      tags:
+        - 结果
+      summary: 列出历史运行
+      description: 按创建时间倒序分页返回历史运行摘要（run_id、状态、热点数与首条热点预览、成本与耗时）。
+      operationId: listRuns
+      parameters:
+        - $ref: '#/components/parameters/RequestId'
+        - name: limit
+          in: query
+          required: false
+          schema:
+            type: integer
+            default: 20
+            minimum: 1
+            maximum: 100
+        - name: offset
+          in: query
+          required: false
+          schema:
+            type: integer
+            default: 0
+            minimum: 0
+      responses:
+        '200':
+          description: 历史运行列表
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RunList'
+        '503':
+          $ref: '#/components/responses/DependencyUnavailable'
+
   /api/runs/{run_id}:
     get:
       tags:
@@ -367,6 +401,66 @@ components:
           oneOf:
             - $ref: '#/components/schemas/ErrorResponse'
             - type: 'null'
+
+    RunSummary:
+      type: object
+      required:
+        - run_id
+        - status
+        - created_at
+        - hotspot_count
+        - hotspot_preview
+        - topk
+        - totals
+      properties:
+        run_id:
+          type: string
+          format: uuid
+        status:
+          type: string
+          enum:
+            - queued
+            - running
+            - succeeded
+            - failed
+        created_at:
+          type: string
+          format: date-time
+        finished_at:
+          oneOf:
+            - type: string
+              format: date-time
+            - type: 'null'
+        hotspot_count:
+          type: integer
+          minimum: 0
+        hotspot_preview:
+          type: string
+          description: 第一条热点的原文预览（超过 60 字截断加省略号）
+        topk:
+          type: integer
+          minimum: 1
+          maximum: 20
+        totals:
+          $ref: '#/components/schemas/RunTotals'
+        error:
+          oneOf:
+            - type: string
+            - type: 'null'
+
+    RunList:
+      type: object
+      required:
+        - items
+        - total
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/RunSummary'
+        total:
+          type: integer
+          minimum: 0
 
     RunDetail:
       type: object

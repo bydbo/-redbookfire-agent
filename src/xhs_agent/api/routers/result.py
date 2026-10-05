@@ -1,5 +1,6 @@
 """结果接口（openapi tag：结果）：读取运行结果与报告、素材关键帧。
 
+- `GET /api/runs`（S5.6）：契约 `RunList`；`created_at` 倒序分页（limit 1–100、offset ≥ 0）。
 - `GET /api/runs/{run_id}`：契约 `RunDetail`；不存在 → 404；尚未完成 → 409。
 - `GET /api/runs/{run_id}/report?format=html|md`：从库里即时渲染（ADR 0011：DB 是权威源），
   返回 `text/html` 或 `text/markdown`；不存在 → 404；尚未完成 → 409。
@@ -23,13 +24,14 @@ from ...config import PROJECT_ROOT
 from ...core.errors import ConflictError, NotFoundError
 from ...services.runs import (
     UNFINISHED_STATUSES,
+    list_runs,
     load_material_frames,
     load_report_model,
     load_run,
 )
 from ...tools.report import render_html, render_markdown
 from ..deps import ConfigDep, SessionDep, request_id_header
-from ..models import ReportFormat, RunDetail, UuidPath, error_response
+from ..models import ReportFormat, RunDetail, RunList, UuidPath, error_response
 
 router = APIRouter(tags=["结果"], dependencies=[Depends(request_id_header)])
 
@@ -46,6 +48,15 @@ def _require_finished(payload: dict[str, Any]) -> None:
     if payload["status"] in UNFINISHED_STATUSES:
         raise ConflictError("运行尚未完成", {"run_id": payload["run_id"],
                                              "status": payload["status"]})
+
+
+@router.get("/runs", response_model=RunList,
+            responses={503: error_response("依赖不可用（不做降级，直接返回错误）")})
+async def get_runs(session: SessionDep,
+                  limit: Annotated[int, Query(ge=1, le=100)] = 20,
+                  offset: Annotated[int, Query(ge=0)] = 0) -> dict[str, Any]:
+    """列出历史运行（S5.6）：`created_at` 倒序分页，返回摘要与总数。"""
+    return await list_runs(session, limit=limit, offset=offset)
 
 
 @router.get("/runs/{run_id}", response_model=RunDetail,

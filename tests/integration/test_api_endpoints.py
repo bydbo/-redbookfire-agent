@@ -298,6 +298,66 @@ class TestRunResults:
             assert client.get(f"/api/runs/{run_id}/report").status_code == 404
 
 
+class TestRunList:
+    """S5.6：`GET /api/runs` 的分页、排序与摘要形状。"""
+
+    def test_empty_database_returns_empty_list(self, client: TestClient) -> None:
+        response = client.get("/api/runs")
+        assert response.status_code == 200, response.text
+        assert response.json() == {"items": [], "total": 0}
+
+    def test_new_run_is_queued_with_zero_totals(self, client: TestClient) -> None:
+        accepted = _submit(client, ["热点A", "热点B"], topk=3)
+        body = client.get("/api/runs").json()
+        assert body["total"] == 1
+        item = body["items"][0]
+        assert set(item) == {"run_id", "status", "created_at", "finished_at", "hotspot_count",
+                             "hotspot_preview", "topk", "totals", "error"}
+        assert (item["run_id"], item["status"], item["topk"]) == \
+            (accepted["run_id"], "queued", 3)
+        assert item["finished_at"] is None and item["error"] is None
+        assert item["hotspot_count"] == 2
+        assert item["hotspot_preview"] == "热点A"          # position=1 的那条
+        assert item["totals"] == {"llm_calls": 0, "prompt_tokens": 0,
+                                  "completion_tokens": 0, "cost_cny": 0.0, "latency_ms": 0}
+
+    @pytest.mark.asyncio
+    async def test_orders_by_created_at_desc_and_paginates(self, client: TestClient,
+                                                           db_engine: AsyncEngine) -> None:
+        first = _submit(client, ["第一条"])["run_id"]
+        second = _submit(client, ["第二条"])["run_id"]
+        third = _submit(client, ["第三条"])["run_id"]
+
+        # 三连提交的 created_at 可能落在同一微秒，这里显式错开时间戳再断言顺序
+        factory = async_sessionmaker(db_engine, expire_on_commit=False)
+        base = datetime(2026, 10, 5, 12, 0, 0, tzinfo=UTC)
+        async with factory() as session:
+            for order, run_id in enumerate((first, second, third)):
+                run = (await session.execute(
+                    select(Run).where(Run.id == uuid.UUID(run_id)))).scalar_one()
+                run.created_at = base.replace(minute=order)
+            await session.commit()
+
+        page = client.get("/api/runs").json()
+        assert page["total"] == 3
+        assert [item["run_id"] for item in page["items"]] == [third, second, first]
+        assert all(item["status"] == "queued" for item in page["items"])
+
+        middle = client.get("/api/runs?limit=1&offset=1").json()
+        assert middle["total"] == 3                       # total 是全量，不随分页变
+        assert [item["run_id"] for item in middle["items"]] == [second]
+
+    def test_long_hotspot_preview_is_truncated(self, client: TestClient) -> None:
+        long_text = "长" * 80
+        _submit(client, [long_text])
+        item = client.get("/api/runs").json()["items"][0]
+        assert item["hotspot_preview"] == "长" * 60 + "…"
+
+    def test_out_of_contract_paging_params_are_rejected(self, client: TestClient) -> None:
+        for query in ("limit=0", "limit=101", "offset=-1", "limit=abc"):
+            assert client.get(f"/api/runs?{query}").status_code == 422, query
+
+
 class TestHealth:
     def test_all_dependencies_up(self, client: TestClient) -> None:
         response = client.get("/api/health")

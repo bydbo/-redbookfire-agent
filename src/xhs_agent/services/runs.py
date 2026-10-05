@@ -194,6 +194,17 @@ async def _matches_by_run_hotspot(session: AsyncSession,
     return grouped
 
 
+def _totals(run: Run) -> dict[str, Any]:
+    """`RunTotals` 投影：批次级模型调用与成本统计（`load_run` 与 `list_runs` 共用）。"""
+    return {
+        "llm_calls": run.llm_calls,
+        "prompt_tokens": run.prompt_tokens,
+        "completion_tokens": run.completion_tokens,
+        "cost_cny": float(run.cost_cny),
+        "latency_ms": run.latency_ms,
+    }
+
+
 @traced_db("db.load_run", operation="select",
            tables=("runs", "run_hotspots", "hotspots", "run_matches", "materials"))
 async def load_run(session: AsyncSession, run_id: uuid.UUID) -> dict[str, Any] | None:
@@ -220,15 +231,65 @@ async def load_run(session: AsyncSession, run_id: uuid.UUID) -> dict[str, Any] |
         "status": run.status,
         "created_at": _iso(run.created_at),
         "finished_at": _iso(run.finished_at),
-        "totals": {
-            "llm_calls": run.llm_calls,
-            "prompt_tokens": run.prompt_tokens,
-            "completion_tokens": run.completion_tokens,
-            "cost_cny": float(run.cost_cny),
-            "latency_ms": run.latency_ms,
-        },
+        "totals": _totals(run),
         "prompt_versions": dict(run.prompt_versions or {}),
         "hotspots": hotspots,
+    }
+
+
+HOTSPOT_PREVIEW_CHARS = 60
+
+
+def _preview(raw_text: str | None) -> str:
+    """首条热点原文预览：超过 60 字截断加省略号（契约 `RunSummary.hotspot_preview`）。"""
+    value = raw_text or ""
+    if len(value) <= HOTSPOT_PREVIEW_CHARS:
+        return value
+    return value[:HOTSPOT_PREVIEW_CHARS] + "…"
+
+
+@traced_db("db.list_runs", operation="select",
+           tables=("runs", "run_hotspots", "hotspots"))
+async def list_runs(session: AsyncSession, *, limit: int, offset: int) -> dict[str, Any]:
+    """`RunList` 形状：`created_at` 倒序分页的历史运行摘要（平局按 id 倒序，保证幂等）。
+
+    `total` 是全部运行条数（分页器用），与当前页条数无关；热点数与首条热点预览在页内
+    用两条批量查询补齐，避免逐行 N+1。
+    """
+    total = (await session.execute(select(func.count()).select_from(Run))).scalar_one()
+    rows = list((await session.execute(
+        select(Run).order_by(Run.created_at.desc(), Run.id.desc())
+        .limit(limit).offset(offset))).scalars())
+    run_ids = [run.id for run in rows]
+
+    counts: dict[uuid.UUID, int] = {}
+    previews: dict[uuid.UUID, str] = {}
+    if run_ids:
+        for run_id, count in (await session.execute(
+                select(RunHotspot.run_id, func.count())
+                .where(RunHotspot.run_id.in_(run_ids))
+                .group_by(RunHotspot.run_id))).all():
+            counts[run_id] = count
+        for run_id, raw_text in (await session.execute(
+                select(RunHotspot.run_id, Hotspot.raw_text)
+                .join(Hotspot, Hotspot.id == RunHotspot.hotspot_id)
+                .where(RunHotspot.run_id.in_(run_ids),
+                       RunHotspot.position == 1))).all():
+            previews[run_id] = raw_text
+
+    return {
+        "items": [{
+            "run_id": str(run.id),
+            "status": run.status,
+            "created_at": _iso(run.created_at),
+            "finished_at": _iso(run.finished_at),
+            "hotspot_count": counts.get(run.id, 0),
+            "hotspot_preview": _preview(previews.get(run.id)),
+            "topk": run.topk,
+            "totals": _totals(run),
+            "error": run.error,
+        } for run in rows],
+        "total": total,
     }
 
 

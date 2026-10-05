@@ -193,6 +193,32 @@ class RunDetail(_Response):
     hotspots: list[HotspotResult]
 
 
+class RunSummary(_Response):
+    """`GET /api/runs` 的一条历史运行摘要（S5.6）。
+
+    必填项严格对齐契约：pydantic 里给默认值会让导出的 `required` 少一项，
+    `scripts/check_openapi.py` 会直接报差异；因此只有契约声明可空的
+    `finished_at` / `error` 才带默认值。
+    """
+
+    run_id: UuidStr
+    status: RunStatus
+    created_at: DateTimeStr
+    hotspot_count: int
+    hotspot_preview: str
+    topk: int
+    totals: RunTotals
+    finished_at: DateTimeStr | None = None
+    error: str | None = None
+
+
+class RunList(_Response):
+    """`GET /api/runs` 响应：分页摘要；`total` 是全部条数（供分页器用），不是本页条数。"""
+
+    items: list[RunSummary]
+    total: int
+
+
 class ComponentHealth(_Response):
     status: ComponentStatus
     detail: str = ""
