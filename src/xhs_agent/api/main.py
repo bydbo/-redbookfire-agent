@@ -27,6 +27,7 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
+from starlette.middleware.gzip import GZipMiddleware
 
 from ..config import AppConfig
 from ..core.logging import configure_logging
@@ -61,6 +62,10 @@ def create_app(cfg: AppConfig | None = None, *, check_startup: bool = True) -> F
         lifespan=_lifespan,
     )
     app.add_middleware(RequestIdMiddleware)
+    # S5.7：压缩文本类响应（JS / CSS / HTML / JSON）。托管前端产物的是这个应用，
+    # 移动端 Lighthouse 的瓶颈就是「1 MB JS 原样传输」；图片等已压缩类型在
+    # Starlette 的排除清单里，不会被二次压缩。
+    app.add_middleware(GZipMiddleware, minimum_size=1024)
     # S4.3：ASGI 服务端 span（最后加 = 最外层，覆盖整条请求；没有 provider 时是空操作）
     install_fastapi_instrumentation(app)
     register_exception_handlers(app)

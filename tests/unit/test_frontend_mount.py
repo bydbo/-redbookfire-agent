@@ -90,6 +90,61 @@ class TestMountedApp:
         assert serving_client.get("/api/docs").status_code == 200
 
 
+class TestCompression:
+    """S5.7：文本资源走 gzip，已压缩类型与小文件不压缩。"""
+
+    @pytest.fixture
+    def asset_client(self, tmp_path: Path) -> Iterator[TestClient]:
+        dist = tmp_path / "dist"
+        (dist / "assets").mkdir(parents=True)
+        (dist / "index.html").write_text(INDEX, encoding="utf-8")
+        (dist / "assets" / "small.js").write_text(ASSET, encoding="utf-8")
+        (dist / "assets" / "big.js").write_text(
+            "console.log('" + "x" * 4000 + "')\n", encoding="utf-8")
+        (dist / "assets" / "frame.jpg").write_bytes(b"\xff\xd8\xff\xe0" + b"\x00" * 4000)
+        cfg = write_config(tmp_path, serve=True, dist_dir=str(dist))
+        with TestClient(create_app(cfg, check_startup=False),
+                        raise_server_exceptions=False) as client:
+            yield client
+
+    def test_text_asset_is_gzipped(self, asset_client: TestClient) -> None:
+        response = asset_client.get("/assets/big.js", headers={"Accept-Encoding": "gzip"})
+        assert response.status_code == 200
+        assert response.headers["content-encoding"] == "gzip"
+        assert response.headers["vary"].lower() == "accept-encoding"
+        assert response.text.startswith("console.log('")      # httpx 已解压
+        assert len(response.content) > 4000
+
+    def test_json_response_is_gzipped(self, asset_client: TestClient) -> None:
+        """API 的 JSON 同样要压缩（移动端首屏的另一半成本）。"""
+        response = asset_client.get("/api/openapi.json", headers={"Accept-Encoding": "gzip"})
+        assert response.status_code == 200
+        assert response.headers["content-encoding"] == "gzip"
+        # 注意：请求经过 BaseHTTPMiddleware（X-Request-ID），响应一律按流式重发，
+        # 所以压缩后不会带 Content-Length——gzip 头只在 body 真的变小时才会加。
+        assert response.headers["vary"].lower() == "accept-encoding"
+        assert response.json()["openapi"].startswith("3.")
+
+    def test_no_compression_without_accept_encoding(self, asset_client: TestClient) -> None:
+        response = asset_client.get("/assets/big.js", headers={"Accept-Encoding": "identity"})
+        assert response.status_code == 200
+        assert "content-encoding" not in response.headers
+
+    def test_binary_asset_is_not_compressed(self, asset_client: TestClient) -> None:
+        """图片已在排除清单里，不能被二次压缩（否则关键帧字节会变）。"""
+        jpeg = asset_client.get("/assets/frame.jpg", headers={"Accept-Encoding": "gzip"})
+        assert jpeg.status_code == 200
+        assert "content-encoding" not in jpeg.headers
+        assert jpeg.content.startswith(b"\xff\xd8\xff\xe0")
+
+    def test_small_static_file_is_still_served(self, asset_client: TestClient) -> None:
+        """注意：静态文件是流式响应，Starlette 的 `minimum_size` 对流式不生效——
+        小文件也会被压缩，但只要解压后内容一致就没问题（这里钉住这个行为）。"""
+        small = asset_client.get("/assets/small.js", headers={"Accept-Encoding": "gzip"})
+        assert small.status_code == 200
+        assert small.text == ASSET
+
+
 class TestServeDisabled:
     def test_only_api_is_served(self, tmp_path: Path) -> None:
         dist = make_dist(tmp_path)

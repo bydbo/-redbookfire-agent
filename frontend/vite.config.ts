@@ -25,5 +25,20 @@ export default defineConfig({
   },
   build: {
     outDir: 'dist',
+    rollupOptions: {
+      output: {
+        // 性能（S5.7）：把第三方库单独成块——改业务代码不再让整包缓存失效；
+        // ECharts 只被结果页用到，由路由懒加载自然分出去。
+        manualChunks(id: string) {
+          if (id.includes('node_modules/echarts') || id.includes('node_modules/zrender')) {
+            return 'echarts'
+          }
+          if (id.includes('node_modules')) {
+            return 'vendor'
+          }
+          return undefined
+        },
+      },
+    },
   },
 })
