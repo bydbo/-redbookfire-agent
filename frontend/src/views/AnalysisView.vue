@@ -75,13 +75,18 @@ async function onSubmit(): Promise<void> {
 <template>
   <main class="min-h-screen bg-slate-50 px-4 py-10">
     <div class="mx-auto flex w-full max-w-2xl flex-col gap-6">
-      <header>
-        <h1 class="text-2xl font-bold text-slate-800">
-          {{ appStore.title }}
-        </h1>
-        <p class="mt-1 text-sm text-slate-600">
-          输入一个或多个热点，在你的素材库里检索可蹭的素材并产出文案初稿（1–10 个热点，逐个分析）。
-        </p>
+      <header class="flex items-start justify-between gap-4">
+        <div>
+          <h1 class="text-2xl font-bold text-slate-800">
+            {{ appStore.title }}
+          </h1>
+          <p class="mt-1 text-sm text-slate-600">
+            输入一个或多个热点，在你的素材库里检索可蹭的素材并产出文案初稿（1–10 个热点，逐个分析）。
+          </p>
+        </div>
+        <n-button size="small" class="shrink-0" @click="router.push({ name: 'run-history' })">
+          运行历史
+        </n-button>
       </header>
 
       <n-card title="分析台">

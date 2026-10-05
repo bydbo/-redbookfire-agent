@@ -7,6 +7,8 @@ export type AnalyzeRequest = components['schemas']['AnalyzeRequest']
 export type AnalyzeAccepted = components['schemas']['AnalyzeAccepted']
 export type JobStatus = components['schemas']['JobStatus']
 export type RunDetail = components['schemas']['RunDetail']
+export type RunSummary = components['schemas']['RunSummary']
+export type RunList = components['schemas']['RunList']
 export type HotspotResult = components['schemas']['HotspotResult']
 export type MatchCandidate = components['schemas']['MatchCandidate']
 export type Element = components['schemas']['Element']
@@ -24,6 +26,15 @@ export function getJob(jobId: string): Promise<JobStatus> {
 /** 读取运行结果；运行未完成时后端返回 409（ApiRequestError.httpStatus = 409）。 */
 export function getRun(runId: string): Promise<RunDetail> {
   return apiFetch<RunDetail>(`/runs/${encodeURIComponent(runId)}`)
+}
+
+/** 历史运行列表（S5.6）：后端按 created_at 倒序分页，limit 1–100、offset ≥ 0。 */
+export function listRuns(params: { limit: number; offset: number }): Promise<RunList> {
+  const query = new URLSearchParams({
+    limit: String(params.limit),
+    offset: String(params.offset),
+  })
+  return apiFetch<RunList>(`/runs?${query.toString()}`)
 }
 
 /** 素材关键帧图片地址（S5.4 取帧接口），可直接用于 <img src>。 */

@@ -65,6 +65,26 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/runs": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * 列出历史运行
+         * @description 按创建时间倒序分页返回历史运行摘要（run_id、状态、热点数与首条热点预览、成本与耗时）。
+         */
+        get: operations["listRuns"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/runs/{run_id}": {
         parameters: {
             query?: never;
@@ -160,6 +180,25 @@ export interface components {
             /** @description 当前所处步骤（拆解 / 检索 / 缺口 / 撰稿 / 报告） */
             current_step?: string;
             error?: components["schemas"]["ErrorResponse"] | null;
+        };
+        RunSummary: {
+            /** Format: uuid */
+            run_id: string;
+            /** @enum {string} */
+            status: "queued" | "running" | "succeeded" | "failed";
+            /** Format: date-time */
+            created_at: string;
+            finished_at?: string | null;
+            hotspot_count: number;
+            /** @description 第一条热点的原文预览（超过 60 字截断加省略号） */
+            hotspot_preview: string;
+            topk: number;
+            totals: components["schemas"]["RunTotals"];
+            error?: string | null;
+        };
+        RunList: {
+            items: components["schemas"]["RunSummary"][];
+            total: number;
         };
         RunDetail: {
             /** Format: uuid */
@@ -446,6 +485,33 @@ export interface operations {
                 };
             };
             404: components["responses"]["NotFound"];
+            503: components["responses"]["DependencyUnavailable"];
+        };
+    };
+    listRuns: {
+        parameters: {
+            query?: {
+                limit?: number;
+                offset?: number;
+            };
+            header?: {
+                /** @description 客户端生成的请求标识；未提供时由服务端生成。用于贯穿日志、调用追踪与数据库记录。 */
+                "X-Request-ID"?: components["parameters"]["RequestId"];
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description 历史运行列表 */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RunList"];
+                };
+            };
             503: components["responses"]["DependencyUnavailable"];
         };
     };
