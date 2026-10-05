@@ -1,12 +1,15 @@
 import type { components } from '@/api/schema'
 
-import { apiFetch } from '@/api/client'
+import { apiFetch, apiUrl } from '@/api/client'
 
 /** 类型全部派生自 openapi-typescript 生成物（AGENTS.md：禁止手写并行类型定义）。 */
 export type AnalyzeRequest = components['schemas']['AnalyzeRequest']
 export type AnalyzeAccepted = components['schemas']['AnalyzeAccepted']
 export type JobStatus = components['schemas']['JobStatus']
 export type RunDetail = components['schemas']['RunDetail']
+export type HotspotResult = components['schemas']['HotspotResult']
+export type MatchCandidate = components['schemas']['MatchCandidate']
+export type Element = components['schemas']['Element']
 
 /** 提交热点分析任务；后端落库后立即返回 202，进度经 getJob 轮询。 */
 export function submitAnalysis(body: AnalyzeRequest): Promise<AnalyzeAccepted> {
@@ -21,4 +24,9 @@ export function getJob(jobId: string): Promise<JobStatus> {
 /** 读取运行结果；运行未完成时后端返回 409（ApiRequestError.httpStatus = 409）。 */
 export function getRun(runId: string): Promise<RunDetail> {
   return apiFetch<RunDetail>(`/runs/${encodeURIComponent(runId)}`)
+}
+
+/** 素材关键帧图片地址（S5.4 取帧接口），可直接用于 <img src>。 */
+export function getKeyframeUrl(materialId: string, index: number): string {
+  return apiUrl(`/materials/${encodeURIComponent(materialId)}/keyframes/${index}`)
 }
