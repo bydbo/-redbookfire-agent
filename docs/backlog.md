@@ -20,7 +20,7 @@
 | E2 数据与检索  | 持久化 + 语义召回，产出评测数字 | 20       | ✅ 已完成（S2.0–S2.10）             | M3  |
 | E3 编排与服务  | 服务化与异步，端到端可演示     | 20.5     | ✅ 已完成（S3.0–S3.10） | M4  |
 | E4 可观测与交付 | 可运维、可交付           | 8        | ✅ 已完成（S4.1–S4.6）  | M5  |
-| E5 前端工程   | 把演示页升级为可交互的单页应用   | 17       | 🔄 进行中（S5.1–S5.6） | M6  |
+| E5 前端工程   | 把演示页升级为可交互的单页应用   | 17       | 🔄 进行中（S5.1–S5.7） | M6  |
 | E6 新功能迭代 | 后续功能迭代的容器（首个主题：素材库页） | 11.5 | ⬜ 未开始 | M7 |
 | **合计**    |                   | **88** |                   |     |
 
@@ -125,9 +125,25 @@
 </details>
 | S5.5 | 数据可视化      | S5.4        | 覆盖度、得分分布、成本与耗时用 ECharts 呈现                                                   | 2   | ✅  |
 | S5.6 | 运行历史       | S5.2        | 列出历史运行，可回看结果并下载报告                                                            | 1.5 | ✅  |
-| S5.7 | 视觉打磨       | S5.5        | 三页共用同一套主题 token 与组件库；暗色主题下正文文本对比度 ≥ 4.5:1；375px 宽度无横向滚动；Lighthouse 性能分 ≥ 80  | 2   | ⬜  |
+| S5.7 | 视觉打磨       | S5.5        | 三页共用同一套主题 token 与组件库；暗色主题下正文文本对比度 ≥ 4.5:1；375px 宽度无横向滚动；Lighthouse 性能分 ≥ 80  | 2   | ✅  |
 | S5.8 | 前端测试       | S5.4        | Vitest 覆盖工具函数与关键组件；`pnpm build` 产物可被服务端挂载                                    | 1.5 | ⬜  |
 | S5.9 | 前端进 CI 与镜像 | S5.8, S4.4  | CI 增加前端 lint、测试与构建；多阶段镜像内含 dist                                              | 1.5 | ⬜  |
+
+<details>
+<summary>S5.7 实测记录（2026-10-05）</summary>
+
+- 风格依据（联网取的一等源）：小红书官网首页与其线上 CSS 包给出品牌红 `#ff2442`（另有 hover `#ff2e4d`）、近黑 `#19191e`、浅灰 `#f5f5f5`、品牌浅底写法 `rgba(255,36,66,.06)`、描边 `rgba(0,0,0,.08)`，以及其自带文本变量 `--color-primary-label:#333`。搜索引擎（Bing / DuckDuckGo）要么被反爬挡住要么查不到，直接抓官网反而拿到更硬的证据。
+- 对比度实测（WCAG 公式）：`#FF2442` 配白字只有 3.76:1（**不达 AA**），故品牌红拆两档——`--xhs-brand:#ff2442`（装饰 / 大面积 / 暗色底红字）与 `--xhs-brand-strong:#d81e3c`（载白字的按钮底，0.92 透明叠加后 4.62:1）。13 对「文字 × 底色」逐对核验：浅色正文 17.51:1、暗色正文 15.32:1（验收要求 ≥4.5），玻璃叠加等效色也在内。
+- 主题层（ADR 0013）：`theme/tokens.ts` 是唯一来源 → `assets/theme.css` 的 CSS 变量 → Tailwind 语义色（`surface` / `ink` / `line` / `brand`…）；Naive themeOverrides 由同一份 token 生成并写死字面值（Naive 内部用 JS 派生 hover/pressed，读不懂 `var()`）。毛玻璃是 ADR 0008 的**唯一例外**：只对 `.n-button` / `.n-card` / 顶栏新增 `backdrop-filter` 与半透明底，不改组件结构；页面加品牌红 + 青绿双层柔光底，模糊才有东西可模糊。暗色只切变量，三页 0 处 `dark:` 变体；默认跟随系统，手动切换写 `localStorage['xhs-theme']`，`index.html` 内联脚本首帧定主题防白闪。
+- 统一外壳：App.vue 变成壳层（`n-config-provider` + 毛玻璃顶栏：品牌 / 分析台 / 运行历史 / 暗色开关），三页不再各自造外壳；分析台的「运行历史」入口与历史页的「返回分析台」由导航取代。图表跟随主题（`charts/options.ts` 新增 `palette` 参数，默认浅色保持向后兼容）。
+- 性能（移动端 Lighthouse 58 → **97**）：瓶颈是单包 1,024 kB 且**完全未压缩**（首屏闲置 661 KiB）。两手都上——① 路由级懒加载（结果页 / 历史页 `() => import(...)`，ECharts 随结果页走）+ `manualChunks` 拆 vendor / echarts：首屏变成 index 14.9 kB + vendor 527.6 kB（gzip 158.6 kB），ECharts 527.8 kB（gzip 179.1 kB）延迟加载；② `api/main.py` 挂 `GZipMiddleware(minimum_size=1024)`（托管 dist 的就是它；图片类在 Starlette 排除清单里，不会被二次压缩）。实测连跑 3 次 **97 / 97 / 97**，FCP 1.8 s、LCP 1.9 s、TBT 130 ms、CLS 0、总传输 166 KiB。
+- 冒烟（Playwright + 本机 Edge headless，截图落 `runs/_smoke_s57/`，22 条断言全过）：按钮 / 卡片 / 顶栏 `backdrop-filter` 生效；浅色 17.51 / 5.28、暗色 15.32 / 7.17；切暗色后刷新仍是暗色；结果页三张图的轴色全部换成暗色调色板；375px × 明暗 × 三页均无横向滚动；控制台零 error。
+- 无障碍：Lighthouse accessibility 88，其中 `color-contrast` **满分**；剩余扣分是 Naive 组件内部标记（`n-card-header` 的 `role="heading"` 缺 `aria-level`、`NDynamicInput` / `NInputNumber` 图标按钮无可访问名），记在 ADR 0013 的「已知不做」，不去 hack 组件内部。
+- 回归：ruff 零告警、mypy 44 文件零错误、单测 753 passed（新增 5 条压缩用例）、check_openapi 零差异（**契约未动**）、前端 type-check / build / check:api 全过。
+- 人日口径：本 Story 估算 2 人日，实际约 3.5（多出来的是主题层、暗色、分包与 gzip）。S6.5 依赖本 Story 的 token 定稿，语义变量名按角色命名，新增第四页只加语义类、不改名。
+- 环境备注：Lighthouse 用 `npx --yes lighthouse`（本机 Chrome，临时下载，不进仓库）；压缩只在 HTTP 层，`frontend/dist` 不需要预压缩产物。
+
+</details>
 
 <details>
 <summary>S5.6 实测记录（2026-10-05）</summary>
