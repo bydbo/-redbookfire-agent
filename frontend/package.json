@@ -13,6 +13,8 @@
     "type-check": "vue-tsc --noEmit -p tsconfig.json && vue-tsc --noEmit -p tsconfig.node.json && vue-tsc --noEmit -p tsconfig.vitest.json",
     "gen:api": "openapi-typescript ../docs/contracts/openapi.yaml -o src/api/schema.d.ts",
     "check:api": "pnpm run gen:api && git diff --exit-code -- src/api/schema.d.ts",
+    "lint": "eslint .",
+    "lint:fix": "eslint . --fix",
     "test": "vitest run",
     "test:watch": "vitest",
     "test:cov": "vitest run --coverage",
