@@ -1,6 +1,7 @@
 import type { EChartsCoreOption } from 'echarts/core'
 
 import type { components } from '@/api/schema'
+import { CHART_LIGHT, type ChartPalette } from '@/theme/tokens'
 
 /**
  * 结果页三张图的 ECharts option 构建器。
@@ -23,16 +24,7 @@ const COST_SERIES = '成本（元）'
 const LATENCY_SERIES = '耗时（秒）'
 
 /** 配色对齐页面既有的 Tailwind 口径（slate / blue / violet / amber / red）。 */
-const COLOR = {
-  primary: '#2563eb',
-  accent: '#7c3aed',
-  high: '#dc2626',
-  muted: '#94a3b8',
-  target: '#f59e0b',
-  targetLabel: '#d97706',
-  axis: '#475569',
-  splitLine: '#e2e8f0',
-} as const
+// 颜色全部来自主题调色板（浅/深两套，见 src/theme/tokens.ts），图表跟随暗色切换
 
 /** tooltip 回调的最小参数形状：显式声明，避免 strict 下的隐式 any。 */
 interface TooltipItem {
@@ -57,7 +49,7 @@ function round4(value: number): number {
  * 覆盖度：按热点横向对比要素覆盖率，附 60% 目标线。
  * 数据源 `HotspotResult.coverage.ratio`；tooltip 补充已覆盖 / 缺口要素数。
  */
-export function buildCoverageOption(run: RunDetail): EChartsCoreOption {
+export function buildCoverageOption(run: RunDetail, palette: ChartPalette = CHART_LIGHT): EChartsCoreOption {
   const labels = run.hotspots.map((_, index) => `热点 ${index + 1}`)
   const ratios = run.hotspots.map((hotspot) => round1(hotspot.coverage.ratio * 100))
   const covered = run.hotspots.map((hotspot) => hotspot.coverage.covered.length)
@@ -78,14 +70,14 @@ export function buildCoverageOption(run: RunDetail): EChartsCoreOption {
       type: 'category',
       data: labels,
       axisTick: { alignWithLabel: true },
-      axisLabel: { color: COLOR.axis },
+      axisLabel: { color: palette.axis },
     },
     yAxis: {
       type: 'value',
       min: 0,
       max: 100,
-      axisLabel: { formatter: '{value}%', color: COLOR.axis },
-      splitLine: { lineStyle: { color: COLOR.splitLine } },
+      axisLabel: { formatter: '{value}%', color: palette.axis },
+      splitLine: { lineStyle: { color: palette.splitLine } },
     },
     series: [
       {
@@ -93,16 +85,16 @@ export function buildCoverageOption(run: RunDetail): EChartsCoreOption {
         type: 'bar',
         data: ratios,
         barMaxWidth: 48,
-        itemStyle: { color: COLOR.primary, borderRadius: [4, 4, 0, 0] },
-        label: { show: true, position: 'top', formatter: '{c}%', color: '#334155' },
+        itemStyle: { color: palette.bar, borderRadius: [4, 4, 0, 0] },
+        label: { show: true, position: 'top', formatter: '{c}%', color: palette.label },
         markLine: {
           silent: true,
           symbol: 'none',
-          lineStyle: { color: COLOR.target, type: 'dashed', width: 1 },
+          lineStyle: { color: palette.target, type: 'dashed', width: 1 },
           label: {
             formatter: `目标 ${Math.round(COVERAGE_TARGET * 100)}%`,
             position: 'insideEndTop',
-            color: COLOR.targetLabel,
+            color: palette.targetLabel,
             fontSize: 11,
           },
           data: [{ yAxis: COVERAGE_TARGET * 100 }],
@@ -116,7 +108,7 @@ export function buildCoverageOption(run: RunDetail): EChartsCoreOption {
  * 候选素材得分分布：把本次运行全部候选的 score 归入 0–20 / 20–40 / 40–60 / 60–80 / 80–100 五档；
  * ≥ 60% 的档位用高亮色，对齐页面对候选 `score ≥ 0.6` 的既有口径。
  */
-export function buildScoreDistributionOption(run: RunDetail): EChartsCoreOption {
+export function buildScoreDistributionOption(run: RunDetail, palette: ChartPalette = CHART_LIGHT): EChartsCoreOption {
   const labels = ['0–20%', '20–40%', '40–60%', '60–80%', '80–100%']
   const counts = [0, 0, 0, 0, 0]
 
@@ -130,7 +122,7 @@ export function buildScoreDistributionOption(run: RunDetail): EChartsCoreOption 
   const data = counts.map((count, index) => ({
     value: count,
     itemStyle: {
-      color: index >= 3 ? COLOR.high : COLOR.muted,
+      color: index >= 3 ? palette.high : palette.muted,
       borderRadius: [4, 4, 0, 0],
     },
   }))
@@ -150,13 +142,13 @@ export function buildScoreDistributionOption(run: RunDetail): EChartsCoreOption 
       type: 'category',
       data: labels,
       axisTick: { alignWithLabel: true },
-      axisLabel: { color: COLOR.axis },
+      axisLabel: { color: palette.axis },
     },
     yAxis: {
       type: 'value',
       minInterval: 1,
-      axisLabel: { color: COLOR.axis },
-      splitLine: { lineStyle: { color: COLOR.splitLine } },
+      axisLabel: { color: palette.axis },
+      splitLine: { lineStyle: { color: palette.splitLine } },
     },
     series: [
       {
@@ -164,7 +156,7 @@ export function buildScoreDistributionOption(run: RunDetail): EChartsCoreOption 
         type: 'bar',
         data,
         barMaxWidth: 48,
-        label: { show: true, position: 'top', formatter: '{c}', color: '#334155' },
+        label: { show: true, position: 'top', formatter: '{c}', color: palette.label },
       },
     ],
   }
@@ -174,7 +166,7 @@ export function buildScoreDistributionOption(run: RunDetail): EChartsCoreOption 
  * 成本与耗时：契约只有 run 级 totals（没有逐热点分解），因此按 run 总量呈现，
  * 叠加按热点数换算的预算线——单热点成本 0.15 元（ADR 0012）、单热点耗时 60 秒（产品方案 §10.1）。
  */
-export function buildCostLatencyOption(run: RunDetail): EChartsCoreOption {
+export function buildCostLatencyOption(run: RunDetail, palette: ChartPalette = CHART_LIGHT): EChartsCoreOption {
   const hotspotCount = Math.max(run.hotspots.length, 1)
   const costActual = round4(run.totals.cost_cny)
   const costBudget = round4(COST_BUDGET_PER_HOTSPOT_CNY * hotspotCount)
@@ -205,7 +197,7 @@ export function buildCostLatencyOption(run: RunDetail): EChartsCoreOption {
       type: 'category',
       data: [COST_SERIES, LATENCY_SERIES],
       axisTick: { alignWithLabel: true },
-      axisLabel: { color: COLOR.axis },
+      axisLabel: { color: palette.axis },
     },
     yAxis: [
       {
@@ -214,15 +206,15 @@ export function buildCostLatencyOption(run: RunDetail): EChartsCoreOption {
         min: 0,
         // ECharts 的轴范围不含 markLine 值：显式把预算线包进来，否则预算线会被顶到轴顶、与耗时线重叠
         max: (value: { max: number }) => Math.max(value.max, costBudget) * 1.15,
-        axisLabel: { color: COLOR.axis },
-        splitLine: { lineStyle: { color: COLOR.splitLine } },
+        axisLabel: { color: palette.axis },
+        splitLine: { lineStyle: { color: palette.splitLine } },
       },
       {
         type: 'value',
         name: '秒',
         min: 0,
         max: (value: { max: number }) => Math.max(value.max, latencyBudget) * 1.15,
-        axisLabel: { color: COLOR.axis },
+        axisLabel: { color: palette.axis },
         splitLine: { show: false },
       },
     ],
@@ -233,16 +225,16 @@ export function buildCostLatencyOption(run: RunDetail): EChartsCoreOption {
         yAxisIndex: 0,
         data: [costActual, null],
         barMaxWidth: 64,
-        itemStyle: { color: COLOR.primary, borderRadius: [4, 4, 0, 0] },
-        label: { show: true, position: 'top', formatter: `¥${costActual.toFixed(4)}`, color: '#334155' },
+        itemStyle: { color: palette.bar, borderRadius: [4, 4, 0, 0] },
+        label: { show: true, position: 'top', formatter: `¥${costActual.toFixed(4)}`, color: palette.label },
         markLine: {
           silent: true,
           symbol: 'none',
-          lineStyle: { color: COLOR.target, type: 'dashed', width: 1 },
+          lineStyle: { color: palette.target, type: 'dashed', width: 1 },
           label: {
             formatter: `预算 ¥${costBudget.toFixed(4)}`,
             position: 'insideStartTop',
-            color: COLOR.targetLabel,
+            color: palette.targetLabel,
             fontSize: 11,
           },
           data: [{ yAxis: costBudget }],
@@ -254,16 +246,16 @@ export function buildCostLatencyOption(run: RunDetail): EChartsCoreOption {
         yAxisIndex: 1,
         data: [null, latencyActual],
         barMaxWidth: 64,
-        itemStyle: { color: COLOR.accent, borderRadius: [4, 4, 0, 0] },
-        label: { show: true, position: 'top', formatter: `${latencyActual.toFixed(1)}s`, color: '#334155' },
+        itemStyle: { color: palette.barAlt, borderRadius: [4, 4, 0, 0] },
+        label: { show: true, position: 'top', formatter: `${latencyActual.toFixed(1)}s`, color: palette.label },
         markLine: {
           silent: true,
           symbol: 'none',
-          lineStyle: { color: COLOR.target, type: 'dashed', width: 1 },
+          lineStyle: { color: palette.target, type: 'dashed', width: 1 },
           label: {
             formatter: `预算 ${latencyBudget.toFixed(1)}s`,
             position: 'insideEndTop',
-            color: COLOR.targetLabel,
+            color: palette.targetLabel,
             fontSize: 11,
           },
           data: [{ yAxis: latencyBudget }],

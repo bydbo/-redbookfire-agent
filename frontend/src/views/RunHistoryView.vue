@@ -75,23 +75,20 @@ function openRun(runId: string): void {
 </script>
 
 <template>
-  <main class="min-h-screen bg-slate-50 px-4 py-10">
+  <main class="px-4 py-8">
     <div class="mx-auto flex w-full max-w-4xl flex-col gap-6">
       <header class="flex items-start justify-between gap-4">
         <div>
-          <h1 class="text-2xl font-bold text-slate-800">
+          <h1 class="text-2xl font-bold text-ink-strong">
             运行历史
           </h1>
-          <p class="mt-1 text-sm text-slate-600">
+          <p class="mt-1 text-sm text-ink">
             按创建时间倒序，共 {{ total }} 条；可回看结果或下载报告。
           </p>
         </div>
         <div class="flex shrink-0 items-center gap-2">
           <n-button size="small" :loading="loading" @click="load">
             刷新
-          </n-button>
-          <n-button size="small" @click="router.push({ name: 'analysis' })">
-            返回分析台
           </n-button>
         </div>
       </header>
@@ -102,7 +99,7 @@ function openRun(runId: string): void {
         <n-spin :show="loading">
           <n-empty v-if="!loading && rows.length === 0" description="还没有运行记录" />
 
-          <div v-else class="flex flex-col divide-y divide-slate-100">
+          <div v-else class="flex flex-col divide-y divide-line">
             <div
               v-for="row in rows"
               :key="row.run_id"
@@ -112,14 +109,14 @@ function openRun(runId: string): void {
                 <n-tag :type="statusMeta(row.status).type" size="small">
                   {{ statusMeta(row.status).label }}
                 </n-tag>
-                <span class="text-xs text-slate-400" :title="row.run_id">#{{ shortId(row.run_id) }}</span>
+                <span class="text-xs text-ink-muted" :title="row.run_id">#{{ shortId(row.run_id) }}</span>
               </div>
 
               <div class="min-w-0 flex-1">
-                <div class="truncate text-sm text-slate-800" :title="row.hotspot_preview">
+                <div class="truncate text-sm text-ink-strong" :title="row.hotspot_preview">
                   {{ row.hotspot_preview || '（无热点）' }}
                 </div>
-                <div class="mt-1 flex flex-wrap gap-x-3 gap-y-1 text-xs text-slate-500">
+                <div class="mt-1 flex flex-wrap gap-x-3 gap-y-1 text-xs text-ink-muted">
                   <span>{{ new Date(row.created_at).toLocaleString() }}</span>
                   <span>{{ row.hotspot_count }} 个热点</span>
                   <span>topk {{ row.topk }}</span>
@@ -127,7 +124,7 @@ function openRun(runId: string): void {
                   <span>耗时 {{ (row.totals.latency_ms / 1000).toFixed(1) }}s</span>
                   <span>{{ row.totals.llm_calls }} 次调用</span>
                 </div>
-                <p v-if="row.error" class="mt-1 truncate text-xs text-red-600" :title="row.error">
+                <p v-if="row.error" class="mt-1 truncate text-xs text-brand-strong" :title="row.error">
                   {{ row.error }}
                 </p>
               </div>

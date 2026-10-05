@@ -73,26 +73,22 @@ async function onSubmit(): Promise<void> {
 </script>
 
 <template>
-  <main class="min-h-screen bg-slate-50 px-4 py-10">
+  <main class="px-4 py-8">
     <div class="mx-auto flex w-full max-w-2xl flex-col gap-6">
-      <header class="flex items-start justify-between gap-4">
-        <div>
-          <h1 class="text-2xl font-bold text-slate-800">
-            {{ appStore.title }}
-          </h1>
-          <p class="mt-1 text-sm text-slate-600">
-            输入一个或多个热点，在你的素材库里检索可蹭的素材并产出文案初稿（1–10 个热点，逐个分析）。
-          </p>
-        </div>
-        <n-button size="small" class="shrink-0" @click="router.push({ name: 'run-history' })">
-          运行历史
-        </n-button>
+      <!-- 页面入口统一由顶栏导航提供（S5.7），此页不再放重复按钮 -->
+      <header>
+        <h1 class="text-2xl font-bold text-ink-strong">
+          {{ appStore.title }}
+        </h1>
+        <p class="mt-1 text-sm text-ink">
+          输入一个或多个热点，在你的素材库里检索可蹭的素材并产出文案初稿（1–10 个热点，逐个分析）。
+        </p>
       </header>
 
       <n-card title="分析台">
         <div class="flex flex-col gap-4">
           <div>
-            <div class="mb-2 text-sm font-medium text-slate-700">
+            <div class="mb-2 text-sm font-medium text-ink-strong">
               热点文本
             </div>
             <n-dynamic-input
@@ -114,7 +110,7 @@ async function onSubmit(): Promise<void> {
           </div>
 
           <div class="flex items-center gap-3">
-            <span class="text-sm font-medium text-slate-700">每热点候选数 topk</span>
+            <span class="text-sm font-medium text-ink-strong">每热点候选数 topk</span>
             <n-input-number v-model:value="analysisStore.topk" :min="1" :max="20" class="w-28" />
           </div>
 
@@ -141,25 +137,25 @@ async function onSubmit(): Promise<void> {
             <pre v-if="analysisStore.failure.detail" class="whitespace-pre-wrap text-xs">{{ analysisStore.failure.detail }}</pre>
           </n-alert>
 
-          <div v-if="phase === 'polling' || phase === 'succeeded'" class="flex flex-col gap-2 rounded-lg border border-slate-200 bg-white p-4">
+          <div v-if="phase === 'polling' || phase === 'succeeded'" class="flex flex-col gap-2 rounded-lg border border-line bg-surface p-4">
             <div class="flex items-center justify-between">
               <div class="flex items-center gap-2">
                 <n-tag v-if="statusMeta" :type="statusMeta.type" size="small">
                   {{ statusMeta.label }}
                 </n-tag>
-                <span v-if="job?.current_step" class="text-sm text-slate-600">
+                <span v-if="job?.current_step" class="text-sm text-ink">
                   当前步骤：{{ job.current_step }}
                 </span>
               </div>
-              <span class="text-xs text-slate-500">已用 {{ elapsedSec }} 秒</span>
+              <span class="text-xs text-ink-muted">已用 {{ elapsedSec }} 秒</span>
             </div>
             <n-progress type="line" :percentage="progressPercent" :height="10" />
-            <p class="text-xs text-slate-500">
-              job_id：<code class="rounded bg-slate-100 px-1">{{ job?.job_id }}</code>
+            <p class="text-xs text-ink-muted">
+              job_id：<code class="rounded bg-surface-muted px-1">{{ job?.job_id }}</code>
             </p>
             <n-alert v-if="queuedTooLong" type="warning" title="任务仍在排队">
               已排队超过 30 秒。请确认 Celery worker 已启动：
-              <code class="rounded bg-slate-100 px-1">uv run celery -A xhs_agent.tasks.worker:app worker --loglevel=info</code>
+              <code class="rounded bg-surface-muted px-1">uv run celery -A xhs_agent.tasks.worker:app worker --loglevel=info</code>
             </n-alert>
           </div>
         </div>
