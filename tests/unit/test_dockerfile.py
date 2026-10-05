@@ -16,9 +16,10 @@ DOCKERIGNORE = PROJECT_ROOT / ".dockerignore"
 class TestDockerfile:
     def test_is_multi_stage_with_pinned_bases(self):
         text = DOCKERFILE.read_text(encoding="utf-8")
-        assert text.count("\nFROM ") == 3                  # uv / builder / runtime
+        assert text.count("\nFROM ") == 4           # uv / builder / frontend / runtime（S5.9）
         assert "FROM python:3.12-slim AS builder" in text
         assert "FROM python:3.12-slim AS runtime" in text
+        assert "FROM node:25.3.0-slim AS frontend" in text   # 前端构建阶段也钉版本
         assert "ghcr.io/astral-sh/uv:0.12.7" in text       # uv 也要钉版本
         assert ":latest" not in text
 
@@ -42,6 +43,16 @@ class TestDockerfile:
         assert "\nUSER appuser" in text
         assert "COPY --from=builder --chown=appuser:appuser /app /app" in text
 
+    def test_frontend_stage_builds_dist_and_runtime_copies_it(self):
+        """S5.9：node 阶段产出 dist，runtime 把 dist 拷进去，容器才托管单页应用。"""
+        text = DOCKERFILE.read_text(encoding="utf-8")
+        # Node 25 没有可用的 corepack，pnpm 必须显式装并钉版本
+        assert "npm install -g pnpm@11.25.0" in text
+        assert "pnpm install --frozen-lockfile" in text
+        assert "RUN pnpm run build" in text
+        assert ("COPY --from=frontend --chown=appuser:appuser /app/frontend/dist "
+                "/app/frontend/dist" in text)
+
     def test_default_command_starts_the_api(self):
         text = DOCKERFILE.read_text(encoding="utf-8")
         assert ('CMD ["python", "-m", "xhs_agent.serve", "--host", "0.0.0.0", "--port", "8000"]'
@@ -58,3 +69,10 @@ class TestDockerignore:
     def test_keeps_env_example_template(self):
         text = DOCKERIGNORE.read_text(encoding="utf-8")
         assert "!config/.env.example" in text
+
+    def test_frontend_source_is_allowed_but_build_artifacts_are_not(self):
+        """S5.9：前端源码要进构建上下文（node 阶段用），依赖与产物不进。"""
+        text = DOCKERIGNORE.read_text(encoding="utf-8")
+        assert "\nfrontend/\n" not in f"\n{text}"        # 不再整块挡掉 frontend/
+        for pattern in ("frontend/node_modules/", "frontend/dist/", "frontend/coverage/"):
+            assert f"\n{pattern}\n" in f"\n{text}", pattern

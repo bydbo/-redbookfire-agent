@@ -73,7 +73,7 @@ jobs:
       - run: docker build -t xhs-agent:ci .
 
   frontend:
-    name: frontend（契约类型生成 + 防漂移校验，S5.2）
+    name: frontend（lint + 单测 + 契约防漂移 + 构建，S5.2 / S5.8 / S5.9）
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7.0.1
@@ -90,6 +90,14 @@ jobs:
       # --frozen-lockfile 对齐 Python 侧的 UV_FROZEN=1：锁文件是事实，不现场解析
       - run: pnpm install --frozen-lockfile
         working-directory: frontend
+      # 前端 lint（ESLint 9 flat config，只做正确性检查）与单测（Vitest + jsdom）
+      - run: pnpm run lint
+        working-directory: frontend
+      - run: pnpm run test:cov
+        working-directory: frontend
       # 重新生成 schema.d.ts 并比对入库副本：openapi.yaml 改了而类型没重新生成提交 → 红
       - run: pnpm run check:api
+        working-directory: frontend
+      # 生产构建（type-check + vite build）：同一条命令也被镜像构建阶段复用
+      - run: pnpm run build
         working-directory: frontend

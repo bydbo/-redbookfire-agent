@@ -28,6 +28,18 @@ COPY config ./config
 COPY scripts ./scripts
 RUN uv sync --frozen --no-dev
 
+# 前端构建阶段（S5.9）：node 阶段只产出 frontend/dist，runtime 再把 dist 拷进去。
+# 注意：Node 25 已不带可用的 corepack（本机实测直接报错），所以 pnpm 显式装并钉版本。
+FROM node:25.3.0-slim AS frontend
+WORKDIR /app/frontend
+RUN npm install -g pnpm@11.25.0
+# 先只拷依赖清单：依赖没变时这一层可复用（改业务代码不会重装依赖）
+COPY frontend/package.json frontend/pnpm-lock.yaml frontend/pnpm-workspace.yaml frontend/.node-version ./
+RUN pnpm install --frozen-lockfile
+# 再拷源码构建（build = type-check + vite build，产物落 /app/frontend/dist）
+COPY frontend/ ./
+RUN pnpm run build
+
 FROM python:3.12-slim AS runtime
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
@@ -38,6 +50,9 @@ WORKDIR /app
 RUN groupadd --gid 1000 appuser \
     && useradd --uid 1000 --gid 1000 --create-home appuser
 COPY --from=builder --chown=appuser:appuser /app /app
+# 前端产物进镜像：PROJECT_ROOT=/app 与契约默认 dist_dir="frontend/dist" 正好对上，
+# 容器按默认 serve=true 即可托管单页应用（S5.9）
+COPY --from=frontend --chown=appuser:appuser /app/frontend/dist /app/frontend/dist
 USER appuser
 
 EXPOSE 8000

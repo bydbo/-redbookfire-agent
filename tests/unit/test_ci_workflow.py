@@ -1,4 +1,4 @@
-"""CI workflow 的静态校验（S4.5；S5.2 起含 frontend job）。
+"""CI workflow 的静态校验（S4.5；S5.2 起含 frontend job，S5.9 起含前端 lint / 测试 / 构建）。
 
 真实验收是"推送 main 后 GitHub Actions 的 Python 三关、镜像 job 与前端契约校验 job 全绿"
 （见 `docs/backlog.md` 的 S4.5 / S5.2）；这里守住几条改 workflow 时最容易悄悄坏掉的回归：
@@ -129,7 +129,10 @@ class TestJobs:
         assert node_inputs["cache-dependency-path"] == f"{FRONTEND_DIR}/pnpm-lock.yaml"
         commands = job_commands(job)
         assert "pnpm install --frozen-lockfile" in commands
-        assert "pnpm run check:api" in commands
+        # S5.8 / S5.9：前端这关要真的跑 lint、单测与生产构建，不只是类型防漂移
+        for command in ("pnpm run lint", "pnpm run test:cov", "pnpm run check:api",
+                        "pnpm run build"):
+            assert command in commands, command
         run_steps = [step for step in job["steps"] if "run" in step]
         assert all(step.get("working-directory") == FRONTEND_DIR for step in run_steps)
 

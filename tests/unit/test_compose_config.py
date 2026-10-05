@@ -92,7 +92,10 @@ class TestAppServices:
         text = COMPOSE.read_text(encoding="utf-8")
         assert "postgresql+asyncpg://xhs:${POSTGRES_PASSWORD:-xhs}@postgres:5432/xhs" in text
         assert "REDIS_URL: redis://redis:6379/0" in text
-        assert 'XHS_FRONTEND_SERVE: "false"' in text      # 前端 dist 归 E5 / S5.9
+        # S5.9：dist 已进镜像，容器不再覆盖该项，按契约默认 serve=true 托管单页应用
+        # （注释里提到变量名无妨，这里只要求别再把它写进 environment）
+        assert not any(line.strip().startswith("XHS_FRONTEND_SERVE:")
+                       for line in text.splitlines())
         assert "XHS_LOG_FORMAT: json" in text
 
     def test_env_file_is_optional_and_points_at_config_env(self):

@@ -18,8 +18,8 @@ x-app: &app
     # 容器内走 compose 网络：覆盖 config/.env 里为宿主机写的 localhost 地址
     DATABASE_URL: postgresql+asyncpg://xhs:${POSTGRES_PASSWORD:-xhs}@postgres:5432/xhs
     REDIS_URL: redis://redis:6379/0
-    # 前端 dist 归 E5 / S5.9；在那之前只跑 API（serve=true 且缺 dist 会被前置检查拒绝启动）
-    XHS_FRONTEND_SERVE: "false"
+    # 前端 dist 已进镜像（S5.9），容器默认按契约 serve=true 托管单页应用；
+    # 只想跑 API 时用 XHS_FRONTEND_SERVE=false 覆盖即可
     XHS_LOG_FORMAT: json
     TZ: Asia/Shanghai
   volumes:

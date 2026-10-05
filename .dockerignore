@@ -35,10 +35,14 @@ data/
 runs/
 evals/
 
-# 前端与文档（前端 dist 归 E5 / S5.9）
-frontend/
+# 文档与测试
 docs/
 tests/
+
+# 前端源码要进上下文（S5.9 的 node 构建阶段要用），但依赖、产物与覆盖率报告不进
+frontend/node_modules/
+frontend/dist/
+frontend/coverage/
 
 # 容器与编排文件本身
 Dockerfile
