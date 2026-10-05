@@ -70,6 +70,8 @@
 | 数据可视化（S5.5：结果详情页新增「数据可视化」卡片——要素覆盖度含 60% 目标线 / 候选得分分布五档 / 成本与耗时含按热点预算线，数据全部来自 RunDetail，无新增接口） | ✅ 已完成（S5.5） |
 | 运行历史（S5.6：契约新增 `GET /api/runs`（RunSummary / RunList，limit 1–100 + offset 分页）；前端 `/runs` 页倒序列表 / 回看结果 / 下载 HTML·MD 报告，分析台加入口） | ✅ 已完成（S5.6） |
 | 视觉打磨（S5.7：小红书风格主题 token（品牌红取自官网 `#ff2442`，加深版供白字按钮达标）+ 明/暗双主题 + 按钮·顶栏·卡片毛玻璃 + 统一顶栏导航；路由分包 + 响应 gzip，移动端 Lighthouse 58→97、总传输 166 KiB） | ✅ 已完成（S5.7） |
+| 前端测试（S5.8：Vitest + jsdom 48 条覆盖工具函数 / store / 关键组件；覆盖率只报告不设门槛；`pnpm build` 产物经 FastAPI 托管实测 14 条断言全过） | ✅ 已完成（S5.8） |
+| 前端进 CI 与镜像（S5.9：CI 的 frontend job 加 lint + 测试 + 构建；镜像多一个 node 构建阶段，dist 进 runtime，容器默认 `serve=true` 托管单页应用，镜像 413MB） | ✅ 已完成（S5.9） |
 
 业务链路**已端到端跑通**：`docker compose up -d --wait` 起依赖 → `uv run celery -A xhs_agent.tasks.worker:app worker` 起 worker → `uv run python -m xhs_agent.serve` 起接口（先跑 7 步启动前置检查）→ `POST /api/analyze` 投递 → worker 自动消费（索引新鲜度 → 五节点分析 → 逐热点写回）→ `/api/jobs/{job_id}` 轮询 → `/api/runs/{run_id}` 取结构化结果、`/report` 取报告。另可运行 `uv run python -m xhs_agent.probe`、`uv run python scripts/index_materials.py`、`uv run python scripts/backfill_embeddings.py`、`uv run python scripts/eval_retrieval.py`、`uv run python scripts/smoke_skeleton.py`。路线图见文末。
 
@@ -151,8 +153,8 @@ docker compose logs -f api      # JSON 结构化日志（XHS_LOG_FORMAT=json）
 docker compose down             # 停全栈（保留 pgdata / redisdata 卷）
 # 迁移由一次性 migrate 服务自动跑；需要手动补跑时：docker compose run --rm migrate
 
-# 容器口径：DATABASE_URL / REDIS_URL 指向 compose 服务名；api 以 XHS_FRONTEND_SERVE=false 启动
-# （dist 进镜像归 S5.9，在那之前容器里只跑 API；本地已可用 frontend/pnpm build 产出 dist），
+# 容器口径：DATABASE_URL / REDIS_URL 指向 compose 服务名；前端 dist 已在镜像里（S5.9），
+# api 按契约默认 serve=true 一并托管单页应用（只想跑 API 时用 XHS_FRONTEND_SERVE=false 覆盖），
 # 镜像以非 root（uid 1000）运行，
 # ./data/materials 与 ./runs 是 bind mount——Linux 宿主上若 uid 不同，需要先 chown。
 
@@ -258,13 +260,16 @@ pnpm run type-check   # vue-tsc 零错误才算过
 pnpm build            # 类型检查 + 构建，产物落 frontend/dist（由 FastAPI 挂载，ADR 0009）
 pnpm run gen:api      # 契约变了才跑：从 ../docs/contracts/openapi.yaml 重新生成 src/api/schema.d.ts
 pnpm run check:api    # 防漂移自检：重新生成 + git diff，有差异即非零（CI 的 frontend job 跑这条）
+pnpm run lint         # ESLint 9（只做正确性规则，不查格式）
+pnpm test             # Vitest 单测（48 条，jsdom，含主题对比度与图表 option）
+pnpm run test:cov     # 单测 + 覆盖率报告（只报告不设门槛）
 ```
 
 `pnpm dev` 与 `uv run python -m xhs_agent.serve --port 8000`（或 `XHS_FRONTEND_SERVE=false` 的等价入口）同时运行，即可在 http://localhost:5173 全栈调试：页面走 Vite，接口经代理进本地 API。
 
 > **`[frontend]` 段怎么起作用**：`serve = true`（默认）且 `frontend/dist` 存在且非空时，FastAPI 会把 dist 挂在根路径，并把 `/api` 之外的未命中路径（无扩展名的）回落成 `index.html`——前端 history 路由刷新不会 404；带扩展名的未命中仍返回 404，API 的 404 也照旧是 `not_found` 的 JSON。
 >
-> **还没有前端产物时**：`serve = true` + 缺 dist 属于配置错误，启动前置检查会**拒绝启动**（退出码 2）。本地纯后端开发用环境变量覆盖即可只跑 API：`XHS_FRONTEND_SERVE=false`（等价于把 `[frontend].serve` 设为 `false`）——`scripts/smoke_skeleton.py` 已经默认这么做了。前端工程已落地（S5.1），本地 `cd frontend && pnpm build` 即可产出 dist。
+> **还没有前端产物时**：`serve = true` + 缺 dist 属于配置错误，启动前置检查会**拒绝启动**（退出码 2）。本地纯后端开发用环境变量覆盖即可只跑 API：`XHS_FRONTEND_SERVE=false`（等价于把 `[frontend].serve` 设为 `false`）——`scripts/smoke_skeleton.py` 已经默认这么做了。前端工程已落地（S5.1–S5.9），本地 `cd frontend && pnpm build` 产 dist；**镜像里也已内含 dist**，`docker compose up -d --wait` 后 http://127.0.0.1:8000/ 直接就是单页应用。
 
 网络受限时：`uv sync --no-dev` 只装运行时环境（pydantic / pydantic-settings / python-dotenv / SQLAlchemy async + asyncpg / pgvector / alembic）；不过 `import xhs_agent` 仍然需要安装或设置 `PYTHONPATH=src`（src 布局）。
 

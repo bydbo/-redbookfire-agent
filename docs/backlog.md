@@ -20,7 +20,7 @@
 | E2 数据与检索  | 持久化 + 语义召回，产出评测数字 | 20       | ✅ 已完成（S2.0–S2.10）             | M3  |
 | E3 编排与服务  | 服务化与异步，端到端可演示     | 20.5     | ✅ 已完成（S3.0–S3.10） | M4  |
 | E4 可观测与交付 | 可运维、可交付           | 8        | ✅ 已完成（S4.1–S4.6）  | M5  |
-| E5 前端工程   | 把演示页升级为可交互的单页应用   | 17       | 🔄 进行中（S5.1–S5.7） | M6  |
+| E5 前端工程   | 把演示页升级为可交互的单页应用   | 17       | ✅ 已完成（S5.1–S5.9） | M6  |
 | E6 新功能迭代 | 后续功能迭代的容器（首个主题：素材库页） | 11.5 | ⬜ 未开始 | M7 |
 | **合计**    |                   | **88** |                   |     |
 
@@ -126,8 +126,32 @@
 | S5.5 | 数据可视化      | S5.4        | 覆盖度、得分分布、成本与耗时用 ECharts 呈现                                                   | 2   | ✅  |
 | S5.6 | 运行历史       | S5.2        | 列出历史运行，可回看结果并下载报告                                                            | 1.5 | ✅  |
 | S5.7 | 视觉打磨       | S5.5        | 三页共用同一套主题 token 与组件库；暗色主题下正文文本对比度 ≥ 4.5:1；375px 宽度无横向滚动；Lighthouse 性能分 ≥ 80  | 2   | ✅  |
-| S5.8 | 前端测试       | S5.4        | Vitest 覆盖工具函数与关键组件；`pnpm build` 产物可被服务端挂载                                    | 1.5 | ⬜  |
-| S5.9 | 前端进 CI 与镜像 | S5.8, S4.4  | CI 增加前端 lint、测试与构建；多阶段镜像内含 dist                                              | 1.5 | ⬜  |
+| S5.8 | 前端测试       | S5.4        | Vitest 覆盖工具函数与关键组件；`pnpm build` 产物可被服务端挂载                                    | 1.5 | ✅  |
+| S5.9 | 前端进 CI 与镜像 | S5.8, S4.4  | CI 增加前端 lint、测试与构建；多阶段镜像内含 dist                                              | 1.5 | ✅  |
+
+<details>
+<summary>S5.8 实测记录（2026-10-05）</summary>
+
+- 工具链：vitest 5 + @vue/test-utils + jsdom + @vitest/coverage-v8（4 个 dev 依赖）。配置见 `frontend/vitest.config.ts`；**有意不开 globals**——每个 spec 显式 import，vue-tsc 才会把测试代码一起做类型检查。
+- 类型边界：新增 `tsconfig.vitest.json`（在应用配置基础上开 node 类型），应用 `tsconfig.json` 反过来排掉 `src/**/*.spec.ts`。这样测试能用 `node:fs`，应用代码继续只认 `vite/client`，避免误用 `process`。`type-check` 因此跑三个 TS project（app / 配置 / 测试），`pnpm build` 也顺带守住测试的类型。
+- 用例 6 个 spec / 48 条：`theme/tokens.spec.ts`（对比度逐对 ≥ 阈值 + CSS 变量与 TS 常量一致，把 S5.7 的一次性脚本变成正式回归）、`charts/options.spec.ts`（三张图取值 / 目标线 / 预算线 / 分箱边界 / palette，并钉住 S5.5 修过的 `yAxis.max` 坑）、`api/client.spec.ts`（ErrorResponse 归一化三件套与非 JSON 兜底）、`stores/analysis.spec.ts`（四项输入校验 + 提交—轮询状态机 + 两类失败路径）、`views/RunHistoryView.spec.ts`（行/顺序、可点与置灰、报告链接、空态、翻页 offset=20）、`App.spec.ts`（顶栏导航、当前栏高亮、暗色开关持久化、主题初始值）。
+- **测试抓到一个真 bug**：`App.vue` 的 `activeNav` 把 `run-result` 映射成 `'history'`，与导航项的 `'run-history'` 对不上——结果详情页上「运行历史」永不亮起。S5.7 的截图冒烟没覆盖这点，本次修掉并加了断言。
+- 覆盖率（`pnpm run test:cov`，**只报告不设门槛**，与验收「覆盖工具函数与关键组件」一致）：api/client 100%、stores/app 100%、stores/analysis 94%、RunHistoryView 92%、charts/options 73%；整体 45%（大视图与 canvas 渲染有意不深覆盖，图表渲染交给 S5.5 / S5.7 的 Playwright 冒烟）。
+- 验收第二条「`pnpm build` 产物可被服务端挂载」：真实 FastAPI（serve=true）托管 `frontend/dist`，14 条断言全过——`/` 200 且含 SPA 容器、index 与入口 JS 都带 `Content-Encoding: gzip`、vendor chunk 含 Vue 运行时、结果页/历史页是懒加载 chunk（不随首屏下载）、`/runs` 刷新走 history 回落、真实产物里暗色切换生效、375px 无横向滚动、控制台零 error。截图落 `runs/_smoke_s58/`。
+
+</details>
+<details>
+<summary>S5.9 实测记录（2026-10-05）</summary>
+
+- **lint**：ESLint 9 flat config（`@eslint/js` + `typescript-eslint` + `eslint-plugin-vue` flat/essential），只做正确性规则、不引 Prettier 类格式化；忽略 `dist/`、`node_modules/`、`coverage/` 与生成物 `src/api/schema.d.ts`；`vue/multi-word-component-names` 放行 `App`/`EChart`。新增 5 个 dev 依赖。实测覆盖 28 个文件（含 6 个 .vue）零告警——用 `--format json` 核对过确实在 lint SFC，不是「没匹配到文件」的假绿。
+- **CI**：仍是五个 job，`frontend` job 在原来的 `pnpm install --frozen-lockfile` + `check:api` 之外补上 `pnpm run lint` → `pnpm run test:cov` → `pnpm run build`（不新增 job 以免重复装依赖）。`tests/unit/test_ci_workflow.py` 的命令断言同步收紧。
+- **镜像**：多阶段从 3 段变 4 段——新增 `node:25.3.0-slim` 前端阶段（`npm install -g pnpm@11.25.0`，因为 **Node 25 已不带可用的 corepack**，本机实测直接崩），先拷依赖清单做依赖层、再拷源码 `pnpm run build`；runtime 阶段把 `/app/frontend/dist` 拷进去（`PROJECT_ROOT=/app` 与契约默认 `dist_dir="frontend/dist"` 正好对上）。
+- **`.dockerignore` / compose**：不再整块挡 `frontend/`，改为只挡 `frontend/node_modules/`、`frontend/dist/`、`frontend/coverage/`；compose 删掉 `XHS_FRONTEND_SERVE: "false"`，回到契约默认 `serve = true`——容器这才真的托管单页应用。`test_dockerfile.py` / `test_compose_config.py` 同步更新。
+- 镜像验收：`docker build -t xhs-agent:0.1.0 .` 成功（前端构建在镜像内完成）；`docker run --rm --entrypoint ls ... /app/frontend/dist` 看到 `index.html` + 6 个产物（vendor / echarts / 两个懒加载视图 chunk / CSS 都在）；镜像 **413MB**（S4.4 记录 412MB，+1MB）。`docker compose up -d --wait` 后 api / worker / postgres / redis 全 healthy、migrate 退 0，容器 `/` 返回 200 text/html 且含 `<div id="app">`、`/runs` 走 SPA 回落、`/api/health` 三项 ok、静态 JS 带 gzip。
+- 回归：ruff 零告警、mypy 44 文件零错误、单测 755 passed（新增 2 条静态用例）、check_openapi 零差异（契约未动）、前端 lint / 48 单测 / type-check（三个 project）/ build / check:api 全过。
+- 不做（有意）：pre-commit 里不加前端钩子——本地钩子要装 node 工具链，CI 才是硬门槛。
+
+</details>
 
 <details>
 <summary>S5.7 实测记录（2026-10-05）</summary>
