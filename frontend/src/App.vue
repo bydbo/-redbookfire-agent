@@ -11,7 +11,7 @@ const route = useRoute()
 
 const overrides = computed(() => buildThemeOverrides(appStore.palette))
 /** 结果详情也归属「运行历史」这一栏（同一条浏览路径）。 */
-const activeNav = computed(() => (route.name === 'run-result' ? 'history' : route.name))
+const activeNav = computed(() => (route.name === 'run-result' ? 'run-history' : route.name))
 </script>
 
 <template>

@@ -1,0 +1,10 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    // 测试跑在 Node 侧（vitest + jsdom），所以这里额外开 node 类型；
+    // 应用代码继续只认 vite/client，避免误用 process / node:fs。
+    "types": ["vite/client", "node"]
+  },
+  "include": ["env.d.ts", "src/**/*.spec.ts", "src/**/*.d.ts"],
+  "exclude": []
+}
