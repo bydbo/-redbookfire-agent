@@ -229,6 +229,67 @@ class MaterialList(_Response):
     dirs: list[MaterialDirCount]
 
 
+class MaterialTrashResult(_Response):
+    """`POST /api/materials/{material_id}/trash` 的结果（S6.3）。"""
+
+    material_id: UuidStr
+    path: str                 # 移入前的相对路径（原样，不带序号）
+    trashed_path: str         # 回收站里的相对路径（同名时带 `-2` 序号）
+    file_missing: bool        # 磁盘上本来就没有这个文件：只删了索引行
+
+
+class TrashItem(_Response):
+    """回收站里的一条素材（旁车跟着媒体走，不单独列出）。"""
+
+    path: str                 # 相对 `_trash/` 的路径，正斜杠
+    name: str
+    type: MaterialType
+    size_bytes: int
+    mtime: DateTimeStr
+
+
+class TrashList(_Response):
+    """`GET /api/materials/trash` 响应：回收站内容。"""
+
+    items: list[TrashItem]
+    total: int
+
+
+class TrashRestoreRequest(BaseModel):
+    """恢复请求（S6.3）：`path` 是回收站里的相对路径（正斜杠）。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    path: str
+
+
+class TrashPurgeRequest(BaseModel):
+    """真删请求（S6.3）：`paths` 与 `all=true` 二选一，且 `confirm` 必须为 true。
+
+    `confirm` 的"必须为 true"在路由层判断（400）——契约里只声明它是个布尔，
+    免得把"二次确认"这种业务规则塞进字段级校验里。
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    paths: list[str] | None = None
+    all: bool = False
+    confirm: bool = False
+
+
+class TrashPurgeResult(_Response):
+    """真删结果：被删掉的相对路径（含跟随媒体一起删的旁车）。"""
+
+    deleted: list[str]
+    count: int
+
+
+class MaterialTaskAccepted(_Response):
+    """素材索引任务已受理（S6.3 起）：`task_id` 用于 `GET /api/materials/tasks/{task_id}`。"""
+
+    task_id: str
+
+
 class MatchCandidate(_Response):
     rank: int
     material_id: UuidStr

@@ -398,6 +398,101 @@ paths:
         '503':
           $ref: '#/components/responses/DependencyUnavailable'
 
+  /api/materials/trash:
+    get:
+      tags:
+        - 素材
+      summary: 列出回收站
+      description: |
+        递归扫 `<素材根>/_trash/`，返回里面的媒体文件（旁车跟着媒体走，不单独列出）。
+        `_trash` 是回收站目录：扫描素材库时跳过它，所以「移进来」就等于出库。
+      operationId: listTrashedMaterials
+      parameters:
+        - $ref: '#/components/parameters/RequestId'
+      responses:
+        '200':
+          description: 回收站内容
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TrashList'
+        '503':
+          $ref: '#/components/responses/DependencyUnavailable'
+
+  /api/materials/trash/restore:
+    post:
+      tags:
+        - 素材
+      summary: 从回收站恢复
+      description: |
+        把回收站里的一条（连同它的旁车）移回素材目录的**原相对路径**，并触发一次索引任务。
+        **恢复等于重新入库**：新 uuid、重新打标；移入回收站时 `run_matches` 已被外键级联清理，
+        历史候选不会回来。目标位置已有同名文件 → 409。
+      operationId: restoreMaterial
+      parameters:
+        - $ref: '#/components/parameters/RequestId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/TrashRestoreRequest'
+      responses:
+        '202':
+          description: 已恢复并受理索引任务
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MaterialTaskAccepted'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          description: 目标位置已有同名文件
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '422':
+          $ref: '#/components/responses/ValidationError'
+        '503':
+          $ref: '#/components/responses/DependencyUnavailable'
+
+  /api/materials/trash/purge:
+    post:
+      tags:
+        - 素材
+      summary: 真删回收站里的文件
+      description: |
+        真删（不可恢复）：`paths` 给具体条目（连同旁车一起删），`all=true` 清空整个回收站；
+        两者二选一必填，且 `confirm` 必须为 `true`（二次确认）。先整体校验再删，
+        任何一条不在回收站里就 404，不做部分删除。
+      operationId: purgeTrashedMaterials
+      parameters:
+        - $ref: '#/components/parameters/RequestId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/TrashPurgeRequest'
+      responses:
+        '200':
+          description: 删除结果
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TrashPurgeResult'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '422':
+          $ref: '#/components/responses/ValidationError'
+        '503':
+          $ref: '#/components/responses/DependencyUnavailable'
+
   /api/materials/{material_id}:
     get:
       tags:
@@ -463,6 +558,39 @@ paths:
           $ref: '#/components/responses/NotFound'
         '422':
           $ref: '#/components/responses/ValidationError'
+        '503':
+          $ref: '#/components/responses/DependencyUnavailable'
+
+  /api/materials/{material_id}/trash:
+    post:
+      tags:
+        - 素材
+      summary: 把素材移进回收站
+      description: |
+        把素材（连同它的 `.txt` / `.md` / `.json` 旁车）移到 `<素材根>/_trash/<原相对路径>`，
+        并删掉索引行；回收站里已有同名时自动加 `-2` 序号，不覆盖。
+        删行会让 `run_matches` 通过外键级联清理——**历史候选不再回来**（恢复 = 重新入库，
+        新 uuid）。磁盘上文件已不在时仍然删行，响应里 `file_missing=true`。
+      operationId: trashMaterial
+      parameters:
+        - $ref: '#/components/parameters/RequestId'
+        - name: material_id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: 移入回收站的结果
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MaterialTrashResult'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
         '503':
           $ref: '#/components/responses/DependencyUnavailable'
 
@@ -1098,6 +1226,119 @@ components:
           type: array
           items:
             $ref: '#/components/schemas/Element'
+
+    MaterialTrashResult:
+      type: object
+      description: 把一个素材移进回收站的结果。
+      required:
+        - material_id
+        - path
+        - trashed_path
+        - file_missing
+      properties:
+        material_id:
+          type: string
+          format: uuid
+        path:
+          type: string
+          description: 移入前的相对路径（原样，不带序号）
+        trashed_path:
+          type: string
+          description: 回收站里的相对路径（同名时带 `-2` 序号）
+        file_missing:
+          type: boolean
+          description: 磁盘上本来就没有这个文件（只删了索引行）
+
+    TrashItem:
+      type: object
+      description: 回收站里的一条素材（旁车跟着媒体走，不单独列出）。
+      required:
+        - path
+        - name
+        - type
+        - size_bytes
+        - mtime
+      properties:
+        path:
+          type: string
+          description: 相对 `_trash/` 的路径（正斜杠）
+        name:
+          type: string
+        type:
+          type: string
+          enum:
+            - video
+            - image
+        size_bytes:
+          type: integer
+          minimum: 0
+        mtime:
+          type: string
+          format: date-time
+
+    TrashList:
+      type: object
+      required:
+        - items
+        - total
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/TrashItem'
+        total:
+          type: integer
+          minimum: 0
+
+    TrashRestoreRequest:
+      type: object
+      description: 恢复请求：`path` 是回收站里的相对路径（正斜杠，越界一律 400）。
+      additionalProperties: false
+      required:
+        - path
+      properties:
+        path:
+          type: string
+
+    TrashPurgeRequest:
+      type: object
+      description: |
+        真删请求：`paths` 与 `all=true` 二选一必填，且 `confirm` 必须为 `true`（二次确认）。
+        违反其中任一条都是 400。
+      additionalProperties: false
+      properties:
+        paths:
+          type: array
+          items:
+            type: string
+        all:
+          type: boolean
+        confirm:
+          type: boolean
+
+    TrashPurgeResult:
+      type: object
+      required:
+        - deleted
+        - count
+      properties:
+        deleted:
+          type: array
+          description: 真删掉的相对路径（含跟随媒体一起删的旁车）
+          items:
+            type: string
+        count:
+          type: integer
+          minimum: 0
+
+    MaterialTaskAccepted:
+      type: object
+      description: 素材索引任务已受理；`task_id` 用于 `GET /api/materials/tasks/{task_id}`。
+      required:
+        - task_id
+      properties:
+        task_id:
+          type: string
 
     UpdateMaterialRequest:
       type: object

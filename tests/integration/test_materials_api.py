@@ -1,7 +1,7 @@
-"""素材库的集成用例（S6.1 查询 + S6.2 编辑）：真 Postgres 容器 + 临时素材目录。
+"""素材库的集成用例（S6.1 查询 + S6.2 编辑 + S6.3 回收站与索引任务）。
 
-查询部分只用路径当基准（不落真实文件）；编辑部分要真文件，因为改动必须同时落到
-`<素材文件名>.txt` 旁车与数据库两边。真实扫描与入库归 S6.4 的用例。
+真 Postgres 容器 + 临时素材目录。查询部分只用路径当基准（不落真实文件）；编辑与回收站要真文件，
+因为改动必须同时落到磁盘与数据库两边；索引任务用真库、真文件 + 假向量客户端（不联网）。
 """
 
 from __future__ import annotations
@@ -10,21 +10,36 @@ import os
 import uuid
 from collections.abc import AsyncIterator, Iterator
 from datetime import UTC, datetime, timedelta
+from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
 import pytest
 import pytest_asyncio
+from celery.result import AsyncResult
 from fastapi.testclient import TestClient
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
-from xhs_agent.api.deps import get_config, get_session
+from xhs_agent.api.deps import CeleryDispatcher, get_config, get_dispatcher, get_session
 from xhs_agent.api.main import create_app
-from xhs_agent.config import AppConfig, load_config
+from xhs_agent.config import AppConfig, EnvView, load_config
 from xhs_agent.db import Base
+from xhs_agent.db.models import Hotspot, Run, RunHotspot, RunMatch
 from xhs_agent.db.models import Material as MaterialRow
-from xhs_agent.services.materials import list_materials, load_material, update_material
+from xhs_agent.services.materials import (
+    list_materials,
+    list_trash,
+    load_material,
+    purge_trash,
+    restore_from_trash,
+    trash_material,
+    trash_root,
+    update_material,
+)
+from xhs_agent.tasks.celery_app import build_celery_app
+from xhs_agent.tasks.indexing import INDEX_TASK_NAME, register_index_task, run_index
+from xhs_agent.tools.embedding import EmbeddingResult
 from xhs_agent.tools.materials import parse_sidecar, sidecar_path
 
 pytestmark = [pytest.mark.integration, pytest.mark.asyncio]
@@ -39,6 +54,28 @@ SEED = [
     ("根目录.mp4", "video", "根目录素材", ["根"], "filename", 4),
     ("50%off.jpg", "image", "50% 折扣海报", ["促销"], "legacy", 5),
 ]
+
+
+class FakeIndexDispatcher:
+    """假投递器：素材接口只该投索引任务，记账后返回固定 task_id。"""
+
+    def __init__(self) -> None:
+        self.index_calls: list[list[str] | None] = []
+
+    async def enqueue(self, job_id: str) -> None:
+        raise AssertionError("素材接口不该投分析任务")
+
+    async def enqueue_index(self, *, force_paths: list[str] | None = None) -> str:
+        self.index_calls.append(force_paths)
+        return "task-1"
+
+
+class FakeEmbedder:
+    """假向量客户端：固定返回一个单位向量，不联网。"""
+
+    async def embed(self, texts: list[str]) -> EmbeddingResult:
+        return EmbeddingResult(vectors=[[1.0] + [0.0] * 1023 for _ in texts],
+                               model="fake", prompt_tokens=1, attempts=1)
 
 
 def write_config(tmp_path: Path) -> AppConfig:
@@ -66,6 +103,16 @@ def cfg(tmp_path: Path) -> AppConfig:
 
 
 @pytest.fixture
+def task_cfg(cfg: AppConfig, postgres_dsn: str, redis_url: str) -> AppConfig:
+    """给「任务自己建 engine / Celery app」的用例用：DSN 与 broker 指向容器。
+
+    与 `cfg` 是**同一个对象**（就地补环境变量）——用例同时要它俩时拿到的配置一致。
+    """
+    cfg._env = EnvView({}, {"DATABASE_URL": postgres_dsn, "REDIS_URL": redis_url})
+    return cfg
+
+
+@pytest.fixture
 def client(db_engine: AsyncEngine, cfg: AppConfig,
            monkeypatch: pytest.MonkeyPatch) -> Iterator[TestClient]:
     app = create_app(check_startup=False)
@@ -77,6 +124,7 @@ def client(db_engine: AsyncEngine, cfg: AppConfig,
             yield session
 
     app.dependency_overrides[get_session] = _session
+    app.dependency_overrides[get_dispatcher] = lambda: FakeIndexDispatcher()
     with TestClient(app, raise_server_exceptions=False) as test_client:
         yield test_client
 
@@ -317,3 +365,156 @@ class TestEdit:
         missing = client.patch(f"/api/materials/{uuid.uuid4()}", json={"title": "x"})
         assert missing.status_code == 404
         assert missing.json()["code"] == "not_found"
+
+
+async def add_run_match(session: AsyncSession, material_id: str, cfg: AppConfig) -> None:
+    """给素材挂一条历史候选（`run_matches`），用来验证移入回收站时的级联清理。"""
+    hotspot = Hotspot(raw_text=f"热点-{material_id[:8]}", clue={})
+    session.add(hotspot)
+    await session.flush()
+    run = Run(job_id=f"job-{uuid.uuid4()}", status="succeeded")
+    session.add(run)
+    await session.flush()
+    run_hotspot = RunHotspot(run_id=run.id, hotspot_id=hotspot.id, position=1)
+    session.add(run_hotspot)
+    await session.flush()
+    session.add(RunMatch(run_hotspot_id=run_hotspot.id,
+                         material_id=uuid.UUID(material_id), rank=1,
+                         score=Decimal("0.8000"), recall_sources=["literal"], reasons=["命中"]))
+    await session.commit()
+
+
+class TestTrash:
+    async def test_moves_file_and_deletes_row_with_cascade(self, db_session: AsyncSession,
+                                                          cfg: AppConfig) -> None:
+        media = touch("运动/挥拍.mp4", cfg)
+        Path(media + ".txt").write_text("标题: 手工\n", encoding="utf-8")
+        ids = await seed(db_session, cfg)
+        await add_run_match(db_session, ids["运动/挥拍.mp4"], cfg)
+
+        result = await trash_material(db_session, cfg, uuid.UUID(ids["运动/挥拍.mp4"]))
+
+        assert result == {"material_id": ids["运动/挥拍.mp4"], "path": "运动/挥拍.mp4",
+                          "trashed_path": "运动/挥拍.mp4", "file_missing": False}
+        assert not os.path.exists(media)
+        trashed = Path(trash_root(cfg)) / "运动" / "挥拍.mp4"
+        assert trashed.is_file()
+        assert (Path(str(trashed) + ".txt")).read_text(encoding="utf-8") == "标题: 手工\n"
+        assert await load_material(db_session, cfg,
+                                   uuid.UUID(ids["运动/挥拍.mp4"])) is None
+        matches = (await db_session.execute(select(RunMatch))).scalars().all()
+        assert matches == []                      # 级联清理：历史候选不再回来
+
+    async def test_missing_file_still_deletes_row(self, db_session: AsyncSession,
+                                                 cfg: AppConfig) -> None:
+        ids = await seed(db_session, cfg)          # 不创建文件
+        result = await trash_material(db_session, cfg, uuid.UUID(ids["美食/火锅.jpg"]))
+        assert result is not None and result["file_missing"] is True
+        assert await load_material(db_session, cfg,
+                                   uuid.UUID(ids["美食/火锅.jpg"])) is None
+
+    async def test_name_collision_gets_suffix(self, db_session: AsyncSession,
+                                             cfg: AppConfig) -> None:
+        touch("运动/挥拍.mp4", cfg)
+        put_trash_file(cfg, "运动/挥拍.mp4")
+        ids = await seed(db_session, cfg)
+
+        result = await trash_material(db_session, cfg, uuid.UUID(ids["运动/挥拍.mp4"]))
+
+        assert result is not None and result["trashed_path"] == "运动/挥拍-2.mp4"
+
+    async def test_unknown_id_returns_none(self, db_session: AsyncSession,
+                                          cfg: AppConfig) -> None:
+        await seed(db_session, cfg)
+        assert await trash_material(db_session, cfg, uuid.uuid4()) is None
+
+
+def put_trash_file(cfg: AppConfig, relative: str, data: bytes = b"old") -> str:
+    path = Path(trash_root(cfg)) / relative
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(data)
+    return str(path)
+
+
+class TestRestoreAndPurge:
+    async def test_restore_moves_back_and_enqueues(self, client: TestClient,
+                                                   cfg: AppConfig) -> None:
+        put_trash_file(cfg, "运动/挥拍.mp4")
+        put_trash_file(cfg, "运动/挥拍.mp4.txt", "标题: 手工\n".encode())
+
+        response = client.post("/api/materials/trash/restore", json={"path": "运动/挥拍.mp4"})
+
+        assert response.status_code == 202, response.text
+        assert response.json() == {"task_id": "task-1"}
+        restored = Path(cfg.materials_dir()) / "运动" / "挥拍.mp4"
+        assert restored.is_file()
+        assert (restored.parent / "挥拍.mp4.txt").read_text(encoding="utf-8") == "标题: 手工\n"
+        assert list_trash(cfg) == {"items": [], "total": 0}
+
+    async def test_restore_then_index_creates_new_uuid(self, task_cfg: AppConfig,
+                                                       db_session: AsyncSession,
+                                                       cfg: AppConfig) -> None:
+        """恢复 = 重新入库：索引任务跑完拿到的是**新 uuid**。"""
+        touch("运动/挥拍.mp4", cfg)
+        ids = await seed(db_session, cfg)
+        await trash_material(db_session, cfg, uuid.UUID(ids["运动/挥拍.mp4"]))
+
+        restore_from_trash(cfg, "运动/挥拍.mp4")
+        report = await run_index(task_cfg, embedder=FakeEmbedder())
+
+        assert report["added"] == 1 and report["scanned"] >= 1
+        path = str(Path(cfg.materials_dir()) / "运动" / "挥拍.mp4")
+        rows = (await db_session.execute(
+            select(MaterialRow).where(MaterialRow.path == path))).scalars().all()
+        assert len(rows) == 1
+        assert str(rows[0].id) != ids["运动/挥拍.mp4"]
+
+    async def test_purge_selected_and_all(self, cfg: AppConfig, client: TestClient) -> None:
+        put_trash_file(cfg, "运动/挥拍.mp4")
+        put_trash_file(cfg, "运动/挥拍.mp4.txt")
+        put_trash_file(cfg, "美食/火锅.jpg")
+
+        selected = purge_trash(cfg, paths=["运动/挥拍.mp4"])
+        assert selected["deleted"] == ["运动/挥拍.mp4", "运动/挥拍.mp4.txt"]
+        remaining = list_trash(cfg)
+        assert remaining["total"] == 1
+
+        response = client.post("/api/materials/trash/purge",
+                               json={"all": True, "confirm": True})
+        assert response.status_code == 200, response.text
+        assert response.json()["count"] == 1
+        assert list_trash(cfg)["total"] == 0
+
+
+class TestIndexTask:
+    async def test_run_index_syncs_new_file(self, task_cfg: AppConfig,
+                                            db_session: AsyncSession,
+                                            cfg: AppConfig) -> None:
+        touch("运动/新片.mp4", cfg)
+        Path(str(Path(cfg.materials_dir()) / "运动" / "新片.mp4") + ".txt").write_text(
+            "标题: 新片\n标签: 羽毛球, 球场\n描述: 新上传的素材\n", encoding="utf-8")
+
+        report = await run_index(task_cfg, embedder=FakeEmbedder())
+
+        assert report["added"] == 1 and report["vision_used"] == 0
+        assert report["embedded"] == 1
+        row = (await db_session.execute(
+            select(MaterialRow).where(MaterialRow.title == "新片"))).scalar_one()
+        assert row.tags == ["羽毛球", "球场"] and row.source == "sidecar"
+        assert "素材同步" in report["summary"]
+
+    async def test_task_is_registered_under_the_contract_name(
+            self, task_cfg: AppConfig) -> None:
+        app = build_celery_app(task_cfg)
+        task = register_index_task(app, task_cfg)
+        assert task.name == INDEX_TASK_NAME
+        assert app.tasks[INDEX_TASK_NAME].name == INDEX_TASK_NAME
+
+    async def test_dispatcher_enqueues_into_real_redis(self, task_cfg: AppConfig) -> None:
+        """真 Redis：设了结果后端之后投递仍然成功，任务的初始状态是 PENDING（没有 worker 消费）。"""
+        dispatcher = CeleryDispatcher(task_cfg)
+
+        task_id = await dispatcher.enqueue_index()
+
+        assert len(task_id) == 36
+        assert AsyncResult(task_id, app=dispatcher.app()).state == "PENDING"

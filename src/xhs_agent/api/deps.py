@@ -13,6 +13,7 @@
 from __future__ import annotations
 
 import asyncio
+import uuid
 from collections.abc import AsyncIterator
 from functools import lru_cache
 from typing import Annotated, Any, Protocol
@@ -80,9 +81,15 @@ async def request_id_header(
 
 
 class Dispatcher(Protocol):
-    """任务投递器：只要能把 `job_id` 投出去即可（S3.4b 的 Celery 实现也满足它）。"""
+    """任务投递器：分析任务投 `job_id`；素材索引任务投一次「同步 + 回填」并返回 `task_id`。
+
+    S6.3 起两句都要：`enqueue` 是 S3.4b 的分析路径，`enqueue_index` 是素材库的扫描 / 上传 /
+    恢复路径（`GET /api/materials/tasks/{task_id}` 读的就是这个 `task_id` 的结果）。
+    """
 
     async def enqueue(self, job_id: str) -> None: ...
+
+    async def enqueue_index(self, *, force_paths: list[str] | None = None) -> str: ...
 
 
 class CeleryDispatcher:
@@ -116,11 +123,32 @@ class CeleryDispatcher:
         headers = current_trace_headers()
         try:
             await asyncio.to_thread(self.app().send_task, ANALYZE_TASK_NAME, args=[job_id],
-                                    headers=headers)
+                                    headers=headers, ignore_result=True)
         except (KombuError, OSError) as exc:
             raise DependencyUnavailableError(
                 "分析队列不可用：投递失败",
                 {"job_id": job_id, "error": f"{type(exc).__name__}: {exc}"[:200]}) from exc
+
+    async def enqueue_index(self, *, force_paths: list[str] | None = None) -> str:
+        """投递一次素材索引任务，返回 `task_id`（S6.3）。
+
+        `ignore_result` 保持默认 False：这个任务的结果**就是要**存进后端——`GET
+        /api/materials/tasks/{task_id}` 靠它报进度与失败原因（ADR 0014）；分析任务反过来
+        显式 `ignore_result=True`，所以设了结果后端也不会把 broker 不可达的失败语义改坏。
+        """
+        from kombu.exceptions import KombuError
+
+        from ..tasks.indexing import INDEX_TASK_NAME
+
+        task_id = str(uuid.uuid4())
+        try:
+            await asyncio.to_thread(self.app().send_task, INDEX_TASK_NAME,
+                                    args=[list(force_paths or [])], task_id=task_id)
+        except (KombuError, OSError) as exc:
+            raise DependencyUnavailableError(
+                "素材索引队列不可用：投递失败",
+                {"error": f"{type(exc).__name__}: {exc}"[:200]}) from exc
+        return task_id
 
 
 def get_dispatcher(cfg: ConfigDep) -> Dispatcher:

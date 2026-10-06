@@ -184,6 +184,72 @@ class TestCeleryDispatcher:
         await dispatcher.enqueue("job-1")
         assert recorded["kwargs"]["headers"] == {}
 
+    @pytest.mark.asyncio
+    async def test_analyze_is_sent_with_ignore_result(self, tmp_path):
+        """S6.3 / ADR 0014：分析任务的投递显式 `ignore_result=True`。
+
+        `send_task` 只在 `ignore_result=False` 时才调 `backend.on_task_call`——少了这个标记，
+        设了结果后端就会把「broker 不可达 → 快速 503」变成几秒后抛裸 RuntimeError。
+        """
+        from xhs_agent.api.deps import CeleryDispatcher
+
+        recorded: dict = {}
+
+        class RecordingApp:
+            def send_task(self, *args, **kwargs):
+                recorded["args"] = args
+                recorded["kwargs"] = kwargs
+
+        cfg = make_config(tmp_path)
+        cfg._env = EnvView({}, {"REDIS_URL": "redis://127.0.0.1:6379/0"})
+        dispatcher = CeleryDispatcher(cfg)
+        dispatcher._app = RecordingApp()        # type: ignore[assignment]
+
+        await dispatcher.enqueue("job-1")
+
+        assert recorded["kwargs"]["ignore_result"] is True
+
+    @pytest.mark.asyncio
+    async def test_enqueue_index_returns_task_id_and_keeps_result(self, tmp_path):
+        """素材索引任务相反：结果**要**存（`GET /api/materials/tasks/{id}` 靠它报进度）。"""
+        from xhs_agent.api.deps import CeleryDispatcher
+        from xhs_agent.tasks.indexing import INDEX_TASK_NAME
+
+        recorded: dict = {}
+
+        class RecordingApp:
+            def send_task(self, *args, **kwargs):
+                recorded["args"] = args
+                recorded["kwargs"] = kwargs
+
+        cfg = make_config(tmp_path)
+        cfg._env = EnvView({}, {"REDIS_URL": "redis://127.0.0.1:6379/0"})
+        dispatcher = CeleryDispatcher(cfg)
+        dispatcher._app = RecordingApp()        # type: ignore[assignment]
+
+        task_id = await dispatcher.enqueue_index()
+
+        assert len(task_id) == 36 and task_id.count("-") == 4      # uuid4
+        assert recorded["args"] == (INDEX_TASK_NAME,)
+        assert recorded["kwargs"]["task_id"] == task_id
+        assert recorded["kwargs"]["args"] == [[]]
+        assert "ignore_result" not in recorded["kwargs"]           # 默认 False = 存结果
+
+    @pytest.mark.asyncio
+    async def test_enqueue_index_broker_failure_is_dependency_unavailable(self, tmp_path):
+        from xhs_agent.api.deps import CeleryDispatcher
+
+        cfg = make_config(tmp_path)
+        cfg._env = EnvView({}, {"REDIS_URL": "redis://127.0.0.1:6379/0"})
+        dispatcher = CeleryDispatcher(cfg)
+        dispatcher._app = self.BrokenApp()      # type: ignore[assignment]
+
+        with pytest.raises(DependencyUnavailableError) as info:
+            await dispatcher.enqueue_index()
+
+        assert info.value.code == "dependency_unavailable"
+        assert "KombuError" in info.value.detail["error"]
+
 
 class TestConflictError:
     def test_conflict_maps_to_409(self):

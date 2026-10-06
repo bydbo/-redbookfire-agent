@@ -192,7 +192,10 @@ def register_analyze_task(app: Any, cfg: AppConfig, *, caller: Any = None,
     """
     # Celery 没有 py.typed / 官方 stubs，装饰器在严格模式下只能是 Any（见 pyproject 的
     # mypy override）；任务体本身仍是全类型标注的。
-    @app.task(bind=True, name=ANALYZE_TASK_NAME, max_retries=cfg.queue.max_retries)  # type: ignore[untyped-decorator]
+    # `ignore_result=True`（S6.3，ADR 0014）：设了结果后端之后，分析任务的结果没人读——
+    # 运行状态的权威源是数据库（ADR 0011），任务级声明与投递端的 `ignore_result=True` 一致。
+    @app.task(bind=True, name=ANALYZE_TASK_NAME, max_retries=cfg.queue.max_retries,  # type: ignore[untyped-decorator]
+              ignore_result=True)
     def analyze_run(self: Any, job_id: str) -> str:
         """消费一个 job：索引新鲜度 → 五节点分析 → 逐热点写回。"""
         return execute(self, job_id, cfg, caller=caller, embedder=embedder, vision=vision)

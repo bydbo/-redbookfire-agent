@@ -192,6 +192,71 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/materials/trash": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * 列出回收站
+         * @description 递归扫 `<素材根>/_trash/`，返回里面的媒体文件（旁车跟着媒体走，不单独列出）。
+         *     `_trash` 是回收站目录：扫描素材库时跳过它，所以「移进来」就等于出库。
+         */
+        get: operations["listTrashedMaterials"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/materials/trash/restore": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * 从回收站恢复
+         * @description 把回收站里的一条（连同它的旁车）移回素材目录的**原相对路径**，并触发一次索引任务。
+         *     **恢复等于重新入库**：新 uuid、重新打标；移入回收站时 `run_matches` 已被外键级联清理，
+         *     历史候选不会回来。目标位置已有同名文件 → 409。
+         */
+        post: operations["restoreMaterial"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/materials/trash/purge": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * 真删回收站里的文件
+         * @description 真删（不可恢复）：`paths` 给具体条目（连同旁车一起删），`all=true` 清空整个回收站；
+         *     两者二选一必填，且 `confirm` 必须为 `true`（二次确认）。先整体校验再删，
+         *     任何一条不在回收站里就 404，不做部分删除。
+         */
+        post: operations["purgeTrashedMaterials"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/materials/{material_id}": {
         parameters: {
             query?: never;
@@ -219,6 +284,29 @@ export interface paths {
          *     标题与描述按**单行**处理（换行折成空格），因为旁车是 `键: 值` 行格式。
          */
         patch: operations["updateMaterial"];
+        trace?: never;
+    };
+    "/api/materials/{material_id}/trash": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * 把素材移进回收站
+         * @description 把素材（连同它的 `.txt` / `.md` / `.json` 旁车）移到 `<素材根>/_trash/<原相对路径>`，
+         *     并删掉索引行；回收站里已有同名时自动加 `-2` 序号，不覆盖。
+         *     删行会让 `run_matches` 通过外键级联清理——**历史候选不再回来**（恢复 = 重新入库，
+         *     新 uuid）。磁盘上文件已不在时仍然删行，响应里 `file_missing=true`。
+         */
+        post: operations["trashMaterial"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
         trace?: never;
     };
 }
@@ -433,6 +521,54 @@ export interface components {
             /** @description 相对素材根目录的父目录（正斜杠；直接放在根目录下时为空串），供前端显示主题 */
             dir: string;
             elements: components["schemas"]["Element"][];
+        };
+        /** @description 把一个素材移进回收站的结果。 */
+        MaterialTrashResult: {
+            /** Format: uuid */
+            material_id: string;
+            /** @description 移入前的相对路径（原样，不带序号） */
+            path: string;
+            /** @description 回收站里的相对路径（同名时带 `-2` 序号） */
+            trashed_path: string;
+            /** @description 磁盘上本来就没有这个文件（只删了索引行） */
+            file_missing: boolean;
+        };
+        /** @description 回收站里的一条素材（旁车跟着媒体走，不单独列出）。 */
+        TrashItem: {
+            /** @description 相对 `_trash/` 的路径（正斜杠） */
+            path: string;
+            name: string;
+            /** @enum {string} */
+            type: "video" | "image";
+            size_bytes: number;
+            /** Format: date-time */
+            mtime: string;
+        };
+        TrashList: {
+            items: components["schemas"]["TrashItem"][];
+            total: number;
+        };
+        /** @description 恢复请求：`path` 是回收站里的相对路径（正斜杠，越界一律 400）。 */
+        TrashRestoreRequest: {
+            path: string;
+        };
+        /**
+         * @description 真删请求：`paths` 与 `all=true` 二选一必填，且 `confirm` 必须为 `true`（二次确认）。
+         *     违反其中任一条都是 400。
+         */
+        TrashPurgeRequest: {
+            paths?: string[];
+            all?: boolean;
+            confirm?: boolean;
+        };
+        TrashPurgeResult: {
+            /** @description 真删掉的相对路径（含跟随媒体一起删的旁车） */
+            deleted: string[];
+            count: number;
+        };
+        /** @description 素材索引任务已受理；`task_id` 用于 `GET /api/materials/tasks/{task_id}`。 */
+        MaterialTaskAccepted: {
+            task_id: string;
         };
         /**
          * @description `PATCH /api/materials/{material_id}` 请求体：只允许这三个字段（其余一律 422），
@@ -850,6 +986,101 @@ export interface operations {
             503: components["responses"]["DependencyUnavailable"];
         };
     };
+    listTrashedMaterials: {
+        parameters: {
+            query?: never;
+            header?: {
+                /** @description 客户端生成的请求标识；未提供时由服务端生成。用于贯穿日志、调用追踪与数据库记录。 */
+                "X-Request-ID"?: components["parameters"]["RequestId"];
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description 回收站内容 */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TrashList"];
+                };
+            };
+            503: components["responses"]["DependencyUnavailable"];
+        };
+    };
+    restoreMaterial: {
+        parameters: {
+            query?: never;
+            header?: {
+                /** @description 客户端生成的请求标识；未提供时由服务端生成。用于贯穿日志、调用追踪与数据库记录。 */
+                "X-Request-ID"?: components["parameters"]["RequestId"];
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["TrashRestoreRequest"];
+            };
+        };
+        responses: {
+            /** @description 已恢复并受理索引任务 */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MaterialTaskAccepted"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            /** @description 目标位置已有同名文件 */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            422: components["responses"]["ValidationError"];
+            503: components["responses"]["DependencyUnavailable"];
+        };
+    };
+    purgeTrashedMaterials: {
+        parameters: {
+            query?: never;
+            header?: {
+                /** @description 客户端生成的请求标识；未提供时由服务端生成。用于贯穿日志、调用追踪与数据库记录。 */
+                "X-Request-ID"?: components["parameters"]["RequestId"];
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["TrashPurgeRequest"];
+            };
+        };
+        responses: {
+            /** @description 删除结果 */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TrashPurgeResult"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            422: components["responses"]["ValidationError"];
+            503: components["responses"]["DependencyUnavailable"];
+        };
+    };
     getMaterial: {
         parameters: {
             query?: never;
@@ -907,6 +1138,34 @@ export interface operations {
             400: components["responses"]["BadRequest"];
             404: components["responses"]["NotFound"];
             422: components["responses"]["ValidationError"];
+            503: components["responses"]["DependencyUnavailable"];
+        };
+    };
+    trashMaterial: {
+        parameters: {
+            query?: never;
+            header?: {
+                /** @description 客户端生成的请求标识；未提供时由服务端生成。用于贯穿日志、调用追踪与数据库记录。 */
+                "X-Request-ID"?: components["parameters"]["RequestId"];
+            };
+            path: {
+                material_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description 移入回收站的结果 */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MaterialTrashResult"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
             503: components["responses"]["DependencyUnavailable"];
         };
     };

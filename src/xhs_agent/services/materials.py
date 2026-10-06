@@ -25,7 +25,7 @@ import asyncio
 import os
 import uuid
 from collections.abc import Callable, Sequence
-from contextlib import AsyncExitStack
+from contextlib import AsyncExitStack, suppress
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from decimal import Decimal
@@ -35,10 +35,11 @@ from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..config import PROJECT_ROOT, AppConfig, ConfigError
-from ..core.errors import BadRequestError
+from ..core.errors import BadRequestError, ConflictError, NotFoundError
 from ..db.models import Material as MaterialRow
 from ..schemas import Material
 from ..tools import materials as materials_tool
+from ..tools import media as media_tool
 from ..tools.embedding import (
     EmbeddingClient,
     EmbeddingError,
@@ -435,6 +436,188 @@ async def update_material(session: AsyncSession, cfg: AppConfig, material_id: uu
     detail = material_item_view(row, cfg.materials_dir())
     detail["elements"] = [dict(element) for element in (row.elements or [])]
     return detail
+
+
+# ---------- 回收站（S6.3：移入 / 列出 / 恢复 / 真删） ----------
+
+TRASH_DIR_NAME = "_trash"
+COMPANION_SUFFIXES = (".txt", ".md", ".json")
+
+
+def trash_root(cfg: AppConfig) -> str:
+    """回收站根目录：`<materials_dir>/_trash`。
+
+    `tools.materials.scan_materials` 跳过 `_` 开头的目录，所以「移进回收站」天然等于出库，
+    「移回去」天然等于重新入库——不需要额外元数据。
+    """
+    return os.path.join(cfg.materials_dir(), TRASH_DIR_NAME)
+
+
+def resolve_under(root: str, relative: str) -> str:
+    """把相对路径解析成 `root` 之下的绝对路径；空路径 / 绝对路径 / 越界一律 400。"""
+    raw = (relative or "").strip()
+    text = raw.replace("\\", "/").strip("/")
+    if not text or text in {".", ".."} or os.path.isabs(raw):
+        raise BadRequestError("路径不合法：必须是相对路径", {"path": relative})
+    root_abs = os.path.realpath(root)
+    target = os.path.realpath(os.path.join(root_abs, *text.split("/")))
+    if not target.startswith(root_abs + os.sep):
+        raise BadRequestError("路径不合法：越出了所在目录", {"path": relative})
+    return target
+
+
+def unique_path(target: str) -> str:
+    """同名时自动加序号：`a.mp4` → `a-2.mp4` → `a-3.mp4`（返回第一个空位）。"""
+    if not os.path.exists(target):
+        return target
+    stem, ext = os.path.splitext(target)
+    index = 2
+    while os.path.exists(f"{stem}-{index}{ext}"):
+        index += 1
+    return f"{stem}-{index}{ext}"
+
+
+def companion_paths(media_path: str) -> list[str]:
+    """媒体文件旁的说明文件（`<素材>.txt|.md|.json`）：跟着素材一起进出回收站。"""
+    return [media_path + suffix for suffix in COMPANION_SUFFIXES
+            if os.path.isfile(media_path + suffix)]
+
+
+def _move_file(source: str, target: str) -> None:
+    os.makedirs(os.path.dirname(target), exist_ok=True)
+    os.replace(source, target)
+
+
+def _move_bundle(source: str, target: str, companions: Sequence[str]) -> None:
+    """移动媒体文件及其旁车（旁车名字跟着媒体走：`A.mp4` → `A-2.mp4` 时 `.txt` 同名）。"""
+    _move_file(source, target)
+    for path in companions:
+        _move_file(path, target + path[len(source):])
+
+
+def _remove_empty_dirs(root: str) -> None:
+    """清掉回收站里的空目录（自底向上）；root 自身保留。"""
+    for dirpath, _dirnames, _filenames in os.walk(root, topdown=False):
+        if os.path.realpath(dirpath) == os.path.realpath(root):
+            continue
+        with suppress(OSError):        # 非空目录 / 权限问题：留着即可，不算错误
+            os.rmdir(dirpath)
+
+
+async def trash_material(session: AsyncSession, cfg: AppConfig,
+                         material_id: uuid.UUID) -> dict[str, Any] | None:
+    """把素材（连同旁车）移进 `_trash/<原相对路径>`，再删掉索引行（S6.3）。
+
+    口径：
+
+    - 文件不在磁盘上时**仍然删行**（`file_missing=true`），不留删不掉的僵尸行；
+    - 回收站里已有同名文件时自动加序号（与上传同一套规则），不覆盖、不报错；
+    - 删除 `materials` 行会通过外键 CASCADE 清掉 `run_matches`——**历史候选不再回来**，
+      这是「恢复 = 重新入库（新 uuid）」的代价。
+    """
+    row = (await session.execute(
+        select(MaterialRow).where(MaterialRow.id == material_id))).scalar_one_or_none()
+    if row is None:
+        return None
+
+    materials_dir = os.path.abspath(cfg.materials_dir())
+    media_path = os.path.abspath(row.path)
+    relative = os.path.relpath(media_path, materials_dir)
+    if relative.startswith(".."):
+        raise BadRequestError("素材不在素材根目录下，拒绝移入回收站",
+                              {"path": row.path})
+
+    root = trash_root(cfg)
+    destination = unique_path(os.path.join(root, relative))
+    file_missing = not os.path.isfile(media_path)
+    if not file_missing:
+        await asyncio.to_thread(_move_bundle, media_path, destination,
+                                companion_paths(media_path))
+
+    trashed = os.path.relpath(destination, root).replace(os.sep, "/")
+    material_id_str = str(row.id)
+    await session.delete(row)
+    await session.commit()
+    return {"material_id": material_id_str, "path": relative.replace(os.sep, "/"),
+            "trashed_path": trashed, "file_missing": file_missing}
+
+
+def list_trash(cfg: AppConfig) -> dict[str, Any]:
+    """列出回收站里的**媒体**文件（旁车跟着媒体走，不单独列出），按相对路径排序。"""
+    root = trash_root(cfg)
+    items: list[dict[str, Any]] = []
+    if os.path.isdir(root):
+        for dirpath, dirnames, filenames in os.walk(root):
+            dirnames[:] = [name for name in dirnames if not name.startswith(".")]
+            for name in sorted(filenames):
+                if name.startswith("."):
+                    continue
+                path = os.path.join(dirpath, name)
+                kind = media_tool.kind_of(path)
+                if kind == "other":
+                    continue
+                stat = os.stat(path)
+                items.append({
+                    "path": os.path.relpath(path, root).replace(os.sep, "/"),
+                    "name": name,
+                    "type": kind,
+                    "size_bytes": int(stat.st_size),
+                    "mtime": datetime.fromtimestamp(stat.st_mtime, tz=UTC).isoformat(),
+                })
+    items.sort(key=lambda item: item["path"])
+    return {"items": items, "total": len(items)}
+
+
+def restore_from_trash(cfg: AppConfig, relative: str) -> str:
+    """把 `_trash/<relative>`（媒体 + 旁车）移回素材根目录，返回恢复后的绝对路径（S6.3）。
+
+    恢复 = **重新入库**：调用方随后触发一次索引任务，拿到的是新 uuid、重新打标——
+    `run_matches` 已在移入回收站时被级联清掉，不会回来。
+    目标位置已有同名文件时抛 `ConflictError`（409），不覆盖。
+    """
+    root = trash_root(cfg)
+    source = resolve_under(root, relative)
+    if not os.path.isfile(source):
+        raise NotFoundError(f"回收站里没有这个文件：{relative}", {"path": relative})
+    target = resolve_under(cfg.materials_dir(), relative)
+    if os.path.exists(target):
+        raise ConflictError(f"目标位置已有同名文件：{relative}", {"path": relative})
+    _move_bundle(source, target, companion_paths(source))
+    return target
+
+
+def purge_trash(cfg: AppConfig, *, paths: Sequence[str] | None = None,
+                all_files: bool = False) -> dict[str, Any]:
+    """真删回收站里的文件（S6.3）：`paths` 给具体条目（连同旁车），`all_files` 清空整个回收站。
+
+    先整体校验再删：任何一条路径不在回收站里就抛 404，不做部分删除（避免"删了一半"的中间态）。
+    """
+    root = trash_root(cfg)
+    if not os.path.isdir(root):
+        return {"deleted": [], "count": 0}
+
+    if all_files:
+        targets = [os.path.join(dirpath, name)
+                   for dirpath, _dirnames, filenames in os.walk(root) for name in filenames]
+    else:
+        targets = []
+        for relative in paths or []:
+            source = resolve_under(root, relative)
+            if not os.path.isfile(source):
+                raise NotFoundError(f"回收站里没有这个文件：{relative}", {"path": relative})
+            targets.extend([source, *companion_paths(source)])
+
+    deleted: list[str] = []
+    for target in dict.fromkeys(targets):          # 去重：all 模式下不会重复，单条模式可能
+        relative = os.path.relpath(target, root).replace(os.sep, "/")
+        try:
+            os.remove(target)
+        except FileNotFoundError:                  # pragma: no cover - 并发删除的窄窗口
+            continue
+        deleted.append(relative)
+    _remove_empty_dirs(root)
+    deleted.sort()
+    return {"deleted": deleted, "count": len(deleted)}
 
 
 async def sync_materials(session: AsyncSession, cfg: AppConfig, *,

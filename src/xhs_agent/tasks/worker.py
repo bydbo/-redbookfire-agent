@@ -23,6 +23,7 @@ from ..core.tracing import flush_tracer, warn_if_disabled
 from ..tools.vision import make_describer
 from .analysis import register_analyze_task
 from .celery_app import build_celery_app, install_logging
+from .indexing import register_index_task
 from .reconcile import install_worker_ready_reconcile
 
 config = load_config()
@@ -33,6 +34,9 @@ app: Celery = build_celery_app(config)
 
 # 视觉打标走能力裁剪：没有 ffmpeg / 没开 [vision] 时 make_describer 返回 None
 analyze_run = register_analyze_task(app, config, vision=make_describer(config))
+
+# S6.3：素材索引任务（扫描 / 上传 / 回收站恢复都投它）—— 同样按能力裁剪注入视觉打标
+index_materials = register_index_task(app, config, vision=make_describer(config))
 
 # S4.1：接管 Celery 自己的日志装配，让 `XHS_LOG_FORMAT=json` 在 worker 里也生效
 install_logging(config)

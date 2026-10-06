@@ -70,14 +70,17 @@ class TestBuildCeleryApp:
         assert conf.task_soft_time_limit == 30
         assert conf.task_time_limit == 45
 
-    def test_no_result_backend(self, tmp_path):
-        """运行状态以数据库为准（ADR 0011）：不设 result backend。
+    def test_result_backend_is_the_same_redis(self, tmp_path):
+        """S6.3 / ADR 0014：素材索引任务的进度与失败原因存在结果后端（前端要读）。
 
-        设了后端会让 send_task 顺带碰后端，broker 不可达时抛裸 RuntimeError 且要等好几秒
-        （实测 6.8 秒），不设后端则直接抛 kombu.OperationalError，能精确映射 503。
+        分析任务反过来显式 `ignore_result=True`（投递端 + 任务声明两处），所以设了后端也不会
+        把「broker 不可达 → 快速 503」改坏——那两点由 `tests/unit/test_api_contract.py` 里的
+        投递器用例与 test_analysis 的任务声守。旧口径（完全不设后端）见 ADR 0014 的备选方案。
         """
         cfg = with_redis(make_config(tmp_path), "redis://127.0.0.1:6379/0")
-        assert not build_celery_app(cfg).conf.result_backend
+        app = build_celery_app(cfg)
+        assert app.conf.result_backend == "redis://127.0.0.1:6379/0"
+        assert app.conf.result_expires == 3600
 
     def test_broker_fails_fast(self, tmp_path):
         cfg = with_redis(make_config(tmp_path), "redis://127.0.0.1:6379/0")

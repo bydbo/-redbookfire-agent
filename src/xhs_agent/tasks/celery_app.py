@@ -1,4 +1,4 @@
-"""Celery 应用工厂：broker 取 `REDIS_URL`，软/硬超时取 `[queue]`（S3.4b）。
+"""Celery 应用工厂：broker 与结果后端都取 `REDIS_URL`，软/硬超时取 `[queue]`（S3.4b / S6.3）。
 
 用途：给 worker 与 API 投递侧造同一份 Celery 配置；**纯工厂**，导入期不读配置（S3.2 口径），
       所以可以离线单测。worker 的模块级 app 在 `tasks/worker.py` 里。
@@ -6,10 +6,17 @@
 输出：配置好的 `celery.Celery` 实例。
 边界：缺 `REDIS_URL` 或前缀不对直接抛 `ConfigError`（配置问题，不降级）。
 
-为什么**不设 result backend**：运行状态的权威源是数据库（ADR 0011），我们从不读 Celery 结果。
-设了后端反而更糟——`send_task` 会顺带碰后端，broker 不可达时实测要 6.8 秒并抛一个裸
-`RuntimeError("Retry limit exceeded … result store backend")`；不设后端则直接抛
-`kombu.exceptions.OperationalError("Timeout connecting to server")`，语义清楚、能精确映射 503。
+为什么 S6.3 起**设** result backend（ADR 0014）：素材索引任务（扫描 / 上传 / 回收站恢复）没有
+数据库行可以承载进度与失败原因（本轮零迁移、不加表），`GET /api/materials/tasks/{task_id}`
+读的就是结果后端。护栏有两层，都是为了不改坏 S3.4b 定下的错误语义：
+
+1. **投递端**：分析任务显式 `ignore_result=True`（`api/deps.py`）——`send_task` 在
+   `ignore_result=True` 时*不会*调 `backend.on_task_call`，所以 broker 不可达仍然是快速
+   `kombu.exceptions.OperationalError` → 503，而不是 6.8 秒后抛裸
+   `RuntimeError("Retry limit exceeded … result store backend")`；
+2. **worker 端**：分析任务在 `register_analyze_task` 里也声明 `ignore_result=True`——消息头
+   优先于任务声明（`celery.app.trace.get_actual_ignore_result`），两边一致就不会往 Redis 里
+   堆没人读的分析结果（ADR 0011：运行状态的权威源是数据库）。
 """
 
 from __future__ import annotations
@@ -43,8 +50,9 @@ def redis_url(cfg: AppConfig) -> str:
 
 
 def build_celery_app(cfg: AppConfig) -> Celery:
-    """按配置造 Celery 应用（broker=Redis；不设 result backend，见模块 docstring）。"""
-    app = Celery("xhs_agent", broker=redis_url(cfg))
+    """按配置造 Celery 应用（broker 与结果后端都是 Redis；理由见模块 docstring）。"""
+    url = redis_url(cfg)
+    app = Celery("xhs_agent", broker=url, backend=url)
     app.conf.update(
         broker_transport_options={"socket_connect_timeout": SOCKET_TIMEOUT_S,
                                   "socket_timeout": SOCKET_TIMEOUT_S,
@@ -52,6 +60,8 @@ def build_celery_app(cfg: AppConfig) -> Celery:
         broker_connection_retry_on_startup=True,
         task_soft_time_limit=cfg.queue.task_soft_time_limit_s,
         task_time_limit=cfg.queue.task_time_limit_s,
+        # 结果只服务于"这次索引任务跑到哪了"，任务结束后一小时即可回收
+        result_expires=3600,
         timezone="Asia/Shanghai",
         enable_utc=True,
     )
