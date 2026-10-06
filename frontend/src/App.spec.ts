@@ -10,7 +10,8 @@ function makeRouter() {
   return createRouter({
     history: createMemoryHistory(),
     routes: [
-      { path: '/', name: 'analysis', component: { template: '<div>分析台占位</div>' } },
+      { path: '/', name: 'chat', component: { template: '<div>对话占位</div>' } },
+      { path: '/analyze', name: 'analysis', component: { template: '<div>分析台占位</div>' } },
       { path: '/materials', name: 'materials', component: { template: '<div>素材库占位</div>' } },
       { path: '/runs', name: 'run-history', component: { template: '<div>历史占位</div>' } },
       { path: '/runs/:runId', name: 'run-result', component: { template: '<div>详情占位</div>' } },
@@ -37,14 +38,24 @@ describe('App 壳层（S5.7 顶栏 + 主题）', () => {
     vi.unstubAllGlobals()
   })
 
-  it('顶栏提供分析台、素材库与运行历史三个入口', async () => {
+  it('顶栏提供聊天、分析台、素材库与运行历史四个入口', async () => {
     const { wrapper, router } = await mountApp()
     const links = wrapper.findAll('.app-nav-link').map((link) => link.text())
-    expect(links).toEqual(['分析台', '素材库', '运行历史'])
+    expect(links).toEqual(['聊天', '分析台', '素材库', '运行历史'])
 
-    await wrapper.findAll('.app-nav-link')[2].trigger('click')
+    await wrapper.findAll('.app-nav-link')[3].trigger('click')
     await flushPromises()
     expect(router.currentRoute.value.name).toBe('run-history')
+  })
+
+  it('首页是聊天，分析台在 /analyze（路由名仍是 analysis）', async () => {
+    const { wrapper, router } = await mountApp()
+    expect(router.currentRoute.value.name).toBe('chat')
+
+    await wrapper.findAll('.app-nav-link')[1].trigger('click')
+    await flushPromises()
+    expect(router.currentRoute.value.name).toBe('analysis')
+    expect(router.currentRoute.value.path).toBe('/analyze')
   })
 
   it('结果详情页把「运行历史」标记为当前栏', async () => {

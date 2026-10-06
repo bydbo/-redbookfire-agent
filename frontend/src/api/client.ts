@@ -46,7 +46,13 @@ function toApiError(body: unknown, status: number): ApiRequestError {
   return new ApiRequestError(message, code, status, detail)
 }
 
-async function normalizeError(response: Response): Promise<ApiRequestError> {
+/**
+ * 把非 2xx 响应归一化成 `ApiRequestError`（导出版）。
+ *
+ * `apiFetch` / `apiUpload` / `uploadWithProgress` 用它，`api/chat.ts` 的 SSE 请求也用它——
+ * 流式接口的失败（400 / 404 / 503）必须和普通接口抛出同一种错误，store 才能一套处理。
+ */
+export async function normalizeResponseError(response: Response): Promise<ApiRequestError> {
   let body: unknown = null
   try {
     body = await response.json()
@@ -64,7 +70,7 @@ export async function apiFetch<T>(path: string, options: ApiFetchOptions = {}): 
     body: options.body === undefined ? undefined : JSON.stringify(options.body),
   })
 
-  if (!response.ok) throw await normalizeError(response)
+  if (!response.ok) throw await normalizeResponseError(response)
 
   return (await response.json()) as T
 }
@@ -77,7 +83,7 @@ export async function apiFetch<T>(path: string, options: ApiFetchOptions = {}): 
 export async function apiUpload<T>(path: string, form: FormData): Promise<T> {
   const response = await fetch(apiUrl(path), { method: 'POST', body: form })
 
-  if (!response.ok) throw await normalizeError(response)
+  if (!response.ok) throw await normalizeResponseError(response)
 
   return (await response.json()) as T
 }
