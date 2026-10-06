@@ -378,6 +378,98 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/chat/sessions": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * 列出对话会话
+         * @description 按最近活跃（`updated_at`）倒序分页；每项带消息数与末条消息预览（超 60 字截断）。
+         */
+        get: operations["listChatSessions"];
+        put?: never;
+        /**
+         * 新建对话会话
+         * @description 建一个空会话（前端「新对话」）。标题留空，等**首条用户消息**落库时取前 20 字自动补上；
+         *     会话与消息只在本机数据库里，附件落在 `runs/_chat/<session_id>/`。
+         */
+        post: operations["createChatSession"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/chat/sessions/{session_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * 读取会话与消息
+         * @description 返回会话与它的消息（按时间升序）。`status=running` 的 assistant 消息代表"这一轮还没跑完"，
+         *     前端刷新后用轮询补齐；超过 `[chat].turn_stale_seconds` 仍未收尾的会被标成 `interrupted`。
+         */
+        get: operations["getChatSession"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/chat/sessions/{session_id}/messages": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * 发一条消息（SSE 流式）
+         * @description 一次 multipart 请求带上文字与（可选的）一张图片，返回 `text/event-stream`：
+         *     `turn_started` → （可选）`tool_started` / `tool_progress` / `tool_finished` →
+         *     `text_delta`（真 token 增量）→ `turn_finished`（带 run_id）；失败则发一条 `error`
+         *     并结束这一轮。每一行 `data:` 是一个 JSON 对象。
+         *     **断开浏览器只停转发**：这一轮照常跑完并落库（库里能看到 assistant 消息的终态）。
+         *     图片只接受 jpg / png / webp（按 magic bytes），单张上限 `[chat].attachment_max_mb`。
+         */
+        post: operations["postChatMessage"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/chat/sessions/{session_id}/attachments/{message_id}/{index}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * 读取会话里的附件
+         * @description 按会话 + 消息 + 下标取回附件原图（回看历史会话时用）。消息不属于该会话、下标越界、
+         *     文件缺失一律 404，不区分原因（与关键帧接口同一口径，避免暴露内部布局）。
+         */
+        get: operations["getChatAttachment"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
 }
 export type webhooks = Record<string, never>;
 export interface components {
@@ -646,6 +738,93 @@ export interface components {
             path: string;
             /** @description 实际落盘的文件名（同名时带 `-2` 序号） */
             name: string;
+        };
+        /** @description 建会话请求体；可以不传（标题留空，等首条用户消息自动补）。 */
+        ChatSessionCreate: {
+            title?: string;
+        };
+        ChatSession: {
+            /** Format: uuid */
+            session_id: string;
+            /** @description 取首条用户消息前 20 字；未发言时为「新对话」，不可编辑 */
+            title: string;
+            /** Format: date-time */
+            created_at: string;
+            /** Format: date-time */
+            updated_at: string;
+        };
+        ChatSessionSummary: {
+            /** Format: uuid */
+            session_id: string;
+            title: string;
+            /** Format: date-time */
+            created_at: string;
+            /** Format: date-time */
+            updated_at: string;
+            message_count: number;
+            /** @description 末条消息正文（超 60 字截断加省略号；没有消息时为空串） */
+            last_message_preview: string;
+        };
+        ChatSessionList: {
+            items: components["schemas"]["ChatSessionSummary"][];
+            total: number;
+        };
+        ChatAttachment: {
+            /** @enum {string} */
+            kind: "image";
+            name: string;
+            mime: string;
+            bytes: number;
+            /** @description 取回附件的地址（可直接当 `<img src>`） */
+            url: string;
+        };
+        /** @description 一次工具调用的过程记录（挂在 assistant 消息上）。 */
+        ChatToolCall: {
+            tool: string;
+            /** @enum {string} */
+            status: "succeeded" | "failed";
+            args: {
+                [key: string]: unknown;
+            };
+            run_id?: string | null;
+            cost_cny?: number;
+            latency_ms?: number;
+            error?: string;
+            steps?: {
+                [key: string]: unknown;
+            }[];
+        };
+        ChatMessage: {
+            /** Format: uuid */
+            message_id: string;
+            /** Format: uuid */
+            session_id: string;
+            /** @enum {string} */
+            role: "user" | "assistant";
+            content: string;
+            /** @enum {string} */
+            status: "running" | "succeeded" | "failed" | "interrupted";
+            attachments: components["schemas"]["ChatAttachment"][];
+            tool_calls: components["schemas"]["ChatToolCall"][];
+            prompt_versions: {
+                [key: string]: number;
+            };
+            run_id?: string | null;
+            cost_cny?: number;
+            latency_ms?: number;
+            error?: string | null;
+            /** Format: date-time */
+            created_at: string;
+        };
+        ChatSessionDetail: {
+            /** Format: uuid */
+            session_id: string;
+            title: string;
+            /** Format: date-time */
+            created_at: string;
+            /** Format: date-time */
+            updated_at: string;
+            messages: components["schemas"]["ChatMessage"][];
         };
         /** @description 素材索引任务的状态；未知或已过期的 task_id 也返回它（state=PENDING）。 */
         MaterialTask: {
@@ -1349,6 +1528,165 @@ export interface operations {
                 };
             };
             400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            503: components["responses"]["DependencyUnavailable"];
+        };
+    };
+    listChatSessions: {
+        parameters: {
+            query?: {
+                limit?: number;
+                offset?: number;
+            };
+            header?: {
+                /** @description 客户端生成的请求标识；未提供时由服务端生成。用于贯穿日志、调用追踪与数据库记录。 */
+                "X-Request-ID"?: components["parameters"]["RequestId"];
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description 会话列表 */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ChatSessionList"];
+                };
+            };
+            503: components["responses"]["DependencyUnavailable"];
+        };
+    };
+    createChatSession: {
+        parameters: {
+            query?: never;
+            header?: {
+                /** @description 客户端生成的请求标识；未提供时由服务端生成。用于贯穿日志、调用追踪与数据库记录。 */
+                "X-Request-ID"?: components["parameters"]["RequestId"];
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: {
+            content: {
+                "application/json": components["schemas"]["ChatSessionCreate"];
+            };
+        };
+        responses: {
+            /** @description 已创建 */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ChatSession"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            422: components["responses"]["ValidationError"];
+            503: components["responses"]["DependencyUnavailable"];
+        };
+    };
+    getChatSession: {
+        parameters: {
+            query?: {
+                /** @description 只取最近 N 条消息（不传 = 全部） */
+                limit?: number;
+            };
+            header?: {
+                /** @description 客户端生成的请求标识；未提供时由服务端生成。用于贯穿日志、调用追踪与数据库记录。 */
+                "X-Request-ID"?: components["parameters"]["RequestId"];
+            };
+            path: {
+                session_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description 会话详情 */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ChatSessionDetail"];
+                };
+            };
+            404: components["responses"]["NotFound"];
+            503: components["responses"]["DependencyUnavailable"];
+        };
+    };
+    postChatMessage: {
+        parameters: {
+            query?: never;
+            header?: {
+                /** @description 客户端生成的请求标识；未提供时由服务端生成。用于贯穿日志、调用追踪与数据库记录。 */
+                "X-Request-ID"?: components["parameters"]["RequestId"];
+            };
+            path: {
+                session_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: {
+            content: {
+                "multipart/form-data": {
+                    /** @description 用户这条消息的文字（与图片至少给一个） */
+                    text?: string;
+                    /**
+                     * Format: binary
+                     * @description 可选的热点图片（jpg / png / webp）
+                     */
+                    file?: string;
+                };
+            };
+        };
+        responses: {
+            /** @description SSE 事件流 */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "text/event-stream": string;
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            422: components["responses"]["ValidationError"];
+            503: components["responses"]["DependencyUnavailable"];
+        };
+    };
+    getChatAttachment: {
+        parameters: {
+            query?: never;
+            header?: {
+                /** @description 客户端生成的请求标识；未提供时由服务端生成。用于贯穿日志、调用追踪与数据库记录。 */
+                "X-Request-ID"?: components["parameters"]["RequestId"];
+            };
+            path: {
+                session_id: string;
+                message_id: string;
+                index: number;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description 附件图片 */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "image/jpeg": string;
+                    "image/png": string;
+                    "image/webp": string;
+                };
+            };
             404: components["responses"]["NotFound"];
             503: components["responses"]["DependencyUnavailable"];
         };

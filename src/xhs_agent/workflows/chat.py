@@ -90,6 +90,7 @@ def _build_graph(*, provider: BaseProvider, run_tool: ToolRunner, max_rounds: in
         history = list(state.get("tool_calls") or [])
         for call in unknown:
             history.append({"tool": call["name"], "status": "failed", "args": call["args"],
+                            "run_id": None, "cost_cny": 0.0, "latency_ms": 0,
                             "error": "模型要调一个不存在的工具", "steps": []})
         reply = turn.text or str(state.get("reply") or "")
         pending = known if remaining > 0 else []

@@ -312,6 +312,94 @@ class MaterialTask(_Response):
     result: dict[str, Any] | None = None
 
 
+class ChatSessionCreate(BaseModel):
+    """`POST /api/chat/sessions` 请求体（可省）：标题留空即等首条用户消息自动补。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    title: str = Field(default="", max_length=100)
+
+
+class ChatAttachment(_Response):
+    """对话消息里的附件引用（S7.2/S7.4）：`url` 可直接当 `<img src>`。"""
+
+    # pydantic 对**单值** Literal 只导出 `const`，而契约与自写比对器认的是 `enum`：
+    # 补一份 enum 让两边可比（取值范围仍是同一个 "image"）。
+    kind: Annotated[Literal["image"], Field(json_schema_extra={"enum": ["image"]})]
+    name: str
+    mime: str
+    bytes: int
+    url: str
+
+
+class ChatToolCall(_Response):
+    """一次工具调用的过程记录（挂在 assistant 消息上）。"""
+
+    tool: str
+    status: Literal["succeeded", "failed"]
+    args: dict[str, Any]
+    run_id: UuidStr | None = None
+    cost_cny: float = 0.0
+    latency_ms: int = 0
+    error: str = ""
+    steps: list[dict[str, Any]] = Field(default_factory=list)
+
+
+class ChatMessage(_Response):
+    """一条对话消息（`role` 只会有 user / assistant，工具过程挂在 `tool_calls`）。"""
+
+    message_id: UuidStr
+    session_id: UuidStr
+    role: Literal["user", "assistant"]
+    content: str
+    status: Literal["running", "succeeded", "failed", "interrupted"]
+    attachments: list[ChatAttachment]
+    tool_calls: list[ChatToolCall]
+    prompt_versions: dict[str, int]
+    created_at: DateTimeStr
+    run_id: UuidStr | None = None
+    cost_cny: float = 0.0
+    latency_ms: int = 0
+    error: str | None = None
+
+
+class ChatSession(_Response):
+    """一个对话会话（S7.2）。"""
+
+    session_id: UuidStr
+    title: str
+    created_at: DateTimeStr
+    updated_at: DateTimeStr
+
+
+class ChatSessionSummary(_Response):
+    """会话列表项：会话字段 + 消息数与末条预览（刻意不用继承，避免导出 `allOf`）。"""
+
+    session_id: UuidStr
+    title: str
+    created_at: DateTimeStr
+    updated_at: DateTimeStr
+    message_count: int
+    last_message_preview: str
+
+
+class ChatSessionList(_Response):
+    """`GET /api/chat/sessions` 响应。"""
+
+    items: list[ChatSessionSummary]
+    total: int
+
+
+class ChatSessionDetail(_Response):
+    """会话详情：会话字段 + 消息数组（同样扁平写全）。"""
+
+    session_id: UuidStr
+    title: str
+    created_at: DateTimeStr
+    updated_at: DateTimeStr
+    messages: list[ChatMessage]
+
+
 class MatchCandidate(_Response):
     rank: int
     material_id: UuidStr

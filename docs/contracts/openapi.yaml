@@ -52,6 +52,8 @@ tags:
     description: 读取运行结果与报告
   - name: 素材
     description: 浏览、整理与导入本地素材库
+  - name: 对话
+    description: 对话式入口：会话、消息与流式回复
   - name: 运维
     description: 健康检查
 
@@ -682,6 +684,206 @@ paths:
                 $ref: '#/components/schemas/MaterialTrashResult'
         '400':
           $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '503':
+          $ref: '#/components/responses/DependencyUnavailable'
+
+  /api/chat/sessions:
+    post:
+      tags:
+        - 对话
+      summary: 新建对话会话
+      description: |
+        建一个空会话（前端「新对话」）。标题留空，等**首条用户消息**落库时取前 20 字自动补上；
+        会话与消息只在本机数据库里，附件落在 `runs/_chat/<session_id>/`。
+      operationId: createChatSession
+      parameters:
+        - $ref: '#/components/parameters/RequestId'
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ChatSessionCreate'
+      responses:
+        '201':
+          description: 已创建
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ChatSession'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '422':
+          $ref: '#/components/responses/ValidationError'
+        '503':
+          $ref: '#/components/responses/DependencyUnavailable'
+    get:
+      tags:
+        - 对话
+      summary: 列出对话会话
+      description: 按最近活跃（`updated_at`）倒序分页；每项带消息数与末条消息预览（超 60 字截断）。
+      operationId: listChatSessions
+      parameters:
+        - $ref: '#/components/parameters/RequestId'
+        - name: limit
+          in: query
+          required: false
+          schema:
+            type: integer
+            default: 20
+            minimum: 1
+            maximum: 100
+        - name: offset
+          in: query
+          required: false
+          schema:
+            type: integer
+            default: 0
+            minimum: 0
+      responses:
+        '200':
+          description: 会话列表
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ChatSessionList'
+        '503':
+          $ref: '#/components/responses/DependencyUnavailable'
+
+  /api/chat/sessions/{session_id}:
+    get:
+      tags:
+        - 对话
+      summary: 读取会话与消息
+      description: |
+        返回会话与它的消息（按时间升序）。`status=running` 的 assistant 消息代表"这一轮还没跑完"，
+        前端刷新后用轮询补齐；超过 `[chat].turn_stale_seconds` 仍未收尾的会被标成 `interrupted`。
+      operationId: getChatSession
+      parameters:
+        - $ref: '#/components/parameters/RequestId'
+        - name: session_id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+        - name: limit
+          in: query
+          required: false
+          description: 只取最近 N 条消息（不传 = 全部）
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 200
+      responses:
+        '200':
+          description: 会话详情
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ChatSessionDetail'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '503':
+          $ref: '#/components/responses/DependencyUnavailable'
+
+  /api/chat/sessions/{session_id}/messages:
+    post:
+      tags:
+        - 对话
+      summary: 发一条消息（SSE 流式）
+      description: |
+        一次 multipart 请求带上文字与（可选的）一张图片，返回 `text/event-stream`：
+        `turn_started` → （可选）`tool_started` / `tool_progress` / `tool_finished` →
+        `text_delta`（真 token 增量）→ `turn_finished`（带 run_id）；失败则发一条 `error`
+        并结束这一轮。每一行 `data:` 是一个 JSON 对象。
+        **断开浏览器只停转发**：这一轮照常跑完并落库（库里能看到 assistant 消息的终态）。
+        图片只接受 jpg / png / webp（按 magic bytes），单张上限 `[chat].attachment_max_mb`。
+      operationId: postChatMessage
+      parameters:
+        - $ref: '#/components/parameters/RequestId'
+        - name: session_id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      requestBody:
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              properties:
+                text:
+                  type: string
+                  description: 用户这条消息的文字（与图片至少给一个）
+                file:
+                  type: string
+                  format: binary
+                  description: 可选的热点图片（jpg / png / webp）
+      responses:
+        '200':
+          description: SSE 事件流
+          content:
+            text/event-stream:
+              schema:
+                type: string
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '422':
+          $ref: '#/components/responses/ValidationError'
+        '503':
+          $ref: '#/components/responses/DependencyUnavailable'
+
+  /api/chat/sessions/{session_id}/attachments/{message_id}/{index}:
+    get:
+      tags:
+        - 对话
+      summary: 读取会话里的附件
+      description: |
+        按会话 + 消息 + 下标取回附件原图（回看历史会话时用）。消息不属于该会话、下标越界、
+        文件缺失一律 404，不区分原因（与关键帧接口同一口径，避免暴露内部布局）。
+      operationId: getChatAttachment
+      parameters:
+        - $ref: '#/components/parameters/RequestId'
+        - name: session_id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+        - name: message_id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+        - name: index
+          in: path
+          required: true
+          schema:
+            type: integer
+            minimum: 0
+      responses:
+        '200':
+          description: 附件图片
+          content:
+            image/jpeg:
+              schema:
+                type: string
+                format: binary
+            image/png:
+              schema:
+                type: string
+                format: binary
+            image/webp:
+              schema:
+                type: string
+                format: binary
         '404':
           $ref: '#/components/responses/NotFound'
         '503':
@@ -1455,6 +1657,225 @@ components:
         name:
           type: string
           description: 实际落盘的文件名（同名时带 `-2` 序号）
+
+    ChatSessionCreate:
+      type: object
+      description: 建会话请求体；可以不传（标题留空，等首条用户消息自动补）。
+      additionalProperties: false
+      properties:
+        title:
+          type: string
+
+    ChatSession:
+      type: object
+      required:
+        - session_id
+        - title
+        - created_at
+        - updated_at
+      properties:
+        session_id:
+          type: string
+          format: uuid
+        title:
+          type: string
+          description: 取首条用户消息前 20 字；未发言时为「新对话」，不可编辑
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+
+    ChatSessionSummary:
+      type: object
+      required:
+        - session_id
+        - title
+        - created_at
+        - updated_at
+        - message_count
+        - last_message_preview
+      properties:
+        session_id:
+          type: string
+          format: uuid
+        title:
+          type: string
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+        message_count:
+          type: integer
+          minimum: 0
+        last_message_preview:
+          type: string
+          description: 末条消息正文（超 60 字截断加省略号；没有消息时为空串）
+
+    ChatSessionList:
+      type: object
+      required:
+        - items
+        - total
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/ChatSessionSummary'
+        total:
+          type: integer
+          minimum: 0
+
+    ChatAttachment:
+      type: object
+      required:
+        - kind
+        - name
+        - mime
+        - bytes
+        - url
+      properties:
+        kind:
+          type: string
+          enum:
+            - image
+        name:
+          type: string
+        mime:
+          type: string
+        bytes:
+          type: integer
+          minimum: 0
+        url:
+          type: string
+          description: 取回附件的地址（可直接当 `<img src>`）
+
+    ChatToolCall:
+      type: object
+      description: 一次工具调用的过程记录（挂在 assistant 消息上）。
+      required:
+        - tool
+        - status
+        - args
+      properties:
+        tool:
+          type: string
+        status:
+          type: string
+          enum:
+            - succeeded
+            - failed
+        args:
+          type: object
+          additionalProperties: true
+        run_id:
+          oneOf:
+            - type: string
+              format: uuid
+            - type: 'null'
+        cost_cny:
+          type: number
+        latency_ms:
+          type: integer
+          minimum: 0
+        error:
+          type: string
+        steps:
+          type: array
+          items:
+            type: object
+            additionalProperties: true
+
+    ChatMessage:
+      type: object
+      required:
+        - message_id
+        - session_id
+        - role
+        - content
+        - status
+        - attachments
+        - tool_calls
+        - prompt_versions
+        - created_at
+      properties:
+        message_id:
+          type: string
+          format: uuid
+        session_id:
+          type: string
+          format: uuid
+        role:
+          type: string
+          enum:
+            - user
+            - assistant
+        content:
+          type: string
+        status:
+          type: string
+          enum:
+            - running
+            - succeeded
+            - failed
+            - interrupted
+        attachments:
+          type: array
+          items:
+            $ref: '#/components/schemas/ChatAttachment'
+        tool_calls:
+          type: array
+          items:
+            $ref: '#/components/schemas/ChatToolCall'
+        prompt_versions:
+          type: object
+          additionalProperties:
+            type: integer
+        run_id:
+          oneOf:
+            - type: string
+              format: uuid
+            - type: 'null'
+        cost_cny:
+          type: number
+        latency_ms:
+          type: integer
+          minimum: 0
+        error:
+          oneOf:
+            - type: string
+            - type: 'null'
+        created_at:
+          type: string
+          format: date-time
+
+    ChatSessionDetail:
+      type: object
+      required:
+        - session_id
+        - title
+        - created_at
+        - updated_at
+        - messages
+      properties:
+        session_id:
+          type: string
+          format: uuid
+        title:
+          type: string
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+        messages:
+          type: array
+          items:
+            $ref: '#/components/schemas/ChatMessage'
 
     MaterialTask:
       type: object
