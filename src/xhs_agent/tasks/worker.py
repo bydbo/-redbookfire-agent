@@ -30,7 +30,8 @@ config = load_config()
 configure_logging(config.log_level, config.log_format)
 warn_if_disabled(config)      # S4.2：缺 Langfuse 三件套只 warning，不阻断 worker 启动
 
-app: Celery = build_celery_app(config)
+# `consumer=True`：worker 的 BRPOP 不能用 1 秒读超时，否则偶发丢任务消息（见工厂 docstring）
+app: Celery = build_celery_app(config, consumer=True)
 
 # 视觉打标走能力裁剪：没有 ffmpeg / 没开 [vision] 时 make_describer 返回 None
 analyze_run = register_analyze_task(app, config, vision=make_describer(config))

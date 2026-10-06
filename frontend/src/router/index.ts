@@ -3,14 +3,20 @@ import type { RouteRecordRaw } from 'vue-router'
 
 import AnalysisView from '@/views/AnalysisView.vue'
 
-// 路由表随页面落地逐步补充（结果详情 S5.4 / 运行历史 S5.6）。
+// 路由表随页面落地逐步补充（结果详情 S5.4 / 运行历史 S5.6 / 素材库 S6.5）。
 // 性能（S5.7）：分析台是首屏、保持同步加载；结果页与历史页懒加载，
-// 这样 ECharts 只随结果页 chunk 走，首屏不再背它那 ~350 KiB。
+// 这样 ECharts 只随结果页 chunk 走，首屏不再背它那 ~350 KiB；素材库同样是懒加载。
 const routes: RouteRecordRaw[] = [
   {
     path: '/',
     name: 'analysis',
     component: AnalysisView,
+  },
+  {
+    // 素材库（S6.5）：浏览 / 导入 / 整理，静态路径与 /runs 一样不会跟其它路由打架
+    path: '/materials',
+    name: 'materials',
+    component: () => import('@/views/MaterialsView.vue'),
   },
   {
     // 历史列表（S5.6）：静态路径优先级高于 /runs/:runId，两者互不冲突

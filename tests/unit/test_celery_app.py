@@ -88,6 +88,31 @@ class TestBuildCeleryApp:
         assert options["socket_connect_timeout"] == SOCKET_TIMEOUT_S
         assert options["retry_policy"]["max_retries"] == RETRY_POLICY["max_retries"]
 
+    def test_consumer_keeps_default_broker_timeouts(self, tmp_path):
+        """worker 用 `consumer=True`：BRPOP 不能被 1 秒读超时打断（那会丢消息）。
+
+        S6.5 真机冒烟实测：连传 3 个文件投了 3 个索引任务，只有 2 个进 worker，
+        第 3 个既不在队列里也没结果——就是 `socket_timeout=1` 与 BRPOP 抢超时丢的。
+        """
+        cfg = with_redis(make_config(tmp_path), "redis://127.0.0.1:6379/0")
+        options = build_celery_app(cfg, consumer=True).conf.broker_transport_options
+        assert "socket_timeout" not in options
+        assert "socket_connect_timeout" not in options
+        # 生产者那条路径不变，仍然是为了"broker 不可达就快速 503"
+        assert "socket_timeout" in build_celery_app(cfg).conf.broker_transport_options
+
+    def test_acks_late_and_prefetch_one(self, tmp_path):
+        """S6.5：任务跑完才 ack，且每个子进程只攥一条消息。
+
+        默认「收到就 ack」时，worker 崩了 / 被杀 / 连接抖一下就会静默吞任务；
+        真机冒烟就是靠这条把"上传后一直不出现"的现象钉住的。
+        """
+        cfg = with_redis(make_config(tmp_path), "redis://127.0.0.1:6379/0")
+        conf = build_celery_app(cfg).conf
+        assert conf.task_acks_late is True
+        assert conf.task_reject_on_worker_lost is True
+        assert conf.worker_prefetch_multiplier == 1
+
     def test_takes_over_celery_logging(self, tmp_path, monkeypatch):
         """S4.1：连上 `setup_logging` 信号等于声明"日志由我们配"（Celery 就不再套自己的 dictConfig）。"""
         from celery.signals import setup_logging

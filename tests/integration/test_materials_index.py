@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import AsyncIterator, Iterator
 from datetime import datetime
 from pathlib import Path
@@ -14,14 +15,16 @@ from typing import Any
 import pytest
 import pytest_asyncio
 from fastapi.testclient import TestClient
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
 from xhs_agent.api.deps import CeleryDispatcher, get_config, get_dispatcher, get_session
 from xhs_agent.api.main import create_app
 from xhs_agent.config import AppConfig, EnvView, load_config
 from xhs_agent.db import Base
+from xhs_agent.db.models import Material as MaterialRow
 from xhs_agent.services.materials import list_materials
-from xhs_agent.tasks.indexing import run_index
+from xhs_agent.tasks.indexing import run_index, run_locked
 from xhs_agent.tools.embedding import EmbeddingResult
 
 pytestmark = [pytest.mark.integration, pytest.mark.asyncio]
@@ -210,3 +213,43 @@ async def test_env_has_redis_dsn(task_cfg: AppConfig) -> None:
     assert (task_cfg.env_view.get("REDIS_URL") or "").startswith("redis://")
     assert (task_cfg.env_view.get("DATABASE_URL")
             or "").startswith("postgresql+asyncpg://")
+
+
+class TestConcurrentIndexing:
+    """S6.5 冒烟抓到的并发问题：多个上传各投一个索引任务，撞在一起就重复打标 + 插入冲突。"""
+
+    async def test_locked_runs_are_serialized(self, task_cfg: AppConfig,
+                                             db_session: AsyncSession,
+                                             cfg: AppConfig) -> None:
+        touch = Path(cfg.materials_dir()) / "运动" / "并发新片.mp4"
+        touch.parent.mkdir(parents=True, exist_ok=True)
+        touch.write_bytes(b"fake-video")
+
+        reports = await asyncio.gather(
+            run_locked(task_cfg, embedder=FakeEmbedder()),
+            run_locked(task_cfg, embedder=FakeEmbedder()),
+        )
+
+        assert all(report["scanned"] >= 1 for report in reports)
+        rows = (await db_session.execute(
+            select(MaterialRow).where(MaterialRow.path == str(touch)))).scalars().all()
+        assert len(rows) == 1                       # 只入库一次
+        assert sum(report["added"] for report in reports) == 1   # 第二个任务看到"没变化"
+
+    async def test_unlocked_runs_still_do_not_crash(self, task_cfg: AppConfig,
+                                                    db_session: AsyncSession,
+                                                    cfg: AppConfig) -> None:
+        """即使绕过锁（分析与索引同时做新鲜度同步），幂等插入也不该报唯一键冲突。"""
+        touch = Path(cfg.materials_dir()) / "运动" / "无锁并发.mp4"
+        touch.parent.mkdir(parents=True, exist_ok=True)
+        touch.write_bytes(b"fake-video")
+
+        reports = await asyncio.gather(
+            run_index(task_cfg, embedder=FakeEmbedder()),
+            run_index(task_cfg, embedder=FakeEmbedder()),
+        )
+
+        assert all(report["added"] >= 1 for report in reports)
+        rows = (await db_session.execute(
+            select(MaterialRow).where(MaterialRow.path == str(touch)))).scalars().all()
+        assert len(rows) == 1

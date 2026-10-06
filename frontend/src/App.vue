@@ -32,6 +32,13 @@ const activeNav = computed(() => (route.name === 'run-result' ? 'run-history' : 
             </router-link>
             <router-link
               class="app-nav-link"
+              :class="{ 'is-active': activeNav === 'materials' }"
+              :to="{ name: 'materials' }"
+            >
+              素材库
+            </router-link>
+            <router-link
+              class="app-nav-link"
               :class="{ 'is-active': activeNav === 'run-history' }"
               :to="{ name: 'run-history' }"
             >

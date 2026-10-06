@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Callable
+from contextlib import suppress
 from typing import Any
 
 from ..config import AppConfig
@@ -29,6 +30,12 @@ INDEX_TASK_NAME = "xhs_agent.index_materials"
 
 # 一次索引最多给多少条素材做视觉打标（与 `scripts/index_materials.py` 的默认一致）
 DEFAULT_MAX_VISION_ITEMS = 50
+
+# 串行化用的 Redis 锁（S6.5 冒烟抓到的并发问题）：
+# 锁最长持有 = 任务硬超时（900s）留余量减半，等待 = 5 分钟（等不到就报错，不静默跳过）。
+INDEX_LOCK_KEY = "xhs_agent:index_materials:lock"
+INDEX_LOCK_TIMEOUT_S = 600
+INDEX_LOCK_WAIT_S = 300
 
 # 阶段名（`GET /api/materials/tasks/{task_id}` 的 `step` 直接透出这两句）
 STEP_SYNC = "扫描素材目录"
@@ -90,6 +97,34 @@ async def run_index(cfg: AppConfig, *, vision: Any = None, embedder: Any = None,
         await engine.dispose()
 
 
+async def run_locked(cfg: AppConfig, **kwargs: Any) -> dict[str, Any]:
+    """拿 Redis 锁再跑一次索引（worker 路径用它；S6.5 冒烟抓到的并发问题）。
+
+    为什么必须串行：素材同步是「扫目录 → 逐个文件重建」。
+    两个任务同时跑会 ① 对同一个新文件各打一次视觉标签（**重复付费**）；
+    ② 同时插入同一路径（唯一键冲突）。锁用 Redis（与 broker 同一个实例），
+    自带 `timeout`——worker 崩了也不会永久占着；等不到锁就抛 `TimeoutError`
+    （任务记 FAILURE、前端看得到原因），不静默跳过。
+    """
+    import redis.asyncio as aioredis
+
+    from .celery_app import redis_url
+
+    client = aioredis.from_url(redis_url(cfg))
+    try:
+        lock = client.lock(INDEX_LOCK_KEY, timeout=INDEX_LOCK_TIMEOUT_S,
+                           blocking_timeout=INDEX_LOCK_WAIT_S)
+        if not await lock.acquire(blocking=True):
+            raise TimeoutError("另一个素材索引任务还在跑，等锁超时（不做静默跳过）")
+        try:
+            return await run_index(cfg, **kwargs)
+        finally:
+            with suppress(Exception):        # 释放失败不影响本次结果（锁会自己过期）
+                await lock.release()
+    finally:
+        await client.aclose()
+
+
 def register_index_task(app: Any, cfg: AppConfig, *, vision: Any = None, embedder: Any = None,
                         max_vision_items: int = DEFAULT_MAX_VISION_ITEMS) -> Any:
     """把素材索引任务注册到给定 app 上（worker 与集成用例共用同一份注册逻辑）。
@@ -105,7 +140,7 @@ def register_index_task(app: Any, cfg: AppConfig, *, vision: Any = None, embedde
         def step(name: str) -> None:
             self.update_state(state="STARTED", meta={"step": name})
 
-        return asyncio.run(run_index(cfg, vision=vision, embedder=embedder,
-                                     max_vision_items=max_vision_items, on_step=step))
+        return asyncio.run(run_locked(cfg, vision=vision, embedder=embedder,
+                                      max_vision_items=max_vision_items, on_step=step))
 
     return index_materials

@@ -62,7 +62,7 @@
 | 契约一致性校验（`scripts/check_openapi.py`：FastAPI 导出的 OpenAPI 必须覆盖 `docs/contracts/openapi.yaml`，跑在 CI 的 test job 里） | ✅ 已完成（S4.6） |
 | Alembic 数据库迁移（唯一建表路径） | ✅ 已完成（S2.3） |
 | 评测集 v1 与示例素材包（七维度口径、版本冻结） | ✅ 已完成（S2.0） |
-| 服务入口（FastAPI 八个接口 + LangGraph 编排，S3.1–S3.3；S5.4 / S5.6 / S6.6 扩充） | ✅ 已完成 |
+| 服务入口（FastAPI 十八个接口 + LangGraph 编排，S3.1–S3.3；S5.4 / S5.6 / S6.1–S6.6 扩充） | ✅ 已完成 |
 | 前端工程脚手架（Vue 3 + Vite + TS + Router + Pinia + Naive UI + Tailwind，S5.1：别名 / 环境变量 / 代理 / 构建配置） | ✅ 已完成（S5.1） |
 | 接口类型生成（S5.2：`openapi-typescript` 从 `docs/contracts/openapi.yaml` 生成 `frontend/src/api/schema.d.ts` 入库；`pnpm run check:api` + CI `frontend` job 防漂移） | ✅ 已完成（S5.2） |
 | 分析台页面（S5.3：多热点输入 → 提交 → 2 秒轮询进度 → 自动跳转结果占位页；`/` 为分析台、`/runs/:runId` 为结果页） | ✅ 已完成（S5.3） |
@@ -76,6 +76,11 @@
 | 预置线索通道（S6.7：`POST /api/analyze` 增加可选 `clues`（与 `hotspots` 等长、单项可 null）——用户确认/编辑过的线索直接落库并**短路拆解节点**，不重复付费；不传时行为与以前逐字节一致） | ✅ 已完成（S6.7） |
 | 分析台图片入口（S6.8：上传 / 拖拽 / 粘贴一张图 → 可编辑的描述与要素卡（类型·取值·权重）→ 与其他热点一起批量提交，或「用这条热点分析」只跑这一条；带 clue 的热点显示「来自图片」） | ✅ 已完成（S6.8） |
 | 图片链路测试与真机冒烟（S6.9：真容器集成用例证明「解析 → 带 clues 提交 → 结果页线索与提交值逐字段一致、拆解节点未被再次调用」；Playwright 驱动本机 Edge 走通真实链路，14/14 断言，run 成本 0.0530 元） | ✅ 已完成（S6.9） |
+| 素材库查询接口（S6.1：`GET /api/materials` 分页 + 关键词 / 类型 / 打标来源 / 主题目录筛选（含 `dirs` 计数）；`GET /api/materials/{id}` 详情含爆点要素；契约先行、`check_openapi` 零 diff） | ✅ 已完成（S6.1） |
+| 素材元数据编辑（S6.2：`PATCH /api/materials/{id}` 白名单三字段，**写库 + 写同名 `.txt` 旁车**——磁盘是唯一来源，重扫描后人工说明仍在；标签去重去空、上限 14 个） | ✅ 已完成（S6.2） |
+| 删除与回收站（S6.3：移入 `_trash/`（连同旁车）并删索引行、列出回收站、恢复 = 重新入库（新 uuid）、单条 / 一键真删；新增 `xhs_agent.index_materials` 任务与 **Celery 结果后端**（ADR 0014，分析任务显式 `ignore_result`）） | ✅ 已完成（S6.3） |
+| 扫描与上传导入（S6.4：`POST /api/materials/scan` 触发「增量同步 + 向量回填」；`POST /api/materials/uploads` **流式**落到 `<素材根>/<YYYY-MM>/`（同名加序号、超 `[upload].max_size_gb` 退 413）；`GET /api/materials/tasks/{id}` 查阶段 / 计数 / 失败原因；镜像装 ffmpeg） | ✅ 已完成（S6.4） |
+| 素材库页（S6.5：第 4 页 `/materials`——搜索 / 类型 / 来源 / 主题 chips、网格↔列表、拖拽上传带进度、编辑弹窗、多选批量删除、回收站抽屉；真机冒烟 20/20：导入 3 条 → 自动打标 → 改标签（库 + 旁车）→ 删入回收站 → 恢复（新 uuid）→ 清空） | ✅ 已完成（S6.5） |
 
 业务链路**已端到端跑通**：`docker compose up -d --wait` 起依赖 → `uv run celery -A xhs_agent.tasks.worker:app worker` 起 worker → `uv run python -m xhs_agent.serve` 起接口（先跑 7 步启动前置检查）→ `POST /api/analyze` 投递 → worker 自动消费（索引新鲜度 → 五节点分析 → 逐热点写回）→ `/api/jobs/{job_id}` 轮询 → `/api/runs/{run_id}` 取结构化结果、`/report` 取报告。另可运行 `uv run python -m xhs_agent.probe`、`uv run python scripts/index_materials.py`、`uv run python scripts/backfill_embeddings.py`、`uv run python scripts/eval_retrieval.py`、`uv run python scripts/smoke_skeleton.py`。路线图见文末。
 
@@ -265,7 +270,7 @@ pnpm build            # 类型检查 + 构建，产物落 frontend/dist（由 Fa
 pnpm run gen:api      # 契约变了才跑：从 ../docs/contracts/openapi.yaml 重新生成 src/api/schema.d.ts
 pnpm run check:api    # 防漂移自检：重新生成 + git diff，有差异即非零（CI 的 frontend job 跑这条）
 pnpm run lint         # ESLint 9（只做正确性规则，不查格式）
-pnpm test             # Vitest 单测（66 条，jsdom，含主题对比度、图表 option 与分析台状态机）
+pnpm test             # Vitest 单测（92 条，jsdom，含主题对比度、图表 option、分析台与素材库状态机）
 pnpm run test:cov     # 单测 + 覆盖率报告（只报告不设门槛）
 ```
 
@@ -274,6 +279,12 @@ pnpm run test:cov     # 单测 + 覆盖率报告（只报告不设门槛）
 > **分析台有两种输入方式（S6.6–S6.9）**：直接写热点文本，或「从图片拆热点」——选文件 / 拖拽 / 把一个图片**粘贴**进卡片（jpg / png / webp，单张 ≤ 10 MB）即可让多模态模型拆出热点描述与爆点要素；描述与要素卡（类型 / 取值 / 权重）都能改，改完点「用这条热点分析」只跑这一条，「加入热点列表」则与手输的热点混在同一次批量提交里。图片只在内存里转成模型输入，**不落盘、不入库**（解析成本按契约不进 `runs` 统计）；提交带线索的热点会**短路拆解节点**，不重复付费。`[vision].enabled` 打开且密钥就位才可用，默认关闭时接口会明确返回 503。
 
 > **`[frontend]` 段怎么起作用**：`serve = true`（默认）且 `frontend/dist` 存在且非空时，FastAPI 会把 dist 挂在根路径，并把 `/api` 之外的未命中路径（无扩展名的）回落成 `index.html`——前端 history 路由刷新不会 404；带扩展名的未命中仍返回 404，API 的 404 也照旧是 `not_found` 的 JSON。
+
+> **素材库页（S6.1–S6.5）**：顶栏「素材库」→ `/materials`。支持拖拽 / 选择文件上传（视频与图片，
+> 单个默认 ≤ 2 GB，落点 `<素材根>/YYYY-MM/`，同名自动加序号）、按主题目录 / 类型 / 打标来源 /
+> 关键词筛选、网格↔列表切换、编辑标题 / 描述 / 标签（**同时写数据库与同名 `.txt` 旁车**，
+> 重扫描后人工说明仍在）、多选批量删除、回收站抽屉（恢复 / 单条真删 / 一键清空）。
+> 「扫描」按钮触发一次「增量同步 + 向量回填」，进度与失败原因用 `GET /api/materials/tasks/{task_id}` 查。
 >
 > **还没有前端产物时**：`serve = true` + 缺 dist 属于配置错误，启动前置检查会**拒绝启动**（退出码 2）。本地纯后端开发用环境变量覆盖即可只跑 API：`XHS_FRONTEND_SERVE=false`（等价于把 `[frontend].serve` 设为 `false`）——`scripts/smoke_skeleton.py` 已经默认这么做了。前端工程已落地（S5.1–S5.9），本地 `cd frontend && pnpm build` 产 dist；**镜像里也已内含 dist**，`docker compose up -d --wait` 后 http://127.0.0.1:8000/ 直接就是单页应用。
 

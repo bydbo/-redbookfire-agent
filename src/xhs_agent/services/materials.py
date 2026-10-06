@@ -32,6 +32,7 @@ from decimal import Decimal
 from typing import Any, Protocol, TypeVar
 
 from sqlalchemy import func, or_, select
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..config import PROJECT_ROOT, AppConfig, ConfigError
@@ -179,6 +180,21 @@ def _row_values(material: Material, keyframes: list[str]) -> dict[str, Any]:
         "fingerprint": material.fingerprint,
         "indexed_at": datetime.now(UTC),
     }
+
+
+def _insert_row(values: dict[str, Any]) -> Any:
+    """按 `path` 幂等插入素材行（S6.5 冒烟抓到的并发问题）。
+
+    为什么不是 `session.add`：素材同步是「扫目录 → 逐个文件重建」，而两个任务可能同时跑
+    （多个上传各投一个索引任务、或分析与索引同时做新鲜度同步）。同一个新文件被两边同时插入时，
+    唯一键 `materials.path` 会直接报 `IntegrityError`——整批任务就此失败。
+    改成 `ON CONFLICT (path) DO UPDATE` 之后，后到的那次改写同一行（内容一致），
+    并把向量清空等回填（与"内容变了"同一条规则）。
+    """
+    statement = pg_insert(MaterialRow).values(**values)
+    return statement.on_conflict_do_update(
+        index_elements=[MaterialRow.path],
+        set_={**values, "embedding": None, "embedding_model": None})
 
 
 def row_to_material(row: MaterialRow) -> Material:
@@ -753,7 +769,8 @@ async def sync_materials(session: AsyncSession, cfg: AppConfig, *,
         values = _row_values(material, _relative_keyframes(material.keyframes))
         existing = rows_by_path.get(os.path.abspath(path))
         if existing is None:
-            session.add(MaterialRow(**values))
+            # 幂等插入：并发同步撞上同一路径时改写而不是报错（见 `_insert_row`）
+            await session.execute(_insert_row(values))
             report.added += 1
         else:
             for column, value in values.items():

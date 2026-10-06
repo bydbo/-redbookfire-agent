@@ -21,7 +21,7 @@
 | E3 编排与服务  | 服务化与异步，端到端可演示     | 20.5     | ✅ 已完成（S3.0–S3.10） | M4  |
 | E4 可观测与交付 | 可运维、可交付           | 8        | ✅ 已完成（S4.1–S4.6）  | M5  |
 | E5 前端工程   | 把演示页升级为可交互的单页应用   | 17       | ✅ 已完成（S5.1–S5.9） | M6  |
-| E6 新功能迭代 | 后续功能迭代的容器（主题一：素材库页；主题二：图片热点解析） | 19.5 | 🔄 主题二「图片热点解析」已完成（S6.6–S6.9）；主题一未开始 | M7 / M8 |
+| E6 新功能迭代 | 后续功能迭代的容器（主题一：素材库页；主题二：图片热点解析） | 19.5 | ✅ 已完成（S6.1–S6.9） | M7 / M8 |
 | E7 对话式入口 | 把现有流水线外放为对话框，对话成为首页 | 25 | ⬜ 未开始 | M9 |
 | **合计**    |                   | **121** |                   |     |
 
@@ -204,11 +204,85 @@
 
 | 编号 | Story | 依赖 | 验收标准 | 人日 | 状态 |
 | --- | --- | --- | --- | --- | --- |
-| S6.1 | 素材库查询接口 | S3.3 | `GET /api/materials`：分页（默认 24/页、上限 100）、关键词搜标题与标签、按 `type` 与 `source` 筛选、按 `indexed_at` 倒序；`GET /api/materials/{id}` 返回含关键帧的详情，非法 uuid 按 404 对齐契约；**契约先行**——先改 `openapi.yaml` 再实现，`scripts/check_openapi.py` 零 diff | 1.5 | ⬜ |
-| S6.2 | 元数据编辑接口 | S6.1 | `PATCH /api/materials/{id}` 只接受 `title` / `tags` / `description`（白名单，其余字段一律拒绝而非静默忽略）；标签去重去空、上限与 `schemas` 既有约束一致；改完列表立即反映 | 1 | ⬜ |
-| S6.3 | 删除与回收站 | S6.1 | `POST /api/materials/{id}/trash` 把文件移到 `_trash/<原相对路径>` 并删掉索引行；`GET /api/materials/trash` 扫盘列出回收站；`POST /api/materials/trash/restore` 按相对路径恢复；`POST /api/materials/trash/purge` 真删（需二次确认）。**恢复等于重新入库**（新 uuid、重新打标、历史候选因 CASCADE 不再回来）——这条写进接口文档，避免被当成 bug | 2 | ⬜ |
-| S6.4 | 扫描与上传导入 | S6.1, S3.4b | `POST /api/materials/scan` 触发 Celery 跑「增量同步 + 向量回填」；`POST /api/materials/uploads` 流式接收文件、落到 `<YYYY-MM>/`、随后自动走同一套索引链路（抽帧打标 + 向量回填）；新增只读 `GET /api/materials/tasks/{task_id}` 查询进度与失败原因（读 Celery result backend，不新建表）；新增 `[upload]` 配置段（`max_size_gb=2`、允许的扩展名）并同步配置契约 | 3 | ⬜ |
-| S6.5 | 前端素材库页 | S5.7, S6.2, S6.3, S6.4 | 网格/列表切换、筛选与搜索、分页、多选与批量删除、编辑弹窗、拖拽上传带进度、扫描按钮、回收站抽屉（恢复/清空）；与前三页共用同一套主题 token；**真实冒烟**（Playwright 驱动本机浏览器）：导入 3 条 → 列表可见 → 改标签 → 删入回收站 → 恢复 → 清空，断言列表条数、标签改动、回收站内容与磁盘状态逐项一致，截图落 `runs/_smoke_s65/` | 4 | ⬜ |
+| S6.1 | 素材库查询接口 | S3.3 | `GET /api/materials`：分页（默认 24/页、上限 100）、关键词搜标题与标签、按 `type` 与 `source` 筛选、按 `indexed_at` 倒序；`GET /api/materials/{id}` 返回含关键帧的详情，非法 uuid 按 404 对齐契约；**契约先行**——先改 `openapi.yaml` 再实现，`scripts/check_openapi.py` 零 diff | 1.5 | ✅ |
+| S6.2 | 元数据编辑接口 | S6.1 | `PATCH /api/materials/{id}` 只接受 `title` / `tags` / `description`（白名单，其余字段一律拒绝而非静默忽略）；标签去重去空、上限与 `schemas` 既有约束一致；改完列表立即反映 | 1 | ✅ |
+| S6.3 | 删除与回收站 | S6.1 | `POST /api/materials/{id}/trash` 把文件移到 `_trash/<原相对路径>` 并删掉索引行；`GET /api/materials/trash` 扫盘列出回收站；`POST /api/materials/trash/restore` 按相对路径恢复；`POST /api/materials/trash/purge` 真删（需二次确认）。**恢复等于重新入库**（新 uuid、重新打标、历史候选因 CASCADE 不再回来）——这条写进接口文档，避免被当成 bug | 2 | ✅ |
+| S6.4 | 扫描与上传导入 | S6.1, S3.4b | `POST /api/materials/scan` 触发 Celery 跑「增量同步 + 向量回填」；`POST /api/materials/uploads` 流式接收文件、落到 `<YYYY-MM>/`、随后自动走同一套索引链路（抽帧打标 + 向量回填）；新增只读 `GET /api/materials/tasks/{task_id}` 查询进度与失败原因（读 Celery result backend，不新建表）；新增 `[upload]` 配置段（`max_size_gb=2`、允许的扩展名）并同步配置契约 | 3 | ✅ |
+| S6.5 | 前端素材库页 | S5.7, S6.2, S6.3, S6.4 | 网格/列表切换、筛选与搜索、分页、多选与批量删除、编辑弹窗、拖拽上传带进度、扫描按钮、回收站抽屉（恢复/清空）；与前三页共用同一套主题 token；**真实冒烟**（Playwright 驱动本机浏览器）：导入 3 条 → 列表可见 → 改标签 → 删入回收站 → 恢复 → 清空，断言列表条数、标签改动、回收站内容与磁盘状态逐项一致，截图落 `runs/_smoke_s65/` | 4 | ✅ |
+
+<details>
+<summary>S6.1–S6.5 实测记录（2026-10-06）</summary>
+
+**S6.1 查询接口（契约先行）**
+
+- `openapi.yaml` 新增 tag `素材`、`GET /api/materials`（分页 + `q` / `type` / `source` / `dir` 筛选）
+  与 `GET /api/materials/{material_id}`，以及 `MaterialItem` / `MaterialDetail` / `MaterialList`
+  三个 schema（**扁平写全、不用 `allOf`**——自写比对器只认 properties/required/items）。
+- `dir` 是「相对素材根目录的主题目录」（空串 = 根目录），`dirs` 是**直接子目录**计数且只受
+  q/type/source 影响（不受 dir 影响，否则选中一个主题后其余主题就消失了）；`dir` 这一列库里没有，
+  由绝对路径现算成正斜杠，前端不用自己拆 Windows 路径。
+- 关键词转义 `%` / `_`（用户搜「50%」不会被当成通配）。
+- 实测：单测 11 条 + 真容器集成 11 条（排序 / 分页 / 关键词 / 类型 / 来源 / 含子目录的 dir /
+  `dirs` 聚合 / 详情 elements / 接口响应形状）。
+
+**S6.2 编辑接口**
+
+- `PATCH` 白名单三字段（`additionalProperties: false` → 越界字段 422），一个字段都没给 → 400。
+- **先写旁车、再落库**：`<素材>.txt`（`标题/标签/描述`，UTF-8+LF）、值没变不写文件、已有 `.md`/`.json`
+  不删（`.txt` 优先）、素材文件不在盘上时只改库；改过就 `source=sidecar`（人工确认过）。
+- 标签去空白 / 去 `#` / 去重，上限 14 个、单个 24 字（超限 400，且校验在查库之前）。
+- 实测：单测 14 条 + 集成 7 条（库与旁车同时变、未变不写文件、`.md` 保留、文件缺失只改库、
+  清空标签、未知 id、接口形状）。
+
+**S6.3 回收站 + 索引任务（ADR 0014）**
+
+- 四条 path：`POST /materials/{id}/trash`（连同旁车移到 `_trash/<相对路径>`、删行级联
+  `run_matches`、同名加序号、文件缺失仍删行并回 `file_missing=true`）、`GET /materials/trash`
+  （只列媒体）、`POST /materials/trash/restore`（反向移动 + 触发索引 → 202 + task_id）、
+  `POST /materials/trash/purge`（`paths` 或 `all=true` 二选一 + `confirm`，先整体校验再删）。
+- 所有路径都做防穿越（空 / 绝对路径 / `../` 一律 400）。
+- **Celery 结果后端（ADR 0014）**：`backend = broker = REDIS_URL`，`GET /api/materials/tasks/{id}`
+  读 state/meta（阶段 / 计数 / 失败原因）；**分析任务显式 `ignore_result=True`**（投递端 + 任务声明），
+  所以 broker 不可达仍是快速 503、Redis 里也不会堆没人读的分析结果。
+- `tasks/indexing.py`：`xhs_agent.index_materials`（同步外壳 + 自建 engine + 任务内 `update_state`）。
+- 实测：单测 24 条（路径安全 6 例）+ 投递器 3 条 + Celery 配置 1 条；集成 10 条（含
+  「恢复后重新入库拿到新 uuid」「真 Redis 上读回 SUCCESS/PENDING/FAILURE」）。
+
+**S6.4 扫描与上传**
+
+- `POST /materials/scan`、`POST /materials/uploads`（multipart 单文件，**流式**落
+  `<素材根>/<YYYY-MM>/`，先写 `.incoming-*.part` 再原子改名）、`GET /materials/tasks/{task_id}`。
+- 体积超 `[upload].max_size_gb` → **413 `payload_too_large`**（新增错误码 + 响应组件）；
+  扩展名按后缀判断（不在清单 400）；同名自动加 `-2`。
+- 配置先行：`[upload]`（`max_size_gb=2`、`allowed_extensions` 与 `tools/media.py` 的 `MEDIA_EXT`
+  同源，单测守着两处不漂）→ 同步 `config.toml`、《配置契约》§3.11 与 `describe()`。
+- 镜像：runtime `apt-get install ffmpeg`——容器这才谈得上「一条命令起全栈」（抽帧 / 探测 / 缩略图）。
+- 实测：单测 31 条（文件名净化、落盘、同名、扩展名、空文件、超限清理、`task_view` 五态、
+  任务接口、`[upload]` 默认与非法值、Dockerfile 装 ffmpeg）；集成 8 条（真上传落盘、真 Redis 读回）。
+
+**S6.5 前端素材库页 + 真机冒烟**
+
+- 第 4 页 `/materials`（顶栏插在「分析台」与「运行历史」之间）：工具条（搜索 / 类型 / 来源 /
+  主题 chips / 网格↔列表 / 重置）、上传区（选择文件 + 拖拽，多文件逐个并发上传各自进度）、
+  网格与列表两种渲染（缩略图走既有取帧接口、无帧占位；类型角标、时长、大小、索引时间、来源、标签）、
+  多选 + 批量删除（单条接口并发 + `Promise.allSettled` 汇总失败）、编辑弹窗（标题 / 描述 / 标签 chip）、
+  回收站抽屉（列表 + 恢复 + 真删 + 一键清空，均二次确认）。新增 `uploadWithProgress`（XHR：
+  fetch 拿不到上传进度）。前端 92 条单测全绿。
+- **真机冒烟 20/20**（`runs/_smoke_s65/`）：容器托管 SPA + 临时 `[vision]` 配置（api 与 worker 都挂），
+  Playwright 驱动本机 Edge：上传 3 个真文件（2 图 + 1 段真视频）→ 12.5 秒索引完成 → `source=vision`
+  且各有标签、视频抽出 3 张关键帧（容器 ffmpeg 生效）→ 主题 chips 过滤出 3 条 → 改标签（库与
+  旁车文件两处都变）→ 删入回收站（列表少一条 + 磁盘进 `_trash/`）→ 恢复（**新 uuid**）→
+  三条再删 + 一键清空（回收站与磁盘无残留）→ `/api/health` 仍 ok、控制台零报错。
+- **冒烟抓到两个真 bug（都已修）**：
+  1. **并发索引互相打架**：多个上传各投一个索引任务，同时扫目录会对同一文件重复打标（重复付费）
+     并插入冲突报 `IntegrityError`。→ 幂等插入（`ON CONFLICT (path) DO UPDATE`）+ 索引用 Redis 锁串行化。
+  2. **worker 偶发吞任务**：连投 3 个任务只有 2 个进 worker，第 3 个既不在队列也没结果。
+     → 消费者的 broker 选项不再带 1 秒 `socket_timeout`（BRPOP 与读超时抢超时丢消息；
+     `build_celery_app(consumer=True)`），并把 `task_acks_late` / `task_reject_on_worker_lost`
+     打开、`prefetch_multiplier=1`（任务跑完才 ack、进程被杀消息回队、一个子进程不攥一堆消息）。
+     前端另外补了「以库为准」兜底：任务状态查不到或返回 FAILURE 但文件确实在库里，就按已入库收尾。
+
+</details>
 
 **主题一的设计约定**（落地时必须先写进契约，否则各写一套）：
 
@@ -361,7 +435,7 @@ GET /api/runs/{run_id}/report → 返回完整 HTML 报告
 | M4 端到端可演示 | E3 完成 | Walking Skeleton 跑通；OpenAPI 文档页可访问        | ✅ 2026-10-03（`scripts/smoke_skeleton.py` 一条命令跑通 §四 的整条链路：候选 5 条、报告 HTML 9k 字符；`/api/docs` 200）                                                                                                                                                                                                   |
 | M5 可交付    | E4 完成 | `docker compose up` 起全栈；CI 三关全绿           | 🔄 前半已验：`docker compose up -d --wait` 退 0、四服务 healthy、migrate exited(0)（S4.4）；**CI 三关待推送确认**——本地已按 CI 的四个 job 逐条干跑（ruff 零告警 / mypy 44 文件零错误 / `pytest --cov` 81.14% ≥ 78% 门槛 / `pytest -m integration` 102 passed+2 已知环境失败 / `docker compose config` + `docker build` 通过），推送后由 GitHub Actions 复验 |
 | M6 前端可演示  | E5 完成 | 三个页面可交互跑通；前端类型与契约零偏差；dist 进入镜像            | ⬜                                                                                                                                                                                                                                                                                                |
-| M7 素材库可用 | E6 主题一完成 | 素材库页跑通「导入 → 浏览 → 编辑 → 删除 → 恢复 → 清空」闭环；契约零漂移（`scripts/check_openapi.py` 通过） | ⬜ |
+| M7 素材库可用 | E6 主题一完成 | 素材库页跑通「导入 → 浏览 → 编辑 → 删除 → 恢复 → 清空」闭环；契约零漂移（`scripts/check_openapi.py` 通过） | ✅ 已完成（2026-10-06） |
 | M8 图片热点可用 | E6 主题二完成 | 图片拆标签 → 一键分析 → 结果页出现候选；契约零漂移（`scripts/check_openapi.py` 通过） | ✅ 已完成（2026-10-06） |
 | M9 对话式入口可用 | E7 完成 | 传图 + 一句话跑通流式对话，越界用例全过；契约零漂移（`scripts/check_openapi.py` 通过） | ⬜ |
 

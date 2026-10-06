@@ -29,7 +29,8 @@ from celery.signals import setup_logging
 from ..config import AppConfig, ConfigError
 from ..core.logging import configure_logging
 
-# 连接与重试都调紧：broker 不可达时要尽快失败（API 拿 503，而不是等默认的几十秒重试）
+# 连接与重试都调紧：broker 不可达时要尽快失败（API 拿 503，而不是等默认的几十秒重试）。
+# **只给生产者（API）用**：consumer 侧另见 `build_celery_app(..., consumer=True)`。
 SOCKET_TIMEOUT_S = 1
 RETRY_POLICY = {"max_retries": 1, "interval_start": 0,
                 "interval_step": 0.2, "interval_max": 0.5}
@@ -49,15 +50,33 @@ def redis_url(cfg: AppConfig) -> str:
     return url
 
 
-def build_celery_app(cfg: AppConfig) -> Celery:
-    """按配置造 Celery 应用（broker 与结果后端都是 Redis；理由见模块 docstring）。"""
+def build_celery_app(cfg: AppConfig, *, consumer: bool = False) -> Celery:
+    """按配置造 Celery 应用（broker 与结果后端都是 Redis；理由见模块 docstring）。
+
+    `consumer=True` 给 worker 用：**不能**带 `socket_timeout`。
+    worker 取任务走 `BRPOP`，读超时设成 1 秒时，消息可能已经被弹出（Redis 里删掉）却还没读回来，
+    客户端超时就把这条消息**直接丢掉**——S6.5 真机冒烟实测：连传 3 个文件、投了 3 个索引任务，
+    只有 2 个进了 worker，第 3 个既不在队列里也没有结果（既不是"没消费"也不是"消费失败"，
+    而是消息消失）。生产者（API 投递）保留 1 秒超时，那是为了 broker 不可达时快速 503。
+    """
     url = redis_url(cfg)
     app = Celery("xhs_agent", broker=url, backend=url)
+    broker_options: dict[str, Any] = {}
+    if not consumer:
+        broker_options = {"socket_connect_timeout": SOCKET_TIMEOUT_S,
+                          "socket_timeout": SOCKET_TIMEOUT_S,
+                          "retry_policy": dict(RETRY_POLICY)}
     app.conf.update(
-        broker_transport_options={"socket_connect_timeout": SOCKET_TIMEOUT_S,
-                                  "socket_timeout": SOCKET_TIMEOUT_S,
-                                  "retry_policy": dict(RETRY_POLICY)},
+        broker_transport_options=broker_options,
         broker_connection_retry_on_startup=True,
+        # S6.5：**任务跑完才 ack**。默认是"收到就 ack"，worker 崩了 / 被 OOM 杀掉 / 连接抖动时
+        # 消息已经 ack 掉但任务没跑，任务就这么没了（真机冒烟里表现为"上传的文件一直不出现"）。
+        # 配套：`task_reject_on_worker_lost` 让进程被杀时消息回队；`prefetch=1` 避免一个子进程
+        # 攥着一堆消息（攥着的那些在它死掉时也一起没了）。代价是重复执行的可能——我们的索引与
+        # 分析都是幂等的（同步按指纹判断、run 有终态检查），重复跑不会写坏数据。
+        task_acks_late=True,
+        task_reject_on_worker_lost=True,
+        worker_prefetch_multiplier=1,
         task_soft_time_limit=cfg.queue.task_soft_time_limit_s,
         task_time_limit=cfg.queue.task_time_limit_s,
         # 结果只服务于"这次索引任务跑到哪了"，任务结束后一小时即可回收

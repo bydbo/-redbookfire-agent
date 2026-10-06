@@ -11,6 +11,7 @@ function makeRouter() {
     history: createMemoryHistory(),
     routes: [
       { path: '/', name: 'analysis', component: { template: '<div>分析台占位</div>' } },
+      { path: '/materials', name: 'materials', component: { template: '<div>素材库占位</div>' } },
       { path: '/runs', name: 'run-history', component: { template: '<div>历史占位</div>' } },
       { path: '/runs/:runId', name: 'run-result', component: { template: '<div>详情占位</div>' } },
     ],
@@ -36,12 +37,12 @@ describe('App 壳层（S5.7 顶栏 + 主题）', () => {
     vi.unstubAllGlobals()
   })
 
-  it('顶栏提供分析台与运行历史两个入口', async () => {
+  it('顶栏提供分析台、素材库与运行历史三个入口', async () => {
     const { wrapper, router } = await mountApp()
     const links = wrapper.findAll('.app-nav-link').map((link) => link.text())
-    expect(links).toEqual(['分析台', '运行历史'])
+    expect(links).toEqual(['分析台', '素材库', '运行历史'])
 
-    await wrapper.findAll('.app-nav-link')[1].trigger('click')
+    await wrapper.findAll('.app-nav-link')[2].trigger('click')
     await flushPromises()
     expect(router.currentRoute.value.name).toBe('run-history')
   })
