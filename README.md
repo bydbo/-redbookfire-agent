@@ -62,7 +62,7 @@
 | 契约一致性校验（`scripts/check_openapi.py`：FastAPI 导出的 OpenAPI 必须覆盖 `docs/contracts/openapi.yaml`，跑在 CI 的 test job 里） | ✅ 已完成（S4.6） |
 | Alembic 数据库迁移（唯一建表路径） | ✅ 已完成（S2.3） |
 | 评测集 v1 与示例素材包（七维度口径、版本冻结） | ✅ 已完成（S2.0） |
-| 服务入口（FastAPI 七个接口 + LangGraph 编排，S3.1–S3.3；S5.4 / S5.6 扩充） | ✅ 已完成 |
+| 服务入口（FastAPI 八个接口 + LangGraph 编排，S3.1–S3.3；S5.4 / S5.6 / S6.6 扩充） | ✅ 已完成 |
 | 前端工程脚手架（Vue 3 + Vite + TS + Router + Pinia + Naive UI + Tailwind，S5.1：别名 / 环境变量 / 代理 / 构建配置） | ✅ 已完成（S5.1） |
 | 接口类型生成（S5.2：`openapi-typescript` 从 `docs/contracts/openapi.yaml` 生成 `frontend/src/api/schema.d.ts` 入库；`pnpm run check:api` + CI `frontend` job 防漂移） | ✅ 已完成（S5.2） |
 | 分析台页面（S5.3：多热点输入 → 提交 → 2 秒轮询进度 → 自动跳转结果占位页；`/` 为分析台、`/runs/:runId` 为结果页） | ✅ 已完成（S5.3） |
@@ -72,6 +72,10 @@
 | 视觉打磨（S5.7：小红书风格主题 token（品牌红取自官网 `#ff2442`，加深版供白字按钮达标）+ 明/暗双主题 + 按钮·顶栏·卡片毛玻璃 + 统一顶栏导航；路由分包 + 响应 gzip，移动端 Lighthouse 58→97、总传输 166 KiB） | ✅ 已完成（S5.7） |
 | 前端测试（S5.8：Vitest + jsdom 48 条覆盖工具函数 / store / 关键组件；覆盖率只报告不设门槛；`pnpm build` 产物经 FastAPI 托管实测 14 条断言全过） | ✅ 已完成（S5.8） |
 | 前端进 CI 与镜像（S5.9：CI 的 frontend job 加 lint + 测试 + 构建；镜像多一个 node 构建阶段，dist 进 runtime，容器默认 `serve=true` 托管单页应用，镜像 413MB） | ✅ 已完成（S5.9） |
+| 图片热点解析接口（S6.6：契约先行新增 `POST /api/hotspots/image-clue`（multipart 单图，jpg/png/webp、≤ 10 MB，按 magic bytes 认类型）；异步多模态客户端 + 新 prompt 资产 `image_hotspot_clue`；图片只在内存里转模型输入，**不落盘不入库**） | ✅ 已完成（S6.6） |
+| 预置线索通道（S6.7：`POST /api/analyze` 增加可选 `clues`（与 `hotspots` 等长、单项可 null）——用户确认/编辑过的线索直接落库并**短路拆解节点**，不重复付费；不传时行为与以前逐字节一致） | ✅ 已完成（S6.7） |
+| 分析台图片入口（S6.8：上传 / 拖拽 / 粘贴一张图 → 可编辑的描述与要素卡（类型·取值·权重）→ 与其他热点一起批量提交，或「用这条热点分析」只跑这一条；带 clue 的热点显示「来自图片」） | ✅ 已完成（S6.8） |
+| 图片链路测试与真机冒烟（S6.9：真容器集成用例证明「解析 → 带 clues 提交 → 结果页线索与提交值逐字段一致、拆解节点未被再次调用」；Playwright 驱动本机 Edge 走通真实链路，14/14 断言，run 成本 0.0530 元） | ✅ 已完成（S6.9） |
 
 业务链路**已端到端跑通**：`docker compose up -d --wait` 起依赖 → `uv run celery -A xhs_agent.tasks.worker:app worker` 起 worker → `uv run python -m xhs_agent.serve` 起接口（先跑 7 步启动前置检查）→ `POST /api/analyze` 投递 → worker 自动消费（索引新鲜度 → 五节点分析 → 逐热点写回）→ `/api/jobs/{job_id}` 轮询 → `/api/runs/{run_id}` 取结构化结果、`/report` 取报告。另可运行 `uv run python -m xhs_agent.probe`、`uv run python scripts/index_materials.py`、`uv run python scripts/backfill_embeddings.py`、`uv run python scripts/eval_retrieval.py`、`uv run python scripts/smoke_skeleton.py`。路线图见文末。
 
@@ -261,11 +265,13 @@ pnpm build            # 类型检查 + 构建，产物落 frontend/dist（由 Fa
 pnpm run gen:api      # 契约变了才跑：从 ../docs/contracts/openapi.yaml 重新生成 src/api/schema.d.ts
 pnpm run check:api    # 防漂移自检：重新生成 + git diff，有差异即非零（CI 的 frontend job 跑这条）
 pnpm run lint         # ESLint 9（只做正确性规则，不查格式）
-pnpm test             # Vitest 单测（48 条，jsdom，含主题对比度与图表 option）
+pnpm test             # Vitest 单测（66 条，jsdom，含主题对比度、图表 option 与分析台状态机）
 pnpm run test:cov     # 单测 + 覆盖率报告（只报告不设门槛）
 ```
 
 `pnpm dev` 与 `uv run python -m xhs_agent.serve --port 8000`（或 `XHS_FRONTEND_SERVE=false` 的等价入口）同时运行，即可在 http://localhost:5173 全栈调试：页面走 Vite，接口经代理进本地 API。
+
+> **分析台有两种输入方式（S6.6–S6.9）**：直接写热点文本，或「从图片拆热点」——选文件 / 拖拽 / 把一个图片**粘贴**进卡片（jpg / png / webp，单张 ≤ 10 MB）即可让多模态模型拆出热点描述与爆点要素；描述与要素卡（类型 / 取值 / 权重）都能改，改完点「用这条热点分析」只跑这一条，「加入热点列表」则与手输的热点混在同一次批量提交里。图片只在内存里转成模型输入，**不落盘、不入库**（解析成本按契约不进 `runs` 统计）；提交带线索的热点会**短路拆解节点**，不重复付费。`[vision].enabled` 打开且密钥就位才可用，默认关闭时接口会明确返回 503。
 
 > **`[frontend]` 段怎么起作用**：`serve = true`（默认）且 `frontend/dist` 存在且非空时，FastAPI 会把 dist 挂在根路径，并把 `/api` 之外的未命中路径（无扩展名的）回落成 `index.html`——前端 history 路由刷新不会 404；带扩展名的未命中仍返回 404，API 的 404 也照旧是 `not_found` 的 JSON。
 >

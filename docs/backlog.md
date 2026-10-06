@@ -21,7 +21,7 @@
 | E3 编排与服务  | 服务化与异步，端到端可演示     | 20.5     | ✅ 已完成（S3.0–S3.10） | M4  |
 | E4 可观测与交付 | 可运维、可交付           | 8        | ✅ 已完成（S4.1–S4.6）  | M5  |
 | E5 前端工程   | 把演示页升级为可交互的单页应用   | 17       | ✅ 已完成（S5.1–S5.9） | M6  |
-| E6 新功能迭代 | 后续功能迭代的容器（主题一：素材库页；主题二：图片热点解析） | 19.5 | ⬜ 未开始 | M7 / M8 |
+| E6 新功能迭代 | 后续功能迭代的容器（主题一：素材库页；主题二：图片热点解析） | 19.5 | 🔄 主题二「图片热点解析」已完成（S6.6–S6.9）；主题一未开始 | M7 / M8 |
 | **合计**    |                   | **96** |                   |     |
 
 全职投入约 9 周；按每天 3 小时的业余节奏约 5 个月。总量的增长分两轮：**E1 期**比初版（41.5）增加 26 人日——前端 Epic 17、API 前缀与静态挂载 1、完整 preflight 1.5、mypy 收紧 0.5、E2 净增 5（集成测试基座 +3、评测集与示例素材包 +3、对比脚本精简 −1）、E1 落地时的范围调整 1（S1.2 配置段全量 +0.5、S1.4 覆盖 8 个模块 +0.5）；此后 E4 可观测与交付、E6 新功能迭代（素材库页 + 图片热点解析）与 Story 级重估继续累加，**当前合计 96 人日**。
@@ -223,10 +223,45 @@
 
 | 编号 | Story | 依赖 | 验收标准 | 人日 | 状态 |
 | --- | --- | --- | --- | --- | --- |
-| S6.6 | 图片热点解析接口 | S3.3 | **契约先行**新增 `POST /api/hotspots/image-clue`（`multipart/form-data`，单张图，jpg / png / webp、≤ 10 MB）：调多模态模型按新 prompt 资产 `image_hotspot_clue` 输出 `{raw_text, clue, prompt_versions}`，`clue` 结构沿用 `HotspotClue`；**图片只在内存里转成模型输入，不落盘、不入库**；格式或体积不合法 → 400，`[vision]` 关闭或缺密钥 → 503 明确报错（不做降级）；`scripts/check_openapi.py` 零 diff | 2 | ⬜ |
-| S6.7 | 预置线索通道 | S6.6, S3.3 | `POST /api/analyze` 请求体增加**可选** `clues`（与 `hotspots` 等长、单项可为 null）：有值时写入该热点的线索快照并**短路拆解节点**——用户编辑后的标签原样生效、不重复付费；不传时行为与现在完全一致（向后兼容，不新增错误码） | 1.5 | ⬜ |
-| S6.8 | 分析台图片入口 | S6.6, S6.7, S5.7 | 分析台新增「从图片拆热点」（粘贴 / 拖拽 / 选择文件）：解析中与失败态、解析后可编辑的热点描述文本与要素卡片、可重解析或丢弃、点「用这条热点分析」走现有提交—轮询—结果页；与「手动输入热点」并存；沿用前三页主题 token | 3 | ⬜ |
-| S6.9 | 图片链路测试与冒烟 | S6.8 | 契约零漂移 + `schema.d.ts` 重新生成入库；单测覆盖 prompt 渲染（缺变量报错）、响应形状与三类错误分支（非图片 MIME / 超 10 MB / vision 关闭）；集成用例（真容器 + 假多模态调用器）验证「解析 → 提交 → `run` 详情里的线索与提交值逐字段一致，且拆解节点未被再次调用」；Playwright 真实冒烟「上传样例图 → 标签出现 → 改一个标签 → 提交 → 结果页有候选」，截图落 `runs/_smoke_s69/` | 1.5 | ⬜ |
+| S6.6 | 图片热点解析接口 | S3.3 | **契约先行**新增 `POST /api/hotspots/image-clue`（`multipart/form-data`，单张图，jpg / png / webp、≤ 10 MB）：调多模态模型按新 prompt 资产 `image_hotspot_clue` 输出 `{raw_text, clue, prompt_versions}`，`clue` 结构沿用 `HotspotClue`；**图片只在内存里转成模型输入，不落盘、不入库**；格式或体积不合法 → 400，`[vision]` 关闭或缺密钥 → 503 明确报错（不做降级）；`scripts/check_openapi.py` 零 diff | 2 | ✅ |
+| S6.7 | 预置线索通道 | S6.6, S3.3 | `POST /api/analyze` 请求体增加**可选** `clues`（与 `hotspots` 等长、单项可为 null）：有值时写入该热点的线索快照并**短路拆解节点**——用户编辑后的标签原样生效、不重复付费；不传时行为与现在完全一致（向后兼容，不新增错误码） | 1.5 | ✅ |
+| S6.8 | 分析台图片入口 | S6.6, S6.7, S5.7 | 分析台新增「从图片拆热点」（粘贴 / 拖拽 / 选择文件）：解析中与失败态、解析后可编辑的热点描述文本与要素卡片、可重解析或丢弃、点「用这条热点分析」走现有提交—轮询—结果页；与「手动输入热点」并存；沿用前三页主题 token | 3 | ✅ |
+| S6.9 | 图片链路测试与冒烟 | S6.8 | 契约零漂移 + `schema.d.ts` 重新生成入库；单测覆盖 prompt 渲染（缺变量报错）、响应形状与三类错误分支（非图片 MIME / 超 10 MB / vision 关闭）；集成用例（真容器 + 假多模态调用器）验证「解析 → 提交 → `run` 详情里的线索与提交值逐字段一致，且拆解节点未被再次调用」；Playwright 真实冒烟「上传样例图 → 标签出现 → 改一个标签 → 提交 → 结果页有候选」，截图落 `runs/_smoke_s69/` | 1.5 | ✅ |
+
+<details>
+<summary>S6.6–S6.9 实测记录（2026-10-06）</summary>
+
+**S6.6 图片热点解析接口（契约先行）**
+
+- `openapi.yaml` 新增 `POST /api/hotspots/image-clue`（tag 分析、`operationId: createImageClue`、multipart 单文件字段 `file`、响应 200 / 400 / 422 / 502 / 503）与 `ImageClueResult`；`scripts/check_openapi.py` 零 diff，`pnpm run gen:api` 重生成 `schema.d.ts`。
+- 校验认**文件内容**（magic bytes：`FF D8 FF` / `89 50 4E 47` / `RIFF..WEBP`），**不信声明的 content-type**；边读边计体积，> 10 MB 立刻 400、空文件 400；**不引 Pillow、不缩放**，图片原样 base64 送模型。
+- `tools/vision.py` 新增**异步**多模态客户端（httpx、请求级连接池、**不重试**：`[vision]` 没有重试预算，用户点「重解析」就是显式重试）；素材打标的同步 urllib 路径一行未动。新增依赖 `python-multipart`（FastAPI 处理 multipart 的硬依赖）。
+- 失败分支：`[vision].enabled=false` 或缺密钥 → 503（明确文案）；上游 HTTP 失败 / 超时 / 非 JSON / 缺 `clue` / 线索不合契约 / 无要素 / 描述超 500 字 → 502。
+- 实测：新增 23 条单测（magic bytes、体积与空文件、503/502 各分支、请求形状与 data URL、接口层 200 契约形状），单测 780 全绿。
+
+**S6.7 预置线索通道**
+
+- `AnalyzeRequest.clues`（1–10、`oneOf: [HotspotClue, null]`，与 `hotspots` 等长）；长度不匹配复用既有 400，**不新增错误码**。
+- 服务层 `submit_analysis(..., clues=None)`：空文本 / 空线索跳过、同一原文后者胜、`hotspot_raw` 一律换成当前原文；非空项**覆盖** `hotspots.clue`——历史回看显示的线索会跟着更新，而 `run_matches` / `coverage` / `draft` 保留运行当时的快照（已写进数据契约 §3.2）。
+- 路由用 `model_dump(exclude_unset=True)`：只落用户确认过的字段，不塞 pydantic 的默认空值。
+- 实测：6 条接口单测 + 5 条真容器集成（写入并覆盖旧快照、同一原文后者胜、null 保留旧快照、不传不清空、服务层长度兜底）；单测 786 全绿。
+
+**S6.8 分析台图片入口（前端）**
+
+- `api/client.ts` 把错误归一化抽成共用函数并新增 `apiUpload`（multipart、**不写 Content-Type**，boundary 交给浏览器）；`api/analysis.ts` 新增 `parseImageClue` 与派生类型，九类要素的中文标签抽成 `ELEMENT_TYPE_LABELS` / `ELEMENT_TYPES`（结果页改为复用，不再各写一份）。
+- `stores/analysis.ts`：热点项升级为 `{ text, clue? }`；图片状态机 idle / parsing / parsed / failed + `parseImage` / `reparse`（复用内存里的 File）/ `discardImage` / `addImageHotspot` / `submitOnly` / 要素增删改；提交时组装与**过滤后** hotspots 等长的 `clues`（无 clue 补 `null`、`hotspot_raw` 同步当前文本），**一条 clue 都没有时不发 `clues` 字段**（请求体与 S6.7 之前逐字节一致）。
+- `views/AnalysisView.vue`：新增「从图片拆热点」卡片（选择文件 / 拖拽 / 粘贴三入口、解析中转圈、失败 alert）+ 结果区（描述可编辑；要素卡的类型 / 取值 / 权重可改可增删；为什么有效 / 机制 / 借势角度 / 风险提示只读）+「重解析 / 丢弃 / 加入热点列表 / 用这条热点分析」；带 clue 的热点项显示「来自图片」。
+- 实测：前端 66 条单测全绿（+18：`apiUpload` 2 条、store 10 条、新增 `AnalysisView.spec.ts` 6 条）；`pnpm run lint` / `type-check` / `build` / `check:api` 全过。
+
+**S6.9 链路测试与真机冒烟**
+
+- 集成 `tests/integration/test_image_clue_chain.py`（真 Postgres 容器 + `httpx.MockTransport` 假多模态 + 假文本 provider，**全离线**）：解析 → 带 `clues` 提交 → 跑完 → `GET /api/runs/{id}` 的线索与提交值**逐字段相等**；假 provider 的 `tasks == []`、`prompt_versions` 只有 `copy_draft` / `material_select`——拆解节点确实被短路。
+- 真机冒烟（`docker compose` + 临时 override：把开了 `[vision]` 的临时 config **只挂进 api**，worker 保持镜像默认的 vision 关闭，避免素材打标顺带花钱；Playwright 驱动本机 Edge headless）：断言清单、截图的原始产物落 `runs/_smoke_s69/`（gitignore 覆盖），**14/14 断言全过**。
+- run_id `608c942d-99cd-4a2f-998e-1b35931cae30`：上传 → 8.0 秒解析出描述与 4 个可编辑要素 → 改一个要素 → 「用这条热点分析」→ 24.1 秒完成 → 结果页 **5 条候选**、覆盖率 100%、`prompt_versions = {"copy_draft": 1, "material_select": 1}`（**无 `hotspot_clue`**）；该 run 成本 **0.0530 元**（另加 1 次多模态解析，按契约不进 `runs` 统计）。
+- 回归：单测 786 全绿（覆盖率 **81.05% ≥ 78%** 门槛）、集成 121 全绿（+1）、ruff / mypy（46 文件）零告警、`check_openapi` 零 diff、`pre-commit run --all-files` 全绿；`runs/` 与 `data/materials/` 未被仓库流程写入。
+- 过程记录：前两次冒烟各暴露一个**冒烟脚本自身**的断言写法问题（把可选字段当必填、在结果页找只有图片卡片才有的「借势角度」），修正后第三次全过——产品代码一次没改。
+
+</details>
 
 **主题二的设计约定**（落地时必须先写进契约，否则各写一套）：
 
@@ -271,7 +306,7 @@ GET /api/runs/{run_id}/report → 返回完整 HTML 报告
 | M5 可交付    | E4 完成 | `docker compose up` 起全栈；CI 三关全绿           | 🔄 前半已验：`docker compose up -d --wait` 退 0、四服务 healthy、migrate exited(0)（S4.4）；**CI 三关待推送确认**——本地已按 CI 的四个 job 逐条干跑（ruff 零告警 / mypy 44 文件零错误 / `pytest --cov` 81.14% ≥ 78% 门槛 / `pytest -m integration` 102 passed+2 已知环境失败 / `docker compose config` + `docker build` 通过），推送后由 GitHub Actions 复验 |
 | M6 前端可演示  | E5 完成 | 三个页面可交互跑通；前端类型与契约零偏差；dist 进入镜像            | ⬜                                                                                                                                                                                                                                                                                                |
 | M7 素材库可用 | E6 主题一完成 | 素材库页跑通「导入 → 浏览 → 编辑 → 删除 → 恢复 → 清空」闭环；契约零漂移（`scripts/check_openapi.py` 通过） | ⬜ |
-| M8 图片热点可用 | E6 主题二完成 | 图片拆标签 → 一键分析 → 结果页出现候选；契约零漂移（`scripts/check_openapi.py` 通过） | ⬜ |
+| M8 图片热点可用 | E6 主题二完成 | 图片拆标签 → 一键分析 → 结果页出现候选；契约零漂移（`scripts/check_openapi.py` 通过） | ✅ 已完成（2026-10-06） |
 
 ## 六、风险与未决项
 
