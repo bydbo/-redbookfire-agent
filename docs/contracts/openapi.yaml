@@ -396,6 +396,18 @@ components:
           maximum: 20
           default: 5
           description: 每个热点返回的候选素材数量上限
+        clues:
+          type: array
+          minItems: 1
+          maxItems: 10
+          description: |
+            预设线索快照（S6.7）：与 hotspots **一一对应、等长**；某一项为 null 表示该热点走正常拆解。
+            非空的那一项会写进对应 hotspots 行的 clue 并**短路拆解节点**（用户确认/编辑过的标签原样生效，
+            不重复付费）。不传时行为与不带该字段完全一致。
+          items:
+            oneOf:
+              - $ref: '#/components/schemas/HotspotClue'
+              - type: 'null'
 
     AnalyzeAccepted:
       type: object

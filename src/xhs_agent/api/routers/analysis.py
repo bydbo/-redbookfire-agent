@@ -101,10 +101,24 @@ async def create_analysis(payload: AnalyzeRequest, request: Request,
     """
     submission = await submit_analysis(session, payload.hotspots, topk=payload.topk,
                                        request_id=request_id_of(request),
+                                       clues=_clue_dicts(payload),
                                        enqueue=dispatcher.enqueue)
     request.state.run_id = submission.run_id
     bind_run_id(submission.run_id)
     return {"job_id": submission.job_id, "run_id": submission.run_id}
+
+
+def _clue_dicts(payload: AnalyzeRequest) -> list[dict[str, Any] | None] | None:
+    """把请求里的 `clues` 折成 JSON 可入库的 dict 列表；长度不匹配按 400 处理（S6.7）。"""
+    if payload.clues is None:
+        return None
+    if len(payload.clues) != len(payload.hotspots):
+        raise BadRequestError(
+            "clues 必须与 hotspots 一一对应（等长）",
+            {"hotspots": len(payload.hotspots), "clues": len(payload.clues)})
+    # exclude_unset：只落用户实际确认过的字段，不塞 pydantic 的默认空值（domain 层会补默认）
+    return [None if clue is None else clue.model_dump(exclude_unset=True)
+            for clue in payload.clues]
 
 
 @router.get("/jobs/{job_id}", response_model=JobStatus,

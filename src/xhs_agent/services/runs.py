@@ -20,7 +20,7 @@
 from __future__ import annotations
 
 import uuid
-from collections.abc import Awaitable, Callable, Sequence
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
@@ -76,11 +76,14 @@ def _normalize(hotspots: Sequence[str]) -> list[str]:
            tables=("hotspots", "runs", "run_hotspots"))
 async def submit_analysis(session: AsyncSession, hotspots: Sequence[str], *,
                           topk: int = 5, request_id: str = "",
+                          clues: Sequence[Mapping[str, Any] | None] | None = None,
                           enqueue: Callable[[str], Awaitable[None]] | None = None) -> Submission:
     """落库一个待执行的运行：复用/新建 hotspots → 建 runs(queued) → 建 run_hotspots 骨架 → 投递。
 
     输入：`hotspots`（1 条以上，本函数只做去空白去重，长度与条数由接口层按契约校验）、
     `topk`（1–20，落 `runs.topk` 供 worker 检索时读取）、`request_id`（`X-Request-ID`，可空）、
+    `clues`（S6.7：与 `hotspots` **等长**、单项可为 None 的线索快照；非空项覆盖对应
+      `hotspots.clue`，worker 会据此短路拆解节点、不再重复付费。同一原文出现多次时后者胜）、
     `enqueue`（`job_id -> None` 的异步投递器；None = 不投递，测试用）。
     输出：`Submission`。
     异常：投递失败**整体回滚**，不留"永远排队的脏行"，异常原样上抛给接口层折成 503。
@@ -91,6 +94,7 @@ async def submit_analysis(session: AsyncSession, hotspots: Sequence[str], *,
     low, high = TOPK_RANGE
     if not low <= topk <= high:
         raise ValueError(f"topk 必须在 {low}–{high} 之间")
+    clue_snapshots = _clue_snapshots(hotspots, clues)
 
     existing = {row.raw_text: row for row in (await session.execute(
         select(Hotspot).where(Hotspot.raw_text.in_(raws)))).scalars().all()}
@@ -101,6 +105,11 @@ async def submit_analysis(session: AsyncSession, hotspots: Sequence[str], *,
             row = Hotspot(raw_text=raw, clue={})   # 线索由 worker 的拆解节点回填
             session.add(row)
             existing[raw] = row
+        snapshot = clue_snapshots.get(raw)
+        if snapshot is not None:
+            # S6.7：用户确认/编辑过的线索覆盖旧快照（历史 run 回看显示的线索会随之更新，
+            # 当时产出的 run_matches / coverage / draft 仍保留快照）
+            row.clue = snapshot
         hotspot_rows.append(row)
     await session.flush()
 
@@ -122,6 +131,29 @@ async def submit_analysis(session: AsyncSession, hotspots: Sequence[str], *,
         await session.rollback()
         raise
     return Submission(job_id=run.job_id, run_id=str(run.id))
+
+
+def _clue_snapshots(hotspots: Sequence[str],
+                    clues: Sequence[Mapping[str, Any] | None] | None) -> dict[str, dict[str, Any]]:
+    """把「与 hotspots 等长」的 `clues` 折成 `raw_text -> 线索快照`（S6.7）。
+
+    - `clues` 为 None → 空 dict（行为与不带该字段完全一致）；
+    - 长度不一致 → `ValueError`（接口层已按 400 拦过一遍，这里是服务层兜底）；
+    - 空文本 / 空线索跳过；同一原文出现多次时**后者胜**；
+    - 快照里的 `hotspot_raw` 一律以当前原文为准（调用方可能没带，或带的是旧值）。
+    """
+    if clues is None:
+        return {}
+    if len(clues) != len(hotspots):
+        raise ValueError(
+            f"clues 必须与 hotspots 等长：hotspots {len(hotspots)}、clues {len(clues)}")
+    snapshots: dict[str, dict[str, Any]] = {}
+    for raw, clue in zip(hotspots, clues, strict=True):
+        text = str(raw or "").strip()
+        if not text or not isinstance(clue, Mapping) or not clue:
+            continue
+        snapshots[text] = {**dict(clue), "hotspot_raw": text}
+    return snapshots
 
 
 async def _run_row(session: AsyncSession, run_id: uuid.UUID) -> Run | None:

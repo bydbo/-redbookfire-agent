@@ -46,7 +46,11 @@ class _Response(BaseModel):
 
 
 class AnalyzeRequest(BaseModel):
-    """`POST /api/analyze` 请求体（契约 `AnalyzeRequest`，未知字段一律拒绝）。"""
+    """`POST /api/analyze` 请求体（契约 `AnalyzeRequest`，未知字段一律拒绝）。
+
+    `clues`（S6.7）与 `hotspots` 一一对应：非空项会被写进 `hotspots.clue` 并短路拆解节点；
+    不传时行为与以前完全一致。
+    """
 
     model_config = ConfigDict(extra="forbid")
 
@@ -54,6 +58,7 @@ class AnalyzeRequest(BaseModel):
                                                     max_length=500)]] = Field(
         min_length=1, max_length=10)
     topk: int = Field(default=5, ge=1, le=20)
+    clues: list[HotspotClue | None] | None = Field(default=None, min_length=1, max_length=10)
 
 
 class AnalyzeAccepted(_Response):
