@@ -1,11 +1,12 @@
-"""素材库查询的集成用例（S6.1）：真 Postgres 容器 + 临时素材目录。
+"""素材库的集成用例（S6.1 查询 + S6.2 编辑）：真 Postgres 容器 + 临时素材目录。
 
-覆盖列表的排序 / 分页 / 关键词 / 类型 / 来源 / 主题目录筛选、主题计数与单条详情。
-这里只用路径当基准（不落真实文件）——真实扫描与入库归 S6.4 的用例。
+查询部分只用路径当基准（不落真实文件）；编辑部分要真文件，因为改动必须同时落到
+`<素材文件名>.txt` 旁车与数据库两边。真实扫描与入库归 S6.4 的用例。
 """
 
 from __future__ import annotations
 
+import os
 import uuid
 from collections.abc import AsyncIterator, Iterator
 from datetime import UTC, datetime, timedelta
@@ -15,6 +16,7 @@ from typing import Any
 import pytest
 import pytest_asyncio
 from fastapi.testclient import TestClient
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
 from xhs_agent.api.deps import get_config, get_session
@@ -22,7 +24,8 @@ from xhs_agent.api.main import create_app
 from xhs_agent.config import AppConfig, load_config
 from xhs_agent.db import Base
 from xhs_agent.db.models import Material as MaterialRow
-from xhs_agent.services.materials import list_materials, load_material
+from xhs_agent.services.materials import list_materials, load_material, update_material
+from xhs_agent.tools.materials import parse_sidecar, sidecar_path
 
 pytestmark = [pytest.mark.integration, pytest.mark.asyncio]
 
@@ -208,5 +211,109 @@ class TestEndpoint:
         assert ok.json()["elements"][0]["type"] == "topic"
 
         missing = client.get(f"/api/materials/{uuid.uuid4()}")
+        assert missing.status_code == 404
+        assert missing.json()["code"] == "not_found"
+
+
+def touch(relative: str, cfg: AppConfig, data: bytes = b"fake-media") -> str:
+    """在临时素材目录里放一个真文件（编辑要写旁车，必须有真实路径）。"""
+    path = Path(cfg.materials_dir()) / relative
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(data)
+    return str(path)
+
+
+async def reload_row(session: AsyncSession, material_id: str) -> MaterialRow:
+    return (await session.execute(
+        select(MaterialRow).where(MaterialRow.id == uuid.UUID(material_id)))).scalar_one()
+
+
+class TestEdit:
+    async def test_updates_db_and_writes_sidecar(self, db_session: AsyncSession,
+                                                 cfg: AppConfig) -> None:
+        media = touch("运动/挥拍.mp4", cfg)
+        ids = await seed(db_session, cfg)
+
+        detail = await update_material(
+            db_session, cfg, uuid.UUID(ids["运动/挥拍.mp4"]),
+            title="  球场挥拍（改）  ", tags=[" 羽毛球 ", "#球场", "球场", ""],
+            description="户外球场挥拍\n第二行")
+
+        assert detail is not None
+        assert detail["title"] == "球场挥拍（改）"        # 去空白
+        assert detail["tags"] == ["羽毛球", "球场"]        # 去 `#` + 去重
+        assert detail["description"] == "户外球场挥拍 第二行"   # 折成单行
+        assert detail["source"] == "sidecar"              # 人工确认过
+
+        row = await reload_row(db_session, ids["运动/挥拍.mp4"])
+        assert (row.title, row.tags, row.description, row.source) == (
+            "球场挥拍（改）", ["羽毛球", "球场"], "户外球场挥拍 第二行", "sidecar")
+
+        written = sidecar_path(media)
+        assert written == media + ".txt"
+        assert parse_sidecar(written) == {"title": "球场挥拍（改）", "tags": ["羽毛球", "球场"],
+                                          "description": "户外球场挥拍 第二行"}
+
+    async def test_unchanged_values_do_not_write_file(self, db_session: AsyncSession,
+                                                      cfg: AppConfig) -> None:
+        media = touch("运动/夜里/夜跑.mp4", cfg)
+        ids = await seed(db_session, cfg)
+
+        detail = await update_material(db_session, cfg, uuid.UUID(ids["运动/夜里/夜跑.mp4"]),
+                                       title="夜跑打卡")
+
+        assert detail is not None and detail["title"] == "夜跑打卡"
+        assert not os.path.exists(media + ".txt")
+        # 没改动就不该顺手把视觉打标"洗"成人工来源
+        assert (await reload_row(db_session, ids["运动/夜里/夜跑.mp4"])).source == "vision"
+
+    async def test_existing_md_sidecar_is_kept(self, db_session: AsyncSession,
+                                               cfg: AppConfig) -> None:
+        media = touch("运动/挥拍.mp4", cfg)
+        Path(media + ".md").write_text("标题: 手工写的\n", encoding="utf-8")
+        ids = await seed(db_session, cfg)
+
+        await update_material(db_session, cfg, uuid.UUID(ids["运动/挥拍.mp4"]), title="新标题")
+
+        assert os.path.isfile(media + ".md")           # 原文件保留
+        assert sidecar_path(media) == media + ".txt"   # 但 .txt 优先
+        assert parse_sidecar(media + ".txt")["title"] == "新标题"
+
+    async def test_missing_media_updates_db_only(self, db_session: AsyncSession,
+                                                 cfg: AppConfig) -> None:
+        ids = await seed(db_session, cfg)      # 不创建文件
+
+        detail = await update_material(db_session, cfg, uuid.UUID(ids["美食/火锅.jpg"]),
+                                       tags=["火锅", "美食", "火锅"])
+
+        assert detail is not None and detail["tags"] == ["火锅", "美食"]
+        assert not os.path.exists(str(Path(cfg.materials_dir()) / "美食" / "火锅.jpg.txt"))
+
+    async def test_unknown_id_returns_none(self, db_session: AsyncSession,
+                                          cfg: AppConfig) -> None:
+        await seed(db_session, cfg)
+        assert await update_material(db_session, cfg, uuid.uuid4(), title="x") is None
+
+    async def test_clear_tags(self, db_session: AsyncSession, cfg: AppConfig) -> None:
+        media = touch("运动/挥拍.mp4", cfg)
+        ids = await seed(db_session, cfg)
+
+        detail = await update_material(db_session, cfg, uuid.UUID(ids["运动/挥拍.mp4"]), tags=[])
+
+        assert detail is not None and detail["tags"] == []
+        assert parse_sidecar(media + ".txt")["tags"] == []
+
+    async def test_patch_endpoint(self, client: TestClient, db_session: AsyncSession,
+                                  cfg: AppConfig) -> None:
+        touch("运动/挥拍.mp4", cfg)
+        ids = await seed(db_session, cfg)
+
+        ok = client.patch(f"/api/materials/{ids['运动/挥拍.mp4']}",
+                          json={"title": "接口改的", "tags": ["球场"]})
+        assert ok.status_code == 200, ok.text
+        assert ok.json()["title"] == "接口改的"
+        assert ok.json()["tags"] == ["球场"]
+
+        missing = client.patch(f"/api/materials/{uuid.uuid4()}", json={"title": "x"})
         assert missing.status_code == 404
         assert missing.json()["code"] == "not_found"

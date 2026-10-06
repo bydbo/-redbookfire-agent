@@ -62,6 +62,20 @@ class AnalyzeRequest(BaseModel):
     clues: list[HotspotClue | None] | None = Field(default=None, min_length=1, max_length=10)
 
 
+class UpdateMaterialRequest(BaseModel):
+    """`PATCH /api/materials/{material_id}` 请求体（S6.2）：白名单三字段，其余一律拒绝。
+
+    "至少要给一个字段"（否则 400）与标签的去重 / 上限（超限 400）都在路由层判断：
+    它们不是字段级类型错误，契约把 422 留给"多字段 / 类型不对"这一档。
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    title: str | None = None
+    tags: list[str] | None = None
+    description: str | None = None
+
+
 class AnalyzeAccepted(_Response):
     """202 受理结果：轮询用 `job_id`，取结果与报告用 `run_id`。"""
 

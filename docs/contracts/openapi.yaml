@@ -424,6 +424,47 @@ paths:
           $ref: '#/components/responses/NotFound'
         '503':
           $ref: '#/components/responses/DependencyUnavailable'
+    patch:
+      tags:
+        - 素材
+      summary: 修改素材元数据
+      description: |
+        只接受 `title` / `tags` / `description`（白名单，其余字段一律 422 拒绝而不是静默忽略），
+        且至少要给一个字段（否则 400）。写入落两处：先写同名旁车 `<素材文件名>.txt`
+        （`标题: …` / `标签: a, b` / `描述: …`），再更新 `materials` 行——磁盘目录始终是
+        唯一来源，重扫描会得到同一份事实。三个字段的值都没变时不写文件。
+        标签会去空白、去 `#` 前缀并去重；去重后最多 14 个、单个标签最多 24 字（超出 400）。
+        标题与描述按**单行**处理（换行折成空格），因为旁车是 `键: 值` 行格式。
+      operationId: updateMaterial
+      parameters:
+        - $ref: '#/components/parameters/RequestId'
+        - name: material_id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateMaterialRequest'
+      responses:
+        '200':
+          description: 更新后的素材详情
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MaterialDetail'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '422':
+          $ref: '#/components/responses/ValidationError'
+        '503':
+          $ref: '#/components/responses/DependencyUnavailable'
 
 components:
   parameters:
@@ -1057,6 +1098,22 @@ components:
           type: array
           items:
             $ref: '#/components/schemas/Element'
+
+    UpdateMaterialRequest:
+      type: object
+      description: |
+        `PATCH /api/materials/{material_id}` 请求体：只允许这三个字段（其余一律 422），
+        且至少要给一个（否则 400）。未给的字段保持原值。
+      additionalProperties: false
+      properties:
+        title:
+          type: string
+        tags:
+          type: array
+          items:
+            type: string
+        description:
+          type: string
 
     MaterialList:
       type: object

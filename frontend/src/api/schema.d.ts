@@ -209,7 +209,16 @@ export interface paths {
         delete?: never;
         options?: never;
         head?: never;
-        patch?: never;
+        /**
+         * 修改素材元数据
+         * @description 只接受 `title` / `tags` / `description`（白名单，其余字段一律 422 拒绝而不是静默忽略），
+         *     且至少要给一个字段（否则 400）。写入落两处：先写同名旁车 `<素材文件名>.txt`
+         *     （`标题: …` / `标签: a, b` / `描述: …`），再更新 `materials` 行——磁盘目录始终是
+         *     唯一来源，重扫描会得到同一份事实。三个字段的值都没变时不写文件。
+         *     标签会去空白、去 `#` 前缀并去重；去重后最多 14 个、单个标签最多 24 字（超出 400）。
+         *     标题与描述按**单行**处理（换行折成空格），因为旁车是 `键: 值` 行格式。
+         */
+        patch: operations["updateMaterial"];
         trace?: never;
     };
 }
@@ -424,6 +433,15 @@ export interface components {
             /** @description 相对素材根目录的父目录（正斜杠；直接放在根目录下时为空串），供前端显示主题 */
             dir: string;
             elements: components["schemas"]["Element"][];
+        };
+        /**
+         * @description `PATCH /api/materials/{material_id}` 请求体：只允许这三个字段（其余一律 422），
+         *     且至少要给一个（否则 400）。未给的字段保持原值。
+         */
+        UpdateMaterialRequest: {
+            title?: string;
+            tags?: string[];
+            description?: string;
         };
         MaterialList: {
             items: components["schemas"]["MaterialItem"][];
@@ -856,6 +874,39 @@ export interface operations {
                 };
             };
             404: components["responses"]["NotFound"];
+            503: components["responses"]["DependencyUnavailable"];
+        };
+    };
+    updateMaterial: {
+        parameters: {
+            query?: never;
+            header?: {
+                /** @description 客户端生成的请求标识；未提供时由服务端生成。用于贯穿日志、调用追踪与数据库记录。 */
+                "X-Request-ID"?: components["parameters"]["RequestId"];
+            };
+            path: {
+                material_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["UpdateMaterialRequest"];
+            };
+        };
+        responses: {
+            /** @description 更新后的素材详情 */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MaterialDetail"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            422: components["responses"]["ValidationError"];
             503: components["responses"]["DependencyUnavailable"];
         };
     };

@@ -35,6 +35,7 @@ from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..config import PROJECT_ROOT, AppConfig, ConfigError
+from ..core.errors import BadRequestError
 from ..db.models import Material as MaterialRow
 from ..schemas import Material
 from ..tools import materials as materials_tool
@@ -335,6 +336,105 @@ async def load_material(session: AsyncSession, cfg: AppConfig,
     view = material_item_view(row, cfg.materials_dir())
     view["elements"] = [dict(element) for element in (row.elements or [])]
     return view
+
+
+# ---------- 素材库编辑（S6.2：人工确认过的元数据写回旁车 + 数据库） ----------
+
+MAX_TAGS = 14
+MAX_TAG_CHARS = 24
+
+
+def single_line(value: str) -> str:
+    """折成单行：旁车是 `键: 值` 行格式，标题 / 描述里的换行会把文件写坏。"""
+    return " ".join(str(value).split())
+
+
+def clean_tags(raw: Sequence[str]) -> list[str]:
+    """去空白、去 `#` 前缀、去重（保序）——与 `tools/materials._merge_tags` 同一口径。"""
+    out: list[str] = []
+    for tag in raw:
+        value = single_line(str(tag)).lstrip("#").strip()
+        if value and value not in out:
+            out.append(value)
+    return out
+
+
+def tag_problem(tags: Sequence[str]) -> str | None:
+    """标签超限提示（None = 合规）：去重后最多 14 个、单个最多 24 字。"""
+    if len(tags) > MAX_TAGS:
+        return f"标签最多 {MAX_TAGS} 个（当前 {len(tags)} 个）"
+    too_long = next((tag for tag in tags if len(tag) > MAX_TAG_CHARS), None)
+    if too_long is not None:
+        return f"单个标签最多 {MAX_TAG_CHARS} 字：{too_long[:MAX_TAG_CHARS]}"
+    return None
+
+
+def sidecar_target(media_path: str) -> str:
+    """素材的 `.txt` 旁车路径（`sidecar_path` 优先读它，因此它优先于既有 `.md` / `.json`）。"""
+    return media_path + ".txt"
+
+
+def render_sidecar(*, title: str, tags: Sequence[str], description: str) -> str:
+    """渲染旁车正文；`tools/materials.parse_sidecar` 能把这三行原样读回。"""
+    return "\n".join([
+        f"标题: {single_line(title)}",
+        f"标签: {', '.join(tags)}",
+        f"描述: {single_line(description)}",
+    ]) + "\n"
+
+
+def write_sidecar(media_path: str, *, title: str, tags: Sequence[str],
+                  description: str) -> str:
+    """把人工确认过的三个字段写进 `<素材文件名>.txt`（UTF-8 + LF），返回写到的路径。"""
+    target = sidecar_target(media_path)
+    with open(target, "w", encoding="utf-8", newline="\n") as handle:
+        handle.write(render_sidecar(title=title, tags=tags, description=description))
+    return target
+
+
+async def update_material(session: AsyncSession, cfg: AppConfig, material_id: uuid.UUID, *,
+                          title: str | None = None, tags: list[str] | None = None,
+                          description: str | None = None) -> dict[str, Any] | None:
+    """改标题 / 标签 / 描述（S6.2）：先写旁车再落库，两边保持同一份事实。
+
+    口径：
+
+    - 三个字段的值都没变时**不写文件**（避免"只读一遍再保存"凭空多出 txt）；
+    - 真的改了就把 `source` 标成 `sidecar`——线索已经由人工确认，重扫描会得到同样结论；
+    - 素材文件已不在磁盘上时只更新数据库（不写孤立的 `.txt`，下次扫描会清理这行）；
+    - `tags` 传 None = 不改；传空列表 = 清空标签；传值会先清洗（去空白 / 去 `#` / 去重），
+      超过 14 个或单个超过 24 字抛 `BadRequestError`（400）——校验在查库之前，
+      请求体不合法时不因为 id 是否存在而改变错误码。
+    """
+    cleaned_tags: list[str] | None = None
+    if tags is not None:
+        cleaned_tags = clean_tags(tags)
+        problem = tag_problem(cleaned_tags)
+        if problem is not None:
+            raise BadRequestError(problem, {"tags": cleaned_tags})
+
+    row = (await session.execute(
+        select(MaterialRow).where(MaterialRow.id == material_id))).scalar_one_or_none()
+    if row is None:
+        return None
+
+    new_title = (row.title or "") if title is None else single_line(title)
+    new_tags = list(row.tags or []) if cleaned_tags is None else cleaned_tags
+    new_description = (row.description or "") if description is None else single_line(description)
+    changed = (new_title, new_tags, new_description) != (
+        row.title or "", list(row.tags or []), row.description or "")
+
+    if changed:
+        if os.path.isfile(row.path):
+            await asyncio.to_thread(write_sidecar, row.path, title=new_title,
+                                    tags=new_tags, description=new_description)
+        row.title, row.tags, row.description = new_title, new_tags, new_description
+        row.source = "sidecar"
+        await session.commit()
+
+    detail = material_item_view(row, cfg.materials_dir())
+    detail["elements"] = [dict(element) for element in (row.elements or [])]
+    return detail
 
 
 async def sync_materials(session: AsyncSession, cfg: AppConfig, *,
