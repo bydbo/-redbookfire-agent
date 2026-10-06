@@ -62,7 +62,7 @@
 | 契约一致性校验（`scripts/check_openapi.py`：FastAPI 导出的 OpenAPI 必须覆盖 `docs/contracts/openapi.yaml`，跑在 CI 的 test job 里） | ✅ 已完成（S4.6） |
 | Alembic 数据库迁移（唯一建表路径） | ✅ 已完成（S2.3） |
 | 评测集 v1 与示例素材包（七维度口径、版本冻结） | ✅ 已完成（S2.0） |
-| 服务入口（FastAPI 十八个接口 + LangGraph 编排，S3.1–S3.3；S5.4 / S5.6 / S6.1–S6.6 扩充） | ✅ 已完成 |
+| 服务入口（FastAPI 二十三个接口 + LangGraph 编排，S3.1–S3.3；S5.4 / S5.6 / S6.1–S6.6 / S7.4 扩充） | ✅ 已完成 |
 | 前端工程脚手架（Vue 3 + Vite + TS + Router + Pinia + Naive UI + Tailwind，S5.1：别名 / 环境变量 / 代理 / 构建配置） | ✅ 已完成（S5.1） |
 | 接口类型生成（S5.2：`openapi-typescript` 从 `docs/contracts/openapi.yaml` 生成 `frontend/src/api/schema.d.ts` 入库；`pnpm run check:api` + CI `frontend` job 防漂移） | ✅ 已完成（S5.2） |
 | 分析台页面（S5.3：多热点输入 → 提交 → 2 秒轮询进度 → 自动跳转结果占位页；`/` 为分析台、`/runs/:runId` 为结果页） | ✅ 已完成（S5.3） |
@@ -81,6 +81,12 @@
 | 删除与回收站（S6.3：移入 `_trash/`（连同旁车）并删索引行、列出回收站、恢复 = 重新入库（新 uuid）、单条 / 一键真删；新增 `xhs_agent.index_materials` 任务与 **Celery 结果后端**（ADR 0014，分析任务显式 `ignore_result`）） | ✅ 已完成（S6.3） |
 | 扫描与上传导入（S6.4：`POST /api/materials/scan` 触发「增量同步 + 向量回填」；`POST /api/materials/uploads` **流式**落到 `<素材根>/<YYYY-MM>/`（同名加序号、超 `[upload].max_size_gb` 退 413）；`GET /api/materials/tasks/{id}` 查阶段 / 计数 / 失败原因；镜像装 ffmpeg） | ✅ 已完成（S6.4） |
 | 素材库页（S6.5：第 4 页 `/materials`——搜索 / 类型 / 来源 / 主题 chips、网格↔列表、拖拽上传带进度、编辑弹窗、多选批量删除、回收站抽屉；真机冒烟 20/20：导入 3 条 → 自动打标 → 改标签（库 + 旁车）→ 删入回收站 → 恢复（新 uuid）→ 清空） | ✅ 已完成（S6.5） |
+| 原生工具调用与真 token 流式（S7.1：`LLMCall` 增 `tools` / `stream`，`LLMResult` 增 `tool_calls`；流式已回吐正文后不重试；记账口径与普通调用一致。DoR 已实测 `deepseek-flash` 支持 `tools` / `tool_calls`，结论见 ADR 0015） | ✅ 已完成（S7.1） |
+| 对话会话与消息存储（S7.2：数据契约 §3.6 / §3.7 + 迁移 **0004** + `services/chat.py`；附件落 `runs/_chat/<session_id>/` 且只存引用；过期 `running` 行按 `[chat].turn_stale_seconds` 兜底标 `interrupted`） | ✅ 已完成（S7.2） |
+| 对话编排图（S7.3：LangGraph `supervisor ⇄ tools`，轮次上限 `[chat].max_tool_rounds`；第一批只挂「跑完整分析」，有图片先走 S6.6 解析再按 S6.7 预置线索提交，**拆解节点短路**；新增 prompt 资产 `chat_supervisor`） | ✅ 已完成（S7.3） |
+| 对话 SSE 接口（S7.4：`POST /api/chat/sessions/{id}/messages` 返回 `text/event-stream`，事件 `turn_started` / `tool_started` / `tool_progress` / `tool_finished` / `text_delta` / `turn_finished` / `error`；Redis pub/sub 传事件，**轮次跑在 detached 任务里**——断开只停转发，不再算这一轮） | ✅ 已完成（S7.4） |
+| 对话首页（S7.5：`/` 改成对话、分析台挪到 `/analyze`（**路由名仍是 `analysis`**）；消息列表 + 输入框（文字 + 可选一张图）+ 工具过程 + 流式增量 + 结果卡片（与结果页共用 `HotspotResult.vue`）+ 历史会话侧栏；刷新后自动打开最近一条会话） | ✅ 已完成（S7.5） |
+| 对话闭环测试与真机冒烟（S7.6：单测 + 真容器集成（发消息 → 触达工具 → 落库 → 读回 → 附件取回）+ Playwright 真机 19/19 断言：传图 + 一句话 → 工具过程 → 流式正文 → 结果卡片 5 条候选 → 刷新仍在，截图落 `runs/_smoke_s76/`） | ✅ 已完成（S7.6） |
 
 业务链路**已端到端跑通**：`docker compose up -d --wait` 起依赖 → `uv run celery -A xhs_agent.tasks.worker:app worker` 起 worker → `uv run python -m xhs_agent.serve` 起接口（先跑 7 步启动前置检查）→ `POST /api/analyze` 投递 → worker 自动消费（索引新鲜度 → 五节点分析 → 逐热点写回）→ `/api/jobs/{job_id}` 轮询 → `/api/runs/{run_id}` 取结构化结果、`/report` 取报告。另可运行 `uv run python -m xhs_agent.probe`、`uv run python scripts/index_materials.py`、`uv run python scripts/backfill_embeddings.py`、`uv run python scripts/eval_retrieval.py`、`uv run python scripts/smoke_skeleton.py`。路线图见文末。
 
@@ -252,6 +258,16 @@ uv run python -m xhs_agent.tasks.reconcile
 #      POST /api/analyze → db.submit_analysis → analyze → hotspot-1 → 3 个模型 generation。
 #      DB span 只有操作与表名（不上报 SQL 语句）；/api/health 与文档页不产生 span。
 
+# 13.5 对话首页（S7.1–S7.6）：浏览器打开 http://127.0.0.1:8000/ 就是对话页
+#      （只跑 API 时 http://localhost:5173/ 走 Vite，同样落在这条路由上）。
+#      传一张图 + 一句话 → 模型自己决定调「跑完整分析」→ 工具过程与正文流式可见 →
+#      结果卡片回到对话里；刷新后自动打开最近一条会话，消息与结果都还在。
+#      接口面：POST/GET /api/chat/sessions、GET /api/chat/sessions/{id}、
+#      POST /api/chat/sessions/{id}/messages（multipart → text/event-stream）、
+#      GET /api/chat/sessions/{id}/attachments/{message_id}/{index}。
+#      两条口径：① 轮次跑在 API 进程的 detached 任务里，关掉页面/断流**不打断**这一轮，
+#      回来看到的是终态消息；② 图片只用于这一次解析（不落素材库），附件落 runs/_chat/。
+
 # 14. 一键跑通 Walking Skeleton（推荐先用它验证环境）
 #     自己起 uvicorn + Celery worker、素材库为空时种入示例素材包、投 case-01 的热点、
 #     轮询到终态、核对"至少 1 条候选且带命中要素与理由"与完整 HTML 报告，跑完回收进程。
@@ -270,7 +286,7 @@ pnpm build            # 类型检查 + 构建，产物落 frontend/dist（由 Fa
 pnpm run gen:api      # 契约变了才跑：从 ../docs/contracts/openapi.yaml 重新生成 src/api/schema.d.ts
 pnpm run check:api    # 防漂移自检：重新生成 + git diff，有差异即非零（CI 的 frontend job 跑这条）
 pnpm run lint         # ESLint 9（只做正确性规则，不查格式）
-pnpm test             # Vitest 单测（92 条，jsdom，含主题对比度、图表 option、分析台与素材库状态机）
+pnpm test             # Vitest 单测（112 条，jsdom，含主题对比度、图表 option、分析台/素材库/对话状态机与 SSE 解析）
 pnpm run test:cov     # 单测 + 覆盖率报告（只报告不设门槛）
 ```
 
@@ -285,6 +301,14 @@ pnpm run test:cov     # 单测 + 覆盖率报告（只报告不设门槛）
 > 关键词筛选、网格↔列表切换、编辑标题 / 描述 / 标签（**同时写数据库与同名 `.txt` 旁车**，
 > 重扫描后人工说明仍在）、多选批量删除、回收站抽屉（恢复 / 单条真删 / 一键清空）。
 > 「扫描」按钮触发一次「增量同步 + 向量回填」，进度与失败原因用 `GET /api/materials/tasks/{task_id}` 查。
+
+> **对话首页（S7.1–S7.6）**：打开 `/`（顶栏第一项「聊天」）就是对话框。传一张图 + 一句话，
+> 模型自己决定要不要调工具：有图片就先解析成热点线索，再把「热点 + 线索」作为**一次完整分析**投给
+> worker（拆解节点被预置线索短路，不重复付费），工具过程（解析图片 → 提交分析 → 分析中）与模型正文
+> 都通过 SSE 流式显示，跑完把结果卡片（爆点要素 / 候选素材 / 覆盖缺口 / 文案初稿）直接贴在对话里。
+> 左侧是历史会话，刷新后自动打开最近一条。两条边界：**关掉页面不会打断这一轮**（轮次跑在 API 进程的
+> detached 任务里，回来看到终态消息）；**不做「停止生成」**——要停就去运行历史看结果。分析台仍在
+> `/analyze`（顶栏第二项），对话里的分析结果与它共用同一套渲染。
 >
 > **还没有前端产物时**：`serve = true` + 缺 dist 属于配置错误，启动前置检查会**拒绝启动**（退出码 2）。本地纯后端开发用环境变量覆盖即可只跑 API：`XHS_FRONTEND_SERVE=false`（等价于把 `[frontend].serve` 设为 `false`）——`scripts/smoke_skeleton.py` 已经默认这么做了。前端工程已落地（S5.1–S5.9），本地 `cd frontend && pnpm build` 产 dist；**镜像里也已内含 dist**，`docker compose up -d --wait` 后 http://127.0.0.1:8000/ 直接就是单页应用。
 
@@ -354,14 +378,14 @@ project/
 ## 测试与开发规范
 
 ```powershell
-# 质量门：lint + 类型检查（mypy 严格模式目前覆盖 schemas / config / probe）
+# 质量门：lint + 类型检查（mypy 严格模式覆盖 core / db / services / tools / api / tasks 等 53 个文件）
 uv run ruff check .
 uv run mypy
 
 # 全量单元测试
 uv run pytest
 
-# 覆盖率（不设门槛，按需查看；加 --cov-report=html 可生成逐行报告）
+# 覆盖率（门槛 78%，只在带 --cov 的跑法下生效；加 --cov-report=html 可生成逐行报告）
 uv run pytest --cov
 
 # 提交前钩子：装一次即可，之后每次 commit 自动跑上面三条
@@ -403,6 +427,8 @@ Docker 不可用时会直接报错并说明原因（不静默跳过）。
 | P3 编排与服务 | LangGraph、FastAPI 接口（/api 前缀）、Celery |
 | P4 可观测与交付 | 结构化日志与调用追踪、容器化、CI |
 | P5 前端工程 | Vue 3 单页应用：分析台、结果详情、运行历史 + ECharts 可视化 |
+| P6 素材与图片 | 素材库页（查询 / 编辑 / 回收站 / 导入）+ 图片热点解析链路 |
+| P7 对话式入口 | 对话首页：原生 function calling + 会话存储 + SSE 流式 + 结果卡片（第一批已落地 S7.1–S7.6） |
 | v1.1 及以后 | 多热点横向对比、历史回看、自动抓热榜、效果回流 |
 
 **完整的任务分解、依赖关系、验收标准与工作量估算见 `docs/backlog.md`** —— 本文件只列阶段，不重复维护任务清单。

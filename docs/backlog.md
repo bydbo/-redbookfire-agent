@@ -22,7 +22,7 @@
 | E4 可观测与交付 | 可运维、可交付           | 8        | ✅ 已完成（S4.1–S4.6）  | M5  |
 | E5 前端工程   | 把演示页升级为可交互的单页应用   | 17       | ✅ 已完成（S5.1–S5.9） | M6  |
 | E6 新功能迭代 | 后续功能迭代的容器（主题一：素材库页；主题二：图片热点解析） | 19.5 | ✅ 已完成（S6.1–S6.9） | M7 / M8 |
-| E7 对话式入口 | 把现有流水线外放为对话框，对话成为首页 | 25 | ⬜ 未开始 | M9 |
+| E7 对话式入口 | 把现有流水线外放为对话框，对话成为首页 | 25 | 🔄 第一批已完成（S7.1–S7.6）；第二、三批未开始 | M9 |
 | **合计**    |                   | **121** |                   |     |
 
 全职投入约 9 周；按每天 3 小时的业余节奏约 5 个月。总量的增长分两轮：**E1 期**比初版（41.5）增加 26 人日——前端 Epic 17、API 前缀与静态挂载 1、完整 preflight 1.5、mypy 收紧 0.5、E2 净增 5（集成测试基座 +3、评测集与示例素材包 +3、对比脚本精简 −1）、E1 落地时的范围调整 1（S1.2 配置段全量 +0.5、S1.4 覆盖 8 个模块 +0.5）；此后 E4 可观测与交付、E6 新功能迭代（素材库页 + 图片热点解析）、E7 对话式入口与 Story 级重估继续累加，**当前合计 121 人日**。
@@ -358,12 +358,91 @@
 
 | 编号 | Story | 依赖 | 验收标准 | 人日 | 状态 |
 | --- | --- | --- | --- | --- | --- |
-| S7.1 | 工具调用能力 | S3.1 | **DoR 前置**：先用一条最小请求验证 `[llm].model` 端点是否支持 `tools` / `tool_calls`；支持则扩 `BaseProvider`（新增工具调用方法 + 工具调用的 token / 成本记账）；不支持则改走「结构化 JSON 协议模拟」（模型输出 `{tool, args}`，复用现有 `json_mode`）。两条路对外行为一致：工具集合、超时、重试、成本都进记账；结论补一条 ADR | 1.5 | ⬜ |
-| S7.2 | 会话与消息存储 | S1.1, S3.3 | 数据契约新增 `chat_sessions` / `chat_messages` 两表 + 迁移 0004（可回滚）；消息含 role / content / attachments / tool_calls / run_id / cost_cny / latency_ms；服务层提供建会话、追加消息、按会话读历史 | 1.5 | ⬜ |
-| S7.3 | 对话编排图 | S7.1, S7.2 | 新增对话用 LangGraph：supervisor 节点（直接回答 or 调工具）→ 工具节点 → 回 supervisor，带**轮次上限（默认 3 次工具调用/轮）**与失败重试；第一批只挂一个工具「跑完整分析」（复用现有 `submit_analysis` 与 Celery，不新写编排）；越界只做识别与拒绝，引导话术第三批补 | 3 | ⬜ |
-| S7.4 | SSE 流式接口 | S7.3 | `POST /api/chat/sessions/{id}/messages` 返回 `text/event-stream`；事件 `turn_started` / `tool_started` / `tool_finished` / `text_delta` / `turn_finished`（带 run_id）/ `error`；分析在 worker 跑，进度经 **Redis pub/sub**（复用现有 redis 依赖）回传、API 订阅后转 SSE；客户端断开不杀 worker 任务 | 2 | ⬜ |
-| S7.5 | 对话首页前端 | S7.4, S5.7 | 新增路由 `chat` 指向 `/`，分析台路由改路径到 `/analyze`（**路由名 `analysis` 保留**，只改 path，减少既有测试改动）；消息列表 + 输入框 + 附件 + 流式增量渲染 + 工具调用过程展示 + 结果卡片（复用结果页组件）+ 历史会话侧栏；刷新后会话仍在 | 3 | ⬜ |
-| S7.6 | 第一批测试与冒烟 | S7.5 | 单测（事件序列、轮次上限、工具失败）；集成（真容器 + 假模型：发消息 → 触达工具 → 落库 → 读回）；Playwright 真机冒烟「传图 + 一句话 → 流式过程 → 结果卡片 → 刷新仍在」，截图落 `runs/_smoke_s76/` | 1 | ⬜ |
+| S7.1 | 工具调用能力 | S3.1 | **DoR 前置**：先用一条最小请求验证 `[llm].model` 端点是否支持 `tools` / `tool_calls`；支持则扩 `BaseProvider`（新增工具调用方法 + 工具调用的 token / 成本记账）；不支持则改走「结构化 JSON 协议模拟」（模型输出 `{tool, args}`，复用现有 `json_mode`）。两条路对外行为一致：工具集合、超时、重试、成本都进记账；结论补一条 ADR | 1.5 | ✅ |
+| S7.2 | 会话与消息存储 | S1.1, S3.3 | 数据契约新增 `chat_sessions` / `chat_messages` 两表 + 迁移 0004（可回滚）；消息含 role / content / attachments / tool_calls / run_id / cost_cny / latency_ms；服务层提供建会话、追加消息、按会话读历史 | 1.5 | ✅ |
+| S7.3 | 对话编排图 | S7.1, S7.2 | 新增对话用 LangGraph：supervisor 节点（直接回答 or 调工具）→ 工具节点 → 回 supervisor，带**轮次上限（默认 3 次工具调用/轮）**与失败重试；第一批只挂一个工具「跑完整分析」（复用现有 `submit_analysis` 与 Celery，不新写编排）；越界只做识别与拒绝，引导话术第三批补 | 3 | ✅ |
+| S7.4 | SSE 流式接口 | S7.3 | `POST /api/chat/sessions/{id}/messages` 返回 `text/event-stream`；事件 `turn_started` / `tool_started` / `tool_finished` / `text_delta` / `turn_finished`（带 run_id）/ `error`；分析在 worker 跑，进度经 **Redis pub/sub**（复用现有 redis 依赖）回传、API 订阅后转 SSE；客户端断开不杀 worker 任务 | 2 | ✅ |
+| S7.5 | 对话首页前端 | S7.4, S5.7 | 新增路由 `chat` 指向 `/`，分析台路由改路径到 `/analyze`（**路由名 `analysis` 保留**，只改 path，减少既有测试改动）；消息列表 + 输入框 + 附件 + 流式增量渲染 + 工具调用过程展示 + 结果卡片（复用结果页组件）+ 历史会话侧栏；刷新后会话仍在 | 3 | ✅ |
+| S7.6 | 第一批测试与冒烟 | S7.5 | 单测（事件序列、轮次上限、工具失败）；集成（真容器 + 假模型：发消息 → 触达工具 → 落库 → 读回）；Playwright 真机冒烟「传图 + 一句话 → 流式过程 → 结果卡片 → 刷新仍在」，截图落 `runs/_smoke_s76/` | 1 | ✅ |
+
+**S7.1 工具调用能力（ADR 0015）**
+
+- **DoR 前置已实测**：`deepseek-flash`（`api.deepseek.com/v1`）返回 `finish_reason=tool_calls`、
+  `message.tool_calls[0].function.{name,arguments}` 与标准 `usage`；`stream=True` 也能用（62 个增量分片）。
+  结论：走**原生 function calling**，不做「结构化 JSON 协议模拟」那条降级路径（ADR 0015）。
+- `LLMCall` 增 `tools` / `stream`，`LLMResult` 增 `tool_calls`，`BaseProvider` 增
+  `complete_with_tools(call, on_delta=None)`；流式已回吐正文后**不重试**（重试会让用户看到重复文本），
+  改为「半截文本 + error」交给对话层收尾；token / 成本 / attempts / latency 与 `complete()` 同口径。
+- 实测：单测 +7 条（带 tools 的请求形状与解析、普通调用不带工具字段、流式增量与分片拼接、
+  缺 usage 时的估算兜底、流式 400 不重试、流式中途坏 JSON 保留半截文本）。
+
+**S7.2 会话与消息存储（迁移 0004）**
+
+- 数据契约 §3.6 / §3.7 新增 `chat_sessions` / `chat_messages`（含 §4.1 两条索引、§4.2 CHECK、
+  §五枚举与 ER 图），迁移 **0004** 可回滚、`alembic check` 零差异；配置契约 §3.12 新增 `[chat]`
+  （`max_tool_rounds=3` / `attachment_max_mb=10` / `history_max_messages=20` / `turn_stale_seconds=300`）。
+- `services/chat.py`：建会话 / 列会话（`updated_at` 倒序 + 页内补消息数与末条预览）/ 读会话 /
+  追加与更新消息；附件落 `runs/_chat/<session_id>/` 且只存引用，`resolve_attachment` 防穿越；
+  `mark_stale_turns` 把过期的 `running` 行标 `interrupted`。
+- 实测：单测 14 条 + 集成 13 条（含标题取首条用户消息前 20 字、列表倒序与预览截断、
+  附件落盘 → 取回往返、过期 running 标中断）；表结构 / 迁移用例同步扩到七张表与 revision 0004。
+
+**S7.3 对话编排图**
+
+- prompt 契约 §一 登记 `chat_supervisor`（**顺手补上 S6.6 漏登记的 `image_hotspot_clue`**）；
+  新增资产 `prompts/chat_supervisor.md`（v1、五段齐全、`requires` 为空——动态内容走对话消息）。
+- `services/chat_tools.py::TOOLS` 是工具定义的**唯一来源**，第一批只有 `run_hotspot_analysis`：
+  有图片附件先走 S6.6 的 `parse_image_clue`，再把线索作为**预置线索**随 `submit_analysis` 提交
+  （S6.7 短路拆解节点），随后轮询 `runs` 到终态并汇总（同一 session 里轮询前必须 `expire_all()`）。
+- `workflows/chat.py`：`supervisor ⇄ tools` 的 LangGraph + 轮次上限 `[chat].max_tool_rounds`；
+  到上限后最后一次调用**不带工具**，逼模型用现有结果作答；未知工具记 failed 并收尾；
+  工具失败把原因作为 tool 消息喂回模型。
+- 实测：单测 19 条（直接回答 / 调工具后收尾 / 分片转发 / 轮次上限 / 未知工具 / 工具失败回话 /
+  参数坏 JSON / provider 报错 / 空回复兜底 / 消息组装；工具：schema 形状、超长与 topk 校验、
+  无输入时的问询、附件读不到时的失败）。
+
+**S7.4 SSE 流式接口**
+
+- 契约新增 tag「对话」与 5 条 path + 8 个 schema（建会话 / 列会话 / 读会话 / 发消息
+  （multipart → `text/event-stream`）/ 取附件），`check_openapi` 零 diff、`schema.d.ts` 重生成。
+- `services/chat_turns.py`：事件走 Redis pub/sub（channel `xhs_agent:chat:{turn_id}`，一行一个 JSON，
+  发布失败只 warning）；`start_turn` 把轮次放进 **detached asyncio 任务**（自建 engine / httpx，
+  跑图 → 落库 → 广播 `turn_started` / `tool_started` / `tool_progress` / `tool_finished` /
+  `text_delta` / `turn_finished` / `error`）；`api/routers/chat.py` **先订阅再起 turn**，
+  SSE 15 秒 `: ping` 心跳、终端事件后收尾，生成器被取消只停转发。
+- 实测：单测 7 条（帧格式与单行 data、缺 `REDIS_URL` 报错、发布 → 订阅往返、坏 JSON 丢弃、
+  心跳 + 终态收尾、detached 成功落库、异常标 failed）；集成 5 条（真 Postgres + 真 Redis + 假模型：
+  SSE 事件顺序与工具参数、消息字段与成本、附件落盘与原样取回、**没有任何订阅者**时轮次照样跑完
+  并落库、过期 running 标 interrupted、404 / 400 分支）。
+
+**S7.5 对话首页**
+
+- `/` 改成对话（`ChatView.vue`），分析台挪到 `/analyze` 且**路由名仍是 `analysis`**；顶栏四项，
+  窄屏导航横向滚动（品牌在 `sm` 以下让位）。
+- `api/chat.ts` 的 `streamMessage()` 用 `fetch` + `ReadableStream` 自己按空行切帧
+  （`EventSource` 只支持 GET，且自带重连而对话轮次并不重放）；`stores/chat.ts` 管会话列表、
+  当前会话消息、流式增量与工具步骤、结果卡片缓存；**刷新后自动打开最近一条会话**。
+- `components/HotspotResult.vue` 把结果页四块抽成纯展示组件，`RunResultView.vue` 改为引用它，
+  对话的结果卡片复用同一套（图表 `RunCharts` 是运行级的，仍只留在结果页）。
+- 实测：前端 112 条单测（+18：SSE 逐帧解析、对话 store 事件归约与刷新恢复、对话首页渲染与
+  结果卡片）、`lint` / `type-check` / `build` / `check:api` 全绿；既有页面用例随路由调整同步更新后全绿。
+
+**S7.6 第一批测试与真机冒烟**
+
+- 真机冒烟（`docker compose` + 临时 override 把开了 `[vision]` 的配置挂进 api / worker；
+  Playwright 驱动本机 Edge headless）：断言清单、截图与统计落 `runs/_smoke_s76/`（gitignore 覆盖），
+  **19/19 断言全过**。
+- run_id `3f643756-2392-401b-a993-201a8b01996b`（session `f0eca9e3-00e5-46f2-905c-91e75ac75ac9`）：
+  传图 + 一句话 → 工具过程（开始 → 解析图片 → 提交分析 → 分析中 → 工具完成）→ **3 个流式中间态**
+  → 结果卡片 5 条候选 + 文案初稿 → 刷新后会话与消息仍在（侧栏标成选中）；这一轮 46.6 秒、
+  **轮级成本 0.0767 元**，其中 `runs.cost_cny = 0.0632`（2 次模型调用、5,959 + 6,071 token），
+  `prompt_versions = {"copy_draft": 1, "material_select": 1}`（图片线索被复用，拆解节点短路）。
+- 过程记录：第一次跑 18/19，唯一失败的是**冒烟脚本自己的断言**——我原以为 375px 下顶栏四个入口
+  必须靠横向滚动才看得全，实测品牌让位后四条链接放得下；改成「放得下**或**自己可滚」后 19/19，
+  产品代码一次没改。两次冒烟合计约 0.144 元（落在 0.1–0.2 元的预估里）。
+- 回归：单测 **923** 全绿、前端 **112** 全绿、集成 **179 passed / 2 failed**（新增 5 条对话用例；
+  那 2 条是本机回环代理拦 `test_http_pool.py` 的老环境问题，GitHub runner 上没有该代理）、
+  ruff / mypy（53 文件）零告警、`check_openapi` 零 diff。
 
 #### 第二批 · 工具集
 
@@ -437,7 +516,7 @@ GET /api/runs/{run_id}/report → 返回完整 HTML 报告
 | M6 前端可演示  | E5 完成 | 三个页面可交互跑通；前端类型与契约零偏差；dist 进入镜像            | ⬜                                                                                                                                                                                                                                                                                                |
 | M7 素材库可用 | E6 主题一完成 | 素材库页跑通「导入 → 浏览 → 编辑 → 删除 → 恢复 → 清空」闭环；契约零漂移（`scripts/check_openapi.py` 通过） | ✅ 已完成（2026-10-06） |
 | M8 图片热点可用 | E6 主题二完成 | 图片拆标签 → 一键分析 → 结果页出现候选；契约零漂移（`scripts/check_openapi.py` 通过） | ✅ 已完成（2026-10-06） |
-| M9 对话式入口可用 | E7 完成 | 传图 + 一句话跑通流式对话，越界用例全过；契约零漂移（`scripts/check_openapi.py` 通过） | ⬜ |
+| M9 对话式入口可用 | E7 完成 | 传图 + 一句话跑通流式对话，越界用例全过；契约零漂移（`scripts/check_openapi.py` 通过） | 🔄 第一批已达成（S7.1–S7.6：传图 + 一句话跑通流式对话，真机 19/19，契约零漂移）；越界用例与多轮记忆待第二、三批 |
 
 ## 六、风险与未决项
 
