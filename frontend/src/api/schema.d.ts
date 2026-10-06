@@ -45,6 +45,29 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/hotspots/image-clue": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * 从图片拆解热点线索
+         * @description 上传一张热点图片（jpg / png / webp，单张，≤ 10 MB），由多模态模型拆成「热点描述 + 爆点要素」。
+         *     图片**只在内存里转成模型输入**——不落盘、不入库；与素材上传是两条独立链路。
+         *     解析结果同样不落库：用户确认（可编辑）后随 `POST /api/analyze` 的 `clues` 字段一起提交。
+         *     该接口**不要求 ffmpeg**（图片不抽帧）：只要求 `[vision].enabled = true` 与密钥。
+         */
+        post: operations["createImageClue"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/jobs/{job_id}": {
         parameters: {
             query?: never;
@@ -159,6 +182,12 @@ export interface components {
              * @default 5
              */
             topk: number;
+            /**
+             * @description 预设线索快照（S6.7）：与 hotspots **一一对应、等长**；某一项为 null 表示该热点走正常拆解。
+             *     非空的那一项会写进对应 hotspots 行的 clue 并**短路拆解节点**（用户确认/编辑过的标签原样生效，
+             *     不重复付费）。不传时行为与不带该字段完全一致。
+             */
+            clues?: (components["schemas"]["HotspotClue"] | null)[];
         };
         AnalyzeAccepted: {
             /** @description 异步任务标识，用于轮询状态 */
@@ -168,6 +197,15 @@ export interface components {
              * @description 运行记录标识，用于读取结果与报告
              */
             run_id: string;
+        };
+        ImageClueResult: {
+            /** @description 模型给出的热点描述（≤ 500 字）；用户可编辑后作为 hotspots 提交 */
+            raw_text: string;
+            clue: components["schemas"]["HotspotClue"];
+            /** @description 本次解析实际使用的 prompt 版本，如 {"image_hotspot_clue": 1} */
+            prompt_versions: {
+                [key: string]: number;
+            };
         };
         JobStatus: {
             job_id: string;
@@ -453,6 +491,43 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["AnalyzeAccepted"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            422: components["responses"]["ValidationError"];
+            502: components["responses"]["UpstreamError"];
+            503: components["responses"]["DependencyUnavailable"];
+        };
+    };
+    createImageClue: {
+        parameters: {
+            query?: never;
+            header?: {
+                /** @description 客户端生成的请求标识；未提供时由服务端生成。用于贯穿日志、调用追踪与数据库记录。 */
+                "X-Request-ID"?: components["parameters"]["RequestId"];
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "multipart/form-data": {
+                    /**
+                     * Format: binary
+                     * @description 单张图片（jpg / png / webp，≤ 10 MB）
+                     */
+                    file: string;
+                };
+            };
+        };
+        responses: {
+            /** @description 解析结果（未落库，供用户确认后随 clues 提交） */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ImageClueResult"];
                 };
             };
             400: components["responses"]["BadRequest"];

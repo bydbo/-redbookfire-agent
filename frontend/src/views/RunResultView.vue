@@ -4,8 +4,8 @@ import { computed, onMounted, reactive, ref } from 'vue'
 import { useRoute } from 'vue-router'
 
 import { ApiRequestError, apiUrl } from '@/api/client'
-import type { Element, RunDetail } from '@/api/analysis'
-import { getKeyframeUrl, getRun } from '@/api/analysis'
+import type { RunDetail } from '@/api/analysis'
+import { ELEMENT_TYPE_LABELS, getKeyframeUrl, getRun } from '@/api/analysis'
 import RunCharts from '@/components/RunCharts.vue'
 
 const route = useRoute()
@@ -53,19 +53,6 @@ const statusMeta = computed(() => {
 })
 
 const reportUrl = computed(() => apiUrl(`/runs/${runId.value}/report?format=html`))
-
-/** 爆点要素类型的中文标签（口径见产品方案 §六） */
-const TYPE_LABELS: Record<Element['type'], string> = {
-  ip: 'IP',
-  topic: '主题',
-  scene: '场景',
-  visual: '画面',
-  emotion: '情绪',
-  sound: '声音',
-  conflict: '冲突',
-  format: '形式',
-  audience: '人群',
-}
 
 /** 关键帧加载失败的素材（隐藏 img、展示占位），键为 material_id */
 const frameFailed = reactive<Record<string, boolean>>({})
@@ -203,7 +190,7 @@ async function copyDraft(draft: Draft, hotspotId: string): Promise<void> {
               </h2>
               <div class="flex flex-wrap gap-2">
                 <n-tag v-for="(el, i) in hotspot.clue.elements" :key="i" size="small" :title="`权重 ${(el.weight * 100).toFixed(0)}%`">
-                  {{ TYPE_LABELS[el.type] }} · {{ el.value }}
+                  {{ ELEMENT_TYPE_LABELS[el.type] }} · {{ el.value }}
                 </n-tag>
                 <span v-if="hotspot.clue.elements.length === 0" class="text-sm text-ink-muted">未识别到要素</span>
               </div>
@@ -260,7 +247,7 @@ async function copyDraft(draft: Draft, hotspotId: string): Promise<void> {
                   </div>
                   <div v-if="cand.hits.length > 0" class="mt-2 flex flex-wrap gap-1">
                     <n-tag v-for="(hit, i) in cand.hits" :key="i" size="tiny" type="success">
-                      {{ TYPE_LABELS[hit.element_type] }} · {{ hit.clue_value }}
+                      {{ ELEMENT_TYPE_LABELS[hit.element_type] }} · {{ hit.clue_value }}
                     </n-tag>
                   </div>
                   <ul class="mt-2 list-disc pl-5 text-sm text-ink">
@@ -287,13 +274,13 @@ async function copyDraft(draft: Draft, hotspotId: string): Promise<void> {
               <div v-if="hotspot.coverage.covered.length > 0" class="mt-2 flex flex-wrap items-center gap-2 text-sm">
                 <span class="text-ink-muted">已覆盖：</span>
                 <n-tag v-for="(el, i) in hotspot.coverage.covered" :key="i" size="tiny" type="success">
-                  {{ TYPE_LABELS[el.type] }} · {{ el.value }}
+                  {{ ELEMENT_TYPE_LABELS[el.type] }} · {{ el.value }}
                 </n-tag>
               </div>
               <div class="mt-2 flex flex-wrap items-center gap-2 text-sm">
                 <span class="text-ink-muted">缺口：</span>
                 <n-tag v-for="(el, i) in hotspot.coverage.gaps" :key="i" size="tiny" type="warning">
-                  {{ TYPE_LABELS[el.type] }} · {{ el.value }}
+                  {{ ELEMENT_TYPE_LABELS[el.type] }} · {{ el.value }}
                 </n-tag>
                 <span v-if="hotspot.coverage.gaps.length === 0" class="text-sm text-ink-muted">无缺口，素材全要素覆盖</span>
               </div>
