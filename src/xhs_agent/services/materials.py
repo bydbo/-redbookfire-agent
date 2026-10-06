@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import uuid
 from collections.abc import Callable, Sequence
 from contextlib import AsyncExitStack
 from dataclasses import dataclass, field
@@ -30,7 +31,7 @@ from datetime import UTC, datetime
 from decimal import Decimal
 from typing import Any, Protocol, TypeVar
 
-from sqlalchemy import or_, select
+from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..config import PROJECT_ROOT, AppConfig, ConfigError
@@ -198,6 +199,142 @@ def row_to_material(row: MaterialRow) -> Material:
         "indexed_at": row.indexed_at.isoformat() if row.indexed_at else "",
         "fingerprint": row.fingerprint or "",
     })
+
+
+# ---------- 素材库查询（S6.1：浏览 / 主题筛选 / 分页） ----------
+
+MATERIALS_PAGE_DEFAULT = 24
+MATERIALS_PAGE_MAX = 100
+
+
+def relative_dir(path: str, materials_dir: str) -> str:
+    """素材相对 `materials_dir` 的父目录（正斜杠；直接放在根目录下时为 `""`）。"""
+    rel = os.path.relpath(os.path.abspath(path), os.path.abspath(materials_dir))
+    parent = os.path.dirname(rel)
+    if parent in ("", "."):
+        return ""
+    return parent.replace(os.sep, "/")
+
+
+def _relative_path_expr(materials_dir: str) -> Any:
+    """SQL 里取「相对 materials_dir 的路径」（含文件名）。"""
+    prefix = os.path.abspath(materials_dir).rstrip(os.sep) + os.sep
+    return func.substr(MaterialRow.path, len(prefix) + 1)
+
+
+def _escape_like(value: str) -> str:
+    """转义 LIKE 元字符：用户搜 `%` / `_` 时不该变成通配符。"""
+    return value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
+def _keyword_clause(keyword: str) -> Any:
+    """关键词命中标题或任一标签（大小写不敏感的子串）。"""
+    like = f"%{_escape_like(keyword)}%"
+    return or_(MaterialRow.title.ilike(like, escape="\\"),
+               func.array_to_string(MaterialRow.tags, ",").ilike(like, escape="\\"))
+
+
+def _dir_clause(materials_dir: str, dir_value: str) -> Any:
+    """`dir` 筛选：空串 = 只看直接放在根目录下的素材，非空 = 该目录前缀（含子目录）。"""
+    rel = _relative_path_expr(materials_dir)
+    normalized = dir_value.strip().strip("/").replace("/", os.sep)
+    if not normalized:
+        return func.strpos(rel, os.sep) == 0
+    return func.substr(rel, 1, len(normalized) + 1) == normalized + os.sep
+
+
+def _filter_clauses(materials_dir: str, *, q: str | None, type: str | None,
+                    source: str | None, dir: str | None) -> list[Any]:
+    clauses: list[Any] = []
+    keyword = (q or "").strip()
+    if keyword:
+        clauses.append(_keyword_clause(keyword))
+    if type:
+        clauses.append(MaterialRow.type == type)
+    if source:
+        clauses.append(MaterialRow.source == source)
+    if dir is not None:
+        clauses.append(_dir_clause(materials_dir, dir))
+    return clauses
+
+
+def _iso(value: Any) -> str:
+    return value.isoformat() if value else ""
+
+
+def material_item_view(row: MaterialRow, materials_dir: str) -> dict[str, Any]:
+    """ORM 行 → 契约 `MaterialItem` 形状（`dir` 由绝对路径现算，库里没有这一列）。"""
+    return {
+        "id": str(row.id),
+        "path": row.path,
+        "type": row.type,
+        "title": row.title or "",
+        "description": row.description or "",
+        "tags": list(row.tags or []),
+        "duration_s": float(row.duration_s or 0),
+        "width": int(row.width or 0),
+        "height": int(row.height or 0),
+        "has_audio": bool(row.has_audio),
+        "size_bytes": int(row.size_bytes or 0),
+        "source": row.source or "filename",
+        "keyframes": list(row.keyframes or []),
+        "indexed_at": _iso(row.indexed_at),
+        "dir": relative_dir(row.path, materials_dir),
+    }
+
+
+async def list_materials(session: AsyncSession, cfg: AppConfig, *, q: str | None = None,
+                         type: str | None = None, source: str | None = None,
+                         dir: str | None = None,
+                         limit: int = MATERIALS_PAGE_DEFAULT,
+                         offset: int = 0) -> dict[str, Any]:
+    """素材库列表：分页 + 关键词 / 类型 / 来源 / 主题目录筛选 + 主题目录计数（S6.1）。
+
+    排序与分页口径：`indexed_at` 倒序、平局按 `id` 倒序（幂等）。`dirs` 只受
+    `q` / `type` / `source` 影响——否则选中一个主题后其它主题的计数会集体消失。
+    """
+    materials_dir = cfg.materials_dir()
+    base_clauses = _filter_clauses(materials_dir, q=q, type=type, source=source, dir=None)
+    clauses = list(base_clauses)
+    if dir is not None:
+        clauses.append(_dir_clause(materials_dir, dir))
+
+    total_stmt = select(func.count()).select_from(MaterialRow)
+    if clauses:
+        total_stmt = total_stmt.where(*clauses)
+    total = int((await session.execute(total_stmt)).scalar_one())
+
+    items_stmt = select(MaterialRow)
+    if clauses:
+        items_stmt = items_stmt.where(*clauses)
+    items_stmt = (items_stmt.order_by(MaterialRow.indexed_at.desc(), MaterialRow.id.desc())
+                  .limit(limit).offset(offset))
+    rows = (await session.execute(items_stmt)).scalars().all()
+
+    rel = _relative_path_expr(materials_dir)
+    direct_dir = func.split_part(rel, os.sep, 1)
+    dirs_stmt = select(direct_dir.label("path"), func.count().label("count")).where(
+        func.strpos(rel, os.sep) > 0)
+    if base_clauses:
+        dirs_stmt = dirs_stmt.where(*base_clauses)
+    dirs_stmt = dirs_stmt.group_by(direct_dir).order_by(direct_dir)
+    dirs = [{"path": str(path), "count": int(count)}
+            for path, count in (await session.execute(dirs_stmt)).all()]
+
+    return {"items": [material_item_view(row, materials_dir) for row in rows],
+            "total": total, "limit": limit, "offset": offset, "dirs": dirs}
+
+
+async def load_material(session: AsyncSession, cfg: AppConfig,
+                        material_id: uuid.UUID) -> dict[str, Any] | None:
+    """单个素材的详情（列表项字段 + 爆点要素 `elements`）；不存在返回 None。"""
+    row = (await session.execute(
+        select(MaterialRow).where(MaterialRow.id == material_id))).scalar_one_or_none()
+    if row is None:
+        return None
+    view = material_item_view(row, cfg.materials_dir())
+    view["elements"] = [dict(element) for element in (row.elements or [])]
+    return view
 
 
 async def sync_materials(session: AsyncSession, cfg: AppConfig, *,

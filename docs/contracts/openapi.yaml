@@ -49,6 +49,8 @@ tags:
     description: 提交热点并跟踪任务
   - name: 结果
     description: 读取运行结果与报告
+  - name: 素材
+    description: 浏览、整理与导入本地素材库
   - name: 运维
     description: 健康检查
 
@@ -320,6 +322,104 @@ paths:
               schema:
                 type: string
                 format: binary
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '503':
+          $ref: '#/components/responses/DependencyUnavailable'
+
+  /api/materials:
+    get:
+      tags:
+        - 素材
+      summary: 列出素材库
+      description: |
+        按索引时间倒序分页返回素材库；支持关键词（标题或标签的子串）、类型、打标来源与
+        主题目录筛选。`dirs` 是**直接子目录**的计数（受 `q` / `type` / `source` 影响、
+        不受 `dir` 影响），供前端渲染主题导航。磁盘目录是唯一来源，这里是索引副本。
+      operationId: listMaterials
+      parameters:
+        - $ref: '#/components/parameters/RequestId'
+        - name: q
+          in: query
+          required: false
+          description: 关键词；匹配标题或任一标签（大小写不敏感的子串，去空白后为空即忽略）
+          schema:
+            type: string
+        - name: type
+          in: query
+          required: false
+          description: 素材类型
+          schema:
+            type: string
+            enum:
+              - video
+              - image
+        - name: source
+          in: query
+          required: false
+          description: 打标来源
+          schema:
+            type: string
+            enum:
+              - sidecar
+              - vision
+              - filename
+              - legacy
+        - name: dir
+          in: query
+          required: false
+          description: |
+            主题目录（相对素材根目录的路径，正斜杠）；空串表示只看直接放在根目录下的素材，
+            非空时按前缀匹配（含子目录）。不传 = 全部。
+          schema:
+            type: string
+        - name: limit
+          in: query
+          required: false
+          schema:
+            type: integer
+            default: 24
+            minimum: 1
+            maximum: 100
+        - name: offset
+          in: query
+          required: false
+          schema:
+            type: integer
+            default: 0
+            minimum: 0
+      responses:
+        '200':
+          description: 素材列表
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MaterialList'
+        '503':
+          $ref: '#/components/responses/DependencyUnavailable'
+
+  /api/materials/{material_id}:
+    get:
+      tags:
+        - 素材
+      summary: 读取素材详情
+      description: 返回单个素材的完整索引信息（含爆点要素 `elements`）；非法或未知 id 一律 404。
+      operationId: getMaterial
+      parameters:
+        - $ref: '#/components/parameters/RequestId'
+        - name: material_id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: 素材详情
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MaterialDetail'
         '404':
           $ref: '#/components/responses/NotFound'
         '503':
@@ -818,6 +918,182 @@ components:
           type: array
           items:
             type: string
+
+    MaterialItem:
+      type: object
+      description: 素材库列表里的一条素材（磁盘目录是唯一来源，这里是索引副本）。
+      required:
+        - id
+        - path
+        - type
+        - title
+        - description
+        - tags
+        - duration_s
+        - width
+        - height
+        - has_audio
+        - size_bytes
+        - source
+        - keyframes
+        - indexed_at
+        - dir
+      properties:
+        id:
+          type: string
+          format: uuid
+        path:
+          type: string
+          description: 素材绝对路径
+        type:
+          type: string
+          enum:
+            - video
+            - image
+        title:
+          type: string
+        description:
+          type: string
+        tags:
+          type: array
+          items:
+            type: string
+        duration_s:
+          type: number
+        width:
+          type: integer
+        height:
+          type: integer
+        has_audio:
+          type: boolean
+        size_bytes:
+          type: integer
+        source:
+          type: string
+          enum:
+            - sidecar
+            - vision
+            - filename
+            - legacy
+        keyframes:
+          type: array
+          items:
+            type: string
+        indexed_at:
+          type: string
+          format: date-time
+        dir:
+          type: string
+          description: 相对素材根目录的父目录（正斜杠；直接放在根目录下时为空串），供前端显示主题
+
+    MaterialDetail:
+      type: object
+      description: 素材详情：列表项的全部字段 + 爆点要素。
+      required:
+        - id
+        - path
+        - type
+        - title
+        - description
+        - tags
+        - duration_s
+        - width
+        - height
+        - has_audio
+        - size_bytes
+        - source
+        - keyframes
+        - indexed_at
+        - dir
+        - elements
+      properties:
+        id:
+          type: string
+          format: uuid
+        path:
+          type: string
+          description: 素材绝对路径
+        type:
+          type: string
+          enum:
+            - video
+            - image
+        title:
+          type: string
+        description:
+          type: string
+        tags:
+          type: array
+          items:
+            type: string
+        duration_s:
+          type: number
+        width:
+          type: integer
+        height:
+          type: integer
+        has_audio:
+          type: boolean
+        size_bytes:
+          type: integer
+        source:
+          type: string
+          enum:
+            - sidecar
+            - vision
+            - filename
+            - legacy
+        keyframes:
+          type: array
+          items:
+            type: string
+        indexed_at:
+          type: string
+          format: date-time
+        dir:
+          type: string
+          description: 相对素材根目录的父目录（正斜杠；直接放在根目录下时为空串），供前端显示主题
+        elements:
+          type: array
+          items:
+            $ref: '#/components/schemas/Element'
+
+    MaterialList:
+      type: object
+      required:
+        - items
+        - total
+        - limit
+        - offset
+        - dirs
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/MaterialItem'
+        total:
+          type: integer
+          minimum: 0
+        limit:
+          type: integer
+          minimum: 1
+        offset:
+          type: integer
+          minimum: 0
+        dirs:
+          type: array
+          description: 直接子目录及其素材数（受 q / type / source 影响，不受 dir 影响）
+          items:
+            type: object
+            required:
+              - path
+              - count
+            properties:
+              path:
+                type: string
+              count:
+                type: integer
+                minimum: 0
 
     Draft:
       type: object

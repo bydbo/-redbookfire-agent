@@ -26,6 +26,7 @@ ElementType = Literal["ip", "topic", "scene", "visual", "emotion", "sound", "con
                       "format", "audience"]
 RunStatus = Literal["queued", "running", "succeeded", "failed"]
 MaterialType = Literal["video", "image"]
+MaterialSource = Literal["sidecar", "vision", "filename", "legacy"]
 ComponentStatus = Literal["ok", "down"]
 RecallSource = Literal["literal", "vector"]
 ReportFormat = Literal["html", "md"]
@@ -150,6 +151,68 @@ class MaterialSummary(_Response):
     height: int = 0
     has_audio: bool = False
     keyframes: list[str] = Field(default_factory=list)
+
+
+class MaterialItem(_Response):
+    """素材库列表项（S6.1）；契约里这些字段全部必填，所以这里不给默认值。"""
+
+    id: UuidStr
+    path: str
+    type: MaterialType
+    title: str
+    description: str
+    tags: list[str]
+    duration_s: float
+    width: int
+    height: int
+    has_audio: bool
+    size_bytes: int
+    source: MaterialSource
+    keyframes: list[str]
+    indexed_at: DateTimeStr
+    dir: str
+
+
+class MaterialDetail(_Response):
+    """素材详情（S6.1）：列表项的全部字段 + 爆点要素。
+
+    刻意**不用继承**：pydantic 继承会让 FastAPI 导出 `allOf`，而 `scripts/check_openapi.py`
+    的递归形状比对不认识 `allOf`，契约里也就跟着扁平写全（两处字段必须始终一致）。
+    """
+
+    id: UuidStr
+    path: str
+    type: MaterialType
+    title: str
+    description: str
+    tags: list[str]
+    duration_s: float
+    width: int
+    height: int
+    has_audio: bool
+    size_bytes: int
+    source: MaterialSource
+    keyframes: list[str]
+    indexed_at: DateTimeStr
+    dir: str
+    elements: list[Element]
+
+
+class MaterialDirCount(_Response):
+    """主题目录及其素材数（`MaterialList.dirs` 的元素）。"""
+
+    path: str
+    count: int
+
+
+class MaterialList(_Response):
+    """`GET /api/materials` 响应：分页列表 + 主题目录聚合。"""
+
+    items: list[MaterialItem]
+    total: int
+    limit: int
+    offset: int
+    dirs: list[MaterialDirCount]
 
 
 class MatchCandidate(_Response):

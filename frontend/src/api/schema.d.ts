@@ -170,6 +170,48 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/materials": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * 列出素材库
+         * @description 按索引时间倒序分页返回素材库；支持关键词（标题或标签的子串）、类型、打标来源与
+         *     主题目录筛选。`dirs` 是**直接子目录**的计数（受 `q` / `type` / `source` 影响、
+         *     不受 `dir` 影响），供前端渲染主题导航。磁盘目录是唯一来源，这里是索引副本。
+         */
+        get: operations["listMaterials"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/materials/{material_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * 读取素材详情
+         * @description 返回单个素材的完整索引信息（含爆点要素 `elements`）；非法或未知 id 一律 404。
+         */
+        get: operations["getMaterial"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
 }
 export type webhooks = Record<string, never>;
 export interface components {
@@ -333,6 +375,66 @@ export interface components {
             height?: number;
             has_audio?: boolean;
             keyframes?: string[];
+        };
+        /** @description 素材库列表里的一条素材（磁盘目录是唯一来源，这里是索引副本）。 */
+        MaterialItem: {
+            /** Format: uuid */
+            id: string;
+            /** @description 素材绝对路径 */
+            path: string;
+            /** @enum {string} */
+            type: "video" | "image";
+            title: string;
+            description: string;
+            tags: string[];
+            duration_s: number;
+            width: number;
+            height: number;
+            has_audio: boolean;
+            size_bytes: number;
+            /** @enum {string} */
+            source: "sidecar" | "vision" | "filename" | "legacy";
+            keyframes: string[];
+            /** Format: date-time */
+            indexed_at: string;
+            /** @description 相对素材根目录的父目录（正斜杠；直接放在根目录下时为空串），供前端显示主题 */
+            dir: string;
+        };
+        /** @description 素材详情：列表项的全部字段 + 爆点要素。 */
+        MaterialDetail: {
+            /** Format: uuid */
+            id: string;
+            /** @description 素材绝对路径 */
+            path: string;
+            /** @enum {string} */
+            type: "video" | "image";
+            title: string;
+            description: string;
+            tags: string[];
+            duration_s: number;
+            width: number;
+            height: number;
+            has_audio: boolean;
+            size_bytes: number;
+            /** @enum {string} */
+            source: "sidecar" | "vision" | "filename" | "legacy";
+            keyframes: string[];
+            /** Format: date-time */
+            indexed_at: string;
+            /** @description 相对素材根目录的父目录（正斜杠；直接放在根目录下时为空串），供前端显示主题 */
+            dir: string;
+            elements: components["schemas"]["Element"][];
+        };
+        MaterialList: {
+            items: components["schemas"]["MaterialItem"][];
+            total: number;
+            limit: number;
+            offset: number;
+            /** @description 直接子目录及其素材数（受 q / type / source 影响，不受 dir 影响） */
+            dirs: {
+                path: string;
+                count: number;
+            }[];
         };
         Draft: {
             /** @description 标题备选，小红书标题上限 20 字 */
@@ -686,6 +788,71 @@ export interface operations {
                 };
                 content: {
                     "image/jpeg": string;
+                };
+            };
+            404: components["responses"]["NotFound"];
+            503: components["responses"]["DependencyUnavailable"];
+        };
+    };
+    listMaterials: {
+        parameters: {
+            query?: {
+                /** @description 关键词；匹配标题或任一标签（大小写不敏感的子串，去空白后为空即忽略） */
+                q?: string;
+                /** @description 素材类型 */
+                type?: "video" | "image";
+                /** @description 打标来源 */
+                source?: "sidecar" | "vision" | "filename" | "legacy";
+                /**
+                 * @description 主题目录（相对素材根目录的路径，正斜杠）；空串表示只看直接放在根目录下的素材，
+                 *     非空时按前缀匹配（含子目录）。不传 = 全部。
+                 */
+                dir?: string;
+                limit?: number;
+                offset?: number;
+            };
+            header?: {
+                /** @description 客户端生成的请求标识；未提供时由服务端生成。用于贯穿日志、调用追踪与数据库记录。 */
+                "X-Request-ID"?: components["parameters"]["RequestId"];
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description 素材列表 */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MaterialList"];
+                };
+            };
+            503: components["responses"]["DependencyUnavailable"];
+        };
+    };
+    getMaterial: {
+        parameters: {
+            query?: never;
+            header?: {
+                /** @description 客户端生成的请求标识；未提供时由服务端生成。用于贯穿日志、调用追踪与数据库记录。 */
+                "X-Request-ID"?: components["parameters"]["RequestId"];
+            };
+            path: {
+                material_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description 素材详情 */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MaterialDetail"];
                 };
             };
             404: components["responses"]["NotFound"];

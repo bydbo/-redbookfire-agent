@@ -37,7 +37,7 @@ from .deps import dispose_engine, get_config
 from .errors import register_exception_handlers
 from .frontend import mount_frontend
 from .middleware import RequestIdMiddleware
-from .routers import analysis, ops, result
+from .routers import analysis, materials, ops, result
 
 API_PREFIX = "/api"
 TITLE = "小红书热点搭子 · 热点相关性 API"
@@ -69,7 +69,7 @@ def create_app(cfg: AppConfig | None = None, *, check_startup: bool = True) -> F
     # S4.3：ASGI 服务端 span（最后加 = 最外层，覆盖整条请求；没有 provider 时是空操作）
     install_fastapi_instrumentation(app)
     register_exception_handlers(app)
-    for router in (ops.router, analysis.router, result.router):
+    for router in (ops.router, analysis.router, result.router, materials.router):
         app.include_router(router, prefix=API_PREFIX)
     app.state.frontend_mounted = False
     app.state.check_startup = check_startup
