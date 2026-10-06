@@ -50,6 +50,9 @@ class LLMCall:
     # `stream=True` 时增量回吐正文（走 `complete_with_tools(on_delta=...)`）。
     tools: list[dict[str, Any]] | None = None
     stream: bool = False
+    # S7.3：真正的多轮对话（system / 历史 user+assistant / tool 结果）走 messages；
+    # 给了 messages 就以它为准，system 与 user 只用于单轮任务（结构化调用那条路径）。
+    messages: list[dict[str, Any]] | None = None
 
 
 @dataclass
@@ -130,7 +133,7 @@ class OpenAICompatibleProvider(BaseProvider):
         """
         payload: dict[str, Any] = {
             "model": self.cfg.model,
-            "messages": [
+            "messages": list(call.messages) if call.messages else [
                 {"role": "system", "content": call.system},
                 {"role": "user", "content": call.user},
             ],
@@ -155,7 +158,7 @@ class OpenAICompatibleProvider(BaseProvider):
                 error: str = "") -> LLMResult:
         """统一记账口径：token 取 `usage`，缺失时按字符估算（与 S7.1 之前一致）。"""
         prompt_tokens = int((usage or {}).get("prompt_tokens")
-                            or estimate_tokens(call.system + call.user))
+                            or estimate_tokens(_prompt_text(call)))
         completion_tokens = int((usage or {}).get("completion_tokens")
                                 or estimate_tokens(text))
         cost = (prompt_tokens / 1_000_000 * self.cfg.price_in_per_m
@@ -286,6 +289,18 @@ class OpenAICompatibleProvider(BaseProvider):
         return ("".join(text_parts),
                 [calls[key] for key in sorted(calls) if calls[key]["name"]],
                 usage)
+
+
+def _prompt_text(call: LLMCall) -> str:
+    """估算 token 用的提示词文本：多轮时把每条消息的 content 拼起来（缺 usage 时的兜底）。"""
+    if call.messages:
+        parts: list[str] = []
+        for message in call.messages:
+            content = message.get("content")
+            parts.append(content if isinstance(content, str)
+                         else json.dumps(content, ensure_ascii=False))
+        return "\n".join(parts)
+    return f"{call.system}\n{call.user}"
 
 
 def _first_message(data: dict[str, Any]) -> dict[str, Any]:

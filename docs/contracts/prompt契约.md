@@ -6,7 +6,7 @@
 
 ## 一、适用范围与地位
 
-**prompt 文本的唯一来源是 `src/xhs_agent/prompts/<task_id>.md`。禁止在代码里内联 prompt 字符串**，也禁止另起一套模板目录。当前适用四个任务：
+**prompt 文本的唯一来源是 `src/xhs_agent/prompts/<task_id>.md`。禁止在代码里内联 prompt 字符串**，也禁止另起一套模板目录。当前适用六个任务：
 
 | task_id | 用途 | 调用方 |
 | --- | --- | --- |
@@ -14,12 +14,20 @@
 | `hotspot_clue` | 热点原文 → 爆点线索 | `agents/clue.py`（S3.1 落地） |
 | `material_select` | 线索 + 候选素材 → 命中解释与建议用法 | `agents/explain.py`（S3.1 落地） |
 | `copy_draft` | 线索 + 选中素材 → 文案初稿 | `agents/draft.py`（S3.1 落地） |
+| `image_hotspot_clue` | 一张图 → 热点描述 + 爆点线索（多模态） | `services/image_clue.py`（S6.6 落地，S7.3 补登记） |
+| `chat_supervisor` | 对话层：读用户消息 → 决定直接回答或调工具 → 把结果讲成人话 | `agents/supervisor.py`（S7.3 落地） |
 
 三条硬规则：
 
 1. `task_id` 必须与 `StructuredCaller` 的 `task` 参数、`runs.prompt_versions` 的键、本契约上表三处一致；
 2. 新增任务必须**同时**建 prompt 文件、登记本表、在 `runs.prompt_versions` 里出现，缺一不可；
 3. 多模态任务同样受本契约约束，差异只在消息组装（见 §四）。
+
+**工具类任务的口径（S7.3）**：`chat_supervisor` 的 prompt 正文里**不写工具清单与参数**
+——工具定义（name / description / 参数 schema）是 API 协议，单一来源在 `services/chat_tools.py`
+的 `TOOLS`，随 model 的 `tools` 参数下发；prompt 的 03 Constraints 只写"能不能调、边界在哪"。
+这样工具改参数不会同时改两份。对话的 prompt 版本记在 `chat_messages.prompt_versions`
+（对话消息不写 `runs`）。
 
 ## 二、五段结构
 
