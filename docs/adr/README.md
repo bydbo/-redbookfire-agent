@@ -58,3 +58,4 @@
 | [0012](0012-end-to-end-cost-threshold.md) | 端到端单热点成本门槛由 0.05 上调至 0.15 元 | 已采纳 |
 | [0013](0013-frontend-theme-layer-and-glass.md) | 前端主题层与毛玻璃边界（token 单一来源） | 已采纳 |
 | [0014](0014-material-task-progress-via-celery-backend.md) | 素材索引进度用 Celery 结果后端，分析任务显式 ignore_result | 已采纳 |
+| [0015](0015-native-function-calling.md) | 对话层用原生 function calling（不做 JSON 协议模拟） | 已采纳 |

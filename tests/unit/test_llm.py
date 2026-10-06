@@ -308,3 +308,169 @@ class FakeConfig:
         self.llm = LLMConfig.model_construct(**fields)
         # 假密钥：httpx 会校验请求头，空 key 的 "Bearer " 在真实连接上会被拒（LocalProtocolError）
         self.llm._env = EnvView({}, {"DEEPSEEK_API_KEY": "sk-test"})
+
+
+# ---------- S7.1 原生 function calling 与真 token 流式 ----------
+
+def tool_calls_response(name: str = "run_hotspot_analysis",
+                        arguments: str = '{"hotspot": "x"}',
+                        call_id: str = "call_1") -> httpx.Response:
+    """非流式：模型要求调用工具（正文为空、finish_reason=tool_calls）。"""
+    return httpx.Response(200, json={
+        "choices": [{
+            "finish_reason": "tool_calls",
+            "message": {"content": "", "tool_calls": [
+                {"id": call_id, "type": "function",
+                 "function": {"name": name, "arguments": arguments}},
+            ]},
+        }],
+        "usage": {"prompt_tokens": 200, "completion_tokens": 30},
+    })
+
+
+def text_delta(text: str) -> dict[str, Any]:
+    return {"choices": [{"delta": {"content": text}}]}
+
+
+def tool_delta(index: int = 0, *, call_id: str | None = None, name: str | None = None,
+               arguments: str | None = None) -> dict[str, Any]:
+    function: dict[str, Any] = {}
+    if name is not None:
+        function["name"] = name
+    if arguments is not None:
+        function["arguments"] = arguments
+    raw: dict[str, Any] = {"index": index, "function": function}
+    if call_id is not None:
+        raw["id"] = call_id
+    return {"choices": [{"delta": {"tool_calls": [raw]}}]}
+
+
+def sse_body(chunks: list[dict[str, Any]]) -> bytes:
+    lines = [f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n" for chunk in chunks]
+    return ("".join(lines) + "data: [DONE]\n\n").encode("utf-8")
+
+
+def sse_response(chunks: list[dict[str, Any]]) -> httpx.Response:
+    return httpx.Response(200, content=sse_body(chunks),
+                          headers={"content-type": "text/event-stream"})
+
+
+class TestToolCalling:
+    """S7.1：`tools` / `tool_calls` 与流式聚合——请求形状、记账与失败口径。"""
+
+    @pytest.mark.asyncio
+    async def test_payload_carries_tools_and_auto_choice(self, make_api):
+        api = make_api(lambda _payload, _n: tool_calls_response())
+        provider = llm.build_provider(FakeConfig(), client=api.client)
+        tools = [{"type": "function", "function": {"name": "run_hotspot_analysis",
+                                                   "description": "跑完整分析",
+                                                   "parameters": {"type": "object"}}}]
+
+        result = await provider.complete_with_tools(
+            llm.LLMCall(task="chat_supervisor", system="s", user="u", json_mode=False,
+                        tools=tools))
+
+        payload = api.calls[0]["payload"]
+        assert payload["tools"] == tools and payload["tool_choice"] == "auto"
+        assert "stream" not in payload
+        assert result.text == ""
+        assert result.tool_calls == [{"id": "call_1", "name": "run_hotspot_analysis",
+                                      "arguments": '{"hotspot": "x"}'}]
+        assert (result.prompt_tokens, result.completion_tokens) == (200, 30)
+        assert result.cost_cny == pytest.approx(200 / 1e6 * 2.0 + 30 / 1e6 * 8.0)
+        assert result.error == ""
+
+    @pytest.mark.asyncio
+    async def test_plain_complete_does_not_add_tool_fields(self, make_api):
+        api = make_api(lambda _payload, _n: chat_response())
+        provider = llm.build_provider(FakeConfig(), client=api.client)
+        await provider.complete(llm.LLMCall(task="t", system="s", user="u"))
+        payload = api.calls[0]["payload"]
+        assert "tools" not in payload and "tool_choice" not in payload
+        assert "stream" not in payload
+        assert payload["response_format"] == {"type": "json_object"}
+
+    @pytest.mark.asyncio
+    async def test_streaming_emits_deltas_and_accumulates_text(self, make_api):
+        chunks = [text_delta("你好"), text_delta("，"), text_delta("世界"),
+                  {"choices": [], "usage": {"prompt_tokens": 11, "completion_tokens": 7}}]
+        api = make_api(lambda _payload, _n: sse_response(chunks))
+        provider = llm.build_provider(FakeConfig(), client=api.client)
+        seen: list[str] = []
+
+        async def on_delta(piece: str) -> None:
+            seen.append(piece)
+
+        result = await provider.complete_with_tools(
+            llm.LLMCall(task="chat_supervisor", system="s", user="u", json_mode=False,
+                        stream=True),
+            on_delta=on_delta)
+
+        assert api.calls[0]["payload"]["stream"] is True
+        assert seen == ["你好", "，", "世界"]
+        assert result.text == "你好，世界"
+        assert result.tool_calls == []
+        assert (result.prompt_tokens, result.completion_tokens) == (11, 7)
+        assert result.error == ""
+
+    @pytest.mark.asyncio
+    async def test_streaming_accumulates_tool_call_arguments(self, make_api):
+        chunks = [tool_delta(call_id="call_9", name="run_hotspot_analysis",
+                             arguments='{"hot'),
+                  tool_delta(arguments='spot": "夜跑"}')]
+        api = make_api(lambda _payload, _n: sse_response(chunks))
+        provider = llm.build_provider(FakeConfig(), client=api.client)
+
+        result = await provider.complete_with_tools(
+            llm.LLMCall(task="chat_supervisor", system="s", user="u", json_mode=False,
+                        tools=[{"type": "function"}], stream=True))
+
+        assert result.text == ""
+        assert result.tool_calls == [{"id": "call_9", "name": "run_hotspot_analysis",
+                                      "arguments": '{"hotspot": "夜跑"}'}]
+
+    @pytest.mark.asyncio
+    async def test_streaming_without_usage_estimates_tokens(self, make_api):
+        api = make_api(lambda _payload, _n: sse_response([text_delta("一二三四五六")]))
+        provider = llm.build_provider(FakeConfig(), client=api.client)
+        result = await provider.complete_with_tools(
+            llm.LLMCall(task="chat_supervisor", system="s", user="u", json_mode=False,
+                        stream=True))
+        assert result.text == "一二三四五六"
+        assert result.prompt_tokens > 0 and result.completion_tokens > 0
+        assert result.cost_cny > 0
+
+    @pytest.mark.asyncio
+    async def test_stream_400_is_not_retried(self, make_api, no_backoff):
+        api = make_api(lambda _payload, _n: httpx.Response(400, json={"error": "bad"}))
+        provider = llm.build_provider(FakeConfig(), client=api.client)
+
+        result = await provider.complete_with_tools(
+            llm.LLMCall(task="chat_supervisor", system="s", user="u", json_mode=False,
+                        stream=True))
+
+        assert len(api.calls) == 1
+        assert "HTTP 400" in result.error and result.text == ""
+
+    @pytest.mark.asyncio
+    async def test_stream_failure_after_first_delta_does_not_retry(self, make_api, no_backoff):
+        body = sse_body([text_delta("前半")]).replace(
+            b"data: [DONE]\n\n", b"data: not-json\n\ndata: [DONE]\n\n")
+        api = make_api(lambda _payload, _n: httpx.Response(
+            200, content=body, headers={"content-type": "text/event-stream"}))
+        provider = llm.build_provider(FakeConfig(), client=api.client)
+        seen: list[str] = []
+
+        async def on_delta(piece: str) -> None:
+            seen.append(piece)
+
+        result = await provider.complete_with_tools(
+            llm.LLMCall(task="chat_supervisor", system="s", user="u", json_mode=False,
+                        stream=True),
+            on_delta=on_delta)
+
+        assert seen == ["前半"]            # 已经吐出去的字不重试、不重复
+        assert result.text == "前半"
+        assert result.error != ""
+        assert result.attempts == 1
+        assert len(api.calls) == 1
