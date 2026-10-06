@@ -17,7 +17,11 @@ const activeNav = computed(() => (route.name === 'run-result' ? 'run-history' : 
 <template>
   <n-config-provider :theme="appStore.isDark ? darkTheme : null" :theme-overrides="overrides">
     <n-global-style />
-    <div class="flex min-h-screen flex-col">
+    <!-- 高度链（对话页独立滚动的前提）：html/body/#app 都是 height:100%（main.css），
+         这里用 h-dvh 把外壳锁在视口内，内容区 flex-1 + min-h-0 拿到确定高度，
+         **由内容区自己滚**——所以文档级滚动条彻底消失，顶栏永远可见。
+         对话页再在内部接管滚动（它的 <main> 用 h-full，外壳这层就没有可滚的内容）。 -->
+    <div class="flex h-dvh flex-col">
       <!-- 四页共用的毛玻璃顶栏（S5.7）：品牌 + 导航 + 暗色开关。
            窄屏（375px）下导航横向滚动，品牌让位——见 S7.5 的真机截图验收。 -->
       <header class="app-topbar">
@@ -58,7 +62,9 @@ const activeNav = computed(() => (route.name === 'run-result' ? 'run-history' : 
           </n-button>
         </div>
       </header>
-      <router-view />
+      <div class="app-content min-h-0 flex-1 overflow-y-auto">
+        <router-view />
+      </div>
     </div>
   </n-config-provider>
 </template>

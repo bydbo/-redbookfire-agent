@@ -65,6 +65,19 @@ describe('App 壳层（S5.7 顶栏 + 主题）', () => {
     expect(active[0].text()).toBe('运行历史')
   })
 
+  it('外壳锁在视口内、内容区自己滚（对话页独立滚动的高度链前提）', async () => {
+    const { wrapper } = await mountApp()
+
+    const content = wrapper.find('.app-content')
+    expect(content.exists()).toBe(true)
+    // 内容区有确定高度（flex-1 + min-h-0）并自己滚 → 文档级滚动条不再出现
+    expect(content.classes()).toContain('min-h-0')
+    expect(content.classes()).toContain('flex-1')
+    expect(content.classes()).toContain('overflow-y-auto')
+    // 外壳高度锁在动态视口高度
+    expect((content.element.parentElement as HTMLElement).className).toContain('h-dvh')
+  })
+
   it('暗色开关翻转 html[data-theme] 并写入 localStorage', async () => {
     const { wrapper } = await mountApp()
     const toggle = wrapper.findAll('button').find((button) => button.text() === '暗色')

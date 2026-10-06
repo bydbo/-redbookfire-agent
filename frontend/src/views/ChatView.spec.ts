@@ -1,11 +1,13 @@
 import { flushPromises, mount } from '@vue/test-utils'
 import { createPinia, setActivePinia } from 'pinia'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import { nextTick } from 'vue'
 
 import type { RunDetail } from '@/api/analysis'
 import { getRun } from '@/api/analysis'
 import type { ChatMessage, ChatSessionDetail, ChatSessionList } from '@/api/chat'
 import { createChatSession, getChatSession, listChatSessions, streamMessage } from '@/api/chat'
+import { useChatStore } from '@/stores/chat'
 import ChatView from '@/views/ChatView.vue'
 
 vi.mock('@/api/chat', () => ({
@@ -114,6 +116,15 @@ async function clickButton(wrapper: ReturnType<typeof mount>, label: string): Pr
   await flushPromises()
 }
 
+/** jsdom 不做布局：scrollHeight / clientHeight 恒为 0，这里显式伪造一份可滚动的度量。 */
+function fakeScrollable(
+  element: HTMLElement,
+  { scrollHeight = 1000, clientHeight = 300 } = {},
+): void {
+  Object.defineProperty(element, 'scrollHeight', { value: scrollHeight, configurable: true })
+  Object.defineProperty(element, 'clientHeight', { value: clientHeight, configurable: true })
+}
+
 describe('ChatView（S7.5 对话首页）', () => {
   beforeEach(() => {
     setActivePinia(createPinia())
@@ -190,5 +201,76 @@ describe('ChatView（S7.5 对话首页）', () => {
     await flushPromises()
     expect(wrapper.text()).toContain('会话不存在')
     expect(wrapper.find('textarea').exists()).toBe(true)
+  })
+
+  it('消息区是唯一滚动容器，输入卡片不参与滚动', async () => {
+    const wrapper = await mountView()
+
+    const messages = wrapper.find('.chat-messages')
+    expect(messages.classes()).toContain('overflow-y-auto')
+    expect(messages.classes()).toContain('min-h-0')
+    expect(messages.classes()).toContain('flex-1')
+    // 输入卡片在滚动容器之外，且不压缩
+    expect(messages.element.contains(wrapper.find('textarea').element)).toBe(false)
+    const composer = wrapper.find('textarea').element.closest('.n-card') as HTMLElement
+    expect(composer.className).toContain('shrink-0')
+  })
+
+  it('贴底时新消息自动跟随到底部', async () => {
+    vi.mocked(getChatSession).mockResolvedValue(detail([
+      message({ message_id: 'm-1', content: '第一条' }),
+    ]))
+    const wrapper = await mountView()
+    const messages = wrapper.find('.chat-messages').element as HTMLElement
+    fakeScrollable(messages)
+
+    // 1000 - 700 - 300 = 0 ≤ 40：用户就在底部
+    messages.scrollTop = 700
+    messages.dispatchEvent(new Event('scroll'))
+    await nextTick()
+
+    const store = useChatStore()
+    store.messages = [...store.messages, message({ message_id: 'm-2', content: '第二条' })]
+    await flushPromises()
+
+    expect(messages.scrollTop).toBe(1000)
+  })
+
+  it('用户上翻看历史时，新消息不把他拽回底部', async () => {
+    vi.mocked(getChatSession).mockResolvedValue(detail([
+      message({ message_id: 'm-1', content: '第一条' }),
+    ]))
+    const wrapper = await mountView()
+    const messages = wrapper.find('.chat-messages').element as HTMLElement
+    fakeScrollable(messages)
+
+    // 1000 - 0 - 300 = 700 > 40：用户在翻历史
+    messages.scrollTop = 0
+    messages.dispatchEvent(new Event('scroll'))
+    await nextTick()
+
+    const store = useChatStore()
+    store.messages = [...store.messages, message({ message_id: 'm-2', content: '第二条' })]
+    await flushPromises()
+
+    expect(messages.scrollTop).toBe(0)
+  })
+
+  it('流式增量在贴底时也跟随（不是只看条数）', async () => {
+    vi.mocked(getChatSession).mockResolvedValue(detail([
+      message({ message_id: 'm-1', role: 'user', content: '帮我看看' }),
+    ]))
+    const wrapper = await mountView()
+    const messages = wrapper.find('.chat-messages').element as HTMLElement
+    fakeScrollable(messages)
+    messages.scrollTop = 690            // 距底 10px，仍算贴底
+    messages.dispatchEvent(new Event('scroll'))
+    await nextTick()
+
+    const store = useChatStore()
+    store.streamText = '正在写…'
+    await flushPromises()
+
+    expect(messages.scrollTop).toBe(1000)
   })
 })

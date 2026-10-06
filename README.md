@@ -286,7 +286,8 @@ pnpm build            # 类型检查 + 构建，产物落 frontend/dist（由 Fa
 pnpm run gen:api      # 契约变了才跑：从 ../docs/contracts/openapi.yaml 重新生成 src/api/schema.d.ts
 pnpm run check:api    # 防漂移自检：重新生成 + git diff，有差异即非零（CI 的 frontend job 跑这条）
 pnpm run lint         # ESLint 9（只做正确性规则，不查格式）
-pnpm test             # Vitest 单测（112 条，jsdom，含主题对比度、图表 option、分析台/素材库/对话状态机与 SSE 解析）
+pnpm test             # Vitest 单测（117 条，jsdom，含主题对比度、图表 option、分析台/素材库/对话状态机、
+                      # SSE 解析与对话独立滚动行为）
 pnpm run test:cov     # 单测 + 覆盖率报告（只报告不设门槛）
 ```
 
@@ -308,7 +309,9 @@ pnpm run test:cov     # 单测 + 覆盖率报告（只报告不设门槛）
 > 都通过 SSE 流式显示，跑完把结果卡片（爆点要素 / 候选素材 / 覆盖缺口 / 文案初稿）直接贴在对话里。
 > 左侧是历史会话，刷新后自动打开最近一条。两条边界：**关掉页面不会打断这一轮**（轮次跑在 API 进程的
 > detached 任务里，回来看到终态消息）；**不做「停止生成」**——要停就去运行历史看结果。分析台仍在
-> `/analyze`（顶栏第二项），对话里的分析结果与它共用同一套渲染。
+> `/analyze`（顶栏第二项），对话里的分析结果与它共用同一套渲染。对话框本身是三段落布局：顶栏与页头固定，
+> **只有消息区滚动**（贴底时新消息与流式增量自动跟随，手动上翻看历史时不会被打断），输入卡片常驻底部；
+> 历史会话侧栏在消息区之外、内容超长时自己滚；窄屏下侧栏限高，不会把消息区挤没。
 >
 > **还没有前端产物时**：`serve = true` + 缺 dist 属于配置错误，启动前置检查会**拒绝启动**（退出码 2）。本地纯后端开发用环境变量覆盖即可只跑 API：`XHS_FRONTEND_SERVE=false`（等价于把 `[frontend].serve` 设为 `false`）——`scripts/smoke_skeleton.py` 已经默认这么做了。前端工程已落地（S5.1–S5.9），本地 `cd frontend && pnpm build` 产 dist；**镜像里也已内含 dist**，`docker compose up -d --wait` 后 http://127.0.0.1:8000/ 直接就是单页应用。
 
