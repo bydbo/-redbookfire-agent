@@ -99,7 +99,7 @@
 
 | 类型 | 规则 | 当前状态 |
 | --- | --- | --- |
-| 运行时依赖 | 必须走第 6 节流程才能引入；引入后同步更新 `docs/技术栈.md` | pydantic 2.x + pydantic-settings 2.x + python-dotenv（S1.1 / S1.2）、sqlalchemy[asyncio] + asyncpg + pgvector + alembic（S2.9 / S2.2 / S2.3）、langgraph（S3.1）、fastapi + uvicorn（S3.2）、redis（S3.3，health 探活）、httpx（S3.5，模型与向量的异步客户端）、celery（S3.4b，任务队列）、structlog（S4.1，结构化日志渲染管线）、langfuse（S4.2，调用追踪门面 `core/tracing.py`）、opentelemetry-api + opentelemetry-instrumentation-fastapi（S4.3，DB span 与 ASGI 埋点；测试用 opentelemetry-sdk 在 dev 组）、pyyaml（S4.5，dev 组，只给 CI workflow 的静态校验用例用），见 `docs/技术栈.md` |
+| 运行时依赖 | 必须走第 6 节流程才能引入；引入后同步更新 `docs/技术栈.md` | pydantic 2.x + pydantic-settings 2.x + python-dotenv（S1.1 / S1.2）、sqlalchemy[asyncio] + asyncpg + pgvector + alembic（S2.9 / S2.2 / S2.3）、langgraph（S3.1）、fastapi + uvicorn（S3.2）、redis（S3.3，health 探活）、httpx（S3.5，模型与向量的异步客户端）、celery（S3.4b，任务队列）、structlog（S4.1，结构化日志渲染管线）、langfuse（S4.2，调用追踪门面 `core/tracing.py`）、opentelemetry-api + opentelemetry-instrumentation-fastapi（S4.3，DB span 与 ASGI 埋点；测试用 opentelemetry-sdk 在 dev 组）、pyyaml（S4.5，dev 组，只给 CI workflow 的静态校验用例用）、python-multipart（S6.6，FastAPI 处理 multipart 上传的硬依赖），见 `docs/技术栈.md` |
 | 开发依赖 | 允许测试与代码质量工具 | `pytest`、`pytest-cov`、`pytest-asyncio`、`testcontainers[redis]`、`ruff`、`mypy`、`pre-commit`（版本见 `docs/技术栈.md`） |
 | 系统级依赖 | 仅指外部程序依赖；缺失时只影响对应能力 | `ffmpeg` / `ffprobe` |
 | 前端依赖 | 由 `frontend/package.json` 管理；直接依赖需在提交信息写明理由，禁止引入第二套组件库或状态管理方案 | pnpm 11.25.0 + Node 25.3.0 + echarts 6.1（S5.5，结果页三张图） |

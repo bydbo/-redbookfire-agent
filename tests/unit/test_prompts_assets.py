@@ -7,7 +7,7 @@ import pytest
 from xhs_agent.tools import prompt as prompt_tool
 
 AGENT_TASKS = ("hotspot_clue", "material_select", "copy_draft")
-ALL_TASKS = (*AGENT_TASKS, "material_tagging")
+ALL_TASKS = (*AGENT_TASKS, "material_tagging", "image_hotspot_clue")
 PLACEHOLDER_MARKERS = ("待 S3.1 填写", "待填写")
 
 

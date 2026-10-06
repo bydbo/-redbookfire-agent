@@ -78,7 +78,7 @@ system 消息 = 01 System  + 分隔  + 03 Constraints
 user   消息 = 02 Task（渲染后） + 04 Examples + 05 Output Schema
 ```
 
-- 多模态任务（`material_tagging`）：按上式组装出 system 与 user 文本后，**图片以 content 数组元素附在 user 消息里**。
+- 多模态任务（`material_tagging` / `image_hotspot_clue`）：按上式组装出 system 与 user 文本后，**图片以 content 数组元素附在 user 消息里**；`image_hotspot_clue` 没有文本占位符（图片本身就是全部输入），因此 `requires` 为空。
 - **失败行为（不做静默降级）**：
 
 | 情形 | 行为 |

@@ -236,6 +236,14 @@ class Health(_Response):
     checks: HealthChecks
 
 
+class ImageClueResult(_Response):
+    """图片拆解结果（S6.6）：**不落库**，用户确认后随 `AnalyzeRequest.clues` 提交。"""
+
+    raw_text: str
+    clue: HotspotClue
+    prompt_versions: dict[str, int]
+
+
 def error_response(description: str) -> dict[str, Any]:
     """构造 `responses={...}` 里的错误响应声明（body 统一是 `ErrorResponse`）。"""
     return {"model": ErrorResponse, "description": description}

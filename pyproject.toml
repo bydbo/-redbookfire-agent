@@ -22,6 +22,7 @@ dependencies = [
     "pydantic>=2.9,<3",
     "pydantic-settings>=2.6,<3",
     "python-dotenv>=1.0,<2",
+    "python-multipart>=0.0.20,<1",
     "redis>=8,<9",
     "sqlalchemy[asyncio]>=2.0,<2.1",
     "structlog>=26.1,<27",
@@ -102,6 +103,8 @@ files = [
     # S3.5 把模型调用层与 agents 改成异步 httpx——对外错误与重试口径的核心
     "src/xhs_agent/tools/llm.py",
     "src/xhs_agent/tools/http.py",
+    # S6.6 把 vision 的异步图片客户端与 magic bytes 校验放进来：图片入口的边界都在这里
+    "src/xhs_agent/tools/vision.py",
     "src/xhs_agent/agents",
     # S3.4a 改写了运行记录落盘（停写 state.json）——运行产物与事件流的核心，纳入严格范围
     "src/xhs_agent/tools/trace.py",
