@@ -15,12 +15,14 @@ BAD_REQUEST = "bad_request"
 VALIDATION_ERROR = "validation_error"
 NOT_FOUND = "not_found"
 CONFLICT = "conflict"
+PAYLOAD_TOO_LARGE = "payload_too_large"
 DEPENDENCY_UNAVAILABLE = "dependency_unavailable"
 UPSTREAM_ERROR = "upstream_error"
 INTERNAL_ERROR = "internal_error"
 
 ERROR_CODES: tuple[str, ...] = (BAD_REQUEST, VALIDATION_ERROR, NOT_FOUND, CONFLICT,
-                                DEPENDENCY_UNAVAILABLE, UPSTREAM_ERROR, INTERNAL_ERROR)
+                                PAYLOAD_TOO_LARGE, DEPENDENCY_UNAVAILABLE, UPSTREAM_ERROR,
+                                INTERNAL_ERROR)
 
 # 错误码 → HTTP 状态（与契约表一一对应）
 CODE_STATUS: dict[str, int] = {
@@ -28,6 +30,7 @@ CODE_STATUS: dict[str, int] = {
     VALIDATION_ERROR: 422,
     NOT_FOUND: 404,
     CONFLICT: 409,
+    PAYLOAD_TOO_LARGE: 413,
     DEPENDENCY_UNAVAILABLE: 503,
     UPSTREAM_ERROR: 502,
     INTERNAL_ERROR: 500,
@@ -39,6 +42,7 @@ STATUS_CODE_MAP: dict[int, str] = {
     404: NOT_FOUND,
     405: BAD_REQUEST,
     409: BAD_REQUEST,
+    413: PAYLOAD_TOO_LARGE,
     422: VALIDATION_ERROR,
     502: UPSTREAM_ERROR,
     503: DEPENDENCY_UNAVAILABLE,
@@ -49,6 +53,7 @@ DEFAULT_MESSAGE: dict[str, str] = {
     VALIDATION_ERROR: "字段校验失败",
     NOT_FOUND: "资源不存在",
     CONFLICT: "当前状态不允许该操作",
+    PAYLOAD_TOO_LARGE: "请求体超过体积上限",
     DEPENDENCY_UNAVAILABLE: "依赖服务不可用",
     UPSTREAM_ERROR: "上游服务返回错误",
     INTERNAL_ERROR: "服务内部错误",
@@ -93,6 +98,12 @@ class ConflictError(ApiError):
     """资源状态不允许当前操作（409），例如运行尚未完成不能读结果或报告。"""
 
     code = CONFLICT
+
+
+class PayloadTooLargeError(ApiError):
+    """请求体超过体积上限（413），例如上传的素材超过 `[upload].max_size_gb`。"""
+
+    code = PAYLOAD_TOO_LARGE
 
 
 class DependencyUnavailableError(ApiError):

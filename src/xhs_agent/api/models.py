@@ -31,6 +31,7 @@ ComponentStatus = Literal["ok", "down"]
 RecallSource = Literal["literal", "vector"]
 ReportFormat = Literal["html", "md"]
 ErrorCode = Literal["bad_request", "validation_error", "not_found", "conflict",
+                    "payload_too_large",
                     "dependency_unavailable", "upstream_error", "internal_error"]
 
 # 带 format 的字符串：类型仍是 str（序列化不变），只在 OpenAPI 里带上 format
@@ -288,6 +289,27 @@ class MaterialTaskAccepted(_Response):
     """素材索引任务已受理（S6.3 起）：`task_id` 用于 `GET /api/materials/tasks/{task_id}`。"""
 
     task_id: str
+
+
+class MaterialUploadAccepted(_Response):
+    """上传受理结果（S6.4）：文件已落盘，索引任务已投递。"""
+
+    task_id: str
+    path: str        # 相对素材根目录的正斜杠路径（`<YYYY-MM>/名称.mp4`）
+    name: str        # 实际落盘的文件名（同名时带 `-2` 序号）
+
+
+class MaterialTask(_Response):
+    """素材索引任务的状态（S6.4）：阶段、结果计数与失败原因。
+
+    `state` 取 Celery 的标准五态；结果键有生命周期（1 小时），过期后回到 `PENDING`。
+    """
+
+    task_id: str
+    state: Literal["PENDING", "STARTED", "RETRY", "SUCCESS", "FAILURE"]
+    step: str | None = None
+    summary: str | None = None
+    result: dict[str, Any] | None = None
 
 
 class MatchCandidate(_Response):

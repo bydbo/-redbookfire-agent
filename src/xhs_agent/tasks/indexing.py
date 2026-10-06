@@ -34,6 +34,32 @@ DEFAULT_MAX_VISION_ITEMS = 50
 STEP_SYNC = "扫描素材目录"
 STEP_EMBED = "向量回填"
 
+# Celery 的标准任务状态；读不到结果（键过期 / 从没投过）时是 PENDING
+TASK_STATES = ("PENDING", "STARTED", "RETRY", "SUCCESS", "FAILURE")
+
+
+def task_view(task_id: str, state: str, info: Any) -> dict[str, Any]:
+    """Celery 的 state / meta → 契约 `MaterialTask` 形状（S6.4）。
+
+    - `SUCCESS`：`meta` 就是任务返回的计数 dict，`summary` 取其中的一句话摘要；
+    - `FAILURE`：`info` 是异常对象，截断成 500 字的 `summary`（**不含密钥**，任务本身不打印密钥）；
+    - 其余（含 `STARTED`）：`meta` 里带的是阶段名；
+    - 无法识别的状态归 `STARTED`（宁可显示"进行中"，也不抛 500 让前端瞎猜）。
+    """
+    normalized = state if state in TASK_STATES else "STARTED"
+    step: str | None = None
+    summary: str | None = None
+    result: dict[str, Any] | None = None
+    if normalized == "SUCCESS" and isinstance(info, dict):
+        summary = str(info.get("summary") or "")[:500] or None
+        result = {str(key): value for key, value in info.items()}
+    elif normalized == "FAILURE":
+        summary = str(info)[:500] if info is not None else None
+    elif isinstance(info, dict):
+        step = str(info.get("step") or "") or None
+    return {"task_id": task_id, "state": normalized, "step": step,
+            "summary": summary, "result": result}
+
 
 async def run_index(cfg: AppConfig, *, vision: Any = None, embedder: Any = None,
                     max_vision_items: int = DEFAULT_MAX_VISION_ITEMS,

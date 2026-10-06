@@ -91,6 +91,8 @@ class Dispatcher(Protocol):
 
     async def enqueue_index(self, *, force_paths: list[str] | None = None) -> str: ...
 
+    async def task_state(self, task_id: str) -> tuple[str, Any]: ...
+
 
 class CeleryDispatcher:
     """把 job 投到 Celery（broker=Redis）的任务投递器。
@@ -149,6 +151,30 @@ class CeleryDispatcher:
                 "素材索引队列不可用：投递失败",
                 {"error": f"{type(exc).__name__}: {exc}"[:200]}) from exc
         return task_id
+
+    async def task_state(self, task_id: str) -> tuple[str, Any]:
+        """读素材索引任务的状态（S6.4）：`(state, info)`。
+
+        只读结果后端（不碰 broker）：读不到就是 `PENDING`（排队中或结果已过期，1 小时 TTL）。
+        后端不可达时折成 `DependencyUnavailableError`（503），语义与投递失败一致。
+        """
+        from kombu.exceptions import KombuError
+        from redis.exceptions import RedisError
+
+        try:
+            result = await asyncio.to_thread(self._read_state, task_id)
+        except (KombuError, OSError, TimeoutError, RedisError) as exc:
+            raise DependencyUnavailableError(
+                "素材索引任务状态不可用：结果后端读不到",
+                {"task_id": task_id, "error": f"{type(exc).__name__}: {exc}"[:200]}) from exc
+        return result
+
+    def _read_state(self, task_id: str) -> tuple[str, Any]:
+        """真正读一次结果后端（同步调用，放线程里跑）。"""
+        from celery.result import AsyncResult
+
+        result = AsyncResult(task_id, app=self.app())
+        return str(result.state), result.info
 
 
 def get_dispatcher(cfg: ConfigDep) -> Dispatcher:

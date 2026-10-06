@@ -44,6 +44,13 @@ LLM_PROVIDERS = ("openai_compatible", "openai", "deepseek", "qwen", "dashscope",
 LOG_LEVELS = ("DEBUG", "INFO", "WARNING", "ERROR")
 LOG_FORMATS = ("console", "json")
 
+# 素材上传允许的扩展名默认值（S6.4）：与 tools/media.py 的 MEDIA_EXT 同源，
+# 由 tests/unit/test_config.py::test_upload_defaults_match_media_tool 守着一致性。
+DEFAULT_UPLOAD_EXTENSIONS = (
+    ".mp4", ".mov", ".mkv", ".avi", ".webm", ".flv", ".m4v", ".wmv", ".ts",
+    ".jpg", ".jpeg", ".png", ".webp", ".bmp", ".heic", ".heif",
+)
+
 # 环境变量覆盖表：扁平变量名 -> 配置里的位置（契约 §2.2 的可选项）。
 # 密钥类变量不在这里——它们由 EnvView 按 api_key_env 动态解析。
 FLAT_OVERRIDE_TARGETS: tuple[tuple[str, tuple[str, ...]], ...] = (
@@ -307,8 +314,40 @@ class FrontendConfig(_Section):
         return text
 
 
+class UploadConfig(_Section):
+    """素材上传（S6.4）。默认值 / 取值范围见《配置契约》§3.11。
+
+    `allowed_extensions` 的默认值与 `tools/media.py` 的 `MEDIA_EXT` **同源**
+    （单测 `test_upload_defaults_match_media_tool` 守着这条一致性）；显式写在配置里是为了
+    让使用者能按需裁剪（比如只允许 mp4 / jpg）。
+    """
+
+    max_size_gb: float = Field(2.0, gt=0)
+    allowed_extensions: list[str] = Field(default_factory=lambda: list(DEFAULT_UPLOAD_EXTENSIONS))
+
+    @field_validator("allowed_extensions", mode="before")
+    @classmethod
+    def _normalize_extensions(cls, value: Any) -> list[str]:
+        """统一成「小写 + 带点」并去重保序；空清单是配置错误（不做静默放行）。"""
+        if value is None:
+            return list(DEFAULT_UPLOAD_EXTENSIONS)
+        items = [value] if isinstance(value, str) else list(value)
+        out: list[str] = []
+        for item in items:
+            text = str(item or "").strip().lower()
+            if not text:
+                continue
+            if not text.startswith("."):
+                text = f".{text}"
+            if text not in out:
+                out.append(text)
+        if not out:
+            raise ValueError("allowed_extensions 不能为空")
+        return out
+
+
 class AppConfig(_Section):
-    """工程配置全量视图：9 个段与契约 §3 一一对应。"""
+    """工程配置全量视图：10 个段与契约 §3 一一对应。"""
 
     llm: LLMConfig = Field(default_factory=LLMConfig)
     vision: VisionConfig = Field(default_factory=VisionConfig)
@@ -319,6 +358,7 @@ class AppConfig(_Section):
     database: DatabaseConfig = Field(default_factory=DatabaseConfig)
     queue: QueueConfig = Field(default_factory=QueueConfig)
     frontend: FrontendConfig = Field(default_factory=FrontendConfig)
+    upload: UploadConfig = Field(default_factory=UploadConfig)
     log_level: str = "INFO"
     log_format: str = "console"
 
@@ -407,6 +447,10 @@ class AppConfig(_Section):
                 "hit_threshold": self.retrieval.hit_threshold,
             },
             "match": {"topk": self.match.topk, "min_score": self.match.min_score},
+            "upload": {
+                "max_size_gb": self.upload.max_size_gb,
+                "allowed_extensions": list(self.upload.allowed_extensions),
+            },
             "paths": {
                 "materials_dir": self.materials_dir(),
                 "runs_dir": self.runs_dir(),

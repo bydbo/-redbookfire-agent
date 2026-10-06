@@ -7,6 +7,9 @@
 - `GET /api/materials/trash`：列回收站；`POST /api/materials/trash/restore`：移回原相对路径
   并触发索引（恢复 = 重新入库，新 uuid）；`POST /api/materials/trash/purge`：真删
   （`paths` 或 `all=true` 二选一 + `confirm`）。
+- `POST /api/materials/scan`（S6.4）：触发一次「增量同步 + 向量回填」；
+- `POST /api/materials/uploads`（S6.4）：流式接收单个媒体文件（落 `<YYYY-MM>/`）并触发索引；
+- `GET /api/materials/tasks/{task_id}`（S6.4）：素材索引任务的阶段 / 结果 / 失败原因。
 
 **路由声明顺序**（backlog 主题一设计约定 1）：静态路径（`/materials/trash*`、`/materials/scan`、
 `/materials/uploads`、`/materials/tasks/{task_id}`）必须写在本文件的 `/materials/{material_id}`
@@ -21,7 +24,7 @@ from __future__ import annotations
 import uuid
 from typing import Annotated, Any
 
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, File, Query, UploadFile
 
 from ...core.errors import BadRequestError, NotFoundError
 from ...services.materials import (
@@ -32,17 +35,21 @@ from ...services.materials import (
     load_material,
     purge_trash,
     restore_from_trash,
+    save_upload,
     trash_material,
     update_material,
 )
+from ...tasks.indexing import task_view
 from ..deps import ConfigDep, DispatcherDep, SessionDep, request_id_header
 from ..models import (
     MaterialDetail,
     MaterialList,
     MaterialSource,
+    MaterialTask,
     MaterialTaskAccepted,
     MaterialTrashResult,
     MaterialType,
+    MaterialUploadAccepted,
     TrashList,
     TrashPurgeRequest,
     TrashPurgeResult,
@@ -102,6 +109,42 @@ async def restore_material_endpoint(payload: TrashRestoreRequest, cfg: ConfigDep
     restore_from_trash(cfg, payload.path)
     task_id = await dispatcher.enqueue_index()
     return {"task_id": task_id}
+
+
+@router.post("/materials/scan", status_code=202, response_model=MaterialTaskAccepted,
+             responses={503: error_response("依赖不可用（不做降级，直接返回错误）")})
+async def scan_materials_endpoint(dispatcher: DispatcherDep) -> dict[str, Any]:
+    """触发一次「增量同步 + 向量回填」（S6.4）；进度与失败原因用任务接口查。"""
+    task_id = await dispatcher.enqueue_index()
+    return {"task_id": task_id}
+
+
+@router.post("/materials/uploads", status_code=202, response_model=MaterialUploadAccepted,
+             responses={400: error_response("请求格式或参数不合法"),
+                        413: error_response("请求体超过体积上限"),
+                        422: error_response("字段级校验失败"),
+                        503: error_response("依赖不可用（不做降级，直接返回错误）")})
+async def upload_material_endpoint(
+        cfg: ConfigDep, dispatcher: DispatcherDep,
+        file: Annotated[UploadFile, File(json_schema_extra={"format": "binary"})],
+) -> dict[str, Any]:
+    """接收一个媒体文件（流式落 `<素材根>/<YYYY-MM>/`）并触发索引（S6.4）。
+
+    体积上限取 `[upload].max_size_gb`（超限 413）、扩展名取 `[upload].allowed_extensions`
+    （不在清单 400）、同名自动加序号；文件落盘后由 `xhs_agent.index_materials` 做
+    抽帧 / 打标 / 向量回填，进度用 `GET /api/materials/tasks/{task_id}` 查。
+    """
+    saved = await save_upload(cfg, file)
+    task_id = await dispatcher.enqueue_index()
+    return {"task_id": task_id, "path": saved["path"], "name": saved["name"]}
+
+
+@router.get("/materials/tasks/{task_id}", response_model=MaterialTask,
+            responses={503: error_response("依赖不可用（不做降级，直接返回错误）")})
+async def get_material_task(task_id: str, dispatcher: DispatcherDep) -> dict[str, Any]:
+    """素材索引任务的状态（S6.4）：阶段、结果计数与失败原因；未知 task_id 也是 200 + PENDING。"""
+    state, info = await dispatcher.task_state(task_id)
+    return task_view(task_id, state, info)
 
 
 @router.post("/materials/trash/purge", response_model=TrashPurgeResult,

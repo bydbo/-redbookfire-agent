@@ -46,6 +46,12 @@ ENV PYTHONUNBUFFERED=1 \
     PATH=/app/.venv/bin:$PATH \
     TZ=Asia/Shanghai
 WORKDIR /app
+# ffmpeg / ffprobe（S6.4）：视频探测、抽关键帧与缩略图都依赖它。
+# 不装的时候 `tools/media.py` 会静默跳过抽帧（能力裁剪），素材库页只能看到占位图——
+# 既然容器是「一条命令起全栈」的推荐路径，就把这份能力补上（镜像约 +70MB）。
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ffmpeg \
+    && rm -rf /var/lib/apt/lists/*
 # 非 root 运行；uid/gid 1000 与常见宿主用户一致，bind mount 出来的 runs/ 才写得进去
 RUN groupadd --gid 1000 appuser \
     && useradd --uid 1000 --gid 1000 --create-home appuser

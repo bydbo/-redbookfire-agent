@@ -92,3 +92,12 @@ max_retries = 2
 serve = true                        # 为 true 时要求 dist_dir 存在且非空（preflight 第 7 步，S3.8 落地）
 dist_dir = "frontend/dist"
 dev_server_url = "http://localhost:5173"
+
+[upload]
+# 素材库上传（S6.4）：单文件体积上限（GB）与允许的扩展名。
+# 允许清单与代码里的 MEDIA_EXT 同源，显式写出来是为了让你能按需裁剪（比如只放行 mp4/jpg）。
+max_size_gb = 2
+allowed_extensions = [
+    ".mp4", ".mov", ".mkv", ".avi", ".webm", ".flv", ".m4v", ".wmv", ".ts",
+    ".jpg", ".jpeg", ".png", ".webp", ".bmp", ".heic", ".heif",
+]

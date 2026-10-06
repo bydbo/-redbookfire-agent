@@ -192,6 +192,75 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/materials/scan": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * 触发素材库扫描
+         * @description 投递一次「增量同步 + 向量回填」：扫描 `<素材根>` 下新增 / 变更 / 消失的文件并落库，
+         *     再给缺向量的素材补齐 `embedding`。素材目录不存在时任务以 FAILURE 结束（不做降级）。
+         *     进度与失败原因用 `GET /api/materials/tasks/{task_id}` 查。
+         */
+        post: operations["scanMaterials"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/materials/uploads": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * 上传素材
+         * @description 流式接收**单个**媒体文件，落到 `<素材根>/<YYYY-MM>/`（同名自动加 `-2` 序号，不覆盖），
+         *     随后投递索引任务（抽帧 + 打标 + 向量回填）。
+         *     扩展名必须在 `[upload].allowed_extensions` 里（否则 400）；体积上限 `[upload].max_size_gb`
+         *     （超限 413，边写边计并清理临时文件）；空文件 400。
+         *     文件先写 `.incoming-*.part` 再原子改名，失败不会在素材目录里留下半截文件。
+         */
+        post: operations["uploadMaterial"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/materials/tasks/{task_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * 查询素材索引任务
+         * @description 读任务状态：`state` 是 Celery 的标准五态，`step` 是当前阶段（扫描素材目录 / 向量回填），
+         *     `summary` 是成功时的一句话摘要或失败时的异常串（截断 500 字，不含密钥），
+         *     `result` 是成功时的计数 dict。**未知或已过期的 `task_id` 返回 200 + `PENDING`**
+         *     （结果键的 TTL 是 1 小时：进度是临时的，素材本身以磁盘与数据库为准）。
+         */
+        get: operations["getMaterialTask"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/materials/trash": {
         parameters: {
             query?: never;
@@ -570,6 +639,28 @@ export interface components {
         MaterialTaskAccepted: {
             task_id: string;
         };
+        /** @description 上传受理结果：文件已落盘，索引任务已投递。 */
+        MaterialUploadAccepted: {
+            task_id: string;
+            /** @description 相对素材根目录的正斜杠路径（`<YYYY-MM>/名称.mp4`） */
+            path: string;
+            /** @description 实际落盘的文件名（同名时带 `-2` 序号） */
+            name: string;
+        };
+        /** @description 素材索引任务的状态；未知或已过期的 task_id 也返回它（state=PENDING）。 */
+        MaterialTask: {
+            task_id: string;
+            /** @enum {string} */
+            state: "PENDING" | "STARTED" | "RETRY" | "SUCCESS" | "FAILURE";
+            /** @description 当前阶段（扫描素材目录 / 向量回填） */
+            step?: string | null;
+            /** @description 成功时的一句话摘要，失败时的异常串（截断 500 字，不含密钥） */
+            summary?: string | null;
+            /** @description 成功时的计数 dict */
+            result?: {
+                [key: string]: unknown;
+            } | null;
+        };
         /**
          * @description `PATCH /api/materials/{material_id}` 请求体：只允许这三个字段（其余一律 422），
          *     且至少要给一个（否则 400）。未给的字段保持原值。
@@ -627,7 +718,7 @@ export interface components {
         };
         ErrorResponse: {
             /** @enum {string} */
-            code: "bad_request" | "validation_error" | "not_found" | "conflict" | "dependency_unavailable" | "upstream_error" | "internal_error";
+            code: "bad_request" | "validation_error" | "not_found" | "conflict" | "payload_too_large" | "dependency_unavailable" | "upstream_error" | "internal_error";
             message: string;
             detail?: {
                 [key: string]: unknown;
@@ -664,6 +755,15 @@ export interface components {
         };
         /** @description 依赖不可用（不做降级，直接返回错误） */
         DependencyUnavailable: {
+            headers: {
+                [name: string]: unknown;
+            };
+            content: {
+                "application/json": components["schemas"]["ErrorResponse"];
+            };
+        };
+        /** @description 请求体超过体积上限（上传超过 `[upload].max_size_gb`） */
+        PayloadTooLarge: {
             headers: {
                 [name: string]: unknown;
             };
@@ -981,6 +1081,90 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["MaterialList"];
+                };
+            };
+            503: components["responses"]["DependencyUnavailable"];
+        };
+    };
+    scanMaterials: {
+        parameters: {
+            query?: never;
+            header?: {
+                /** @description 客户端生成的请求标识；未提供时由服务端生成。用于贯穿日志、调用追踪与数据库记录。 */
+                "X-Request-ID"?: components["parameters"]["RequestId"];
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description 已受理索引任务 */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MaterialTaskAccepted"];
+                };
+            };
+            503: components["responses"]["DependencyUnavailable"];
+        };
+    };
+    uploadMaterial: {
+        parameters: {
+            query?: never;
+            header?: {
+                /** @description 客户端生成的请求标识；未提供时由服务端生成。用于贯穿日志、调用追踪与数据库记录。 */
+                "X-Request-ID"?: components["parameters"]["RequestId"];
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "multipart/form-data": {
+                    /** Format: binary */
+                    file: string;
+                };
+            };
+        };
+        responses: {
+            /** @description 文件已落盘并受理索引任务 */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MaterialUploadAccepted"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            413: components["responses"]["PayloadTooLarge"];
+            422: components["responses"]["ValidationError"];
+            503: components["responses"]["DependencyUnavailable"];
+        };
+    };
+    getMaterialTask: {
+        parameters: {
+            query?: never;
+            header?: {
+                /** @description 客户端生成的请求标识；未提供时由服务端生成。用于贯穿日志、调用追踪与数据库记录。 */
+                "X-Request-ID"?: components["parameters"]["RequestId"];
+            };
+            path: {
+                task_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description 任务状态 */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MaterialTask"];
                 };
             };
             503: components["responses"]["DependencyUnavailable"];

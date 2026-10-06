@@ -35,7 +35,12 @@ from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..config import PROJECT_ROOT, AppConfig, ConfigError
-from ..core.errors import BadRequestError, ConflictError, NotFoundError
+from ..core.errors import (
+    BadRequestError,
+    ConflictError,
+    NotFoundError,
+    PayloadTooLargeError,
+)
 from ..db.models import Material as MaterialRow
 from ..schemas import Material
 from ..tools import materials as materials_tool
@@ -618,6 +623,87 @@ def purge_trash(cfg: AppConfig, *, paths: Sequence[str] | None = None,
     _remove_empty_dirs(root)
     deleted.sort()
     return {"deleted": deleted, "count": len(deleted)}
+
+
+# ---------- 素材上传（S6.4：流式落盘到 <YYYY-MM>/） ----------
+
+UPLOAD_CHUNK_BYTES = 1024 * 1024
+INCOMING_PREFIX = ".incoming-"
+_WINDOWS_ILLEGAL = '<>:"|?*'
+
+
+class _Upload(Protocol):
+    """`fastapi.UploadFile` 的窄接口：服务层只需要文件名与分块读。"""
+
+    filename: str | None
+
+    async def read(self, size: int = ...) -> bytes: ...
+
+
+def safe_filename(raw: str | None) -> str:
+    """只取 basename 并清掉 Windows 非法字符；空名 / `.` / `..` → 400。"""
+    name = (raw or "").replace("\\", "/").split("/")[-1].strip()
+    if not name or name in {".", ".."} or "\x00" in name:
+        raise BadRequestError("文件名不合法", {"filename": raw or ""})
+    for bad in _WINDOWS_ILLEGAL:
+        name = name.replace(bad, "_")
+    return name
+
+
+def upload_dir(cfg: AppConfig, *, now: datetime | None = None) -> str:
+    """上传落点：`<materials_dir>/<YYYY-MM>/`（数据契约 §一 的目录约定）。"""
+    stamp = (now or datetime.now()).strftime("%Y-%m")
+    return os.path.join(cfg.materials_dir(), stamp)
+
+
+async def save_upload(cfg: AppConfig, upload: _Upload, *,
+                      now: datetime | None = None) -> dict[str, Any]:
+    """把一个上传的媒体文件流式写进 `<YYYY-MM>/`，返回 `{path, name, size_bytes}`（S6.4）。
+
+    口径：
+
+    - 扩展名不在 `[upload].allowed_extensions` → 400（**按文件名后缀判断**：素材入库后由抽帧与
+      打标负责内容，这里不做 magic bytes 嗅探——那是热点图片那条链路的口径）；
+    - 边写边计体积，超过 `[upload].max_size_gb` → 413，并删掉临时文件；
+    - 空文件 → 400；
+    - 先写 `<YYYY-MM>/.incoming-<uuid>.part` 再原子改名：中途失败不会在素材目录里留下半截文件，
+      也不会被扫描当成素材（`.incoming-*` 以 `.` 开头，`scan_materials` 直接跳过）。
+    """
+    name = safe_filename(upload.filename)
+    suffix = os.path.splitext(name)[1].lower()
+    allowed = [str(ext).lower() for ext in cfg.upload.allowed_extensions]
+    if suffix not in allowed:
+        raise BadRequestError(f"不支持的文件类型：{suffix or '（没有扩展名）'}",
+                              {"allowed_extensions": allowed})
+
+    limit_bytes = int(cfg.upload.max_size_gb * 1024 ** 3)
+    target_dir = upload_dir(cfg, now=now)
+    await asyncio.to_thread(os.makedirs, target_dir, exist_ok=True)
+    temp = os.path.join(target_dir, f"{INCOMING_PREFIX}{uuid.uuid4().hex}.part")
+    total = 0
+    try:
+        with open(temp, "wb") as handle:
+            while True:
+                chunk = await upload.read(UPLOAD_CHUNK_BYTES)
+                if not chunk:
+                    break
+                total += len(chunk)
+                if total > limit_bytes:
+                    raise PayloadTooLargeError(
+                        f"文件超过 {cfg.upload.max_size_gb} GB 上限",
+                        {"max_size_gb": cfg.upload.max_size_gb, "limit_bytes": limit_bytes})
+                await asyncio.to_thread(handle.write, chunk)
+        if total == 0:
+            raise BadRequestError("上传的文件为空")
+        final = unique_path(os.path.join(target_dir, name))
+        await asyncio.to_thread(os.replace, temp, final)
+    except BaseException:
+        with suppress(OSError):
+            os.remove(temp)
+        raise
+
+    return {"path": os.path.relpath(final, cfg.materials_dir()).replace(os.sep, "/"),
+            "name": os.path.basename(final), "size_bytes": total}
 
 
 async def sync_materials(session: AsyncSession, cfg: AppConfig, *,

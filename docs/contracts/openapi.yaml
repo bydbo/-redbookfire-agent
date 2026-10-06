@@ -35,6 +35,7 @@ info:
     | `validation_error` | 422 | 字段级校验失败（如 topk 越界） |
     | `not_found` | 404 | job_id 或 run_id 不存在 |
     | `conflict` | 409 | 当前状态不允许该操作（如运行尚未完成就取结果） |
+    | `payload_too_large` | 413 | 请求体超过体积上限（如上传超过 `[upload].max_size_gb`） |
     | `dependency_unavailable` | 503 | 数据库或 Redis 不可用，或模型配置缺失 |
     | `upstream_error` | 502 | 上游模型返回错误或连续重试失败 |
     | `internal_error` | 500 | 未分类的内部错误 |
@@ -398,6 +399,98 @@ paths:
         '503':
           $ref: '#/components/responses/DependencyUnavailable'
 
+  /api/materials/scan:
+    post:
+      tags:
+        - 素材
+      summary: 触发素材库扫描
+      description: |
+        投递一次「增量同步 + 向量回填」：扫描 `<素材根>` 下新增 / 变更 / 消失的文件并落库，
+        再给缺向量的素材补齐 `embedding`。素材目录不存在时任务以 FAILURE 结束（不做降级）。
+        进度与失败原因用 `GET /api/materials/tasks/{task_id}` 查。
+      operationId: scanMaterials
+      parameters:
+        - $ref: '#/components/parameters/RequestId'
+      responses:
+        '202':
+          description: 已受理索引任务
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MaterialTaskAccepted'
+        '503':
+          $ref: '#/components/responses/DependencyUnavailable'
+
+  /api/materials/uploads:
+    post:
+      tags:
+        - 素材
+      summary: 上传素材
+      description: |
+        流式接收**单个**媒体文件，落到 `<素材根>/<YYYY-MM>/`（同名自动加 `-2` 序号，不覆盖），
+        随后投递索引任务（抽帧 + 打标 + 向量回填）。
+        扩展名必须在 `[upload].allowed_extensions` 里（否则 400）；体积上限 `[upload].max_size_gb`
+        （超限 413，边写边计并清理临时文件）；空文件 400。
+        文件先写 `.incoming-*.part` 再原子改名，失败不会在素材目录里留下半截文件。
+      operationId: uploadMaterial
+      parameters:
+        - $ref: '#/components/parameters/RequestId'
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required:
+                - file
+              properties:
+                file:
+                  type: string
+                  format: binary
+      responses:
+        '202':
+          description: 文件已落盘并受理索引任务
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MaterialUploadAccepted'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '413':
+          $ref: '#/components/responses/PayloadTooLarge'
+        '422':
+          $ref: '#/components/responses/ValidationError'
+        '503':
+          $ref: '#/components/responses/DependencyUnavailable'
+
+  /api/materials/tasks/{task_id}:
+    get:
+      tags:
+        - 素材
+      summary: 查询素材索引任务
+      description: |
+        读任务状态：`state` 是 Celery 的标准五态，`step` 是当前阶段（扫描素材目录 / 向量回填），
+        `summary` 是成功时的一句话摘要或失败时的异常串（截断 500 字，不含密钥），
+        `result` 是成功时的计数 dict。**未知或已过期的 `task_id` 返回 200 + `PENDING`**
+        （结果键的 TTL 是 1 小时：进度是临时的，素材本身以磁盘与数据库为准）。
+      operationId: getMaterialTask
+      parameters:
+        - $ref: '#/components/parameters/RequestId'
+        - name: task_id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: 任务状态
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MaterialTask'
+        '503':
+          $ref: '#/components/responses/DependencyUnavailable'
+
   /api/materials/trash:
     get:
       tags:
@@ -632,6 +725,12 @@ components:
             $ref: '#/components/schemas/ErrorResponse'
     DependencyUnavailable:
       description: 依赖不可用（不做降级，直接返回错误）
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+    PayloadTooLarge:
+      description: 请求体超过体积上限（上传超过 `[upload].max_size_gb`）
       content:
         application/json:
           schema:
@@ -1340,6 +1439,57 @@ components:
         task_id:
           type: string
 
+    MaterialUploadAccepted:
+      type: object
+      description: 上传受理结果：文件已落盘，索引任务已投递。
+      required:
+        - task_id
+        - path
+        - name
+      properties:
+        task_id:
+          type: string
+        path:
+          type: string
+          description: 相对素材根目录的正斜杠路径（`<YYYY-MM>/名称.mp4`）
+        name:
+          type: string
+          description: 实际落盘的文件名（同名时带 `-2` 序号）
+
+    MaterialTask:
+      type: object
+      description: 素材索引任务的状态；未知或已过期的 task_id 也返回它（state=PENDING）。
+      required:
+        - task_id
+        - state
+      properties:
+        task_id:
+          type: string
+        state:
+          type: string
+          enum:
+            - PENDING
+            - STARTED
+            - RETRY
+            - SUCCESS
+            - FAILURE
+        step:
+          oneOf:
+            - type: string
+            - type: 'null'
+          description: 当前阶段（扫描素材目录 / 向量回填）
+        summary:
+          oneOf:
+            - type: string
+            - type: 'null'
+          description: 成功时的一句话摘要，失败时的异常串（截断 500 字，不含密钥）
+        result:
+          oneOf:
+            - type: object
+              additionalProperties: true
+            - type: 'null'
+          description: 成功时的计数 dict
+
     UpdateMaterialRequest:
       type: object
       description: |
@@ -1513,6 +1663,7 @@ components:
             - validation_error
             - not_found
             - conflict
+            - payload_too_large
             - dependency_unavailable
             - upstream_error
             - internal_error
