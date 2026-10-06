@@ -1,8 +1,9 @@
-"""数据契约的五张表（SQLAlchemy 2.0 声明式映射）。
+"""数据契约的七张表（SQLAlchemy 2.0 声明式映射）。
 
 用途：把 `docs/contracts/数据契约.md` §3 的字段表、§4 的索引与约束、级联规则逐项落成 ORM。
-输入：无（模型定义；写入由仓储层负责，见 S2.4）。
-输出：`Material` / `Hotspot` / `Run` / `RunHotspot` / `RunMatch` 五个映射类。
+输入：无（模型定义；写入由仓储层负责，见 S2.4 / S7.2）。
+输出：`Material` / `Hotspot` / `Run` / `RunHotspot` / `RunMatch` / `ChatSession` /
+      `ChatMessage` 七个映射类。
 
 口径提醒：
 - `uuid` 主键默认值走 PostgreSQL 16 内置的 `gen_random_uuid()`，不需要 pgcrypto；
@@ -202,4 +203,58 @@ class RunMatch(Base):
         CheckConstraint("jsonb_array_length(reasons) >= 1", name="reasons_not_empty"),
         UniqueConstraint("run_hotspot_id", "rank", name="uq_run_matches_run_hotspot_id_rank"),
         Index("ix_run_matches_material_id", "material_id"),
+    )
+
+
+class ChatSession(Base):
+    """`chat_sessions` — 对话会话（数据契约 §3.6，S7.2）。"""
+
+    __tablename__ = "chat_sessions"
+
+    id: Mapped[uuid.UUID] = _pk()
+    title: Mapped[str] = mapped_column(Text, nullable=False, server_default=text("''"))
+    created_at: Mapped[datetime] = _created_at()
+    updated_at: Mapped[datetime] = _created_at()
+
+    __table_args__ = (
+        # 普通 B-tree 就够：Postgres 反向扫描它即可满足 `ORDER BY updated_at DESC`
+        Index("ix_chat_sessions_updated_at", "updated_at"),
+    )
+
+
+class ChatMessage(Base):
+    """`chat_messages` — 对话消息（数据契约 §3.7，S7.2）。
+
+    工具过程不单独建行：一个 assistant 消息的 `tool_calls` 里带齐本轮调了什么、结果与耗时。
+    `run_id` 刻意**不加外键**——run 被删（例如素材回收站那类维护动作）不该动到历史消息。
+    """
+
+    __tablename__ = "chat_messages"
+
+    id: Mapped[uuid.UUID] = _pk()
+    session_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("chat_sessions.id", ondelete="CASCADE"), nullable=False)
+    role: Mapped[str] = mapped_column(Text, nullable=False)
+    content: Mapped[str] = mapped_column(Text, nullable=False, server_default=text("''"))
+    status: Mapped[str] = mapped_column(Text, nullable=False, server_default=text("'succeeded'"))
+    attachments: Mapped[list[dict[str, Any]]] = mapped_column(
+        JSONB, nullable=False, server_default=text("'[]'"))
+    tool_calls: Mapped[list[dict[str, Any]]] = mapped_column(
+        JSONB, nullable=False, server_default=text("'[]'"))
+    prompt_versions: Mapped[dict[str, int]] = mapped_column(
+        JSONB, nullable=False, server_default=text("'{}'"))
+    run_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
+    cost_cny: Mapped[Decimal] = mapped_column(Numeric(10, 4), nullable=False,
+                                              server_default=text("0"))
+    latency_ms: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
+    error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = _created_at()
+
+    __table_args__ = (
+        CheckConstraint("role IN ('user', 'assistant')", name="role_allowed"),
+        CheckConstraint("status IN ('running', 'succeeded', 'failed', 'interrupted')",
+                        name="status_allowed"),
+        CheckConstraint("cost_cny >= 0", name="cost_non_negative"),
+        CheckConstraint("latency_ms >= 0", name="latency_non_negative"),
+        Index("ix_chat_messages_session_id_created_at", "session_id", "created_at"),
     )

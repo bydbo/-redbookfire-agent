@@ -346,8 +346,21 @@ class UploadConfig(_Section):
         return out
 
 
+class ChatConfig(_Section):
+    """对话式入口（S7.2 / S7.3）。默认值 / 取值范围见《配置契约》§3.12。"""
+
+    # 一轮对话最多几次工具调用（模型来回轮次），超过就收尾并说明
+    max_tool_rounds: int = Field(3, ge=1, le=10)
+    # 对话里传的图片单张上限（MB）；与热点图片解析的 10MB 口径一致
+    attachment_max_mb: int = Field(10, ge=1, le=100)
+    # 装配给 supervisor 的历史消息条数（最近的 N 条；摘要式裁剪归 S7.10）
+    history_max_messages: int = Field(20, ge=1, le=200)
+    # `status=running` 的 assistant 行超过多久算「中断」（API 重启等），读会话时兜底标记
+    turn_stale_seconds: int = Field(300, ge=30, le=86400)
+
+
 class AppConfig(_Section):
-    """工程配置全量视图：10 个段与契约 §3 一一对应。"""
+    """工程配置全量视图：11 个段与契约 §3 一一对应。"""
 
     llm: LLMConfig = Field(default_factory=LLMConfig)
     vision: VisionConfig = Field(default_factory=VisionConfig)
@@ -359,6 +372,7 @@ class AppConfig(_Section):
     queue: QueueConfig = Field(default_factory=QueueConfig)
     frontend: FrontendConfig = Field(default_factory=FrontendConfig)
     upload: UploadConfig = Field(default_factory=UploadConfig)
+    chat: ChatConfig = Field(default_factory=ChatConfig)
     log_level: str = "INFO"
     log_format: str = "console"
 
@@ -450,6 +464,12 @@ class AppConfig(_Section):
             "upload": {
                 "max_size_gb": self.upload.max_size_gb,
                 "allowed_extensions": list(self.upload.allowed_extensions),
+            },
+            "chat": {
+                "max_tool_rounds": self.chat.max_tool_rounds,
+                "attachment_max_mb": self.chat.attachment_max_mb,
+                "history_max_messages": self.chat.history_max_messages,
+                "turn_stale_seconds": self.chat.turn_stale_seconds,
             },
             "paths": {
                 "materials_dir": self.materials_dir(),

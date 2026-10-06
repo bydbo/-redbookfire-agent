@@ -101,3 +101,11 @@ allowed_extensions = [
     ".mp4", ".mov", ".mkv", ".avi", ".webm", ".flv", ".m4v", ".wmv", ".ts",
     ".jpg", ".jpeg", ".png", ".webp", ".bmp", ".heic", ".heif",
 ]
+
+[chat]
+# 对话式入口（S7.2 起）：一轮对话的工具调用轮次上限、附件上限、历史装配条数，
+# 以及「跑着的这一轮多久算中断」（API 重启等场景，读会话时兜底标记）。
+max_tool_rounds = 3
+attachment_max_mb = 10
+history_max_messages = 20
+turn_stale_seconds = 300

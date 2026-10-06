@@ -1,4 +1,4 @@
-"""五张表与数据契约的逐项核对（S2.2）。
+"""七张表与数据契约的逐项核对（S2.2；S7.2 补两张对话表）。
 
 建表走 `Base.metadata.create_all`：正式建表在 S2.3 由 Alembic 迁移负责，
 这里验证的是"模型 metadata 与 `docs/contracts/数据契约.md` 一致"。
@@ -46,6 +46,15 @@ COLUMN_SPECS: dict[str, dict[str, str]] = {
         "recall_sources": "_text", "hits": "jsonb", "missing": "jsonb", "reasons": "jsonb",
         "usage": "text",
     },
+    "chat_sessions": {
+        "id": "uuid", "title": "text", "created_at": "timestamptz", "updated_at": "timestamptz",
+    },
+    "chat_messages": {
+        "id": "uuid", "session_id": "uuid", "role": "text", "content": "text",
+        "status": "text", "attachments": "jsonb", "tool_calls": "jsonb",
+        "prompt_versions": "jsonb", "run_id": "uuid", "cost_cny": "numeric",
+        "latency_ms": "int4", "error": "text", "created_at": "timestamptz",
+    },
 }
 
 NULLABLE_COLUMNS: dict[str, set[str]] = {
@@ -54,15 +63,18 @@ NULLABLE_COLUMNS: dict[str, set[str]] = {
     "runs": {"started_at", "finished_at", "error", "request_id"},
     "run_hotspots": {"draft", "error"},
     "run_matches": set(),
+    "chat_sessions": set(),
+    "chat_messages": {"run_id", "error"},
 }
 
-# 数据契约 §4.1 的 14 条索引（唯一约束在 PG 里也是索引）
+# 数据契约 §4.1 的 16 条索引（唯一约束在 PG 里也是索引）
 EXPECTED_INDEXES = {
     "uq_materials_path", "ix_materials_fingerprint", "ix_materials_tags",
     "ix_materials_text_trgm", "ix_materials_embedding_hnsw", "ix_materials_indexed_at",
     "ix_hotspots_created_at", "uq_runs_job_id", "ix_runs_status", "ix_runs_created_at",
     "uq_run_hotspots_run_id_position", "ix_run_hotspots_hotspot_id",
     "uq_run_matches_run_hotspot_id_rank", "ix_run_matches_material_id",
+    "ix_chat_sessions_updated_at", "ix_chat_messages_session_id_created_at",
 }
 
 
@@ -155,6 +167,23 @@ class TestStructure:
         assert run.created_at is not None
         assert run.prompt_versions == {}
 
+        async with db_engine.begin() as conn:
+            session_id = (await conn.execute(text(
+                "INSERT INTO chat_sessions DEFAULT VALUES RETURNING id, title, "
+                "created_at, updated_at"))).one()
+            message = (await conn.execute(text(
+                "INSERT INTO chat_messages (session_id, role) VALUES (:s, 'user') "
+                "RETURNING content, status, attachments, tool_calls, prompt_versions, "
+                "run_id, cost_cny, latency_ms, error, created_at"),
+                {"s": session_id.id})).one()
+        assert session_id.title == ""
+        assert session_id.created_at is not None and session_id.updated_at is not None
+        assert message.content == "" and message.status == "succeeded"
+        assert message.attachments == [] and message.tool_calls == []
+        assert message.prompt_versions == {} and message.run_id is None
+        assert (float(message.cost_cny), message.latency_ms) == (0.0, 0)
+        assert message.error is None and message.created_at is not None
+
 
 class TestConstraints:
     @pytest.mark.parametrize("label, statement", [
@@ -165,6 +194,22 @@ class TestConstraints:
         ("material size_bytes 非负", "INSERT INTO materials (path, size_bytes) VALUES ('p5', -1)"),
         ("run status 枚举", "INSERT INTO runs (job_id, status) VALUES ('j1', 'xx')"),
         ("run cost_cny 非负", "INSERT INTO runs (job_id, cost_cny) VALUES ('j2', -1)"),
+        # 对话四例用 CTE 现造会话，保证失败的**只能是 CHECK**（而不是外键）
+        ("chat message role 枚举",
+         "WITH s AS (INSERT INTO chat_sessions DEFAULT VALUES RETURNING id) "
+         "INSERT INTO chat_messages (session_id, role) SELECT id, 'tool' FROM s"),
+        ("chat message status 枚举",
+         "WITH s AS (INSERT INTO chat_sessions DEFAULT VALUES RETURNING id) "
+         "INSERT INTO chat_messages (session_id, role, status) "
+         "SELECT id, 'user', 'xx' FROM s"),
+        ("chat message cost_cny 非负",
+         "WITH s AS (INSERT INTO chat_sessions DEFAULT VALUES RETURNING id) "
+         "INSERT INTO chat_messages (session_id, role, cost_cny) "
+         "SELECT id, 'user', -1 FROM s"),
+        ("chat message latency_ms 非负",
+         "WITH s AS (INSERT INTO chat_sessions DEFAULT VALUES RETURNING id) "
+         "INSERT INTO chat_messages (session_id, role, latency_ms) "
+         "SELECT id, 'user', -1 FROM s"),
     ])
     async def test_check_constraints_reject(self, db_engine: AsyncEngine, label: str,
                                            statement: str) -> None:
@@ -243,6 +288,19 @@ class TestConstraints:
                 "SELECT (SELECT count(*) FROM run_hotspots) AS hotspots, "
                 "(SELECT count(*) FROM run_matches) AS matches"))).one()
         assert (remaining.hotspots, remaining.matches) == (0, 0)
+
+        # 3) CASCADE：删会话 → 它的消息一起消失（S7.2）
+        async with db_engine.begin() as conn:
+            session_id = (await conn.execute(text(
+                "INSERT INTO chat_sessions DEFAULT VALUES RETURNING id"))).scalar_one()
+            await conn.execute(text(
+                "INSERT INTO chat_messages (session_id, role) VALUES (:s, 'user')"),
+                {"s": session_id})
+            await conn.execute(text("DELETE FROM chat_sessions WHERE id = :s"),
+                               {"s": session_id})
+            left = (await conn.execute(text(
+                "SELECT count(*) FROM chat_messages"))).scalar_one()
+        assert left == 0
 
 
 class TestVector:
