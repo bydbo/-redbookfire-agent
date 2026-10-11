@@ -1,7 +1,7 @@
-"""对话可调用的工具（S7.3 起，S7.7 扩到 3 个只读工具）。
+"""对话可调用的工具（S7.3 起；S7.7 加只读三件，S7.7b 加拆解预览，S7.8 加改写）。
 
 用途：把「对话层能做的事」写成工具——跑完整分析（第一批）、解析图片 / 查素材库 / 读历史运行
-      （S7.7 只读三件，无副作用）、预览爆点要素（S7.7b）、改写文案（S7.8）。
+      （S7.7 只读三件）、预览爆点要素与缺口（S7.7b）、改写文案（S7.8）。
 输入：`ToolContext`（配置 / 会话 / 投递器 / 文本模型 caller / 可注入的连接池与 sleep）+ 工具参数 dict。
 输出：`ToolOutcome`（status / payload / steps / error / prompt_versions）——payload 既喂回给模型，
       也落进 `chat_messages.tool_calls`。
@@ -51,9 +51,10 @@ from ..schemas import TYPE_LABELS, Element, HotspotClue
 from ..services.chat import resolve_attachment
 from ..services.image_clue import TASK_ID as IMAGE_CLUE_TASK
 from ..services.image_clue import ImageClueParse, parse_image_clue
-from ..services.retrieval import retrieve_candidates
+from ..services.retrieval import literal_only_candidates, retrieve_candidates
 from ..services.runs import load_job, load_run, submit_analysis
 from ..tools.embedding import EmbeddingError
+from ..tools.gaps import gap_advice
 from ..tools.llm import LLMError, StructuredCaller
 from ..tools.vision import sniff_image_mime
 
@@ -61,6 +62,7 @@ TOOL_RUN_ANALYSIS = "run_hotspot_analysis"
 TOOL_PARSE_IMAGE = "parse_image_clue"
 TOOL_SEARCH_MATERIALS = "search_materials"
 TOOL_READ_RUN = "read_run"
+TOOL_PREVIEW_COVERAGE = "preview_element_coverage"
 
 # 运行终态：出现在这里就是"这一批跑完了"（与 `tasks/analysis.py` 同一口径）
 RUN_TERMINAL = ("succeeded", "failed")
@@ -163,6 +165,29 @@ TOOLS: list[dict[str, Any]] = [
                     },
                 },
                 "required": ["run_id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": TOOL_PREVIEW_COVERAGE,
+            "description": (
+                "只做要素拆解与覆盖估算：把一条热点拆成九类爆点要素，再按你本地素材库里"
+                "「已经沾边的素材」估算要素覆盖率、指出缺口并给出补拍建议。**这一步不产出候选"
+                "素材、不写文案、不产生运行记录**；用户想先看看这条热点由什么构成、缺哪些画面，"
+                "或者想省一次完整分析的成本时用它。要看具体候选素材请改用 search_materials，"
+                "要完整分析和文案请用 run_hotspot_analysis。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "hotspot": {
+                        "type": "string",
+                        "description": "热点原文（1–500 字）。整理用户原话即可，不要改写成标题。",
+                    },
+                },
+                "required": ["hotspot"],
             },
         },
     },
@@ -487,6 +512,57 @@ async def read_run(ctx: ToolContext, args: dict[str, Any], *,
     return ToolOutcome(status="succeeded", steps=steps, payload=_run_summary(detail))
 
 
+async def preview_element_coverage(ctx: ToolContext, args: dict[str, Any], *,
+                                   attachments: list[dict[str, Any]] | None = None,
+                                   on_progress: ProgressFn | None = None) -> ToolOutcome:
+    """「拆解预览」工具（S7.7b）：要素 + 字面通道的覆盖估算与补拍建议；不产出候选素材。
+
+    只花一次文本模型钱（拆解），覆盖估算走 `literal_only_candidates`（不调 embedding）；
+    不写稿、不落 `runs`、不产生 `job_id`。
+    """
+    steps: list[dict[str, Any]] = []
+
+    async def progress(stage: str, done: int = 0, total: int = 0) -> None:
+        _step(steps, stage, done, total)
+        if on_progress is not None:
+            await on_progress(stage, done, total)
+
+    text, invalid = _check_hotspot(args)
+    if invalid:
+        return ToolOutcome(status="failed", steps=steps, error=invalid)
+
+    await progress("拆解要素")
+    try:
+        record = await _clue_for(ctx, text)
+    except (ApiError, LLMError) as exc:
+        return ToolOutcome(status="failed", steps=steps,
+                           error=f"热点拆解失败：{_reason(exc)}")
+
+    await progress("估算覆盖")
+    try:
+        outcome = await literal_only_candidates(ctx.session, ctx.cfg, record.clue)
+    except (ApiError, EmbeddingError, LLMError) as exc:
+        return ToolOutcome(status="failed", steps=steps,
+                           error=f"覆盖估算失败：{_reason(exc)}")
+
+    coverage = outcome.coverage
+    payload = {
+        "hotspot": text[:100],
+        "elements": _elements_of(record.clue),
+        "coverage_ratio": round(float(coverage.ratio), 3),
+        "covered": [_element_view(item) for item in coverage.covered],
+        "gaps": [_element_view(item) for item in coverage.gaps],
+        "gap_advice": gap_advice(coverage),
+        "materials_considered": outcome.candidates_considered,
+        "note": ("这一步只做要素拆解与覆盖估算，**不产出候选素材**；"
+                 "要看具体候选请调 search_materials，要完整分析与文案请调 run_hotspot_analysis"),
+        "cost_cny": record.cost_cny,
+    }
+    await progress("完成", 100, 100)
+    return ToolOutcome(status="succeeded", steps=steps, payload=payload,
+                       prompt_versions={CLUE_TASK: record.version})
+
+
 async def _read_image(ctx: ToolContext, attachment: dict[str, Any]) -> tuple[bytes, str]:
     """读附件字节并确认它是受支持的图片（magic bytes；与图片解析接口同一口径）。"""
     relative = str(attachment.get("path") or "")
@@ -591,6 +667,7 @@ HANDLERS: dict[str, ToolHandler] = {
     TOOL_PARSE_IMAGE: parse_clue_from_image,
     TOOL_SEARCH_MATERIALS: search_materials,
     TOOL_READ_RUN: read_run,
+    TOOL_PREVIEW_COVERAGE: preview_element_coverage,
 }
 
 

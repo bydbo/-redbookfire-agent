@@ -217,3 +217,39 @@ async def retrieve_candidates(session: AsyncSession, cfg: AppConfig, clue: Hotsp
     outcome.candidates, outcome.coverage = retrieval_tool.rank_candidates(
         clue, materials, channel_ranks, params, now=now)
     return outcome
+
+
+async def literal_only_candidates(session: AsyncSession, cfg: AppConfig, clue: HotspotClue, *,
+                                  topk: int | None = None,
+                                  now: float | None = None) -> RetrievalOutcome:
+    """只走字面通道（pg_trgm）的候选与覆盖度——给对话层的「拆解预览」用（S7.7b）。
+
+    与 `retrieve_candidates` 的口径一致（同一套字面召回 → 融合 → 要素加权），只有两处差别：
+
+    - **不做向量召回**：不向量化查询、不读向量列，因此不产生 embedding 费用、也不依赖上游可用；
+    - `vector_coverage` 留空：预览不报向量覆盖率（那是"本次有多少素材参与了向量召回"，
+      这里本来就没有向量这回事）。
+
+    仍然读库（字面召回要 `pg_trgm`）——这是刻意的：只报要素不报覆盖，说服力会差很多。
+    """
+    params = retrieval_tool.RetrievalParams.from_config(cfg)
+    if topk is not None:
+        params = replace(params, topk=int(topk))   # RetrievalParams 是 frozen dataclass
+    outcome = RetrievalOutcome()
+
+    literal_hits = await literal_recall(session, retrieval_tool.literal_query_keywords(clue),
+                                        limit=params.recall_limit,
+                                        threshold=params.similarity_threshold)
+    outcome.literal_recalled = len(literal_hits)
+    channel_ranks = {retrieval_tool.LITERAL: _ranks(literal_hits)} if literal_hits else {}
+
+    material_ids = sorted({material_id for ranks in channel_ranks.values()
+                           for material_id in ranks})
+    rows = await _load_materials(session, material_ids)
+    order = {material_id: index for index, material_id in enumerate(material_ids)}
+    materials = sorted((row_to_material(row) for row in rows),
+                       key=lambda material: order.get(material.id, 0))
+    outcome.candidates_considered = len(materials)
+    outcome.candidates, outcome.coverage = retrieval_tool.rank_candidates(
+        clue, materials, channel_ranks, params, now=now)
+    return outcome

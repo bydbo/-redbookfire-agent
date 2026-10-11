@@ -13,9 +13,12 @@ from typing import Any, cast
 import pytest
 
 from xhs_agent.config import AppConfig, load_config
+from xhs_agent.schemas import Coverage, Element
+from xhs_agent.services import chat_tools
 from xhs_agent.services.chat_tools import (
     HANDLERS,
     TOOL_PARSE_IMAGE,
+    TOOL_PREVIEW_COVERAGE,
     TOOL_READ_RUN,
     TOOL_RUN_ANALYSIS,
     TOOL_SEARCH_MATERIALS,
@@ -24,11 +27,13 @@ from xhs_agent.services.chat_tools import (
     ToolOutcome,
     _clue_for,
     parse_clue_from_image,
+    preview_element_coverage,
     read_run,
     run_hotspot_analysis,
     search_materials,
     tool_names,
 )
+from xhs_agent.services.retrieval import RetrievalOutcome
 from xhs_agent.tools import llm
 from xhs_agent.tools.llm import LLMResult, StructuredCaller
 
@@ -93,7 +98,8 @@ class TestToolSchema:
         """清单与分发表一一对上：加工具时漏掉任一处都会被这条挡住。"""
         names = tool_names()
         assert names == {TOOL_RUN_ANALYSIS, TOOL_PARSE_IMAGE,
-                         TOOL_SEARCH_MATERIALS, TOOL_READ_RUN}
+                         TOOL_SEARCH_MATERIALS, TOOL_READ_RUN,
+                         TOOL_PREVIEW_COVERAGE}
         assert set(HANDLERS) == names
 
     def test_required_arguments_are_declared(self) -> None:
@@ -101,8 +107,16 @@ class TestToolSchema:
                    for item in TOOLS}
         assert by_name[TOOL_PARSE_IMAGE]["properties"] == {}          # 只吃本轮附件
         assert by_name[TOOL_SEARCH_MATERIALS]["required"] == ["hotspot"]
+        assert by_name[TOOL_PREVIEW_COVERAGE]["required"] == ["hotspot"]
         assert by_name[TOOL_READ_RUN]["required"] == ["run_id"]
         assert by_name[TOOL_RUN_ANALYSIS]["required"] == []            # 只发图片时热点为空
+
+    def test_preview_tool_says_it_produces_no_candidates(self) -> None:
+        """S7.7b 的硬要求：说明里必须写明"不产出候选素材"，否则模型会把它当成分析的替代品。"""
+        description = next(item["function"]["description"] for item in TOOLS
+                           if item["function"]["name"] == TOOL_PREVIEW_COVERAGE)
+        assert "不产出候选素材" in description
+        assert TOOL_SEARCH_MATERIALS in description
 
     def test_tool_message_is_json(self) -> None:
         outcome = ToolOutcome(status="failed", payload={"run_id": "r-1"}, error="炸了")
@@ -182,6 +196,21 @@ class TestReadOnlyArguments:
         outcome = await parse_clue_from_image(context(tmp_path), {})
         assert outcome.status == "failed" and "图片" in outcome.error
 
+    @pytest.mark.asyncio
+    async def test_preview_without_hotspot_is_rejected(self, tmp_path: Path) -> None:
+        outcome = await preview_element_coverage(context(tmp_path), {})
+        assert outcome.status == "failed" and "hotspot" in outcome.error
+
+    @pytest.mark.asyncio
+    async def test_preview_with_too_long_hotspot_is_rejected(self, tmp_path: Path) -> None:
+        outcome = await preview_element_coverage(context(tmp_path), {"hotspot": "热" * 501})
+        assert outcome.status == "failed" and "500" in outcome.error
+
+    @pytest.mark.asyncio
+    async def test_preview_without_caller_fails_politely(self, tmp_path: Path) -> None:
+        outcome = await preview_element_coverage(context(tmp_path), {"hotspot": "夜跑"})
+        assert outcome.status == "failed" and "拆解失败" in outcome.error
+
 
 class TestClueCache:
     @pytest.mark.asyncio
@@ -199,3 +228,37 @@ class TestClueCache:
         assert first.cost_cny > 0 and second.cost_cny == 0.0
         assert first.version == 1 and second.version == 1
         assert third.cost_cny > 0
+
+
+class TestPreviewShaping:
+    @pytest.mark.asyncio
+    async def test_gap_advice_is_derived_from_coverage_gaps(
+            self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """缺口建议必须由 `tools/gaps.py` 从覆盖度派生——这条不依赖匹配口径，是确定性的。
+
+        真库上的覆盖率由 `tools/matching.py` 算（那里有"关键词命中给所有要素抬到 0.9"的既有行为），
+        所以把检索结果换成替身来钉住"工具这一层怎么摆字段"。
+        """
+        provider = CountingProvider()
+        ctx = context(tmp_path, caller=StructuredCaller(provider=provider))
+        covered = Element(type="topic", value="羽毛球", weight=0.9, confidence=0.9,
+                          evidence="原文")
+        gap = Element(type="ip", value="某顶流明星", weight=0.9, confidence=0.9, evidence="原文")
+        outcome = RetrievalOutcome(coverage=Coverage(covered=[covered], gaps=[gap], ratio=0.5))
+        outcome.candidates_considered = 3
+
+        async def fake_literal_only(*_args: Any, **_kwargs: Any) -> RetrievalOutcome:
+            return outcome
+
+        monkeypatch.setattr(chat_tools, "literal_only_candidates", fake_literal_only)
+        result = await preview_element_coverage(ctx, {"hotspot": "羽毛球球场随手拍"})
+
+        assert result.status == "succeeded", result.error
+        assert result.payload["coverage_ratio"] == 0.5
+        assert [item["type"] for item in result.payload["covered"]] == ["topic"]
+        assert [item["type"] for item in result.payload["gaps"]] == ["ip"]
+        advice = result.payload["gap_advice"]
+        assert [item["type"] for item in advice] == ["ip"]
+        assert advice[0]["value"] == "某顶流明星" and "同款" in advice[0]["advice"]
+        assert result.payload["materials_considered"] == 3
+        assert result.payload["cost_cny"] > 0          # 只花拆解那一次
