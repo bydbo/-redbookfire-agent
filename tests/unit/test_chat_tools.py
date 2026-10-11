@@ -20,6 +20,7 @@ from xhs_agent.services.chat_tools import (
     TOOL_PARSE_IMAGE,
     TOOL_PREVIEW_COVERAGE,
     TOOL_READ_RUN,
+    TOOL_REVISE_DRAFT,
     TOOL_RUN_ANALYSIS,
     TOOL_SEARCH_MATERIALS,
     TOOLS,
@@ -29,6 +30,7 @@ from xhs_agent.services.chat_tools import (
     parse_clue_from_image,
     preview_element_coverage,
     read_run,
+    revise_draft,
     run_hotspot_analysis,
     search_materials,
     tool_names,
@@ -99,7 +101,7 @@ class TestToolSchema:
         names = tool_names()
         assert names == {TOOL_RUN_ANALYSIS, TOOL_PARSE_IMAGE,
                          TOOL_SEARCH_MATERIALS, TOOL_READ_RUN,
-                         TOOL_PREVIEW_COVERAGE}
+                         TOOL_PREVIEW_COVERAGE, TOOL_REVISE_DRAFT}
         assert set(HANDLERS) == names
 
     def test_required_arguments_are_declared(self) -> None:
@@ -109,7 +111,14 @@ class TestToolSchema:
         assert by_name[TOOL_SEARCH_MATERIALS]["required"] == ["hotspot"]
         assert by_name[TOOL_PREVIEW_COVERAGE]["required"] == ["hotspot"]
         assert by_name[TOOL_READ_RUN]["required"] == ["run_id"]
+        assert by_name[TOOL_REVISE_DRAFT]["required"] == ["run_id", "request"]
         assert by_name[TOOL_RUN_ANALYSIS]["required"] == []            # 只发图片时热点为空
+
+    def test_revise_tool_says_it_does_not_overwrite_the_run(self) -> None:
+        """S7.8 的硬要求：说明里必须写明"不覆盖原结果"，否则模型会以为结果卡片会跟着变。"""
+        description = next(item["function"]["description"] for item in TOOLS
+                           if item["function"]["name"] == TOOL_REVISE_DRAFT)
+        assert "不覆盖原结果" in description
 
     def test_preview_tool_says_it_produces_no_candidates(self) -> None:
         """S7.7b 的硬要求：说明里必须写明"不产出候选素材"，否则模型会把它当成分析的替代品。"""
@@ -262,3 +271,154 @@ class TestPreviewShaping:
         assert advice[0]["value"] == "某顶流明星" and "同款" in advice[0]["advice"]
         assert result.payload["materials_considered"] == 3
         assert result.payload["cost_cny"] > 0          # 只花拆解那一次
+
+
+# ---------- 改写工具（S7.8） ----------
+
+RUN_UUID = "0f4d6f1e-6f2f-4b1a-9c3e-0d1a2b3c4d5e"
+REVISED_PAYLOAD: dict[str, Any] = {
+    "refused": False,
+    "draft": {"titles": [{"text": "改后标题", "style": "避坑"}], "cover_text": "封面",
+              "first_3s": "开头", "body": "改后的正文", "tags": ["#夜跑"],
+              "shot_list": ["先拍球鞋"], "compliance_notes": ["别用他人肖像"]},
+}
+REFUSAL_PAYLOAD: dict[str, Any] = {
+    "refused": True, "reason": "不能用他人的姓名或肖像做蹭热度文案",
+}
+
+
+def run_detail(*, status: str = "succeeded", with_draft: bool = True,
+               hotspots: int = 1) -> dict[str, Any]:
+    """`load_run` 形状的替身（只带工具真会读的字段）。"""
+    items: list[dict[str, Any]] = []
+    for position in range(1, hotspots + 1):
+        raw = f"夜跑球鞋第 {position} 条"
+        items.append({
+            "hotspot_id": f"h-{position}",
+            "hotspot_raw": raw,
+            "clue": {"hotspot_raw": raw, "why_it_works": ["反差"],
+                     "mechanisms": [{"name": "反差", "explain": "夜里跑步"}],
+                     "elements": [{"type": "topic", "value": "夜跑", "weight": 0.9,
+                                   "confidence": 0.9, "evidence": "原文"}],
+                     "match_keywords": ["夜跑"]},
+            "coverage": {"ratio": 1.0, "covered": [], "gaps": []},
+            "candidates": [{"material": {"id": "m-1", "path": "D:/m/夜跑.mp4",
+                                         "type": "video", "title": "夜里的球鞋"}}],
+            "draft": ({"material_id": "m-1", "hotspot_key": raw,
+                       "titles": [{"text": "原标题", "style": "直给"}], "body": "原始正文",
+                       "tags": ["#夜跑"], "cover_text": "", "first_3s": "", "shot_list": [],
+                       "compliance_notes": []} if with_draft else None),
+        })
+    return {"run_id": RUN_UUID, "status": status, "created_at": "", "totals": {},
+            "hotspots": items}
+
+
+@pytest.fixture
+def patched_run(monkeypatch: pytest.MonkeyPatch) -> Any:
+    """把 `load_run` 换成替身；返回一个可以改返回值的句柄。"""
+    holder: dict[str, Any] = {"detail": run_detail()}
+
+    async def fake_load_run(_session: Any, _run_id: Any) -> Any:
+        return holder["detail"]
+
+    monkeypatch.setattr(chat_tools, "load_run", fake_load_run)
+    return holder
+
+
+class TestReviseArguments:
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("run_id", ["", "not-a-uuid", 123])
+    async def test_bad_run_id_is_rejected(self, tmp_path: Path, run_id: Any) -> None:
+        outcome = await revise_draft(context(tmp_path), {"run_id": run_id, "request": "改短点"})
+        assert outcome.status == "failed" and "run_id" in outcome.error
+
+    @pytest.mark.asyncio
+    async def test_missing_request_is_rejected(self, tmp_path: Path) -> None:
+        outcome = await revise_draft(context(tmp_path), {"run_id": RUN_UUID})
+        assert outcome.status == "failed" and "request" in outcome.error
+
+    @pytest.mark.asyncio
+    async def test_too_long_request_is_rejected(self, tmp_path: Path) -> None:
+        outcome = await revise_draft(context(tmp_path),
+                                     {"run_id": RUN_UUID, "request": "改" * 501})
+        assert outcome.status == "failed" and "500" in outcome.error
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("index", [0, -1, "abc"])
+    async def test_bad_hotspot_index_is_rejected(self, tmp_path: Path, index: Any) -> None:
+        outcome = await revise_draft(context(tmp_path),
+                                     {"run_id": RUN_UUID, "request": "改短点",
+                                      "hotspot_index": index})
+        assert outcome.status == "failed" and "hotspot_index" in outcome.error
+
+
+class TestRevisePaths:
+    @pytest.mark.asyncio
+    async def test_returns_the_rewritten_draft(self, tmp_path: Path,
+                                               patched_run: Any) -> None:
+        provider = CountingProvider(REVISED_PAYLOAD)
+        ctx = context(tmp_path, caller=StructuredCaller(provider=provider))
+
+        outcome = await revise_draft(ctx, {"run_id": RUN_UUID, "request": "改成避坑向"})
+
+        assert outcome.status == "succeeded", outcome.error
+        assert outcome.payload["refused"] is False
+        assert outcome.payload["revised"]["body"] == "改后的正文"
+        assert outcome.payload["revised"]["material_id"] == "m-1"    # 关联字段按原稿写回
+        assert outcome.payload["cost_cny"] > 0
+        assert outcome.prompt_versions == {"copy_revise": 1}
+        assert provider.calls == 1
+
+    @pytest.mark.asyncio
+    async def test_refusal_is_a_successful_outcome(self, tmp_path: Path,
+                                                   patched_run: Any) -> None:
+        provider = CountingProvider(REFUSAL_PAYLOAD)
+        ctx = context(tmp_path, caller=StructuredCaller(provider=provider))
+
+        outcome = await revise_draft(ctx, {"run_id": RUN_UUID,
+                                           "request": "把明星名字写进标题"})
+
+        assert outcome.status == "succeeded"          # 拒绝是一次成功的判断，不是工具故障
+        assert outcome.payload["refused"] is True
+        assert "肖像" in outcome.payload["reason"]
+        assert "revised" not in outcome.payload
+        assert outcome.prompt_versions == {"copy_revise": 1}
+
+    @pytest.mark.asyncio
+    async def test_missing_run_is_reported(self, tmp_path: Path,
+                                           patched_run: Any) -> None:
+        patched_run["detail"] = None
+        outcome = await revise_draft(context(tmp_path), {"run_id": RUN_UUID,
+                                                         "request": "改短点"})
+        assert outcome.status == "failed" and "找不到这次运行" in outcome.error
+
+    @pytest.mark.asyncio
+    async def test_unfinished_run_is_reported(self, tmp_path: Path,
+                                              patched_run: Any) -> None:
+        patched_run["detail"] = run_detail(status="running")
+        outcome = await revise_draft(context(tmp_path), {"run_id": RUN_UUID,
+                                                         "request": "改短点"})
+        assert outcome.status == "failed" and "还没跑完" in outcome.error
+
+    @pytest.mark.asyncio
+    async def test_index_out_of_range_is_reported(self, tmp_path: Path,
+                                                  patched_run: Any) -> None:
+        outcome = await revise_draft(context(tmp_path), {"run_id": RUN_UUID,
+                                                         "request": "改短点",
+                                                         "hotspot_index": 3})
+        assert outcome.status == "failed" and "只有 1 条热点" in outcome.error
+
+    @pytest.mark.asyncio
+    async def test_hotspot_without_draft_is_reported(self, tmp_path: Path,
+                                                     patched_run: Any) -> None:
+        patched_run["detail"] = run_detail(with_draft=False)
+        outcome = await revise_draft(context(tmp_path), {"run_id": RUN_UUID,
+                                                         "request": "改短点"})
+        assert outcome.status == "failed" and "没有文案初稿" in outcome.error
+
+    @pytest.mark.asyncio
+    async def test_without_caller_fails_politely(self, tmp_path: Path,
+                                                 patched_run: Any) -> None:
+        outcome = await revise_draft(context(tmp_path), {"run_id": RUN_UUID,
+                                                         "request": "改短点"})
+        assert outcome.status == "failed" and "caller" in outcome.error

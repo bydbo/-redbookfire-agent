@@ -17,9 +17,15 @@ export interface ToolStep {
 const POLL_INTERVAL_MS = 2000
 const SESSION_PAGE_SIZE = 20
 
-// 工具名的中文标签（工具 schema 的单一来源是后端 services/chat_tools.py::TOOLS）。
-const TOOL_LABELS: Record<string, string> = {
+// 工具名的中文标签（工具 schema 的单一来源是后端 services/chat_tools.py::TOOLS；
+// 这里只做展示，没登记的名字原样回落到英文名，不会挡住新工具上线）。
+export const TOOL_LABELS: Record<string, string> = {
   run_hotspot_analysis: '跑完整分析',
+  parse_image_clue: '解析图片',
+  search_materials: '查素材库',
+  read_run: '读历史运行',
+  preview_element_coverage: '预览爆点要素',
+  revise_draft: '改写文案',
 }
 
 export function toolLabel(name: string): string {

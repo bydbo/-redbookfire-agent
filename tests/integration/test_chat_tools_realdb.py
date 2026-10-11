@@ -12,6 +12,8 @@
 from __future__ import annotations
 
 import json
+import uuid
+from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
@@ -22,12 +24,14 @@ from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
 
 from xhs_agent.config import AppConfig, load_config
 from xhs_agent.db import Base
-from xhs_agent.db.models import Run
+from xhs_agent.db.models import Hotspot, Material, Run, RunHotspot, RunMatch
 from xhs_agent.services.chat_tools import (
     ToolContext,
     preview_element_coverage,
+    revise_draft,
     search_materials,
 )
+from xhs_agent.services.runs import submit_analysis
 from xhs_agent.tools import llm
 from xhs_agent.tools.llm import LLMResult, StructuredCaller
 
@@ -72,13 +76,14 @@ class CountingProvider(llm.BaseProvider):
 
     name = "counting"
 
-    def __init__(self) -> None:
+    def __init__(self, payload: dict[str, Any] | None = None) -> None:
         super().__init__(model="counting-1")
+        self.payload = payload or CLUE_PAYLOAD
         self.calls = 0
 
     async def complete(self, call: llm.LLMCall) -> LLMResult:
         self.calls += 1
-        return LLMResult(text=json.dumps(CLUE_PAYLOAD, ensure_ascii=False),
+        return LLMResult(text=json.dumps(self.payload, ensure_ascii=False),
                          provider=self.name, model=self.model,
                          prompt_tokens=100, completion_tokens=50, cost_cny=0.003)
 
@@ -142,6 +147,65 @@ async def seed_material(session: AsyncSession, *, path: str, title: str,
 
 async def runs_count(session: AsyncSession) -> int:
     return int((await session.execute(select(func.count()).select_from(Run))).scalar_one())
+
+
+REVISED_BODY = "改后的正文"
+REVISED_PAYLOAD: dict[str, Any] = {
+    "refused": False,
+    "draft": {"titles": [{"text": "改后标题", "style": "避坑"}], "cover_text": "封面",
+              "first_3s": "开头", "body": REVISED_BODY, "tags": ["#夜跑"],
+              "shot_list": ["先拍球鞋"], "compliance_notes": ["别用他人肖像"]},
+}
+REFUSAL_PAYLOAD: dict[str, Any] = {
+    "refused": True, "reason": "不能用他人的姓名或肖像做蹭热度文案",
+}
+
+
+async def seed_finished_run(session: AsyncSession, *, hotspot: str = "夜跑球鞋开箱"
+                            ) -> tuple[str, dict[str, Any]]:
+    """造一条「已完成」的运行，返回（run_id，原始初稿）。
+
+    与 `test_api_endpoints.py::_finish_run` 同一套口径：走服务层建 run / hotspots /
+    run_hotspots，再手工把线索、初稿、候选与统计写回，模拟 worker 干完的活。
+    """
+    submission = await submit_analysis(session, [hotspot], topk=3)
+    run_id = uuid.UUID(str(submission.run_id))
+    run_hotspot = (await session.execute(
+        select(RunHotspot).where(RunHotspot.run_id == run_id)
+        .order_by(RunHotspot.position))).scalars().first()
+    assert run_hotspot is not None
+    hotspot_row = (await session.execute(
+        select(Hotspot).where(Hotspot.id == run_hotspot.hotspot_id))).scalar_one()
+    hotspot_row.clue = {
+        "hotspot_raw": hotspot,
+        "why_it_works": ["夜里跑步的反差"],
+        "mechanisms": [{"name": "反差", "explain": "夜里跑步"}],
+        "elements": [{"type": "topic", "value": "夜跑", "weight": 0.9, "confidence": 0.9,
+                      "evidence": "热点原文"}],
+        "match_keywords": ["夜跑"],
+        "borrow_angles": ["从夜跑场景切入"],
+        "risk_notes": [],
+    }
+    run_hotspot.status = "succeeded"
+    run_hotspot.coverage = {"ratio": 1.0, "covered": [], "gaps": []}
+    material = Material(path="D:/materials/夜跑球鞋.mp4", type="video", title="夜里的球鞋",
+                        description="夜里跑步的球鞋特写", tags=["夜跑"], elements=[],
+                        source="sidecar", width=1080, height=1920, size_bytes=2048)
+    session.add(material)
+    await session.flush()
+    draft = {"material_id": str(material.id), "hotspot_key": hotspot,
+             "titles": [{"text": "原标题", "style": "直给"}], "body": "原始正文",
+             "tags": ["#夜跑"], "cover_text": "", "first_3s": "", "shot_list": [],
+             "compliance_notes": []}
+    run_hotspot.draft = dict(draft)
+    session.add(RunMatch(run_hotspot_id=run_hotspot.id, material_id=material.id, rank=1,
+                         score=Decimal("0.8000"), recall_sources=["literal"],
+                         hits=[], missing=[], reasons=["命中主题「夜跑」"], usage="放开头 3 秒"))
+    run = (await session.execute(select(Run).where(Run.id == run_id))).scalar_one()
+    run.status = "succeeded"
+    run.prompt_versions = {"hotspot_clue": 1, "material_select": 1, "copy_draft": 1}
+    await session.commit()
+    return str(run_id), draft
 
 
 class TestSearchMaterials:
@@ -217,3 +281,55 @@ class TestPreviewElementCoverage:
         # 两个工具用的是同一段热点文本：第二次走缓存，所以只拆了一次
         assert provider.calls == 1
         assert await runs_count(db_session) == 0
+
+
+class TestReviseDraft:
+    async def test_returns_a_new_draft_and_keeps_the_snapshot(
+            self, db_session: AsyncSession, cfg: AppConfig) -> None:
+        run_id, original = await seed_finished_run(db_session)
+        provider = CountingProvider(REVISED_PAYLOAD)
+        ctx = ToolContext(cfg=cfg, session=db_session,
+                          caller=StructuredCaller(provider=provider))
+
+        outcome = await revise_draft(ctx, {"run_id": run_id, "request": "改成避坑向"})
+
+        assert outcome.status == "succeeded", outcome.error
+        assert outcome.payload["refused"] is False
+        assert outcome.payload["revised"]["body"] == REVISED_BODY
+        assert outcome.payload["revised"]["material_id"] == original["material_id"]
+        assert outcome.prompt_versions == {"copy_revise": 1}
+        assert provider.calls == 1
+        # 关键：改后文案只在对话里，run 的初稿快照一个字都没动
+        db_session.expire_all()
+        stored = (await db_session.execute(
+            select(RunHotspot.draft).where(RunHotspot.run_id == uuid.UUID(run_id))
+        )).scalar_one()
+        assert stored["body"] == original["body"]
+        assert stored["titles"] == original["titles"]
+
+    async def test_refusal_keeps_the_snapshot_and_reports_the_reason(
+            self, db_session: AsyncSession, cfg: AppConfig) -> None:
+        run_id, original = await seed_finished_run(db_session)
+        provider = CountingProvider(REFUSAL_PAYLOAD)
+        ctx = ToolContext(cfg=cfg, session=db_session,
+                          caller=StructuredCaller(provider=provider))
+
+        outcome = await revise_draft(ctx, {"run_id": run_id,
+                                           "request": "把明星的名字写进标题"})
+
+        assert outcome.status == "succeeded"          # 拒绝是成功的判断，不是工具故障
+        assert outcome.payload["refused"] is True
+        assert "肖像" in outcome.payload["reason"]
+        assert "revised" not in outcome.payload
+        db_session.expire_all()
+        stored = (await db_session.execute(
+            select(RunHotspot.draft).where(RunHotspot.run_id == uuid.UUID(run_id))
+        )).scalar_one()
+        assert stored["body"] == original["body"]
+
+    async def test_missing_run_is_reported(self, db_session: AsyncSession,
+                                           cfg: AppConfig) -> None:
+        ctx = ToolContext(cfg=cfg, session=db_session,
+                          caller=StructuredCaller(provider=CountingProvider()))
+        outcome = await revise_draft(ctx, {"run_id": str(uuid.uuid4()), "request": "改短点"})
+        assert outcome.status == "failed" and "找不到这次运行" in outcome.error

@@ -45,9 +45,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..agents.clue import TASK_ID as CLUE_TASK
 from ..agents.clue import extract_clue
+from ..agents.revise import TASK_ID as REVISE_TASK
+from ..agents.revise import ReviseOutcome
+from ..agents.revise import revise_draft as revise_agent
 from ..config import AppConfig
 from ..core.errors import ApiError, BadRequestError
-from ..schemas import TYPE_LABELS, Element, HotspotClue
+from ..schemas import TYPE_LABELS, Element, HotspotClue, SchemaError
 from ..services.chat import resolve_attachment
 from ..services.image_clue import TASK_ID as IMAGE_CLUE_TASK
 from ..services.image_clue import ImageClueParse, parse_image_clue
@@ -63,12 +66,15 @@ TOOL_PARSE_IMAGE = "parse_image_clue"
 TOOL_SEARCH_MATERIALS = "search_materials"
 TOOL_READ_RUN = "read_run"
 TOOL_PREVIEW_COVERAGE = "preview_element_coverage"
+TOOL_REVISE_DRAFT = "revise_draft"
 
 # 运行终态：出现在这里就是"这一批跑完了"（与 `tasks/analysis.py` 同一口径）
 RUN_TERMINAL = ("succeeded", "failed")
 
 # 热点原文上限（与 `POST /api/analyze` 的 AnalyzeRequest 同口径）
 MAX_HOTSPOT_CHARS = 500
+# 修改要求上限（与热点原文同口径；模型看上下文有限，太长反而抓不到重点）
+MAX_REQUEST_CHARS = 500
 MAX_TOPK = 20
 # 回给模型的候选条数上限：再多也是噪声，且会挤占对话上下文
 CANDIDATE_PREVIEW_LIMIT = 8
@@ -188,6 +194,40 @@ TOOLS: list[dict[str, Any]] = [
                     },
                 },
                 "required": ["hotspot"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": TOOL_REVISE_DRAFT,
+            "description": (
+                "按用户的要求改写**某次运行已经产出的文案初稿**（改结构、口吻、详略、角度）："
+                "不重新分析、不检索素材、**不覆盖原结果**——改后的文案只出现在这次回复里，"
+                "由你讲给用户。用户在初稿基础上提修改意见（「标题再狠一点」「正文写短些」"
+                "「换成避坑角度」）时用它。要求越界（要写他人姓名/肖像、要编造素材里没有的事）时"
+                "工具会拒绝并给出理由，你把这个理由如实讲给用户，不要替他换个说法再来一次。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "run_id": {
+                        "type": "string",
+                        "description": "要改写的那次运行的 run_id（uuid）。取自之前分析的"
+                                       "返回值，不要自己编。",
+                    },
+                    "request": {
+                        "type": "string",
+                        "description": "用户的修改要求（1–500 字）。整理用户原话即可，"
+                                       "不要替他加要求。",
+                    },
+                    "hotspot_index": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "description": "改第几条热点的初稿，默认 1。",
+                    },
+                },
+                "required": ["run_id", "request"],
             },
         },
     },
@@ -563,6 +603,98 @@ async def preview_element_coverage(ctx: ToolContext, args: dict[str, Any], *,
                        prompt_versions={CLUE_TASK: record.version})
 
 
+async def revise_draft(ctx: ToolContext, args: dict[str, Any], *,
+                       attachments: list[dict[str, Any]] | None = None,
+                       on_progress: ProgressFn | None = None) -> ToolOutcome:
+    """「改写文案」工具（S7.8）：按用户要求改写某次运行已产出的初稿。
+
+    **只回对话、不写库**：`run_hotspots.draft` 保持当时的快照（数据契约 §3.2 的口径），
+    改后的文案由 supervisor 讲给用户。越界要求返回 `succeeded + refused=true`（拒绝是一次
+    成功的判断，不是工具故障）。
+    """
+    steps: list[dict[str, Any]] = []
+
+    async def progress(stage: str, done: int = 0, total: int = 0) -> None:
+        _step(steps, stage, done, total)
+        if on_progress is not None:
+            await on_progress(stage, done, total)
+
+    raw_run = str(args.get("run_id") or "").strip()
+    try:
+        run_uuid = uuid.UUID(raw_run)
+    except (TypeError, ValueError):
+        return ToolOutcome(status="failed", steps=steps,
+                           error=f"run_id 必须是一个 uuid，收到 {raw_run!r}")
+    request = str(args.get("request") or "").strip()
+    if not request:
+        return ToolOutcome(status="failed", steps=steps,
+                           error="缺少 request：请把用户的修改要求整理后传进来（1–500 字）")
+    if len(request) > MAX_REQUEST_CHARS:
+        return ToolOutcome(status="failed", steps=steps,
+                           error=f"修改要求超过 {MAX_REQUEST_CHARS} 字，请让用户说得再短一点")
+    raw_index = args.get("hotspot_index")
+    if raw_index is None or raw_index == "":
+        index = 1                                # 不传就是第一条；0 是非法值，不能顺手当默认
+    else:
+        try:
+            index = int(raw_index)
+        except (TypeError, ValueError):
+            return ToolOutcome(status="failed", steps=steps,
+                               error="hotspot_index 必须是 ≥1 的整数（第几条热点）")
+    if index < 1:
+        return ToolOutcome(status="failed", steps=steps,
+                           error="hotspot_index 必须是 ≥1 的整数（第几条热点）")
+
+    detail = await load_run(ctx.session, run_uuid)
+    if detail is None:
+        return ToolOutcome(status="failed", steps=steps,
+                           error=f"找不到这次运行（run_id：{raw_run}），请确认 id 是否正确")
+    if str(detail.get("status")) != "succeeded":
+        return ToolOutcome(status="failed", steps=steps,
+                           error="这次运行还没跑完（或失败了），暂时改不了；"
+                                 "稍后可以在运行历史里回看")
+    hotspots = list(detail.get("hotspots") or [])
+    if index > len(hotspots):
+        return ToolOutcome(status="failed", steps=steps,
+                           error=f"这次运行只有 {len(hotspots)} 条热点，没有第 {index} 条")
+    item = hotspots[index - 1]
+    draft = item.get("draft")
+    if not isinstance(draft, dict) or not draft:
+        return ToolOutcome(status="failed", steps=steps,
+                           error="这次运行的这条热点没有文案初稿，没有可改的东西")
+    if ctx.caller is None:                       # pragma: no cover - 运行器总会注入
+        return ToolOutcome(status="failed", steps=steps,
+                           error="改写失败：对话工具缺少文本模型 caller")
+
+    candidates = item.get("candidates") or []
+    material = dict(candidates[0].get("material") or {}) if candidates else None
+    await progress("改写文案")
+    before = len(ctx.caller.records)
+    try:
+        outcome = await revise_agent(clue=HotspotClue.from_dict(item.get("clue") or {}),
+                                     material=material, draft=dict(draft),
+                                     request=request, caller=ctx.caller)
+    except (ApiError, LLMError, SchemaError) as exc:
+        return ToolOutcome(status="failed", steps=steps, error=f"改写失败：{_reason(exc)}")
+
+    cost = _records_cost(ctx.caller, before)
+    result = outcome.value
+    assert isinstance(result, ReviseOutcome)      # 由 `revise_agent` 保证
+    versions = {REVISE_TASK: int(outcome.version or 1)}
+    await progress("完成", 100, 100)
+    if result.refused:
+        return ToolOutcome(status="succeeded", steps=steps,
+                           payload={"run_id": raw_run, "hotspot_index": index,
+                                    "refused": True, "reason": result.reason,
+                                    "cost_cny": cost},
+                           prompt_versions=versions)
+    revised = result.draft.to_dict() if result.draft is not None else {}
+    return ToolOutcome(status="succeeded", steps=steps,
+                       payload={"run_id": raw_run, "hotspot_index": index,
+                                "refused": False, "revised": revised, "cost_cny": cost},
+                       prompt_versions=versions)
+
+
 async def _read_image(ctx: ToolContext, attachment: dict[str, Any]) -> tuple[bytes, str]:
     """读附件字节并确认它是受支持的图片（magic bytes；与图片解析接口同一口径）。"""
     relative = str(attachment.get("path") or "")
@@ -668,6 +800,7 @@ HANDLERS: dict[str, ToolHandler] = {
     TOOL_SEARCH_MATERIALS: search_materials,
     TOOL_READ_RUN: read_run,
     TOOL_PREVIEW_COVERAGE: preview_element_coverage,
+    TOOL_REVISE_DRAFT: revise_draft,
 }
 
 

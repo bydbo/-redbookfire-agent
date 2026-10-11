@@ -1,4 +1,4 @@
-"""六条 prompt 资产的完整性守卫（S3.1 补完三条 agent 正文后变为硬约束；S7.3 加对话 supervisor）。"""
+"""七条 prompt 资产的完整性守卫（S3.1 补完三条 agent 正文后变为硬约束；S7.3 加对话 supervisor，S7.8 加改写）。"""
 
 from __future__ import annotations
 
@@ -6,7 +6,8 @@ import pytest
 
 from xhs_agent.tools import prompt as prompt_tool
 
-AGENT_TASKS = ("hotspot_clue", "material_select", "copy_draft", "chat_supervisor")
+AGENT_TASKS = ("hotspot_clue", "material_select", "copy_draft", "chat_supervisor",
+               "copy_revise")
 ALL_TASKS = (*AGENT_TASKS, "material_tagging", "image_hotspot_clue")
 PLACEHOLDER_MARKERS = ("待 S3.1 填写", "待填写")
 

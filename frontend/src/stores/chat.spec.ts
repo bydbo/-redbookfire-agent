@@ -5,7 +5,7 @@ import type { RunDetail } from '@/api/analysis'
 import { getRun } from '@/api/analysis'
 import type { ChatMessage, ChatSessionDetail, ChatSessionList } from '@/api/chat'
 import { createChatSession, getChatSession, listChatSessions, streamMessage } from '@/api/chat'
-import { useChatStore } from '@/stores/chat'
+import { TOOL_LABELS, toolLabel, useChatStore } from '@/stores/chat'
 
 vi.mock('@/api/chat', () => ({
   createChatSession: vi.fn(),
@@ -201,5 +201,15 @@ describe('useChatStore', () => {
     await expect(store.ensureRun('r-2')).resolves.toBeNull()
     await store.ensureRun('r-2')
     expect(getRun).toHaveBeenCalledTimes(2)
+  })
+
+  it('工具名有中文标签，没登记的名字原样回落', () => {
+    expect(TOOL_LABELS.run_hotspot_analysis).toBe('跑完整分析')
+    expect(toolLabel('parse_image_clue')).toBe('解析图片')
+    expect(toolLabel('search_materials')).toBe('查素材库')
+    expect(toolLabel('read_run')).toBe('读历史运行')
+    expect(toolLabel('preview_element_coverage')).toBe('预览爆点要素')
+    expect(toolLabel('revise_draft')).toBe('改写文案')
+    expect(toolLabel('brand_new_tool')).toBe('brand_new_tool')
   })
 })
