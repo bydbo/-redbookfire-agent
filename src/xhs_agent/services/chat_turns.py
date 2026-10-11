@@ -35,8 +35,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from ..config import AppConfig
 from ..core.errors import DependencyUnavailableError
 from ..db.session import create_engine_from_config, create_session_factory
+from ..services import chat_tools
 from ..services.chat import update_message
-from ..services.chat_tools import TOOL_RUN_ANALYSIS, ToolContext, run_hotspot_analysis
+from ..services.chat_tools import ToolContext, ToolOutcome
 from ..tools.http import build_http_client
 from ..tools.llm import BaseProvider, build_provider
 from ..workflows.chat import ChatTurn, run_turn
@@ -172,15 +173,15 @@ def build_turn_provider(cfg: AppConfig, client: Any) -> BaseProvider:
 def build_tool_runner(session: AsyncSession, *, cfg: AppConfig, client: Any,
                       session_id: uuid.UUID, attachments: list[dict[str, Any]],
                       dispatcher: Any) -> Any:
-    """工具执行器：把「跑完整分析」接到 S7.3 的工具上（其余工具名直接报错）。"""
+    """工具执行器：按 `chat_tools.HANDLERS` 分派（S7.7a）——这里也不写具体工具名。"""
     context = ToolContext(cfg=cfg, session=session, session_id=session_id,
                           enqueue=getattr(dispatcher, "enqueue", None), http=client)
 
     async def runner(name: str, args: dict[str, Any], *, on_progress: Any = None) -> Any:
-        if name != TOOL_RUN_ANALYSIS:
-            raise ValueError(f"未知工具：{name}")
-        return await run_hotspot_analysis(context, args, attachments=attachments,
-                                          on_progress=on_progress)
+        handler = chat_tools.HANDLERS.get(name)
+        if handler is None:                      # 图已按清单过滤过；这里只是兜底，不炸整轮
+            return ToolOutcome(status="failed", error=f"未知工具：{name}")
+        return await handler(context, args, attachments=attachments, on_progress=on_progress)
 
     return runner
 

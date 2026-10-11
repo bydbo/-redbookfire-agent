@@ -8,9 +8,10 @@
 
 口径：
 
-- **工具定义（`TOOLS`）是唯一来源**：给模型的 function schema 与执行分派都读它。
-  prompt 契约管的是 `prompts/` 下的 prompt 正文；工具的 name/description/参数属于 API 协议，
-  随代码走，不再抄一份进 prompt（避免两处漂移）；
+- **工具定义（`TOOLS`）是唯一来源，执行分派（`HANDLERS`）也在本文件**（S7.7a）：给模型的
+  function schema 与 name → handler 映射都集中在这里，`workflows/chat.py` 里不出现任何具体
+  工具名——「新增一个工具只改 `chat_tools.py` 一处」。prompt 契约管的是 `prompts/` 下的
+  prompt 正文；工具的 name/description/参数属于 API 协议，随代码走，不抄一份进 prompt；
 - 有图片附件时先走 S6.6 的 `parse_image_clue`（多模态），把解析出的线索作为**预置线索**
   随 `submit_analysis(clues=...)` 提交——拆解节点短路，不重复付费（S6.7）；
 - 分析在 Celery worker 跑，本工具只等结果：轮询 `runs`（ADR 0011：库是权威源），
@@ -79,6 +80,7 @@ TOOLS: list[dict[str, Any]] = [
 
 ProgressFn = Callable[[str, int, int], Awaitable[None]]
 EnqueueFn = Callable[[str], Awaitable[None]]
+ToolHandler = Callable[..., Awaitable["ToolOutcome"]]
 
 
 @dataclass
@@ -103,6 +105,9 @@ class ToolOutcome:
     payload: dict[str, Any] = field(default_factory=dict)
     steps: list[dict[str, Any]] = field(default_factory=list)
     error: str = ""
+    # 这个工具内部用掉的 prompt 版本（如 `{"hotspot_clue": 1}`），由对话图汇总进
+    # `chat_messages.prompt_versions`——不写进 payload，所以不会漏给模型看。
+    prompt_versions: dict[str, int] = field(default_factory=dict)
 
     def as_tool_message(self) -> str:
         """给模型的 tool 消息正文（JSON 字符串，模型自己读字段）。"""
@@ -253,3 +258,18 @@ def tool_result_note(outcome: ToolOutcome) -> str:
         return (f"run={os.path.basename(str(outcome.payload.get('run_id') or ''))} "
                 f"candidates={outcome.payload.get('candidates', 0)}")
     return f"失败：{outcome.error}"
+
+
+# ---------- 分发表（S7.7a） ----------
+# **加工具只改这个文件**：① 上面 `TOOLS` 加一条 function schema；② 这里加一条 name → handler 映射。
+# 对话图（`workflows/chat.py`）按 `tool_names()` 做已知/未知划分、按名字调 handler，
+# 自身不出现任何具体工具名——有源码扫描用例（`tests/unit/test_chat_graph.py`）钉住这条。
+
+HANDLERS: dict[str, ToolHandler] = {
+    TOOL_RUN_ANALYSIS: run_hotspot_analysis,
+}
+
+
+def tool_names() -> set[str]:
+    """`TOOLS` 里声明的工具名集合（每次现算：图里读模块属性，注册假工具也能被发现）。"""
+    return {str(item["function"]["name"]) for item in TOOLS}

@@ -9,6 +9,11 @@
 
 - **轮次上限**：`[chat].max_tool_rounds`（默认 3）。到上限后最后一次调用**不带工具**，
   逼模型用现有结果作答——用户永远能拿到一段话，而不是"工具调不停"；
+- **工具清单与分派都不在这里**（S7.7a）：本文件不出现任何具体工具名，已知/未知按
+  `services/chat_tools.py::TOOLS` 的名字集合动态划分，执行由运行器查 `HANDLERS`——
+  加工具只改 `chat_tools.py` 一处；
+- **prompt 版本**：这一轮用过的 prompt 版本（supervisor 自己 + 工具内部的拆解/改写）
+  汇总成 `ChatTurn.prompt_versions`，落 `chat_messages.prompt_versions`；
 - 模型点名不存在的工具：记一条 `status=failed` 的工具记录并结束这一轮（不猜、不硬套）；
 - 工具失败不炸整轮：把失败原因作为 tool 消息喂回模型，由它向用户解释；
 - 事件只在两个地方发：模型正文增量（`text_delta`）与工具过程（`tool_started` /
@@ -28,7 +33,8 @@ from typing_extensions import TypedDict
 
 from ..agents.supervisor import TASK_ID, initial_messages, supervise
 from ..config import AppConfig
-from ..services.chat_tools import TOOL_RUN_ANALYSIS, TOOLS, ToolOutcome
+from ..services import chat_tools
+from ..services.chat_tools import ToolOutcome
 from ..tools.llm import BaseProvider
 
 EventFn = Callable[[str, dict[str, Any]], Awaitable[None]]
@@ -46,6 +52,7 @@ class ChatState(TypedDict, total=False):
     pending: list[dict[str, Any]]
     tool_calls: list[dict[str, Any]]
     records: list[dict[str, Any]]
+    prompt_versions: dict[str, int]
     run_id: str
     tool_rounds: int
     version: int
@@ -76,7 +83,7 @@ def _build_graph(*, provider: BaseProvider, run_tool: ToolRunner, max_rounds: in
     async def supervisor_node(state: ChatState) -> dict[str, Any]:
         rounds = int(state.get("tool_rounds") or 0)
         remaining = max(0, int(max_rounds) - rounds)
-        tools = TOOLS if remaining > 0 else []      # 到上限就不给工具，逼出正文
+        tools = chat_tools.TOOLS if remaining > 0 else []   # 到上限就不给工具，逼出正文
 
         async def delta(piece: str) -> None:
             await emit("text_delta", {"text": piece})
@@ -84,8 +91,12 @@ def _build_graph(*, provider: BaseProvider, run_tool: ToolRunner, max_rounds: in
         turn = await supervise(provider, state.get("messages") or [], tools=tools,
                                on_delta=delta if stream else None, stream=stream)
         records = [*(state.get("records") or []), turn.record]
-        known = [call for call in turn.tool_calls if call["name"] == TOOL_RUN_ANALYSIS]
-        unknown = [call for call in turn.tool_calls if call["name"] != TOOL_RUN_ANALYSIS]
+        # 已知 / 未知**按工具清单动态划分**（S7.7a）：这里不写任何具体工具名，
+        # 加工具只改 `services/chat_tools.py` 一处。清单读模块属性而不是导入时快照，
+        # 用例注册一个假工具也能被认出来。
+        registered = chat_tools.tool_names()
+        known = [call for call in turn.tool_calls if call["name"] in registered]
+        unknown = [call for call in turn.tool_calls if call["name"] not in registered]
 
         history = list(state.get("tool_calls") or [])
         for call in unknown:
@@ -103,6 +114,7 @@ def _build_graph(*, provider: BaseProvider, run_tool: ToolRunner, max_rounds: in
     async def tools_node(state: ChatState) -> dict[str, Any]:
         messages = list(state.get("messages") or [])
         history = list(state.get("tool_calls") or [])
+        versions = dict(state.get("prompt_versions") or {})
         rounds = int(state.get("tool_rounds") or 0)
         run_id = str(state.get("run_id") or "")
 
@@ -132,6 +144,8 @@ def _build_graph(*, provider: BaseProvider, run_tool: ToolRunner, max_rounds: in
                 "steps": outcome.steps,
             }
             history.append(entry)
+            # 工具内部用掉的 prompt 版本（拆解 / 改写…）一并计入这一轮
+            versions.update(outcome.prompt_versions)
             messages.append({"role": "assistant", "content": "", "tool_calls": [
                 {"id": call_id, "type": "function",
                  "function": {"name": call["name"], "arguments": call["arguments"]}}]})
@@ -141,6 +155,7 @@ def _build_graph(*, provider: BaseProvider, run_tool: ToolRunner, max_rounds: in
             run_id = str(outcome.payload.get("run_id") or run_id)
 
         return {"messages": messages, "tool_calls": history, "pending": [],
+                "prompt_versions": versions,
                 "tool_rounds": rounds + len(state.get("pending") or []), "run_id": run_id}
 
     def route(state: ChatState) -> str:
@@ -170,6 +185,8 @@ async def run_turn(cfg: AppConfig, *, provider: BaseProvider, history: list[dict
         final = await graph.ainvoke({
             "messages": messages, "reply": "", "pending": [], "tool_calls": [],
             "records": [], "run_id": "", "tool_rounds": 0, "version": rendered.version,
+            # 这一轮的 prompt 版本先记上 supervisor 自己，工具内部用掉的由 tools_node 合并进来
+            "prompt_versions": {TASK_ID: rendered.version},
         })
     except Exception as exc:                     # noqa: BLE001 - 整轮失败要落库，不能炸进程
         return ChatTurn(status="failed", error=f"{type(exc).__name__}: {exc}",
@@ -178,6 +195,8 @@ async def run_turn(cfg: AppConfig, *, provider: BaseProvider, history: list[dict
 
     records = list(final.get("records") or [])
     tool_calls = list(final.get("tool_calls") or [])
+    versions = dict(final.get("prompt_versions") or {})
+    versions.setdefault(TASK_ID, rendered.version)
     cost = (sum(float(item.get("cost_cny") or 0) for item in records)
             + sum(float(item.get("cost_cny") or 0) for item in tool_calls))
     return ChatTurn(
@@ -186,5 +205,5 @@ async def run_turn(cfg: AppConfig, *, provider: BaseProvider, history: list[dict
         run_id=str(final.get("run_id") or ""),
         cost_cny=round(cost, 4),
         latency_ms=int((time.monotonic() - started) * 1000),
-        prompt_versions={TASK_ID: rendered.version},
+        prompt_versions=versions,
     )

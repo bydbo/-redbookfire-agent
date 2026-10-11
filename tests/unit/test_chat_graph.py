@@ -1,4 +1,4 @@
-"""对话编排图的离线单测（S7.3）：直接回答 / 调工具 / 轮次上限 / 失败路径。
+"""对话编排图的离线单测（S7.3；S7.7a 补"分发不再硬编码"的反证）。
 
 provider、工具执行器、事件回调全部注入，不联网不连库。
 """
@@ -6,16 +6,20 @@ provider、工具执行器、事件回调全部注入，不联网不连库。
 from __future__ import annotations
 
 import json
+import uuid
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import pytest
 
 from xhs_agent.agents.supervisor import TASK_ID, initial_messages
 from xhs_agent.config import AppConfig, load_config
+from xhs_agent.services import chat_tools
 from xhs_agent.services.chat_tools import TOOL_RUN_ANALYSIS, TOOLS, ToolOutcome
+from xhs_agent.services.chat_turns import build_tool_runner
 from xhs_agent.tools import llm
 from xhs_agent.tools.llm import LLMResult
+from xhs_agent.workflows import chat as chat_workflow
 from xhs_agent.workflows.chat import run_turn
 
 
@@ -268,3 +272,76 @@ class TestTurn:
         assert "HTTP 500" in turn.error
         assert turn.reply == ""
         assert turn.prompt_versions == {TASK_ID: 1}
+
+
+# ---------- S7.7a：工具清单与分派都不在图里写死 ----------
+
+FAKE_TOOL = "fake_probe"
+FAKE_TASK = "fake_probe_task"
+
+
+def register_fake_tool(monkeypatch: pytest.MonkeyPatch) -> list[dict[str, Any]]:
+    """往 `chat_tools` 注册一个假工具（清单 + 分发表各一处），返回它收到的参数记录。"""
+    seen: list[dict[str, Any]] = []
+    schema = {
+        "type": "function",
+        "function": {
+            "name": FAKE_TOOL,
+            "description": "用例注册的假工具",
+            "parameters": {"type": "object", "properties": {}, "required": []},
+        },
+    }
+    monkeypatch.setattr(chat_tools, "TOOLS", [*chat_tools.TOOLS, schema])
+
+    async def handler(_ctx: Any, args: dict[str, Any], *, attachments: Any = None,
+                      on_progress: Any = None) -> ToolOutcome:
+        seen.append(args)
+        return ToolOutcome(status="succeeded", payload={"ok": True},
+                           prompt_versions={FAKE_TASK: 7})
+
+    monkeypatch.setitem(chat_tools.HANDLERS, FAKE_TOOL, handler)
+    return seen
+
+
+class TestDispatchIsDataDriven:
+    """S7.7a：`workflows/chat.py` 里不出现任何具体工具名；注册新工具只改 `chat_tools.py`。"""
+
+    def test_graph_source_contains_no_tool_name(self) -> None:
+        source = Path(str(chat_workflow.__file__)).read_text(encoding="utf-8")
+        for name in chat_tools.tool_names():
+            assert name not in source, f"workflows/chat.py 里写死了工具名：{name}"
+
+    @pytest.mark.asyncio
+    async def test_registered_tool_is_dispatched(self, tmp_path: Path,
+                                                 monkeypatch: pytest.MonkeyPatch) -> None:
+        seen = register_fake_tool(monkeypatch)
+        cfg = write_config(tmp_path)
+        # 用**真实**的运行器（build_tool_runner）证明分发表确实把假工具接上了
+        runner = build_tool_runner(cast(Any, None), cfg=cfg, client=cast(Any, None),
+                                   session_id=uuid.uuid4(), attachments=[], dispatcher=None)
+        provider = ScriptedProvider([
+            {"text": "", "tool_calls": [tool_call(name=FAKE_TOOL, arguments='{"n": 2}')]},
+            {"text": "假工具跑完了。"},
+        ])
+
+        turn = await run_turn(cfg, provider=provider, history=[], user_text="试试新工具",
+                              run_tool=runner)
+
+        assert seen == [{"n": 2}]                            # 分发到了假 handler
+        assert provider.calls[0].tools is not None
+        assert provider.calls[0].tools[-1]["function"]["name"] == FAKE_TOOL   # 清单也带上了
+        assert turn.tool_calls[0]["tool"] == FAKE_TOOL
+        assert turn.tool_calls[0]["status"] == "succeeded"
+        assert turn.reply == "假工具跑完了。"
+        # 工具内部用掉的 prompt 版本要汇总进这一轮
+        assert turn.prompt_versions == {TASK_ID: 1, FAKE_TASK: 7}
+
+    @pytest.mark.asyncio
+    async def test_unknown_tool_error_message_is_unchanged(self, tmp_path: Path) -> None:
+        """对外行为逐字不变：不在清单里的名字仍记 failed 并收尾。"""
+        cfg = write_config(tmp_path)
+        turn, provider, runner = await run(
+            cfg, steps=[{"text": "", "tool_calls": [tool_call(name="no_such_tool")]}])
+
+        assert runner.calls == [] and len(provider.calls) == 1
+        assert turn.tool_calls[0]["error"] == "模型要调一个不存在的工具"

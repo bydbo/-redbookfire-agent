@@ -13,11 +13,13 @@ import pytest
 
 from xhs_agent.config import AppConfig, load_config
 from xhs_agent.services.chat_tools import (
+    HANDLERS,
     TOOL_RUN_ANALYSIS,
     TOOLS,
     ToolContext,
     ToolOutcome,
     run_hotspot_analysis,
+    tool_names,
 )
 
 
@@ -51,6 +53,16 @@ class TestToolSchema:
         outcome = ToolOutcome(status="failed", payload={"run_id": "r-1"}, error="炸了")
         payload = json.loads(outcome.as_tool_message())
         assert payload == {"status": "failed", "run_id": "r-1", "error": "炸了"}
+
+    def test_every_declared_tool_has_a_handler(self) -> None:
+        """S7.7a：清单与分发表必须一一对上——加工具时漏掉分发表会被这条挡住。"""
+        assert tool_names() == {TOOL_RUN_ANALYSIS}
+        assert set(HANDLERS) >= tool_names()
+
+    def test_prompt_versions_do_not_leak_into_the_tool_message(self) -> None:
+        outcome = ToolOutcome(status="succeeded", payload={"run_id": "r-1"},
+                              prompt_versions={"hotspot_clue": 1})
+        assert "prompt_versions" not in json.loads(outcome.as_tool_message())
 
 
 class TestArguments:
