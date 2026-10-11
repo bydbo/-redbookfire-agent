@@ -1,6 +1,7 @@
-"""「跑完整分析」工具的离线单测（S7.3）：参数校验、工具 schema 与失败回话。
+"""对话工具集的离线单测（S7.3 起，S7.7 扩到只读三件）：schema、参数校验、失败回话、缓存。
 
-真链路（提交分析 → Celery → 轮询 → 汇总）在集成用例里跑；这里只测不碰数据库的分支。
+真链路（提交分析 → Celery → 轮询 → 汇总；拆解 → 检索 → 候选）在集成用例里跑；
+这里只测不碰数据库的分支。
 """
 
 from __future__ import annotations
@@ -14,50 +15,99 @@ import pytest
 from xhs_agent.config import AppConfig, load_config
 from xhs_agent.services.chat_tools import (
     HANDLERS,
+    TOOL_PARSE_IMAGE,
+    TOOL_READ_RUN,
     TOOL_RUN_ANALYSIS,
+    TOOL_SEARCH_MATERIALS,
     TOOLS,
     ToolContext,
     ToolOutcome,
+    _clue_for,
+    parse_clue_from_image,
+    read_run,
     run_hotspot_analysis,
+    search_materials,
     tool_names,
 )
+from xhs_agent.tools import llm
+from xhs_agent.tools.llm import LLMResult, StructuredCaller
+
+CLUE_PAYLOAD: dict[str, Any] = {
+    "hotspot_raw": "",
+    "why_it_works": ["把日常器材拍出陌生感"],
+    "mechanisms": [{"name": "反差", "explain": "器材特写与运动场景错位"}],
+    "elements": [{"type": "visual", "value": "球拍特写", "weight": 0.9,
+                  "confidence": 0.85, "evidence": "画面正中是球拍"}],
+    "match_keywords": ["球拍", "球场"],
+    "borrow_angles": ["用同款球场做热场"],
+    "risk_notes": [],
+}
 
 
-def write_config(tmp_path: Path) -> AppConfig:
+def write_config(tmp_path: Path, body: str = "") -> AppConfig:
     path = tmp_path / "config.toml"
     path.write_text(
         "[paths]\n"
-        f'runs_dir = "{(tmp_path / "runs").as_posix()}"\n',
+        f'runs_dir = "{(tmp_path / "runs").as_posix()}"\n' + body,
         encoding="utf-8",
     )
     return load_config(str(path))
 
 
-def context(tmp_path: Path) -> ToolContext:
+def context(tmp_path: Path, **kwargs: Any) -> ToolContext:
     """只有 cfg 是真的：这些用例在用到 session 之前就该返回。"""
-    return ToolContext(cfg=write_config(tmp_path), session=cast(Any, None))
+    return ToolContext(cfg=write_config(tmp_path), session=cast(Any, None), **kwargs)
+
+
+class CountingProvider(llm.BaseProvider):
+    """记账的假文本模型：固定回一段线索 JSON，只用来数"拆了几次"。"""
+
+    name = "counting"
+
+    def __init__(self, payload: dict[str, Any] | None = None) -> None:
+        super().__init__(model="counting-1")
+        self.payload = payload or CLUE_PAYLOAD
+        self.calls = 0
+
+    async def complete(self, call: llm.LLMCall) -> LLMResult:
+        self.calls += 1
+        return LLMResult(text=json.dumps(self.payload, ensure_ascii=False),
+                         provider=self.name, model=self.model,
+                         prompt_tokens=10, completion_tokens=5, cost_cny=0.003)
 
 
 class TestToolSchema:
-    def test_single_tool_with_documented_parameters(self) -> None:
-        assert len(TOOLS) == 1
-        function = TOOLS[0]["function"]
-        assert TOOLS[0]["type"] == "function"
-        assert function["name"] == TOOL_RUN_ANALYSIS
-        properties = function["parameters"]["properties"]
-        assert set(properties) == {"hotspot", "topk"}
-        assert function["parameters"]["required"] == []      # 只发图片时热点为空
-        assert "description" in function and len(function["description"]) > 20
+    def test_every_tool_is_a_wellformed_function_schema(self) -> None:
+        assert TOOLS, "工具清单不能为空"
+        for item in TOOLS:
+            assert item["type"] == "function"
+            function = item["function"]
+            assert function["name"] and function["description"].strip()
+            assert len(function["description"]) > 20          # 描述要说清"什么时候用"
+            parameters = function["parameters"]
+            assert parameters["type"] == "object"
+            assert isinstance(parameters["properties"], dict)
+            assert isinstance(parameters.get("required", []), list)
+
+    def test_registry_and_dispatcher_match(self) -> None:
+        """清单与分发表一一对上：加工具时漏掉任一处都会被这条挡住。"""
+        names = tool_names()
+        assert names == {TOOL_RUN_ANALYSIS, TOOL_PARSE_IMAGE,
+                         TOOL_SEARCH_MATERIALS, TOOL_READ_RUN}
+        assert set(HANDLERS) == names
+
+    def test_required_arguments_are_declared(self) -> None:
+        by_name = {item["function"]["name"]: item["function"]["parameters"]
+                   for item in TOOLS}
+        assert by_name[TOOL_PARSE_IMAGE]["properties"] == {}          # 只吃本轮附件
+        assert by_name[TOOL_SEARCH_MATERIALS]["required"] == ["hotspot"]
+        assert by_name[TOOL_READ_RUN]["required"] == ["run_id"]
+        assert by_name[TOOL_RUN_ANALYSIS]["required"] == []            # 只发图片时热点为空
 
     def test_tool_message_is_json(self) -> None:
         outcome = ToolOutcome(status="failed", payload={"run_id": "r-1"}, error="炸了")
         payload = json.loads(outcome.as_tool_message())
         assert payload == {"status": "failed", "run_id": "r-1", "error": "炸了"}
-
-    def test_every_declared_tool_has_a_handler(self) -> None:
-        """S7.7a：清单与分发表必须一一对上——加工具时漏掉分发表会被这条挡住。"""
-        assert tool_names() == {TOOL_RUN_ANALYSIS}
-        assert set(HANDLERS) >= tool_names()
 
     def test_prompt_versions_do_not_leak_into_the_tool_message(self) -> None:
         outcome = ToolOutcome(status="succeeded", payload={"run_id": "r-1"},
@@ -65,7 +115,7 @@ class TestToolSchema:
         assert "prompt_versions" not in json.loads(outcome.as_tool_message())
 
 
-class TestArguments:
+class TestAnalyzeArguments:
     @pytest.mark.asyncio
     async def test_too_long_hotspot_is_rejected(self, tmp_path: Path) -> None:
         outcome = await run_hotspot_analysis(context(tmp_path), {"hotspot": "热" * 501})
@@ -92,3 +142,60 @@ class TestArguments:
         assert outcome.status == "failed"
         assert "图片" in outcome.error
         assert outcome.steps and outcome.steps[0]["stage"] == "解析图片"
+
+
+class TestReadOnlyArguments:
+    @pytest.mark.asyncio
+    async def test_search_without_hotspot_is_rejected(self, tmp_path: Path) -> None:
+        outcome = await search_materials(context(tmp_path), {})
+        assert outcome.status == "failed" and "hotspot" in outcome.error
+
+    @pytest.mark.asyncio
+    async def test_search_with_too_long_hotspot_is_rejected(self, tmp_path: Path) -> None:
+        outcome = await search_materials(context(tmp_path), {"hotspot": "热" * 501})
+        assert outcome.status == "failed" and "500" in outcome.error
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("topk", [0, 21, "abc"])
+    async def test_search_with_bad_topk_is_rejected(self, tmp_path: Path,
+                                                    topk: Any) -> None:
+        outcome = await search_materials(context(tmp_path),
+                                         {"hotspot": "夜跑", "topk": topk})
+        assert outcome.status == "failed" and "topk" in outcome.error
+
+    @pytest.mark.asyncio
+    async def test_search_without_caller_fails_politely(self, tmp_path: Path) -> None:
+        """运行器忘了注入 caller 时给一句能回给用户的话，而不是把异常往上抛。"""
+        outcome = await search_materials(context(tmp_path), {"hotspot": "夜跑"})
+        assert outcome.status == "failed"
+        assert "拆解失败" in outcome.error
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("run_id", ["", "not-a-uuid", 123])
+    async def test_read_run_with_bad_id_is_rejected(self, tmp_path: Path,
+                                                    run_id: Any) -> None:
+        outcome = await read_run(context(tmp_path), {"run_id": run_id})
+        assert outcome.status == "failed" and "run_id" in outcome.error
+
+    @pytest.mark.asyncio
+    async def test_parse_image_without_attachment_is_rejected(self, tmp_path: Path) -> None:
+        outcome = await parse_clue_from_image(context(tmp_path), {})
+        assert outcome.status == "failed" and "图片" in outcome.error
+
+
+class TestClueCache:
+    @pytest.mark.asyncio
+    async def test_same_hotspot_is_decomposed_once(self, tmp_path: Path) -> None:
+        """S7.7 的"不重复付费"：同一轮里同一段原文只拆一次，第二次成本记 0。"""
+        provider = CountingProvider()
+        ctx = context(tmp_path, caller=StructuredCaller(provider=provider))
+
+        first = await _clue_for(ctx, "夜跑的球拍特写")
+        second = await _clue_for(ctx, "夜跑的球拍特写")
+        third = await _clue_for(ctx, "另一条热点")
+
+        assert provider.calls == 2                     # 第三段文本是新的一次拆解
+        assert first.clue == second.clue
+        assert first.cost_cny > 0 and second.cost_cny == 0.0
+        assert first.version == 1 and second.version == 1
+        assert third.cost_cny > 0

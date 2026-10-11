@@ -39,7 +39,7 @@ from ..services import chat_tools
 from ..services.chat import update_message
 from ..services.chat_tools import ToolContext, ToolOutcome
 from ..tools.http import build_http_client
-from ..tools.llm import BaseProvider, build_provider
+from ..tools.llm import BaseProvider, StructuredCaller, build_provider
 from ..workflows.chat import ChatTurn, run_turn
 
 logger = logging.getLogger("xhs_agent.chat")
@@ -172,10 +172,15 @@ def build_turn_provider(cfg: AppConfig, client: Any) -> BaseProvider:
 
 def build_tool_runner(session: AsyncSession, *, cfg: AppConfig, client: Any,
                       session_id: uuid.UUID, attachments: list[dict[str, Any]],
-                      dispatcher: Any) -> Any:
-    """工具执行器：按 `chat_tools.HANDLERS` 分派（S7.7a）——这里也不写具体工具名。"""
+                      dispatcher: Any, caller: Any = None) -> Any:
+    """工具执行器：按 `chat_tools.HANDLERS` 分派（S7.7a）——这里也不写具体工具名。
+
+    `caller` 是给只读工具用的文本模型入口（拆解热点等）；`cache` 让同一轮内的同一件事
+    只付一次钱（S7.7）。
+    """
     context = ToolContext(cfg=cfg, session=session, session_id=session_id,
-                          enqueue=getattr(dispatcher, "enqueue", None), http=client)
+                          enqueue=getattr(dispatcher, "enqueue", None), http=client,
+                          caller=caller)
 
     async def runner(name: str, args: dict[str, Any], *, on_progress: Any = None) -> Any:
         handler = chat_tools.HANDLERS.get(name)
@@ -220,7 +225,8 @@ async def run_turn_task(cfg: AppConfig, events: TurnEvents, *, session_id: uuid.
                     runner = build_tool_runner(session, cfg=cfg, client=client,
                                                session_id=session_id,
                                                attachments=attachments or [],
-                                               dispatcher=dispatcher)
+                                               dispatcher=dispatcher,
+                                               caller=StructuredCaller(provider=provider))
 
                     async def on_event(event: str, payload: dict[str, Any]) -> None:
                         await events.publish(event, payload)
