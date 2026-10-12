@@ -12,7 +12,8 @@
 
 输入：`AppConfig`（读 `[vision]` 段与密钥）。
 输出：同步 `describe(frames, hint)` → `{"title", "tags", "description"}` 或 None；
-      异步 `AsyncImageClient.complete(rendered, data, mime)` → 模型返回的文本（失败抛 `VisionError`）。
+      异步 `AsyncImageClient.complete(rendered, data, mime)` → `ImageCompletion`（文本 + 用量，
+      失败抛 `VisionError`）；用量供 S7.10 把图片解析成本计入轮级成本。
 prompt 来源：`src/xhs_agent/prompts/material_tagging.md`（五段结构，见
 `docs/contracts/prompt契约.md`）——本模块**不再内联 prompt 文本**。
 能力裁剪：开关关闭、没有密钥、机器没有 ffmpeg 时 `make_describer` 直接返回 None，
@@ -27,6 +28,7 @@ import os
 import urllib.error
 import urllib.request
 from collections.abc import Callable
+from dataclasses import dataclass
 from typing import Any
 
 import httpx
@@ -34,6 +36,7 @@ import httpx
 from ..config import AppConfig
 from ..util import extract_json
 from . import prompt as prompt_tools
+from .llm import estimate_tokens
 
 TASK_ID = "material_tagging"
 IMAGE_TASK_ID = "image_hotspot_clue"
@@ -136,6 +139,20 @@ def _data_url_from_bytes(data: bytes, mime: str) -> str:
     return f"data:{mime};base64,{payload}"
 
 
+@dataclass(frozen=True)
+class ImageCompletion:
+    """一次多模态调用的结果：模型文本 + 用量（成本由调用方按 `[vision].price_*` 折算）。
+
+    `prompt_tokens` / `completion_tokens` 优先取上游 `usage`；上游没给就按字符估算
+    （图片本身的 token 估不出来，估算只覆盖文本部分，是**下界**）——S7.10 起这两项参与
+    轮级成本与 tokens 记账。
+    """
+
+    text: str
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+
+
 class AsyncImageClient:
     """一张图片 → 多模态模型（OpenAI 兼容 `/chat/completions`，异步 httpx）。
 
@@ -153,8 +170,8 @@ class AsyncImageClient:
             raise VisionError("缺少 [vision].base_url，无法调用多模态模型")
 
     async def complete(self, rendered: prompt_tools.RenderedPrompt, data: bytes,
-                       mime: str) -> str:
-        """发一次多模态调用，返回模型文本；任何失败都抛 `VisionError`。"""
+                       mime: str) -> ImageCompletion:
+        """发一次多模态调用，返回文本与用量；任何失败都抛 `VisionError`。"""
         payload = {
             "model": self.cfg.model,
             "messages": [
@@ -187,7 +204,16 @@ class AsyncImageClient:
             raise VisionError(f"返回结构异常：{str(body)[:200]}") from exc
         if not text:
             raise VisionError("返回内容为空")
-        return str(text)
+        usage = body.get("usage") if isinstance(body, dict) else None
+        usage = usage if isinstance(usage, dict) else {}
+        prompt_tokens = int(usage.get("prompt_tokens") or 0)
+        completion_tokens = int(usage.get("completion_tokens") or 0)
+        if not prompt_tokens:
+            prompt_tokens = estimate_tokens(f"{rendered.system}\n{rendered.user}")
+        if not completion_tokens:
+            completion_tokens = estimate_tokens(str(text))
+        return ImageCompletion(text=str(text), prompt_tokens=prompt_tokens,
+                               completion_tokens=completion_tokens)
 
 
 def build_image_client(cfg: AppConfig, *,

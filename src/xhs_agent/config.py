@@ -155,11 +155,15 @@ class VisionConfig(_Section):
 
     enabled: bool = False
     base_url: str = "https://dashscope.aliyuncs.com/compatible-mode/v1"
-    model: str = "qwen-vl-max"
+    model: str = "qwen3-vl-plus"
     api_key_env: str = "DASHSCOPE_API_KEY"
     max_frames: int = Field(3, ge=1, le=10)
     max_width: int = Field(720, ge=64, le=4096)
     timeout_s: int = Field(60, ge=1, le=600)
+    # 成本估算单价（人民币元/百万 token），仅用于成本估算；按百炼 qwen-vl 系列价目表折算，
+    # 换模型（如 qwen3-vl-plus）时按新价目表同步。S7.10 起图片解析成本计入轮级成本
+    price_in_per_m: float = Field(3.0, ge=0)
+    price_out_per_m: float = Field(9.0, ge=0)
 
     _env: EnvView = PrivateAttr(default_factory=EnvView)
 
@@ -353,8 +357,11 @@ class ChatConfig(_Section):
     max_tool_rounds: int = Field(3, ge=1, le=10)
     # 对话里传的图片单张上限（MB）；与热点图片解析的 10MB 口径一致
     attachment_max_mb: int = Field(10, ge=1, le=100)
-    # 装配给 supervisor 的历史消息条数（最近的 N 条；摘要式裁剪归 S7.10）
+    # 装配给 supervisor 的历史里**保留原文**的最近消息条数；更早的降级成摘要（S7.10）
     history_max_messages: int = Field(20, ge=1, le=200)
+    # 历史部分的 token 预算（粗估，口径见 `tools/llm.py::estimate_tokens`）：
+    # 超预算先摘要、仍超再裁剪，不硬截断（S7.10）
+    history_token_budget: int = Field(6000, ge=500, le=32000)
     # `status=running` 的 assistant 行超过多久算「中断」（API 重启等），读会话时兜底标记
     turn_stale_seconds: int = Field(300, ge=30, le=86400)
 
@@ -469,6 +476,7 @@ class AppConfig(_Section):
                 "max_tool_rounds": self.chat.max_tool_rounds,
                 "attachment_max_mb": self.chat.attachment_max_mb,
                 "history_max_messages": self.chat.history_max_messages,
+                "history_token_budget": self.chat.history_token_budget,
                 "turn_stale_seconds": self.chat.turn_stale_seconds,
             },
             "paths": {

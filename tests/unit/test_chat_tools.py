@@ -14,7 +14,7 @@ from typing import Any, cast
 import pytest
 
 from xhs_agent.config import AppConfig, load_config
-from xhs_agent.schemas import Coverage, Element
+from xhs_agent.schemas import Coverage, Element, HotspotClue
 from xhs_agent.services import chat_tools
 from xhs_agent.services.chat_tools import (
     HANDLERS,
@@ -36,6 +36,7 @@ from xhs_agent.services.chat_tools import (
     search_materials,
     tool_names,
 )
+from xhs_agent.services.image_clue import ImageClueParse
 from xhs_agent.services.retrieval import RetrievalOutcome
 from xhs_agent.tools import llm
 from xhs_agent.tools.llm import LLMResult, StructuredCaller
@@ -237,8 +238,119 @@ class TestClueCache:
         assert provider.calls == 2                     # 第三段文本是新的一次拆解
         assert first.clue == second.clue
         assert first.cost_cny > 0 and second.cost_cny == 0.0
+        assert first.prompt_tokens > 0 and second.prompt_tokens == 0   # S7.10：用量只在第一次记
         assert first.version == 1 and second.version == 1
         assert third.cost_cny > 0
+
+
+class TestImageUsageAndFallback:
+    """图片解析的用量记账与跨轮回落（S7.10）。"""
+
+    @staticmethod
+    def _parsed() -> ImageClueParse:
+        clue = HotspotClue.from_dict({**CLUE_PAYLOAD, "hotspot_raw": "夜跑球鞋开箱"})
+        return ImageClueParse(raw_text="夜跑球鞋开箱", clue=clue,
+                              prompt_versions={"image_hotspot_clue": 1},
+                              prompt_tokens=1000, completion_tokens=500, cost_cny=0.0075)
+
+    @pytest.mark.asyncio
+    async def test_same_image_is_parsed_once_and_usage_is_zeroed(
+            self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """同一轮里同一张图只解析一次；第二次的用量记 0（钱只在上游真发生的那次记）。"""
+        parsed = self._parsed()
+        calls: list[str] = []
+
+        async def fake_read(_ctx: ToolContext, _attachment: dict[str, Any]) -> Any:
+            return b"jpeg-bytes", "image/jpeg"
+
+        async def fake_parse(_cfg: Any, _data: bytes, _mime: str, *,
+                             http: Any = None) -> ImageClueParse:
+            calls.append(_mime)
+            return parsed
+
+        monkeypatch.setattr(chat_tools, "_read_image", fake_read)
+        monkeypatch.setattr(chat_tools, "parse_image_clue", fake_parse)
+        ctx = context(tmp_path)
+        attachment = {"kind": "image", "path": "runs/_chat/s/图.png"}
+
+        first, version = await chat_tools._image_clue_for(ctx, attachment)
+        second, _version = await chat_tools._image_clue_for(ctx, attachment)
+
+        assert calls == ["image/jpeg"] and version == 1
+        assert first.prompt_tokens == 1000 and first.cost_cny == pytest.approx(0.0075)
+        assert (second.prompt_tokens, second.completion_tokens, second.cost_cny) == (0, 0, 0.0)
+
+    @pytest.mark.asyncio
+    async def test_parse_image_falls_back_to_the_recent_attachment(
+            self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        parsed = self._parsed()
+        seen: list[dict[str, Any]] = []
+
+        async def fake_image(_ctx: ToolContext, attachment: dict[str, Any]
+                             ) -> tuple[ImageClueParse, int]:
+            seen.append(attachment)
+            return parsed, 1
+
+        monkeypatch.setattr(chat_tools, "_image_clue_for", fake_image)
+        ctx = context(tmp_path, recent_attachment={"kind": "image", "path": "旧图.png"})
+        outcome = await parse_clue_from_image(ctx, {})
+
+        assert outcome.status == "succeeded", outcome.error
+        assert seen == [{"kind": "image", "path": "旧图.png"}]
+        assert outcome.payload["raw_text"] == "夜跑球鞋开箱"
+        assert outcome.payload["prompt_tokens"] == 1000
+        assert outcome.payload["cost_cny"] == pytest.approx(0.0075)
+
+    @pytest.mark.asyncio
+    async def test_analysis_without_text_uses_the_recent_image(
+            self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        parsed = self._parsed()
+        seen: list[dict[str, Any]] = []
+
+        async def fake_image(_ctx: ToolContext, attachment: dict[str, Any]
+                             ) -> tuple[ImageClueParse, int]:
+            seen.append(attachment)
+            return parsed, 1
+
+        class Stop(Exception):
+            """哨兵：走到提交分析就够了，这里不碰库。"""
+
+        async def fake_submit(*_args: Any, **_kwargs: Any) -> Any:
+            raise Stop
+
+        monkeypatch.setattr(chat_tools, "_image_clue_for", fake_image)
+        monkeypatch.setattr(chat_tools, "submit_analysis", fake_submit)
+        ctx = context(tmp_path, recent_attachment={"kind": "image", "path": "旧图.png"})
+
+        with pytest.raises(Stop):
+            await run_hotspot_analysis(ctx, {})
+        assert seen == [{"kind": "image", "path": "旧图.png"}]
+
+    @pytest.mark.asyncio
+    async def test_analysis_with_text_ignores_the_recent_image(
+            self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """有热点文本时绝不混入旧图：否则会拿旧图的线索去跑一条新热点。"""
+        parsed = self._parsed()
+        seen: list[dict[str, Any]] = []
+
+        async def fake_image(_ctx: ToolContext, attachment: dict[str, Any]
+                             ) -> tuple[ImageClueParse, int]:
+            seen.append(attachment)
+            return parsed, 1
+
+        class Stop(Exception):
+            """哨兵：走到提交分析就够了。"""
+
+        async def fake_submit(*_args: Any, **_kwargs: Any) -> Any:
+            raise Stop
+
+        monkeypatch.setattr(chat_tools, "_image_clue_for", fake_image)
+        monkeypatch.setattr(chat_tools, "submit_analysis", fake_submit)
+        ctx = context(tmp_path, recent_attachment={"kind": "image", "path": "旧图.png"})
+
+        with pytest.raises(Stop):
+            await run_hotspot_analysis(ctx, {"hotspot": "一条全新的热点"})
+        assert seen == []
 
 
 class TestPreviewShaping:

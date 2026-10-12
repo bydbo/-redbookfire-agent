@@ -429,7 +429,7 @@ class TestTurnPromptVersions:
         assert [item["tool"] for item in turn.tool_calls] == ["search_materials"]
         assert turn.tool_calls[0]["status"] == "succeeded"
         # supervisor 的版本（v2）+ 工具内部拆解的版本，都记进这一轮
-        assert turn.prompt_versions == {"chat_supervisor": 2, "hotspot_clue": 1}
+        assert turn.prompt_versions == {"chat_supervisor": 3, "hotspot_clue": 1}
         assert provider.tasks == ["hotspot_clue"]
         assert turn.run_id == ""                      # 只读工具不产生 run
         assert turn.cost_cny > 0
@@ -451,5 +451,5 @@ class TestTurnPromptVersions:
 
         assert turn.status == "succeeded", turn.error
         assert turn.tool_calls[0]["tool"] == "revise_draft"
-        assert turn.prompt_versions == {"chat_supervisor": 2, "copy_revise": 1}
+        assert turn.prompt_versions == {"chat_supervisor": 3, "copy_revise": 1}
         assert provider.tasks == ["copy_revise"]

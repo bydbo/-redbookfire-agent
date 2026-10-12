@@ -59,3 +59,4 @@
 | [0013](0013-frontend-theme-layer-and-glass.md) | 前端主题层与毛玻璃边界（token 单一来源） | 已采纳 |
 | [0014](0014-material-task-progress-via-celery-backend.md) | 素材索引进度用 Celery 结果后端，分析任务显式 ignore_result | 已采纳 |
 | [0015](0015-native-function-calling.md) | 对话层用原生 function calling（不做 JSON 协议模拟） | 已采纳 |
+| [0016](0016-prompt-machine-readable-assets.md) | `prompts/` 携带机读数据资产（能力清单） | 已采纳 |

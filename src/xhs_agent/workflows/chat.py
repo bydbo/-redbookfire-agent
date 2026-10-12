@@ -3,7 +3,8 @@
 用途：把「模型决定要不要调工具 → 调工具 → 拿结果再决定 → 收尾成一段话」编成 LangGraph，
       与分析图（S3.1）同一套写法与口径。
 输入：`AppConfig`、provider、会话历史、本轮用户文本、工具执行器（`run_tool`）。
-输出：`ChatTurn`（reply / tool_calls / run_id / cost_cny / latency_ms / prompt_versions / status）。
+输出：`ChatTurn`（reply / tool_calls / run_id / cost_cny / prompt_tokens / completion_tokens /
+      latency_ms / prompt_versions / status）。
 
 口径：
 
@@ -14,6 +15,8 @@
   加工具只改 `chat_tools.py` 一处；
 - **prompt 版本**：这一轮用过的 prompt 版本（supervisor 自己 + 工具内部的拆解/改写）
   汇总成 `ChatTurn.prompt_versions`，落 `chat_messages.prompt_versions`；
+- **轮级用量**：`prompt_tokens` / `completion_tokens` = 本轮 supervisor 各次调用 + 各工具
+  内部模型调用（含图片解析、分析那次 run）之和，与 `cost_cny` 一起落 `chat_messages`（S7.10）；
 - 模型点名不存在的工具：记一条 `status=failed` 的工具记录并结束这一轮（不猜、不硬套）；
 - 工具失败不炸整轮：把失败原因作为 tool 消息喂回模型，由它向用户解释；
 - 事件只在两个地方发：模型正文增量（`text_delta`）与工具过程（`tool_started` /
@@ -66,6 +69,8 @@ class ChatTurn:
     tool_calls: list[dict[str, Any]] = field(default_factory=list)
     run_id: str = ""
     cost_cny: float = 0.0
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
     latency_ms: int = 0
     prompt_versions: dict[str, int] = field(default_factory=dict)
     status: str = "succeeded"
@@ -139,6 +144,8 @@ def _build_graph(*, provider: BaseProvider, run_tool: ToolRunner, max_rounds: in
                 "args": call["args"],
                 "run_id": outcome.payload.get("run_id"),
                 "cost_cny": float(outcome.payload.get("cost_cny") or 0),
+                "prompt_tokens": int(outcome.payload.get("prompt_tokens") or 0),
+                "completion_tokens": int(outcome.payload.get("completion_tokens") or 0),
                 "latency_ms": int((time.monotonic() - started) * 1000),
                 "error": outcome.error,
                 "steps": outcome.steps,
@@ -178,7 +185,9 @@ async def run_turn(cfg: AppConfig, *, provider: BaseProvider, history: list[dict
     started = time.monotonic()
     rounds = int(max_rounds if max_rounds is not None else cfg.chat.max_tool_rounds)
     rendered, messages = initial_messages(history, user_text,
-                                          attachment_note=attachment_note)
+                                          attachment_note=attachment_note,
+                                          keep_messages=cfg.chat.history_max_messages,
+                                          token_budget=cfg.chat.history_token_budget)
     graph = _build_graph(provider=provider, run_tool=run_tool, max_rounds=rounds,
                          on_event=on_event, stream=stream, version=rendered.version)
     try:
@@ -199,11 +208,16 @@ async def run_turn(cfg: AppConfig, *, provider: BaseProvider, history: list[dict
     versions.setdefault(TASK_ID, rendered.version)
     cost = (sum(float(item.get("cost_cny") or 0) for item in records)
             + sum(float(item.get("cost_cny") or 0) for item in tool_calls))
+    prompt_tokens = sum(int(item.get("prompt_tokens") or 0) for item in (*records, *tool_calls))
+    completion_tokens = sum(int(item.get("completion_tokens") or 0)
+                            for item in (*records, *tool_calls))
     return ChatTurn(
         reply=str(final.get("reply") or ""),
         tool_calls=tool_calls,
         run_id=str(final.get("run_id") or ""),
         cost_cny=round(cost, 4),
+        prompt_tokens=prompt_tokens,
+        completion_tokens=completion_tokens,
         latency_ms=int((time.monotonic() - started) * 1000),
         prompt_versions=versions,
     )

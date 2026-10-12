@@ -48,6 +48,20 @@
 "这次不产出领域对象"（例如 `copy_revise` 的 `refused` / `reason`）。领域字段仍必须引用数据契约 /
 API 契约里的既有 schema，不得自造字段（§二 05 Output Schema 与 §五 的"不新造字段"说的是这一层）。
 
+**机读数据资产（S7.11 起，ADR 0016）**：`src/xhs_agent/prompts/` 除 `<task_id>.md` 外，允许放
+**机读数据资产** `<name>.json`，规则三条：① 它不是 prompt 任务（`.json` 不进 `available_tasks()`
+的 `.md` 扫描，不受五段结构约束）；② 只能由 `tools/prompt.py` 的读写函数加载，格式不合契约直接抛
+`PromptError`；③ 需要模型看到的内容一律经**现有占位符机制**注入到某个 prompt 的 §02 Task
+（当前唯一的资产是能力清单 `chat_capabilities.json`，由 `chat_supervisor` 的
+`{{ capabilities }}` 注入，组装规则不变）。
+
+**能力清单（S7.11）**：`prompts/chat_capabilities.json` 是越界处理的**唯一来源**，三类边界按固定
+顺序 `in_scope`（能力内）/ `out_of_scope_guidable`（边界外可引导）/ `compliance_red_line`（合规红线），
+每类含 `title` / `judge` / `reply`（固定话术）。`chat_supervisor` 的 §01 System 声明"边界以本轮
+下发的《能力清单》为准"，§03 Constraints 只写"按清单三类分别处理"与红线口径（含**约束作用于用户
+指令本身**）；清单正文经 §02 Task 注入。清单与 prompt 的一致性由
+`tests/unit/test_prompts_assets.py::TestCapabilityCatalog` 钉住。
+
 ## 二、五段结构
 
 一个任务一份文件，文件内固定五段：
@@ -140,6 +154,13 @@ user   消息 = 02 Task（渲染后） + 04 Examples + 05 Output Schema
    （那是分析链路的），而是**工具选择评测** `scripts/eval_chat_tools.py`——固定一组消息判定
    "该调的调、不该调的不调"，外加改写路径的越界拒绝，报告按
    `evals/reports/chat-tools-<日期>.md` 归档。
+   **S7.11 / S7.12 起扩成三节**：① 工具选择（该调的调、不该调的不调）；② **越界话术**
+   （红线实体词不出现、拒绝措辞出现、不调用会产出越界内容的工具；可引导类还必须给出替代路径）；
+   ③ **多轮**（假工具 + 真模型：指代承接、不重复付费、历史预算内、关键事实不丢）。
+   用例集是 `evals/chat/cases.json`（自带 `version`，当前 `chat-v1`；它不属于 evals v1 冻结资产，
+   改动只升这个版本号），判定**全部是确定性规则**，不引入模型评委。**轮级成本门槛 ≤ 0.25 元/轮
+   （含一次分析）**——`runs.cost_cny` 仍是"一次分析一行"，轮级成本看 `chat_messages.cost_cny`
+   （含图片解析，S7.10 起）。
 2. **保留可对比的旧版本**——版本号随内容变更递增；对比报告按 `evals/reports/prompt-<task_id>-v<N>-<日期>.md` 归档入库，报告里写明本次改动的是哪一层、为什么改。
 3. **用同一批输入重新测试**——固定使用 `evals/cases/` 的 20 组用例，变更前后各跑一遍，报告列出每条用例的维度得分与总分变化。
 

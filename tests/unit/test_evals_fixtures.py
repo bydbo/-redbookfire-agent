@@ -72,8 +72,10 @@ class TestManifest:
         actual = {path.relative_to(EVALS_DIR).as_posix()
                   for path in EVALS_DIR.rglob("*")
                   if path.is_file() and path.name not in {".gitkeep", "manifest.json"}
-                  # evals/reports/ 是评测输出（不入 manifest、不属于冻结资产），见 docs/评测集.md §六
-                  and not path.relative_to(EVALS_DIR).as_posix().startswith("reports/")}
+                  # evals/reports/ 是评测输出、evals/chat/ 是对话层用例集（自带 chat-vN 版本），
+                  # 两者都不入 manifest、不属于 v1 冻结资产，见 docs/评测集.md §六
+                  and not path.relative_to(EVALS_DIR).as_posix().startswith(("reports/",
+                                                                             "chat/"))}
         unexpected = sorted(actual - registered)
         assert not unexpected, f"这些文件没登记进 manifest：{unexpected}"
 

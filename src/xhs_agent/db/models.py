@@ -227,6 +227,8 @@ class ChatMessage(Base):
 
     工具过程不单独建行：一个 assistant 消息的 `tool_calls` 里带齐本轮调了什么、结果与耗时。
     `run_id` 刻意**不加外键**——run 被删（例如素材回收站那类维护动作）不该动到历史消息。
+    `prompt_tokens` / `completion_tokens` 是本轮用量（supervisor + 工具内部调用 + 本轮分析），
+    S7.10 起与 `cost_cny` 一起落库。
     """
 
     __tablename__ = "chat_messages"
@@ -247,6 +249,9 @@ class ChatMessage(Base):
     cost_cny: Mapped[Decimal] = mapped_column(Numeric(10, 4), nullable=False,
                                               server_default=text("0"))
     latency_ms: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
+    prompt_tokens: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
+    completion_tokens: Mapped[int] = mapped_column(Integer, nullable=False,
+                                                   server_default=text("0"))
     error: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = _created_at()
 
@@ -256,5 +261,7 @@ class ChatMessage(Base):
                         name="status_allowed"),
         CheckConstraint("cost_cny >= 0", name="cost_non_negative"),
         CheckConstraint("latency_ms >= 0", name="latency_non_negative"),
+        CheckConstraint("prompt_tokens >= 0", name="prompt_tokens_non_negative"),
+        CheckConstraint("completion_tokens >= 0", name="completion_tokens_non_negative"),
         Index("ix_chat_messages_session_id_created_at", "session_id", "created_at"),
     )

@@ -788,6 +788,8 @@ export interface components {
             };
             run_id?: string | null;
             cost_cny?: number;
+            prompt_tokens?: number;
+            completion_tokens?: number;
             latency_ms?: number;
             error?: string;
             steps?: {
@@ -811,6 +813,8 @@ export interface components {
             };
             run_id?: string | null;
             cost_cny?: number;
+            prompt_tokens?: number;
+            completion_tokens?: number;
             latency_ms?: number;
             error?: string | null;
             /** Format: date-time */

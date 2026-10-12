@@ -114,7 +114,7 @@ def cfg(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> AppConfig:
         "[vision]\n"
         "enabled = true\n"
         'api_key_env = "MY_VISION_KEY"\n'
-        'model = "qwen-vl-max"\n'
+        'model = "qwen3-vl-plus"\n'
         "[embedding]\n"
         "enabled = true\n"
         f'model = "{MODEL}"\n'

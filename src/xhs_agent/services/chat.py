@@ -13,6 +13,8 @@
   （HTTP 语义留在 HTTP 层，与 `POST /api/hotspots/image-clue` 同一分工）；
 - 读消息时给每个附件补 `url`（`/api/chat/sessions/{id}/attachments/{message_id}/{index}`），
   前端可以直接当 `<img src>` 用；
+- 跨轮图片回落（S7.10）：用户说「上面那张图」时这一轮并没有附件，`latest_attachment` 取本会话
+  最近一张图片交给工具（与 `latest_run_id` 同一思路）；
 - `status=running` 的 assistant 行代表"这一轮还没跑完"；进程重启遗留的行由
   `mark_stale_turns` 在读会话时兜底标成 `interrupted`。
 """
@@ -36,6 +38,8 @@ CHAT_DIR_NAME = "_chat"
 TITLE_CHARS = 20
 DEFAULT_TITLE = "新对话"
 PREVIEW_CHARS = 60
+# `latest_attachment` 往回找几条消息（一张图可能夹在若干纯文字消息之后）
+LOOKBACK_MESSAGES = 20
 # 附件 URL 的固定前缀：`api/main.py` 的 API_PREFIX 是契约固定的 "/api"（ADR 0009），
 # 这里不 import 它——services 反向依赖 api 会成环。
 API_PREFIX = "/api"
@@ -138,6 +142,8 @@ def message_view(row: ChatMessage) -> dict[str, Any]:
         "run_id": str(row.run_id) if row.run_id else None,
         "cost_cny": float(row.cost_cny or 0),
         "latency_ms": int(row.latency_ms or 0),
+        "prompt_tokens": int(row.prompt_tokens or 0),
+        "completion_tokens": int(row.completion_tokens or 0),
         "error": row.error,
         "created_at": row.created_at.isoformat() if row.created_at else "",
     }
@@ -170,6 +176,27 @@ async def latest_run_id(session: AsyncSession, session_id: uuid.UUID) -> str:
         .order_by(ChatMessage.created_at.desc(), ChatMessage.id.desc())
         .limit(1))).scalar_one_or_none()
     return str(row) if row else ""
+
+
+async def latest_attachment(session: AsyncSession,
+                            session_id: uuid.UUID) -> dict[str, Any] | None:
+    """本会话最近一张图片附件（跨轮图片回落用，S7.10）。
+
+    用户说「上面那张图」时，这一轮并没有附件、模型也看不到早前的图片字节——由服务端兜底：
+    从最近的消息往回找第一张图片（最多看 `LOOKBACK_MESSAGES` 条），交给工具去解析。
+    没有就返回 None（工具按"这一轮没有图片"处理）。
+    """
+    rows = (await session.execute(
+        select(ChatMessage.attachments)
+        .where(ChatMessage.session_id == session_id,
+               func.jsonb_array_length(ChatMessage.attachments) > 0)
+        .order_by(ChatMessage.created_at.desc(), ChatMessage.id.desc())
+        .limit(LOOKBACK_MESSAGES))).scalars().all()
+    for attachments in rows:
+        for item in reversed(list(attachments or [])):
+            if str(item.get("kind") or "") == "image":
+                return dict(item)
+    return None
 
 
 async def list_sessions(session: AsyncSession, *, limit: int = 50,
@@ -240,7 +267,8 @@ async def append_message(session: AsyncSession, session_id: uuid.UUID, *, role: 
                          tool_calls: list[dict[str, Any]] | None = None,
                          prompt_versions: dict[str, int] | None = None,
                          run_id: str | None = None, cost_cny: float = 0.0,
-                         latency_ms: int = 0,
+                         latency_ms: int = 0, prompt_tokens: int = 0,
+                         completion_tokens: int = 0,
                          error: str | None = None) -> dict[str, Any] | None:
     """追加一条消息并刷新会话的 `updated_at`；会话不存在返回 None（接口层折 404）。
 
@@ -261,6 +289,8 @@ async def append_message(session: AsyncSession, session_id: uuid.UUID, *, role: 
         run_id=uuid.UUID(str(run_id)) if run_id else None,
         cost_cny=Decimal(f"{float(cost_cny or 0):.4f}"),
         latency_ms=int(latency_ms or 0),
+        prompt_tokens=int(prompt_tokens or 0),
+        completion_tokens=int(completion_tokens or 0),
         error=error,
     )
     session.add(row)
@@ -277,6 +307,8 @@ async def update_message(session: AsyncSession, message_id: uuid.UUID, *, conten
                          prompt_versions: dict[str, int] | None = None,
                          run_id: str | None = None, cost_cny: float | None = None,
                          latency_ms: int | None = None,
+                         prompt_tokens: int | None = None,
+                         completion_tokens: int | None = None,
                          error: str | None = None) -> dict[str, Any] | None:
     """更新一条消息（只改显式给了的字段）；不存在返回 None。"""
     row = (await session.execute(
@@ -298,6 +330,10 @@ async def update_message(session: AsyncSession, message_id: uuid.UUID, *, conten
         row.cost_cny = Decimal(f"{float(cost_cny):.4f}")
     if latency_ms is not None:
         row.latency_ms = int(latency_ms)
+    if prompt_tokens is not None:
+        row.prompt_tokens = int(prompt_tokens)
+    if completion_tokens is not None:
+        row.completion_tokens = int(completion_tokens)
     if error is not None:
         row.error = error
     await session.commit()

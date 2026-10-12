@@ -140,6 +140,11 @@ def dummy_factory() -> DummySession:
     return DummySession()
 
 
+async def no_recent_attachment(_session: Any, _session_id: uuid.UUID) -> None:
+    """假的本会话最近图片查询：这些用例用的是假会话，不碰库（S7.10 的回落由 chat 单测覆盖）。"""
+    return None
+
+
 class DummyEngine:
     def __init__(self) -> None:
         self.disposed = 0
@@ -293,6 +298,7 @@ async def test_start_turn_persists_terminal_message(cfg: AppConfig, fake_redis: 
 
     engine = DummyEngine()
     monkeypatch.setattr(chat_turns, "update_message", fake_update)
+    monkeypatch.setattr(chat_turns, "latest_attachment", no_recent_attachment)
     monkeypatch.setattr(chat_turns, "create_engine_from_config", lambda _cfg: engine)
     monkeypatch.setattr(chat_turns, "create_session_factory", lambda _engine: dummy_factory)
     monkeypatch.setattr(chat_turns, "build_turn_provider",
@@ -340,6 +346,7 @@ async def test_start_turn_marks_message_failed_on_crash(
 
     engine = DummyEngine()
     monkeypatch.setattr(chat_turns, "update_message", fake_update)
+    monkeypatch.setattr(chat_turns, "latest_attachment", no_recent_attachment)
     monkeypatch.setattr(chat_turns, "create_engine_from_config", lambda _cfg: engine)
     monkeypatch.setattr(chat_turns, "create_session_factory", lambda _engine: dummy_factory)
     monkeypatch.setattr(chat_turns, "build_turn_provider",

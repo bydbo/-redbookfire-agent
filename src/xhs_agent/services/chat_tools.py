@@ -3,8 +3,8 @@
 用途：把「对话层能做的事」写成工具——跑完整分析（第一批）、解析图片 / 查素材库 / 读历史运行
       （S7.7 只读三件）、预览爆点要素与缺口（S7.7b）、改写文案（S7.8）。
 输入：`ToolContext`（配置 / 会话 / 投递器 / 文本模型 caller / 可注入的连接池与 sleep）+ 工具参数 dict。
-输出：`ToolOutcome`（status / payload / steps / error / prompt_versions）——payload 既喂回给模型，
-      也落进 `chat_messages.tool_calls`。
+输出：`ToolOutcome`（status / payload / steps / error / prompt_versions / 用量）——payload 既喂回
+      给模型，也落进 `chat_messages.tool_calls`。
 
 口径：
 
@@ -21,13 +21,18 @@
 - **`run_id` 可省**（`read_run` / `revise_draft`）：不传就落到本会话**最近一次**运行产出的
   那个（`services/chat.py::latest_run_id`）——装配给模型的历史只有消息正文，工具返回值里的 id
   它看不到，用户说「上次那批」「刚才那版」时只能由服务端兜底（S7.9 冒烟实测到这条）；
+- **跨轮图片回落**（S7.10）：这一轮没有附件时，图片类工具用 `ToolContext.recent_attachment`
+  （本会话最近一张图，`services/chat.py::latest_attachment`）——用户说「上面那张图」才用得上。
+  `run_hotspot_analysis` **只在热点文本为空时**才用它，避免拿旧图线索去跑一条新热点；
 - 有图片附件时先走 S6.6 的 `parse_image_clue`（多模态），把解析出的线索作为**预置线索**
   随 `submit_analysis(clues=...)` 提交——拆解节点短路，不重复付费（S6.7）；
 - 分析在 Celery worker 跑，本工具只等结果：轮询 `runs`（ADR 0011：库是权威源），
   上限 `[queue].task_time_limit_s`；同一 session 里轮询前必须 `expire_all()`，否则读到旧对象；
-- **成本记账**：文本模型调用的成本取 `StructuredCaller.records` 的增量，写进
-  `payload["cost_cny"]`（由对话图累加进本轮成本）；多模态图片解析仍按 S6.6 口径**不计成本**；
-  `read_run` 不花钱；
+- **成本与用量记账**：文本模型调用的成本/用量取 `StructuredCaller.records` 的增量，写进
+  `payload["cost_cny"]` 与 `payload["prompt_tokens"] / ["completion_tokens"]`，同时落到
+  `ToolOutcome` 的用量字段（由对话图累加进这一轮）；**S7.10 起多模态图片解析也计入**
+  （S6.6 的「图片解析不计成本」临时口径作废，单价在 `[vision]`）；
+  分析工具的用量取那次 run 的 `totals`；`read_run` 不花钱；
 - 参数不合法 / 上游失败一律返回 `status=failed` + 一句能直接回给用户的原因，不抛异常
   （抛出去会触发节点重试，可能重复付费）。
 """
@@ -246,11 +251,13 @@ ToolHandler = Callable[..., Awaitable["ToolOutcome"]]
 
 @dataclass(frozen=True)
 class ClueRecord:
-    """一次热点拆解的结果 + 它的 prompt 版本与这次花的钱。"""
+    """一次热点拆解的结果 + 它的 prompt 版本与这次的用量。"""
 
     clue: HotspotClue
     version: int
     cost_cny: float = 0.0
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
 
 
 @dataclass
@@ -275,6 +282,8 @@ class ToolContext:
     sleep: Callable[[float], Awaitable[None]] = asyncio.sleep
     poll_interval_s: float = 1.5
     max_wait_s: float | None = None          # None = 取 [queue].task_time_limit_s
+    # 本会话最近一张图片附件（跨轮图片回落，S7.10）；运行器注入，离线测试直接给假实现
+    recent_attachment: dict[str, Any] | None = None
 
 
 @dataclass
@@ -313,6 +322,13 @@ def _records_cost(caller: StructuredCaller, before: int) -> float:
     """取 `StructuredCaller` 这次调用新增的成本（records 的增量）。"""
     return round(sum(float(item.get("cost_cny") or 0.0)
                      for item in caller.records[before:]), 4)
+
+
+def _records_tokens(caller: StructuredCaller, before: int) -> tuple[int, int]:
+    """取 `StructuredCaller` 这次调用新增的 token 用量（records 的增量）。"""
+    window = caller.records[before:]
+    return (sum(int(item.get("prompt_tokens") or 0) for item in window),
+            sum(int(item.get("completion_tokens") or 0) for item in window))
 
 
 def _element_view(element: Element) -> dict[str, Any]:
@@ -375,13 +391,15 @@ async def _clue_for(ctx: ToolContext, text: str) -> ClueRecord:
     """拆解热点（同一轮内同一段文本只拆一次）；缓存命中时本次成本记 0。"""
     cached = ctx.cache.clues.get(text)
     if cached is not None:
-        return replace(cached, cost_cny=0.0)
+        return replace(cached, cost_cny=0.0, prompt_tokens=0, completion_tokens=0)
     if ctx.caller is None:                       # pragma: no cover - 运行器总会注入
         raise LLMError("对话工具缺少文本模型 caller")
     before = len(ctx.caller.records)
     outcome = await extract_clue(text, ctx.caller)
+    prompt_tokens, completion_tokens = _records_tokens(ctx.caller, before)
     record = ClueRecord(clue=outcome.value, version=int(outcome.version or 1),
-                        cost_cny=_records_cost(ctx.caller, before))
+                        cost_cny=_records_cost(ctx.caller, before),
+                        prompt_tokens=prompt_tokens, completion_tokens=completion_tokens)
     ctx.cache.clues[text] = record
     return record
 
@@ -410,11 +428,16 @@ async def _resolve_run_id(ctx: ToolContext, raw: str) -> tuple[str, str]:
 
 async def _image_clue_for(ctx: ToolContext, attachment: dict[str, Any],
                           ) -> tuple[ImageClueParse, int]:
-    """解析图片（同一轮内同一张图只解析一次）；返回（解析结果，prompt 版本）。"""
+    """解析图片（同一轮内同一张图只解析一次）；返回（解析结果，prompt 版本）。
+
+    缓存命中时把用量清零（与 `_clue_for` 同一口径）：钱只在真正发生的那一次调用上记，
+    「先解析图片、再跑完整分析」这类同轮组合不会把一次多模态调用记两遍。
+    """
     key = str(attachment.get("path") or "")
     cached = ctx.cache.image_clues.get(key) if key else None
     if cached is not None:
-        return cached
+        parsed, version = cached
+        return replace(parsed, cost_cny=0.0, prompt_tokens=0, completion_tokens=0), version
     data, mime = await _read_image(ctx, attachment)
     parsed = await parse_image_clue(ctx.cfg, data, mime, http=ctx.http)
     version = int(parsed.prompt_versions.get(IMAGE_CLUE_TASK) or 1)
@@ -447,6 +470,12 @@ async def run_hotspot_analysis(ctx: ToolContext, args: dict[str, Any], *,
     versions: dict[str, int] = {}
     clue: dict[str, Any] | None = None
     image: dict[str, Any] | None = attachments[0] if attachments else None
+    # 跨轮图片回落（S7.10）：这一轮没带图、用户也没给热点文本时才用本会话最近那张图——
+    # 有热点文本时绝不混入旧图，否则会拿旧图的线索去跑一条新热点
+    if image is None and not text:
+        image = ctx.recent_attachment
+    image_cost = 0.0
+    image_tokens = (0, 0)
     if image is not None:
         await progress("解析图片")
         try:
@@ -455,6 +484,8 @@ async def run_hotspot_analysis(ctx: ToolContext, args: dict[str, Any], *,
             return ToolOutcome(status="failed", steps=steps,
                                error=f"图片没能解析出来：{_reason(exc)}")
         versions[IMAGE_CLUE_TASK] = image_version
+        image_cost = float(parsed.cost_cny or 0.0)
+        image_tokens = (int(parsed.prompt_tokens), int(parsed.completion_tokens))
         clue = parsed.clue.to_dict()
         if not text:
             text = parsed.raw_text.strip()
@@ -486,8 +517,13 @@ async def run_hotspot_analysis(ctx: ToolContext, args: dict[str, Any], *,
                            prompt_versions=versions)
 
     await progress("完成", 100, 100)
+    summary = await _summarise(ctx, submission.run_id, text)
+    # 这一轮的用量 = 分析那次 run 的用量 + 图片解析的用量（S7.10：图片解析不再"不计成本"）
+    summary["cost_cny"] = round(float(summary.get("cost_cny") or 0) + image_cost, 4)
+    summary["prompt_tokens"] = int(summary.get("prompt_tokens") or 0) + image_tokens[0]
+    summary["completion_tokens"] = int(summary.get("completion_tokens") or 0) + image_tokens[1]
     return ToolOutcome(status="succeeded", steps=steps,
-                       payload=await _summarise(ctx, submission.run_id, text),
+                       payload=summary,
                        prompt_versions=versions)
 
 
@@ -498,8 +534,11 @@ async def parse_clue_from_image(ctx: ToolContext, args: dict[str, Any], *,
     steps: list[dict[str, Any]] = []
     image: dict[str, Any] | None = attachments[0] if attachments else None
     if image is None:
+        image = ctx.recent_attachment          # 跨轮回落（S7.10）：用户说「上面那张图」时用得上
+    if image is None:
         return ToolOutcome(status="failed", steps=steps,
-                           error="这一轮没有图片附件，请让用户先发一张图")
+                           error="这一轮没有图片附件（本会话也没有早前的图片），"
+                                 "请让用户先发一张图")
     _step(steps, "解析图片")
     if on_progress is not None:
         await on_progress("解析图片", 0, 0)
@@ -508,7 +547,10 @@ async def parse_clue_from_image(ctx: ToolContext, args: dict[str, Any], *,
     except (ApiError, LLMError, EmbeddingError) as exc:
         return ToolOutcome(status="failed", steps=steps,
                            error=f"图片没能解析出来：{_reason(exc)}")
-    payload = {"raw_text": parsed.raw_text, "elements": _elements_of(parsed.clue)}
+    payload = {"raw_text": parsed.raw_text, "elements": _elements_of(parsed.clue),
+               "cost_cny": float(parsed.cost_cny or 0.0),
+               "prompt_tokens": int(parsed.prompt_tokens),
+               "completion_tokens": int(parsed.completion_tokens)}
     return ToolOutcome(status="succeeded", steps=steps, payload=payload,
                        prompt_versions={IMAGE_CLUE_TASK: version})
 
@@ -555,6 +597,8 @@ async def search_materials(ctx: ToolContext, args: dict[str, Any], *,
         "candidates": [_candidate_view(item)
                        for item in candidates[:CANDIDATE_PREVIEW_LIMIT]],
         "cost_cny": record.cost_cny,
+        "prompt_tokens": record.prompt_tokens,
+        "completion_tokens": record.completion_tokens,
     }
     await progress("完成", 100, 100)
     return ToolOutcome(status="succeeded", steps=steps, payload=payload,
@@ -625,6 +669,8 @@ async def preview_element_coverage(ctx: ToolContext, args: dict[str, Any], *,
         "note": ("这一步只做要素拆解与覆盖估算，**不产出候选素材**；"
                  "要看具体候选请调 search_materials，要完整分析与文案请调 run_hotspot_analysis"),
         "cost_cny": record.cost_cny,
+        "prompt_tokens": record.prompt_tokens,
+        "completion_tokens": record.completion_tokens,
     }
     await progress("完成", 100, 100)
     return ToolOutcome(status="succeeded", steps=steps, payload=payload,
@@ -704,6 +750,7 @@ async def revise_draft(ctx: ToolContext, args: dict[str, Any], *,
         return ToolOutcome(status="failed", steps=steps, error=f"改写失败：{_reason(exc)}")
 
     cost = _records_cost(ctx.caller, before)
+    prompt_tokens, completion_tokens = _records_tokens(ctx.caller, before)
     result = outcome.value
     assert isinstance(result, ReviseOutcome)      # 由 `revise_agent` 保证
     versions = {REVISE_TASK: int(outcome.version or 1)}
@@ -712,12 +759,15 @@ async def revise_draft(ctx: ToolContext, args: dict[str, Any], *,
         return ToolOutcome(status="succeeded", steps=steps,
                            payload={"run_id": raw_run, "hotspot_index": index,
                                     "refused": True, "reason": result.reason,
-                                    "cost_cny": cost},
+                                    "cost_cny": cost, "prompt_tokens": prompt_tokens,
+                                    "completion_tokens": completion_tokens},
                            prompt_versions=versions)
     revised = result.draft.to_dict() if result.draft is not None else {}
     return ToolOutcome(status="succeeded", steps=steps,
                        payload={"run_id": raw_run, "hotspot_index": index,
-                                "refused": False, "revised": revised, "cost_cny": cost},
+                                "refused": False, "revised": revised, "cost_cny": cost,
+                                "prompt_tokens": prompt_tokens,
+                                "completion_tokens": completion_tokens},
                        prompt_versions=versions)
 
 
@@ -774,6 +824,8 @@ async def _summarise(ctx: ToolContext, run_id: str, hotspot: str) -> dict[str, A
         "draft_titles": [item.get("text") for item in (draft.get("titles") or [])][:3],
         "has_draft": bool(draft),
         "cost_cny": float(totals.get("cost_cny") or 0),
+        "prompt_tokens": int(totals.get("prompt_tokens") or 0),
+        "completion_tokens": int(totals.get("completion_tokens") or 0),
         "latency_ms": int(totals.get("latency_ms") or 0),
     }
 
@@ -801,6 +853,8 @@ def _run_summary(detail: dict[str, Any]) -> dict[str, Any]:
         "created_at": detail.get("created_at"),
         "totals": {"llm_calls": totals.get("llm_calls"),
                    "cost_cny": float(totals.get("cost_cny") or 0),
+                   "prompt_tokens": int(totals.get("prompt_tokens") or 0),
+                   "completion_tokens": int(totals.get("completion_tokens") or 0),
                    "latency_ms": int(totals.get("latency_ms") or 0)},
         "prompt_versions": detail.get("prompt_versions") or {},
         "hotspots": hotspots,

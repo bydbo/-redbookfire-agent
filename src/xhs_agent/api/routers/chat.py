@@ -51,6 +51,9 @@ from ..models import (
 router = APIRouter(tags=["对话"], dependencies=[Depends(request_id_header)])
 
 _READ_CHUNK_BYTES = 1024 * 1024
+# 装配历史时从库里往回读的上限（真裁剪按 `[chat].history_token_budget` 在
+# `agents/supervisor.py::assemble_history` 里做；这里读一个够大的窗口即可）
+_HISTORY_SCAN_LIMIT = 200
 
 
 def _uuid(raw: str, *, what: str) -> uuid.UUID:
@@ -138,7 +141,7 @@ async def post_chat_message(
     if len(body) > 500:
         raise BadRequestError("热点原文（这一条消息）不能超过 500 字", {"chars": len(body)})
 
-    detail = await load_session(session, chat_id, limit=cfg.chat.history_max_messages)
+    detail = await load_session(session, chat_id, limit=_HISTORY_SCAN_LIMIT)
     if detail is None:
         raise NotFoundError(f"会话不存在：{session_id}", {"session_id": session_id})
 
@@ -155,8 +158,12 @@ async def post_chat_message(
         attachments.append(saved)
         note = f"1 张图片（{saved['name']}，{saved['mime']}）"
 
-    history = [{"role": item["role"], "content": item["content"]}
-               for item in detail["messages"] if item.get("content")]
+    # 原样交给装配器：带 tool_calls（模型据此拿到 run_id）与 attachments（提示"早前传过图"）。
+    # 只读本会话的消息 → 跨会话天然不串味（S7.10）。
+    history = [{"role": item["role"], "content": item["content"],
+                "tool_calls": item.get("tool_calls") or [],
+                "attachments": item.get("attachments") or []}
+               for item in detail["messages"]]
     await append_message(session, chat_id, role="user", content=body,
                          attachments=attachments)
     assistant = await append_message(session, chat_id, role="assistant", status="running")

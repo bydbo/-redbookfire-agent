@@ -226,7 +226,7 @@ class TestChatApi:
         assert assistant["content"] == "跑了完整分析，命中 5 条。"
         assert assistant["run_id"] == RUN_ID
         assert assistant["cost_cny"] == pytest.approx(0.054)
-        assert assistant["prompt_versions"] == {"chat_supervisor": 2}
+        assert assistant["prompt_versions"] == {"chat_supervisor": 3}
         entry = assistant["tool_calls"][0]
         assert entry["tool"] == TOOL_RUN_ANALYSIS and entry["status"] == "succeeded"
         assert entry["run_id"] == RUN_ID and entry["args"] == {"hotspot": "夜跑", "topk": 5}
@@ -339,3 +339,61 @@ class TestChatApi:
         # 附件取回：下标越界 / 消息不属于该会话 / 文件不存在
         assert client.get(f"/api/chat/sessions/{session_id}/attachments/"
                           f"{uuid.uuid4()}/0").status_code == 404
+
+
+class TestMemoryAndUsage:
+    """多轮记忆与轮级用量（S7.10）：跨会话不串味、跨轮图片回落、tokens 落库。"""
+
+    def test_usage_is_persisted_on_the_message(self, client: TestClient,
+                                               provider: ScriptedProvider) -> None:
+        provider.steps = [{"text": "把热点文字发我，或者丢张图。"}]
+        session_id = new_session(client)
+
+        client.post(f"/api/chat/sessions/{session_id}/messages", data={"text": "你好"})
+
+        assistant = client.get(f"/api/chat/sessions/{session_id}").json()["messages"][-1]
+        assert assistant["status"] == "succeeded"
+        # ScriptedProvider 每次回 10 / 5
+        assert (assistant["prompt_tokens"], assistant["completion_tokens"]) == (10, 5)
+        assert assistant["cost_cny"] == pytest.approx(0.002)
+
+    def test_history_does_not_leak_across_sessions(self, client: TestClient,
+                                                   provider: ScriptedProvider) -> None:
+        provider.steps = [{"text": "收到"}, {"text": "好的"}]
+        first = new_session(client)
+        client.post(f"/api/chat/sessions/{first}/messages", data={"text": "甲会话的暗号ZZZ"})
+        second = new_session(client)
+        client.post(f"/api/chat/sessions/{second}/messages", data={"text": "乙会话开始"})
+
+        seen = "\n".join(str(item.get("content")) for item in provider.calls[-1].messages)
+        assert "甲会话的暗号ZZZ" not in seen            # 只装配本会话的消息
+        assert "乙会话开始" in seen
+
+    def test_recent_attachment_is_passed_to_the_runner(
+            self, client: TestClient, provider: ScriptedProvider,
+            monkeypatch: pytest.MonkeyPatch) -> None:
+        """第二轮说「上面那张图」时，运行器要拿到本会话最近那张图（S7.10 的跨轮回落）。"""
+        captured: list[dict[str, Any]] = []
+
+        def fake_builder(_session: Any, **kwargs: Any) -> FakeToolRunner:
+            # `build_tool_runner` 是**同步**调用（不 await）——写成 async 会拿到一个从未被 await
+            # 的协程，`captured` 永远为空（S7.12 集成跑第一遍就踩到）。
+            captured.append(kwargs)
+            return FakeToolRunner(ToolOutcome(status="succeeded", payload={}))
+
+        monkeypatch.setattr(chat_turns, "build_tool_runner", fake_builder)
+        provider.steps = [{"text": "图我收到了"}, {"text": "就是刚才那张图"}]
+        session_id = new_session(client)
+
+        client.post(f"/api/chat/sessions/{session_id}/messages", data={"text": "看看这张"},
+                    files={"file": ("热点.png", PNG, "image/png")})
+        client.post(f"/api/chat/sessions/{session_id}/messages", data={"text": "上面那张图"})
+
+        # 第一轮：这张图既是本轮附件、也已经是「本会话最近一张图」——接口先落库用户消息（含附件）
+        # 再起 turn，所以回落在同一轮里也查得到它
+        assert captured[0]["attachments"][0]["name"] == "热点.png"
+        assert captured[0]["recent_attachment"]["name"] == "热点.png"
+        # 第二轮没有附件：回落仍然拿得到上一轮那张图（S7.10 的修复点）
+        assert captured[1]["attachments"] == []
+        recent = captured[1]["recent_attachment"]
+        assert recent is not None and recent["name"] == "热点.png"

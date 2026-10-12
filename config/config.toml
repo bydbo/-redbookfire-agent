@@ -30,14 +30,18 @@ price_in_per_m = 2.16
 price_out_per_m = 8.64
 
 [vision]
-# 多模态打标开关：打开即要求 api_key_env 指向的密钥；E2 接入工作流后再打开
-enabled = false
+# 多模态打标开关：打开即要求 api_key_env 指向的密钥。
+# 开启后同时启用两条链路：图片热点解析（S6.6）与素材关键帧打标（后者还需机器有 ffmpeg）。
+enabled = true
 base_url = "https://dashscope.aliyuncs.com/compatible-mode/v1"
-model = "qwen-vl-max"
+model = "qwen3-vl-plus"                # qwen-vl-max / qwen-vl-plus 已被上游下线（404），实测可用的是它
 api_key_env = "DASHSCOPE_API_KEY"
 max_frames = 3
 max_width = 720
 timeout_s = 60                       # 独立于 [llm].timeout_s，按多模态调用自行设定
+# 成本估算单价（元/百万 token）：图片解析的用量按这两个单价计入对话轮级成本（S7.10）
+price_in_per_m = 3.0
+price_out_per_m = 9.0
 
 [embedding]
 # 语义召回：默认启用（向量召回是产品主线）；打开即要求 api_key_env 指向的密钥。
@@ -107,5 +111,6 @@ allowed_extensions = [
 # 以及「跑着的这一轮多久算中断」（API 重启等场景，读会话时兜底标记）。
 max_tool_rounds = 3
 attachment_max_mb = 10
-history_max_messages = 20
+history_max_messages = 20            # 历史里保留原文的最近消息条数（更早的降级成摘要）
+history_token_budget = 6000          # 历史部分的 token 预算（粗估）；超了先摘要、再裁剪（S7.10）
 turn_stale_seconds = 300

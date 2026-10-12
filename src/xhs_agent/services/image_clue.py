@@ -3,12 +3,14 @@
 用途：给 `POST /api/hotspots/image-clue` 用。返回的线索**不落库**——用户确认（可编辑）后
       随 `POST /api/analyze` 的 `clues` 字段提交（S6.7），那时才写进 `hotspots.clue`。
 输入：`AppConfig`、图片字节与按 magic bytes 认出的 MIME；`http` 可注入（测试复用一个连接池）。
-输出：`ImageClueParse`（`raw_text` / `clue` / `prompt_versions`）。
+输出：`ImageClueParse`（`raw_text` / `clue` / `prompt_versions` / 用量与成本）。
 
 口径：
 
 - `[vision].enabled = false` 或缺密钥 → `DependencyUnavailableError`（503，明确文案）；
   **不要求 ffmpeg**——图片不抽帧，直接进模型。
+- **成本按 `[vision].price_in_per_m` / `price_out_per_m` 折算**（S7.10 起不再"不计成本"）：
+  用量优先取上游 `usage`，缺失时按字符估算（下界）；结果里带回，由调用方算进对话轮级成本。
 - 上游 HTTP 失败 / 超时 / 返回不是 JSON / 缺少 `clue` / 线索结构不合 `HotspotClue` 契约 / 要素为空
   → `UpstreamError`（502）。**不重试**：`[vision]` 段没有重试预算，用户点「重解析」就是显式重试。
 - 图片本身只在这一个函数里变成模型输入，**不落盘、不入库**。
@@ -28,7 +30,12 @@ from ..core.errors import DependencyUnavailableError, UpstreamError
 from ..schemas import HotspotClue, SchemaError
 from ..tools import prompt as prompt_tool
 from ..tools.http import build_http_client
-from ..tools.vision import VisionError, build_image_client, images_ready
+from ..tools.vision import (
+    ImageCompletion,
+    VisionError,
+    build_image_client,
+    images_ready,
+)
 from ..util import extract_json
 
 TASK_ID = "image_hotspot_clue"
@@ -42,6 +49,16 @@ class ImageClueParse:
     raw_text: str
     clue: HotspotClue
     prompt_versions: dict[str, int] = field(default_factory=dict)
+    # S7.10：图片解析也算轮级成本——用量优先取上游 usage，缺失时按字符估算（下界）
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+    cost_cny: float = 0.0
+
+
+def _cost_cny(cfg: AppConfig, completion: ImageCompletion) -> float:
+    """按 `[vision]` 的单价把用量折成人民币元（与 `tools/llm.py` 同一记账口径）。"""
+    return round(completion.prompt_tokens / 1_000_000 * cfg.vision.price_in_per_m
+                 + completion.completion_tokens / 1_000_000 * cfg.vision.price_out_per_m, 4)
 
 
 @asynccontextmanager
@@ -70,11 +87,12 @@ async def parse_image_clue(cfg: AppConfig, data: bytes, mime: str, *,
         if api is None:   # pragma: no cover - images_ready 已经拦过一遍，这里只是兜底
             raise DependencyUnavailableError("图片热点解析未启用：缺少可用的多模态客户端")
         try:
-            text = await api.complete(rendered, data, mime)
+            completion = await api.complete(rendered, data, mime)
         except VisionError as exc:
             raise UpstreamError(f"图片解析失败：{exc}",
                                 {"detail": str(exc)[:200]}) from exc
 
+    text = completion.text
     payload = _parse_payload(text)
     raw_text = str(payload.get("raw_text") or "").strip()
     if not raw_text:
@@ -93,7 +111,10 @@ async def parse_image_clue(cfg: AppConfig, data: bytes, mime: str, *,
         # 没有要素的"热点"检索不出任何素材，按上游失败处理（不返回半成品）
         raise UpstreamError("图片解析失败：模型没有给出任何爆点要素")
     return ImageClueParse(raw_text=raw_text, clue=clue,
-                          prompt_versions={rendered.task_id: rendered.version})
+                          prompt_versions={rendered.task_id: rendered.version},
+                          prompt_tokens=completion.prompt_tokens,
+                          completion_tokens=completion.completion_tokens,
+                          cost_cny=_cost_cny(cfg, completion))
 
 
 def _parse_payload(text: str) -> dict[str, Any]:

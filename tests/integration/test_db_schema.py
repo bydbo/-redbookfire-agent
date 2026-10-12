@@ -53,7 +53,8 @@ COLUMN_SPECS: dict[str, dict[str, str]] = {
         "id": "uuid", "session_id": "uuid", "role": "text", "content": "text",
         "status": "text", "attachments": "jsonb", "tool_calls": "jsonb",
         "prompt_versions": "jsonb", "run_id": "uuid", "cost_cny": "numeric",
-        "latency_ms": "int4", "error": "text", "created_at": "timestamptz",
+        "latency_ms": "int4", "prompt_tokens": "int4", "completion_tokens": "int4",
+        "error": "text", "created_at": "timestamptz",
     },
 }
 

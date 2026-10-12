@@ -15,7 +15,7 @@ ALL_TASKS = (*AGENT_TASKS, "material_tagging", "image_hotspot_clue")
 PLACEHOLDER_MARKERS = ("待 S3.1 填写", "待填写")
 # 版本号只随内容变更递增（prompt 契约 §三 / §六）——钉住当前值，顺手改正文却忘了升版本会被挡下
 EXPECTED_VERSIONS = {"hotspot_clue": 1, "material_select": 1, "copy_draft": 1,
-                     "chat_supervisor": 2, "copy_revise": 1}
+                     "chat_supervisor": 3, "copy_revise": 1}
 CONTRACT_PATH = (Path(__file__).resolve().parents[2]
                  / "docs" / "contracts" / "prompt契约.md")
 
@@ -72,3 +72,43 @@ class TestToolCatalog:
         """契约只登记"有什么"，schema 的唯一来源必须是代码——这句不能丢。"""
         section = CONTRACT_PATH.read_text(encoding="utf-8").split("**对话工具清单", 1)[1]
         assert "services/chat_tools.py" in section and "不复制" in section
+
+
+class TestCapabilityCatalog:
+    """机读能力清单（S7.11）：唯一来源，且必须真的被 `chat_supervisor` 用上。"""
+
+    def test_three_categories_in_contract_order(self):
+        payload = prompt_tool.load_capabilities()
+        assert [item["id"] for item in payload["categories"]] == \
+            list(prompt_tool.CAPABILITY_CATEGORIES)
+        assert [item["title"] for item in payload["categories"]] == \
+            ["能力内", "边界外可引导", "合规红线"]
+
+    def test_red_line_refuses_and_forbids_workarounds(self):
+        """红线话术必须拒绝 + 不给绕过写法（拼音/缩写/谐音都算绕过）。"""
+        red = next(item for item in prompt_tool.load_capabilities()["categories"]
+                   if item["id"] == "compliance_red_line")
+        assert "不能做" in red["reply"]
+        assert "绕过" in red["reply"]
+
+    def test_guidable_category_offers_an_alternative(self):
+        """边界外可引导：要说清"不在范围内"，也要给出替代路径。"""
+        item = next(item for item in prompt_tool.load_capabilities()["categories"]
+                    if item["id"] == "out_of_scope_guidable")
+        assert "不在这套工具的能力范围内" in item["reply"]
+        assert "我能做的是" in item["reply"]
+
+    def test_capabilities_are_not_a_prompt_task(self):
+        """它是数据资产：不进 `available_tasks()`（只扫 `.md`），否则会被当成缺五段的 prompt。"""
+        assert prompt_tool.CAPABILITIES_NAME.endswith(".json")
+        assert prompt_tool.CAPABILITIES_NAME[:-5] not in prompt_tool.available_tasks()
+
+    def test_supervisor_injects_the_catalog(self):
+        rendered = prompt_tool.render("chat_supervisor",
+                                      capabilities=prompt_tool.render_capabilities())
+        both = rendered.system + rendered.user
+        for item in prompt_tool.load_capabilities()["categories"]:
+            assert item["title"] in both
+            assert item["reply"] in both
+        # §01 System 段必须声明界限来源在清单上（契约要求的"System 段引用它"）
+        assert "能力清单" in rendered.system

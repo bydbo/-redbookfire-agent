@@ -3,7 +3,7 @@
 > 这份文档是给人看的：怎么和 AI 一起开发这个项目，规则放在哪，密钥怎么管。
 > 给 AI 看的硬规则在根目录 `AGENTS.md`，两者职责不同。
 
-## 一、规范体系的四份文件
+## 一、规范体系
 
 | 文件 | 给谁看 | 作用 |
 | --- | --- | --- |
@@ -12,8 +12,11 @@
 | `docs/项目结构.md` | 人 + AI | 目录树与每个目录的职责边界 |
 | `docs/技术栈.md` | 人 + AI | 当前技术栈、依赖清单与规划中的演进 |
 | `docs/AI开发说明.md` | 人 | 本文件：协作方式、提需求模板、密钥操作 |
+| `docs/contracts/` | 人 + AI | 五份契约（API / 数据 / 检索 / 配置 / prompt），**唯一事实源** |
 
-冲突时的优先级：`AGENTS.md` > `docs/开发规范.md` > 其他文档。
+冲突时的优先级：`AGENTS.md` > `docs/开发规范.md` > `docs/contracts/` > 其他文档。
+
+**产品类文档（`docs/产品方案.md`、`docs/产品方案-业务版.md`、`docs/简历与面试.md`、`docs/评测集.md`、`docs/backlog.md`）不属于规范体系**，但同样是事实源的一部分：改代码导致口径变化时必须同步它们，否则会出现"文档说的和代码做的不是一回事"。
 
 **只保留一份 `AGENTS.md`（在仓库根）。** 不要给子目录另建 AGENTS.md——多处规则一定会互相矛盾，最后没人知道听谁的。
 
@@ -34,14 +37,14 @@
 
 **可以自由读**：`src/`、`tests/`、`docs/`、`config/config.toml`、`config/.env.example`、`pyproject.toml`、`README.md`、`AGENTS.md`。
 
-**改之前先说清楚**：`docs/contracts/`（数据与接口契约，改它会牵动多处）、`src/xhs_agent/models/`（P1 之前为 `schemas.py`，内存实现）、`pyproject.toml`（依赖）、`AGENTS.md`（规范本身）。
+**改之前先说清楚**：`docs/contracts/`（五份契约，改它会牵动多处）、`src/xhs_agent/schemas.py`（内存契约实现）、`src/xhs_agent/db/models.py`（ORM 映射）、`pyproject.toml`（依赖）、`AGENTS.md`（规范本身）。
 
 **原则上不碰**：
 
 - `config/.env`（真实密钥，改动需由你本人操作）
 - `data/materials/`（你的真实素材，只读）
 - `runs/`（运行产物，可随时重建）
-- `docs/产品方案.md`、`docs/简历与面试.md`（面向外部读者，措辞需你确认）
+- `docs/产品方案.md`、`docs/产品方案-业务版.md`、`docs/简历与面试.md`（面向外部读者，措辞需你确认）
 
 ## 四、规则怎么复用（减少反复猜测）
 
@@ -62,7 +65,8 @@ Copy-Item config/.env.example config/.env
 
 # 2. 编辑 config/.env，填入真实密钥
 #    DEEPSEEK_API_KEY=xxx
-#    DASHSCOPE_API_KEY=xxx        # 仅在使用多模态打标或向量召回时需要，见 docs/contracts/配置契约.md
+#    DASHSCOPE_API_KEY=xxx        # 向量（[embedding].enabled 默认开启）与多模态打标的密钥；
+#                                 # 只要这两项里有任一启用就是必填，口径见 docs/contracts/配置契约.md §2.1.1
 
 # 3. 确认它确实被忽略了（应输出匹配到的忽略规则）
 git check-ignore -v config/.env
@@ -85,9 +89,9 @@ uv run python -m xhs_agent.probe
 1. **不要单独移动 `src/`、`config/`、`data/`、`runs/` 中的任何一个。** 工程根是靠 `src/xhs_agent/config.py` 上溯三层算出来的，拆开之后不会报错，只会静默用错路径。
 2. **示例素材包放 `evals/fixtures/demo_pack/`，不要放 `data/materials/`。** 后者整个目录被忽略规则挡住，放进去了也不会进版本库。
 3. **`tests/unit/` 已有契约、配置与前置检查用例**，`uv run pytest` 应全绿；新增能力必须带用例（`tools/` 的行为回归见 `docs/backlog.md` 的 S1.4）。
-4. **加依赖要论证，不为省几行代码加，也不为凑简历关键词加。** 企业级组件（FastAPI、LangGraph、pgvector 等）已列入最终技术栈，按 `docs/技术栈.md` 第四节分阶段引入，并走 `AGENTS.md` 第 6 节流程。
+4. **加依赖要论证，不为省几行代码加，也不为凑简历关键词加。** 企业级组件（FastAPI、LangGraph、pgvector、Celery、Langfuse、OpenTelemetry 等）已按 `docs/技术栈.md` 第四节分阶段**落地完毕**，当前运行时依赖 18 项、开发依赖 12 项。再加任何依赖仍走 `AGENTS.md` 第 6 节流程。
 5. **项目不做运行时降级。** 缺 API 密钥、连不上数据库或队列时启动直接失败并报错——遇到“没密钥就跑不起来”不是 bug。
 6. **Docker Desktop 必须先启动**，数据库与队列都跑在容器里；C 盘只剩约 33 GB，建议把 Docker 镜像存储位置迁到 D 盘。
 7. **代理会拦截本地 HTTP，导致集成测试假失败。** 若本机开着代理工具（TUN/透明模式），跑 `uv run pytest -m integration` 时 `tests/integration/test_http_pool.py` 的 2 条用例会拿到 `502 Bad Gateway`（服务端收到请求数为 0）——透明代理解析了 loopback 的 HTTP，而 Postgres / Redis 这类裸 TCP 不受影响。**处置**：给代理加 loopback 直连规则，或跑集成本地 HTTP 用例前暂时关闭代理；判据是"沙箱内同一脚本返回 200、真实终端返回 502"。
 8. **前端是独立工具链**：在 `frontend/` 下用 pnpm 安装与构建；改了 `docs/contracts/openapi.yaml` 之后要重新生成 TS 类型，否则前端类型会与契约漂移。
-9. **启动前置检查在 `src/xhs_agent/probe.py`**：`uv run python -m xhs_agent.probe` 退出码 0 表示配置可用，退出码 2 表示配置错误（缺哪些变量、怎么补都会打印出来）。数据库、扩展、Alembic、Redis、前端 dist 的检查属于 S3.8，目前尚未实现。
+9. **启动前置检查在 `src/xhs_agent/probe.py`**（契约 §四 的 7 步，S3.8 起全部实现）：`uv run python -m xhs_agent.probe` 退出码 0 表示配置与依赖都可用，**2** 表示配置错误（缺哪些变量、怎么补都会打印出来），**3** 表示依赖不可用（数据库 / Redis / 扩展 / 迁移版本 / 前端 dist）。推荐用 `uv run python -m xhs_agent.serve` 启动——它先跑同一套检查、精确透传 2/3，再交给 uvicorn。

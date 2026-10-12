@@ -146,6 +146,24 @@ class TestTurn:
         assert runner.calls == []
 
     @pytest.mark.asyncio
+    async def test_turn_sums_tokens_from_supervisor_and_tools(self, tmp_path: Path) -> None:
+        """S7.10：轮级 tokens = supervisor 各次调用 + 工具内部模型调用（含图片解析/分析 run）。"""
+        cfg = write_config(tmp_path)
+        tools = FakeTools(ToolOutcome(
+            status="succeeded",
+            payload={"run_id": "r-1", "candidates": 5, "cost_cny": 0.05,
+                     "prompt_tokens": 700, "completion_tokens": 300},
+            steps=[{"stage": "完成", "done": 100, "total": 100, "at": "t"}]))
+        turn, _provider, _runner = await run(
+            cfg, steps=[{"text": "", "tool_calls": [tool_call()]}, {"text": "跑好了"}],
+            tools=tools)
+
+        # ScriptedProvider 每次回 10 / 5，两跳共 20 / 10；工具再贡献 700 / 300
+        assert (turn.prompt_tokens, turn.completion_tokens) == (720, 310)
+        assert turn.tool_calls[0]["prompt_tokens"] == 700
+        assert turn.tool_calls[0]["completion_tokens"] == 300
+
+    @pytest.mark.asyncio
     async def test_tool_call_then_final_answer(self, tmp_path: Path) -> None:
         cfg = write_config(tmp_path)
         events = Events()
@@ -279,7 +297,7 @@ class TestTurn:
 FAKE_TOOL = "fake_probe"
 FAKE_TASK = "fake_probe_task"
 # `chat_supervisor` 当前的 prompt 版本：prompt 升版时这条要跟着改（prompt 契约 §六 要求升版必跑回归）
-SUPERVISOR_VERSION = 2
+SUPERVISOR_VERSION = 3
 
 
 def register_fake_tool(monkeypatch: pytest.MonkeyPatch) -> list[dict[str, Any]]:

@@ -4,18 +4,29 @@
 - 五段：01 System / 02 Task / 03 Constraints / 04 Examples / 05 Output Schema。
 - 组装：system = 01 System + 03 Constraints；user = 02 Task（渲染后）+ 04 Examples + 05 Output Schema。
 - 占位符 `{{name}}` **只在 02 Task 段生效**，其它段里出现的按字面文本处理。
+- 同目录另有**机读能力清单** `chat_capabilities.json`（S7.11）：它不是 prompt 资产、不进
+  `available_tasks()`，由 `load_capabilities()` / `render_capabilities()` 读写（ADR 0016）。
 - 未知 task_id / 缺段 / 缺变量 / requires 与实际占位符不符，一律抛 PromptError——
   不做静默降级（AGENTS.md 第 4 节，docs/contracts/prompt契约.md §四）。
 """
 
 from __future__ import annotations
 
+import json
 import re
 from dataclasses import dataclass
 from importlib import resources
+from typing import Any
 
 PACKAGE = "xhs_agent.prompts"
 SUFFIX = ".md"
+# 机读能力清单（S7.11）：三类边界，顺序即契约（ADR 0016）
+CAPABILITIES_NAME = "chat_capabilities.json"
+CAPABILITY_CATEGORIES: tuple[str, ...] = (
+    "in_scope",
+    "out_of_scope_guidable",
+    "compliance_red_line",
+)
 
 # 五段的顺序与标题必须逐字一致（契约 §三）
 SECTION_TITLES: tuple[str, ...] = (
@@ -165,3 +176,45 @@ def available_tasks() -> tuple[str, ...]:
         for entry in resources.files(PACKAGE).iterdir()
         if entry.name.endswith(SUFFIX)
     ))
+
+
+def load_capabilities() -> dict[str, Any]:
+    """读机读能力清单（`prompts/chat_capabilities.json`，S7.11）。
+
+    它**不是** prompt 资产：不进 `available_tasks()`（只扫 `.md`），是「测试可读 + 模型可见」
+    的单一来源——`chat_supervisor` 用 `{{ capabilities }}` 把它注入 §02 Task，评测脚本按
+    `category` 归类越界用例。格式不合契约直接抛 `PromptError`，不静默降级。
+    """
+    path = resources.files(PACKAGE).joinpath(CAPABILITIES_NAME)
+    try:
+        text = path.read_text(encoding="utf-8")
+    except FileNotFoundError as exc:
+        raise PromptError(f"未找到能力清单：{CAPABILITIES_NAME}") from exc
+    try:
+        payload = json.loads(text)
+    except ValueError as exc:
+        raise PromptError(f"能力清单不是合法 JSON（{exc}）") from exc
+    if not isinstance(payload, dict):
+        raise PromptError("能力清单的顶层必须是 JSON 对象")
+    categories = payload.get("categories")
+    if not isinstance(categories, list) or not categories:
+        raise PromptError("能力清单缺少 categories 数组")
+    ids = [str(item.get("id") or "") for item in categories if isinstance(item, dict)]
+    if tuple(ids) != CAPABILITY_CATEGORIES:
+        raise PromptError(
+            f"能力清单的三类边界必须逐项为 {list(CAPABILITY_CATEGORIES)}，实际是 {ids}")
+    for item in categories:
+        for key in ("title", "judge", "reply"):
+            if not str(item.get(key) or "").strip():
+                raise PromptError(f"能力清单的 {item.get('id')} 缺少 {key}")
+    return payload
+
+
+def render_capabilities(payload: dict[str, Any] | None = None) -> str:
+    """把能力清单渲染成注入 §02 Task 的确定性文本（无模板引擎）。"""
+    data = payload if payload is not None else load_capabilities()
+    lines = [f"【能力清单 v{data.get('version', '')} · 三类边界】"]
+    for index, item in enumerate(data.get("categories") or [], start=1):
+        lines.append(f"{index}. {item['title']} —— 判定：{item['judge']}")
+        lines.append(f"   固定话术：{item['reply']}")
+    return "\n".join(lines)

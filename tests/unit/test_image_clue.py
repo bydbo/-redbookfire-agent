@@ -19,7 +19,7 @@ from xhs_agent.config import AppConfig, load_config
 from xhs_agent.core.errors import DependencyUnavailableError, UpstreamError
 from xhs_agent.services import image_clue as image_clue_service
 from xhs_agent.services.image_clue import parse_image_clue
-from xhs_agent.tools.vision import sniff_image_mime
+from xhs_agent.tools.vision import ImageCompletion, sniff_image_mime
 
 # 三种受支持格式的最小字节头（内容本身不需要是真图片：校验只看 magic bytes）
 JPEG = b"\xff\xd8\xff\xe0" + b"\x00" * 64
@@ -40,7 +40,7 @@ CLUE_PAYLOAD: dict[str, Any] = {
 
 
 def build_config(tmp_path, monkeypatch, *, enabled: bool = True,
-                 key: str | None = "sk-vision", model: str = "qwen-vl-max") -> AppConfig:
+                 key: str | None = "sk-vision", model: str = "qwen3-vl-plus") -> AppConfig:
     """临时配置：`[vision]` 按需打开，密钥走自定义变量名（不读真实 config/.env）。"""
     toml_path = tmp_path / "config.toml"
     toml_path.write_text(
@@ -107,7 +107,7 @@ class TestParseImageClue:
 
         payload = capture["payload"]
         assert capture["url"].endswith("/chat/completions")
-        assert payload["model"] == "qwen-vl-max"
+        assert payload["model"] == "qwen3-vl-plus"
         assert payload["response_format"] == {"type": "json_object"}
         assert "不猜身份" in payload["messages"][0]["content"]        # 01+03 进了 system
         image_part = payload["messages"][1]["content"][1]
@@ -156,13 +156,16 @@ class TestParseImageClue:
 class FakeVisionClient:
     """假的多模态客户端：直接回一段预置 JSON（不碰网络）。"""
 
-    def __init__(self, text: str) -> None:
+    def __init__(self, text: str, prompt_tokens: int = 0, completion_tokens: int = 0) -> None:
         self.text = text
         self.calls = 0
+        self.prompt_tokens = prompt_tokens
+        self.completion_tokens = completion_tokens
 
-    async def complete(self, rendered, data: bytes, mime: str) -> str:
+    async def complete(self, rendered, data: bytes, mime: str) -> ImageCompletion:
         self.calls += 1
-        return self.text
+        return ImageCompletion(text=self.text, prompt_tokens=self.prompt_tokens,
+                               completion_tokens=self.completion_tokens)
 
 
 class TestImageClueEndpoint:
@@ -188,6 +191,20 @@ class TestImageClueEndpoint:
         assert body["prompt_versions"] == {"image_hotspot_clue": 1}
         assert body["clue"]["elements"][0]["type"] == "scene"
         assert fake.calls == 1
+
+    @pytest.mark.asyncio
+    async def test_image_parse_cost_is_charged_with_vision_prices(self, tmp_path, monkeypatch):
+        """S7.10：图片解析不再"不计成本"——用量按 `[vision].price_*` 折成人民币元。"""
+        cfg = build_config(tmp_path, monkeypatch)
+        fake = FakeVisionClient(json.dumps(CLUE_PAYLOAD, ensure_ascii=False),
+                                prompt_tokens=1_000_000, completion_tokens=1_000_000)
+        monkeypatch.setattr(image_clue_service, "build_image_client",
+                            lambda _cfg, *, client: fake)
+        parsed = await parse_image_clue(cfg, JPEG, "image/jpeg")
+        assert parsed.prompt_tokens == 1_000_000
+        assert parsed.completion_tokens == 1_000_000
+        # 3.0 + 9.0 元/百万 token（[vision] 默认单价）
+        assert parsed.cost_cny == pytest.approx(12.0)
 
     @pytest.mark.parametrize(("name", "data", "content_type"), [
         ("note.txt", b"hello world", "text/plain"),

@@ -39,7 +39,7 @@
 | `agents/` 与 `workflows/` 编排层 | ✅ 已完成（S3.1） |
 | 本地依赖编排（PostgreSQL 16 + pgvector、Redis，Docker Compose） | ✅ 已完成（S2.1） |
 | 集成测试基座（testcontainers + pytest-asyncio） | ✅ 已完成（S2.9） |
-| 数据库 ORM 与会话（五张表、14 条索引、向量列） | ✅ 已完成（S2.2） |
+| 数据库 ORM 与会话（七张表、14+ 条索引、向量列） | ✅ 已完成（S2.2；对话两表随 S7.2 追加） |
 | 素材索引入库 + 增量判断（`materials` 表 + 指纹增量 + 消失即删） | ✅ 已完成（S2.4） |
 | 向量回填（embedding 客户端 + `materials.embedding` / `embedding_model`） | ✅ 已完成（S2.5） |
 | 双通道召回 + RRF + 要素加权（素材检索服务） | ✅ 已完成（S2.6） |
@@ -58,7 +58,7 @@
 | Langfuse 调用追踪（运行 / 热点 / 模型调用三级，看得到 token·成本·延迟；缺键只告警不阻断） | ✅ 已完成（S4.2） |
 | OpenTelemetry 追踪（API 请求 → 数据库 → worker 模型调用连成一条 trace） | ✅ 已完成（S4.3） |
 | 多阶段 Docker 镜像 + 全栈 compose（`docker compose up` 一条命令起 api / worker / postgres / redis，含一次性迁移服务） | ✅ 已完成（S4.4） |
-| GitHub Actions CI（lint / typecheck / test + 镜像构建；覆盖率门槛 78%） | ✅ 已完成（S4.5） |
+| GitHub Actions CI（lint / typecheck / test + 镜像构建 + 前端；覆盖率门槛 78%） | ✅ 已完成（S4.5；frontend job 随 S5.9 加入） |
 | 契约一致性校验（`scripts/check_openapi.py`：FastAPI 导出的 OpenAPI 必须覆盖 `docs/contracts/openapi.yaml`，跑在 CI 的 test job 里） | ✅ 已完成（S4.6） |
 | Alembic 数据库迁移（唯一建表路径） | ✅ 已完成（S2.3） |
 | 评测集 v1 与示例素材包（七维度口径、版本冻结） | ✅ 已完成（S2.0） |
@@ -92,6 +92,10 @@
 | 拆解预览工具（S7.7b：`preview_element_coverage` 只做要素拆解 + **字面通道**覆盖估算，不调 embedding、不写稿、不落 `runs`；返回缺口与补拍建议，说明里写明"这一步不产出候选素材"） | ✅ 已完成（S7.7b） |
 | 改写文案工具（S7.8：新 prompt 资产 `copy_revise`（§03 逐字复用 `copy_draft` 的 12 条边界 + 越界必须拒绝）+ 工具 `revise_draft`；改后文案只回对话、**不覆盖 run 的初稿快照**） | ✅ 已完成（S7.8） |
 | 工具集测试与真机冒烟（S7.9：新增 `scripts/eval_chat_tools.py` 真模型工具选择评测（两臂对照，报告落 `evals/reports/chat-tools-*.md`）；`chat_supervisor` v1 → v2（能力边界改为以工具清单为准）并按 prompt 契约 §六 的对话类口径回归；真机 19/19：传图 + 问素材 → 完整分析 → 改写 → 刷新仍在，截图落 `runs/_smoke_s79/`） | ✅ 已完成（S7.9） |
+| 多轮记忆与上下文预算（S7.10：历史按 token 预算装配——最近 `[chat].history_max_messages` 条保留原文、更早的降级成摘要、超 `[chat].history_token_budget` 再裁剪并说明；工具摘要行带 `run_id`；跨轮图片回落 `latest_attachment`；`chat_messages` 加 `prompt_tokens` / `completion_tokens` + 迁移 **0005**；图片解析成本计入轮级成本） | ✅ 已完成（S7.10） |
+| 越界处理（S7.11：机读能力清单 `prompts/chat_capabilities.json` —— 能力内 / 边界外可引导 / 合规红线三类 + 固定话术，红线不给绕过写法；`chat_supervisor` §02 用 `{{ capabilities }}` 注入、prompt v3；新增 ADR 0016） | ✅ 已完成（S7.11） |
+| 越界与多轮评测 + 成本口径（S7.12：用例集 `evals/chat/cases.json`（工具选择 10 / 越界 10 / 多轮 5 / 改写 3），`scripts/eval_chat_tools.py` 扩成四节、判定全为确定性规则；轮级成本门槛 ≤ 0.25 元/轮（含一次分析），同步产品方案与 prompt 契约 §六） | ✅ 已完成（S7.12） |
+| 第三批文档收口（S7.13：产品方案补对话式入口与可复现边界、项目结构补对话模块与能力清单、技术栈路线图与各契约同步） | ✅ 已完成（S7.13） |
 
 业务链路**已端到端跑通**：`docker compose up -d --wait` 起依赖 → `uv run celery -A xhs_agent.tasks.worker:app worker` 起 worker → `uv run python -m xhs_agent.serve` 起接口（先跑 7 步启动前置检查）→ `POST /api/analyze` 投递 → worker 自动消费（索引新鲜度 → 五节点分析 → 逐热点写回）→ `/api/jobs/{job_id}` 轮询 → `/api/runs/{run_id}` 取结构化结果、`/report` 取报告。另可运行 `uv run python -m xhs_agent.probe`、`uv run python scripts/index_materials.py`、`uv run python scripts/backfill_embeddings.py`、`uv run python scripts/eval_retrieval.py`、`uv run python scripts/smoke_skeleton.py`。路线图见文末。
 
@@ -123,12 +127,12 @@
 | HTTP 客户端 | httpx（异步 + 连接池；文本模型与向量的统一传输，S3.5） |
 | Agent 编排 | LangGraph（状态图 + 检查点 + 失败重试） |
 | 数据库与缓存 | PostgreSQL 16 + pgvector 0.8.6、Redis 7.4.11（本地 `docker compose` 起，tag 固定） |
-| 数据访问 | SQLAlchemy 2.0 async ORM + asyncpg + pgvector（已落地，模型见 `src/xhs_agent/db/`）；Alembic 迁移待落地（S2.3） |
+| 数据访问 | SQLAlchemy 2.0 async ORM + asyncpg + pgvector（模型见 `src/xhs_agent/db/`）；Alembic 迁移已落地（S2.3，五个版本 `0001`–`0005`） |
 | 检索 | 混合召回：pg_trgm 字面 + pgvector 语义，RRF 融合后套要素加权 |
 | Embedding | 默认通义 text-embedding-v3（API）；本地小模型为可选实现 |
 | 队列与缓存 | Redis + Celery |
 | 可观测 | structlog（`console` / `json`）+ run_id 贯穿全链路 + Langfuse Cloud 调用追踪 + OpenTelemetry（ASGI 服务端 span、`xhs_agent.db` DB span、W3C 跨进程传播；默认只上报元数据，`LANGFUSE_CAPTURE_CONTENT=true` 才连提示词与正文） |
-| 容器化 / CI | Docker Compose（api / worker / postgres / redis 五服务）；GitHub Actions 四个 job（lint / typecheck / test / image） |
+| 容器化 / CI | Docker Compose（postgres / redis / migrate / api / worker 五服务）；GitHub Actions 五个 job（lint / typecheck / test / image / frontend） |
 | 代码质量 / 测试 | ruff + mypy + pre-commit + pytest-cov + pytest-asyncio + testcontainers（均已落地） |
 | 前端 | Vue 3 + Vite + TypeScript + Pinia + Vue Router（S5.1 已落地） |
 | UI 与可视化 | Naive UI + Tailwind CSS（S5.1 已落地；S5.7 起统一语义 token + 明/暗主题 + 毛玻璃，边界见 ADR 0013）+ ECharts 6.1（S5.5 已落地：覆盖度 / 得分分布 / 成本耗时三张图，S5.7 起跟随主题） |
@@ -263,7 +267,7 @@ uv run python -m xhs_agent.tasks.reconcile
 #      POST /api/analyze → db.submit_analysis → analyze → hotspot-1 → 3 个模型 generation。
 #      DB span 只有操作与表名（不上报 SQL 语句）；/api/health 与文档页不产生 span。
 
-# 13.5 对话首页（S7.1–S7.6）：浏览器打开 http://127.0.0.1:8000/ 就是对话页
+# 13.5 对话首页（S7.1–S7.9）：浏览器打开 http://127.0.0.1:8000/ 就是对话页
 #      （只跑 API 时 http://localhost:5173/ 走 Vite，同样落在这条路由上）。
 #      传一张图 + 一句话 → 模型自己决定调哪个工具（跑完整分析 / 解析图片 / 查素材库 /
 #      读历史运行 / 预览爆点要素 / 改写文案）→ 工具过程与正文流式可见 → 结果卡片回到对话里；
@@ -446,9 +450,9 @@ Docker 不可用时会直接报错并说明原因（不静默跳过）。
 | P2 数据与检索 | Postgres + pgvector、混合召回、评测集 |
 | P3 编排与服务 | LangGraph、FastAPI 接口（/api 前缀）、Celery |
 | P4 可观测与交付 | 结构化日志与调用追踪、容器化、CI |
-| P5 前端工程 | Vue 3 单页应用：分析台、结果详情、运行历史 + ECharts 可视化 |
+| P5 前端工程 | Vue 3 单页应用：对话首页、分析台、结果详情、运行历史、素材库 + ECharts 可视化 |
 | P6 素材与图片 | 素材库页（查询 / 编辑 / 回收站 / 导入）+ 图片热点解析链路 |
-| P7 对话式入口 | 对话首页：原生 function calling + 会话存储 + SSE 流式 + 结果卡片 + **工具集**（第一、二批已落地 S7.1–S7.9：跑完整分析 / 解析图片 / 查素材库 / 读历史运行 / 预览爆点要素 / 改写文案） |
+| P7 对话式入口 | 对话首页：原生 function calling + 会话存储 + SSE 流式 + 结果卡片 + **工具集**（第一、二批已落地 S7.1–S7.9：跑完整分析 / 解析图片 / 查素材库 / 读历史运行 / 预览爆点要素 / 改写文案；**第三批多轮记忆与越界话术未开始**） |
 | v1.1 及以后 | 多热点横向对比、历史回看、自动抓热榜、效果回流 |
 
 **完整的任务分解、依赖关系、验收标准与工作量估算见 `docs/backlog.md`** —— 本文件只列阶段，不重复维护任务清单。

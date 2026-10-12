@@ -340,6 +340,9 @@ class ChatToolCall(_Response):
     args: dict[str, Any]
     run_id: UuidStr | None = None
     cost_cny: float = 0.0
+    # 这次工具调用用掉的 token（含图片解析与分析那次 run 的用量，S7.10）
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
     latency_ms: int = 0
     error: str = ""
     steps: list[dict[str, Any]] = Field(default_factory=list)
@@ -359,6 +362,9 @@ class ChatMessage(_Response):
     created_at: DateTimeStr
     run_id: UuidStr | None = None
     cost_cny: float = 0.0
+    # 本轮用量 = supervisor 调用 + 各工具内部模型调用（含图片解析）之和，S7.10 起落库
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
     latency_ms: int = 0
     error: str | None = None
 

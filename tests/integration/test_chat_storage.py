@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import uuid
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -22,6 +23,7 @@ from xhs_agent.db import Base
 from xhs_agent.services.chat import (
     append_message,
     create_session,
+    latest_attachment,
     list_sessions,
     load_message,
     load_session,
@@ -244,3 +246,64 @@ class TestAttachments:
 
         assert loaded is not None and loaded["attachments"][0]["name"] == "a.png"
         assert await load_message(db_session, uuid.uuid4()) is None
+
+
+class TestUsage:
+    """轮级用量落库（S7.10）：`prompt_tokens` / `completion_tokens` 与 `cost_cny` 同进同出。"""
+
+    async def test_tokens_round_trip_through_append_and_update(
+            self, db_session: AsyncSession) -> None:
+        created = await create_session(db_session)
+        session_id = uuid.UUID(created["session_id"])
+
+        row = await append_message(db_session, session_id, role="assistant", content="跑好了",
+                                   prompt_tokens=1234, completion_tokens=567, cost_cny=0.0123)
+        assert row is not None
+        assert (row["prompt_tokens"], row["completion_tokens"]) == (1234, 567)
+
+        updated = await update_message(db_session, uuid.UUID(row["message_id"]),
+                                       prompt_tokens=2000, completion_tokens=800)
+        assert updated is not None
+        assert (updated["prompt_tokens"], updated["completion_tokens"]) == (2000, 800)
+        assert updated["cost_cny"] == pytest.approx(0.0123)     # 只改显式给了的字段
+
+
+class TestLatestAttachment:
+    """跨轮图片回落（S7.10）：本会话最近一张图，且绝不跨会话。"""
+
+    async def test_returns_the_newest_image(self, db_session: AsyncSession,
+                                            cfg: AppConfig) -> None:
+        created = await create_session(db_session)
+        session_id = uuid.UUID(created["session_id"])
+        older = save_attachment(cfg, session_id, b"\x89PNG-old", name="旧图.png",
+                                mime="image/png")
+        newer = save_attachment(cfg, session_id, b"\x89PNG-new", name="新图.png",
+                                mime="image/png")
+
+        await append_message(db_session, session_id, role="user", content="第一张",
+                             attachments=[older])
+        await asyncio.sleep(0.01)          # 保证两条消息的 created_at 不同（排序才无歧义）
+        await append_message(db_session, session_id, role="user", content="第二张",
+                             attachments=[newer])
+
+        found = await latest_attachment(db_session, session_id)
+        assert found is not None and found["name"] == "新图.png"
+
+    async def test_none_when_the_session_has_no_image(self,
+                                                      db_session: AsyncSession) -> None:
+        created = await create_session(db_session)
+        session_id = uuid.UUID(created["session_id"])
+        await append_message(db_session, session_id, role="user", content="只有文字")
+        assert await latest_attachment(db_session, session_id) is None
+
+    async def test_never_crosses_sessions(self, db_session: AsyncSession,
+                                          cfg: AppConfig) -> None:
+        first = uuid.UUID((await create_session(db_session))["session_id"])
+        second = uuid.UUID((await create_session(db_session))["session_id"])
+        saved = save_attachment(cfg, second, b"\x89PNG", name="乙图.png", mime="image/png")
+        await append_message(db_session, second, role="user", content="乙会话的图",
+                             attachments=[saved])
+
+        assert await latest_attachment(db_session, first) is None
+        found = await latest_attachment(db_session, second)
+        assert found is not None and found["name"] == "乙图.png"
