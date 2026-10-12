@@ -118,7 +118,7 @@ class TestMessages:
              {"role": "assistant", "content": "   "}],      # 生成中的空行不进上下文
             "帮我看看这张图", attachment_note="1 张图片（热点.png）")
 
-        assert rendered.task_id == TASK_ID and rendered.version == 1
+        assert rendered.task_id == TASK_ID and rendered.version == SUPERVISOR_VERSION
         assert messages[0]["role"] == "system" and messages[0]["content"] == rendered.system
         assert messages[1]["role"] == "user" and messages[1]["content"] == rendered.user
         assert [item["content"] for item in messages[2:4]] == ["你好", "在的"]
@@ -139,7 +139,7 @@ class TestTurn:
         assert turn.status == "succeeded"
         assert turn.reply == "把热点文字发我，或者丢张图。"
         assert turn.tool_calls == [] and turn.run_id == ""
-        assert turn.prompt_versions == {TASK_ID: 1}
+        assert turn.prompt_versions == {TASK_ID: SUPERVISOR_VERSION}
         assert turn.cost_cny == pytest.approx(0.001)
         assert len(provider.calls) == 1
         assert provider.calls[0].tools == TOOLS          # 第一轮带着工具清单
@@ -271,13 +271,15 @@ class TestTurn:
         assert turn.status == "failed"
         assert "HTTP 500" in turn.error
         assert turn.reply == ""
-        assert turn.prompt_versions == {TASK_ID: 1}
+        assert turn.prompt_versions == {TASK_ID: SUPERVISOR_VERSION}
 
 
 # ---------- S7.7a：工具清单与分派都不在图里写死 ----------
 
 FAKE_TOOL = "fake_probe"
 FAKE_TASK = "fake_probe_task"
+# `chat_supervisor` 当前的 prompt 版本：prompt 升版时这条要跟着改（prompt 契约 §六 要求升版必跑回归）
+SUPERVISOR_VERSION = 2
 
 
 def register_fake_tool(monkeypatch: pytest.MonkeyPatch) -> list[dict[str, Any]]:
@@ -334,7 +336,7 @@ class TestDispatchIsDataDriven:
         assert turn.tool_calls[0]["status"] == "succeeded"
         assert turn.reply == "假工具跑完了。"
         # 工具内部用掉的 prompt 版本要汇总进这一轮
-        assert turn.prompt_versions == {TASK_ID: 1, FAKE_TASK: 7}
+        assert turn.prompt_versions == {TASK_ID: SUPERVISOR_VERSION, FAKE_TASK: 7}
 
     @pytest.mark.asyncio
     async def test_unknown_tool_error_message_is_unchanged(self, tmp_path: Path) -> None:

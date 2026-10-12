@@ -226,7 +226,7 @@ class TestChatApi:
         assert assistant["content"] == "跑了完整分析，命中 5 条。"
         assert assistant["run_id"] == RUN_ID
         assert assistant["cost_cny"] == pytest.approx(0.054)
-        assert assistant["prompt_versions"] == {"chat_supervisor": 1}
+        assert assistant["prompt_versions"] == {"chat_supervisor": 2}
         entry = assistant["tool_calls"][0]
         assert entry["tool"] == TOOL_RUN_ANALYSIS and entry["status"] == "succeeded"
         assert entry["run_id"] == RUN_ID and entry["args"] == {"hotspot": "夜跑", "topk": 5}

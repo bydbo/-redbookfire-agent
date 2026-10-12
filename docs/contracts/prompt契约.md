@@ -30,6 +30,24 @@
 这样工具改参数不会同时改两份。对话的 prompt 版本记在 `chat_messages.prompt_versions`
 （对话消息不写 `runs`）。
 
+**对话工具清单（S7.7 起）**：对话层能调的工具**只有**下表这些。**参数 schema 与返回结构的
+单一来源仍是 `services/chat_tools.py` 的 `TOOLS` 与各 handler 的 payload**——本表只登记
+"有什么、有没有副作用、用不用 prompt、返回要点"，不复制 schema（复制就会漂移；
+`tests/unit/test_prompts_assets.py` 有一条用例钉住"本表的工具名集合 == `TOOLS` 的名字集合"）。
+
+| 工具 | 用途 | 副作用 | 带 prompt 版本 | 返回要点 |
+| --- | --- | --- | --- | --- |
+| `run_hotspot_analysis` | 把一条热点跑一遍完整分析（拆解 → 检索 → 缺口 → 撰稿） | **有**：投 Celery job、写 `runs` 与 `run_matches` | 间接：落 `runs.prompt_versions` | run_id、候选数、首选素材、覆盖率、初稿标题、成本 |
+| `parse_image_clue` | 把本轮图片拆成热点描述 + 爆点要素 | 无（图片只在内存里变成模型输入，不落盘不入库） | `image_hotspot_clue` | 热点描述、要素清单 |
+| `search_materials` | 在创作者素材库里检索能蹭这条热点的素材 | 无（只读库） | `hotspot_clue` | 要素、覆盖率、候选摘要、成本 |
+| `read_run` | 读回一次已完成运行的结果（`run_id` 可省：默认本会话最近一次运行） | 无（只读库、不调模型、不花钱） | 无 | 每条热点的要素 / 覆盖率 / 候选数 / 首选 / 初稿标题 |
+| `preview_element_coverage` | 要素拆解 + 字面通道覆盖估算与补拍建议 | 无（只读库、不调 embedding、不落 `runs`） | `hotspot_clue` | 要素、覆盖率、缺口与补拍建议 |
+| `revise_draft` | 按用户要求改写某次运行已产出的初稿（`run_id` 可省：默认本会话最近一次运行） | **有**：花一次模型钱；**不写库**（run 的初稿快照不动） | `copy_revise` | `refused` + 理由，或改后初稿 |
+
+**工具类 prompt 的控制字段（S7.8 起）**：工具类 prompt 允许在最外层带**控制字段**——用来表达
+"这次不产出领域对象"（例如 `copy_revise` 的 `refused` / `reason`）。领域字段仍必须引用数据契约 /
+API 契约里的既有 schema，不得自造字段（§二 05 Output Schema 与 §五 的"不新造字段"说的是这一层）。
+
 ## 二、五段结构
 
 一个任务一份文件，文件内固定五段：
@@ -117,6 +135,11 @@ user   消息 = 02 Task（渲染后） + 04 Examples + 05 Output Schema
 **三条维护要求**（同时是提交规范）：
 
 1. **一次只改一层**——单次提交只允许修改五段中的一个段；跨段改动必须拆成多个提交。这样 diff 才能与指标变化一一对应；混着改就无法归因。
+   **对话类 prompt 的例外（S7.9 起）**：`chat_supervisor` 的 §01–§03 讲的是同一件事
+   （能力边界与工具选择），允许在同一次变更里一并修改；它的回归口径也不是下面那张七维度表
+   （那是分析链路的），而是**工具选择评测** `scripts/eval_chat_tools.py`——固定一组消息判定
+   "该调的调、不该调的不调"，外加改写路径的越界拒绝，报告按
+   `evals/reports/chat-tools-<日期>.md` 归档。
 2. **保留可对比的旧版本**——版本号随内容变更递增；对比报告按 `evals/reports/prompt-<task_id>-v<N>-<日期>.md` 归档入库，报告里写明本次改动的是哪一层、为什么改。
 3. **用同一批输入重新测试**——固定使用 `evals/cases/` 的 20 组用例，变更前后各跑一遍，报告列出每条用例的维度得分与总分变化。
 

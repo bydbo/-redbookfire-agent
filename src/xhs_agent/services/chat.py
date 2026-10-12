@@ -157,6 +157,21 @@ async def create_session(session: AsyncSession, *, title: str = "") -> dict[str,
     return _session_view(row)
 
 
+async def latest_run_id(session: AsyncSession, session_id: uuid.UUID) -> str:
+    """本会话**最近一次**分析产出的 run_id（没有就返回空串）。
+
+    存在的理由（S7.9 冒烟暴露）：`run_id` 只出现在工具的返回值里，而装配给模型的历史只有
+    消息**正文**——所以用户在下一轮说「把刚才那版改得更口语一点」时，模型手上根本没有 id。
+    让 `read_run` / `revise_draft` 的 `run_id` 可省（缺省就落到这里），多轮对话才真的可用。
+    """
+    row = (await session.execute(
+        select(ChatMessage.run_id)
+        .where(ChatMessage.session_id == session_id, ChatMessage.run_id.is_not(None))
+        .order_by(ChatMessage.created_at.desc(), ChatMessage.id.desc())
+        .limit(1))).scalar_one_or_none()
+    return str(row) if row else ""
+
+
 async def list_sessions(session: AsyncSession, *, limit: int = 50,
                         offset: int = 0) -> dict[str, Any]:
     """会话列表：`updated_at` 倒序（平局按 id 倒序），页内批量补消息数与末条预览。"""

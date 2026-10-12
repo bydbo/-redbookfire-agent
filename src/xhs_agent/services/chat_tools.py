@@ -18,6 +18,9 @@
   与 `revise_draft`（花一次模型钱，但**不写库**——run 的初稿快照不动）；
 - **一轮内不重复付费**：`ToolContext.cache` 按「热点原文」缓存拆解结果、按「附件路径」缓存
   图片解析结果，所以「先预览再检索」「先解析图片再跑分析」都只付一次模型钱；
+- **`run_id` 可省**（`read_run` / `revise_draft`）：不传就落到本会话**最近一次**运行产出的
+  那个（`services/chat.py::latest_run_id`）——装配给模型的历史只有消息正文，工具返回值里的 id
+  它看不到，用户说「上次那批」「刚才那版」时只能由服务端兜底（S7.9 冒烟实测到这条）；
 - 有图片附件时先走 S6.6 的 `parse_image_clue`（多模态），把解析出的线索作为**预置线索**
   随 `submit_analysis(clues=...)` 提交——拆解节点短路，不重复付费（S6.7）；
 - 分析在 Celery worker 跑，本工具只等结果：轮询 `runs`（ADR 0011：库是权威源），
@@ -51,7 +54,7 @@ from ..agents.revise import revise_draft as revise_agent
 from ..config import AppConfig
 from ..core.errors import ApiError, BadRequestError
 from ..schemas import TYPE_LABELS, Element, HotspotClue, SchemaError
-from ..services.chat import resolve_attachment
+from ..services.chat import latest_run_id, resolve_attachment
 from ..services.image_clue import TASK_ID as IMAGE_CLUE_TASK
 from ..services.image_clue import ImageClueParse, parse_image_clue
 from ..services.retrieval import literal_only_candidates, retrieve_candidates
@@ -159,18 +162,19 @@ TOOLS: list[dict[str, Any]] = [
             "description": (
                 "读回一次**已完成**的运行结果（按 run_id）：每条热点的爆点要素、要素覆盖率、"
                 "候选素材条数、首选素材与初稿标题。它不重新分析、不检索、不花钱；用户追问"
-                "「刚才那次」「上次那批」的结果细节时用它。"
+                "「刚才那次」「上次那批」的结果细节时用它。**run_id 可以不传**——不传就用"
+                "这个会话里最近一次运行的结果（用户说「上次那批」时正是这种情况）。"
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "run_id": {
                         "type": "string",
-                        "description": "要读回的运行 id（uuid）。取自之前那次分析的返回值，"
-                                       "不要自己编。",
+                        "description": "要读回的运行 id（uuid）。可取之前分析的返回值；"
+                                       "用户指的是「上次那批」时留空即可，不要自己编。",
                     },
                 },
-                "required": ["run_id"],
+                "required": [],
             },
         },
     },
@@ -207,6 +211,8 @@ TOOLS: list[dict[str, Any]] = [
                 "由你讲给用户。用户在初稿基础上提修改意见（「标题再狠一点」「正文写短些」"
                 "「换成避坑角度」）时用它。要求越界（要写他人姓名/肖像、要编造素材里没有的事）时"
                 "工具会拒绝并给出理由，你把这个理由如实讲给用户，不要替他换个说法再来一次。"
+                "**run_id 可以不传**：不传就改这个会话里最近一次运行产出的初稿"
+                "（用户说「刚才那版」时正是这种情况）。"
             ),
             "parameters": {
                 "type": "object",
@@ -214,7 +220,7 @@ TOOLS: list[dict[str, Any]] = [
                     "run_id": {
                         "type": "string",
                         "description": "要改写的那次运行的 run_id（uuid）。取自之前分析的"
-                                       "返回值，不要自己编。",
+                                       "返回值；用户指的是「刚才那版」时留空即可，不要自己编。",
                     },
                     "request": {
                         "type": "string",
@@ -227,7 +233,7 @@ TOOLS: list[dict[str, Any]] = [
                         "description": "改第几条热点的初稿，默认 1。",
                     },
                 },
-                "required": ["run_id", "request"],
+                "required": ["request"],
             },
         },
     },
@@ -378,6 +384,28 @@ async def _clue_for(ctx: ToolContext, text: str) -> ClueRecord:
                         cost_cny=_records_cost(ctx.caller, before))
     ctx.cache.clues[text] = record
     return record
+
+
+async def _resolve_run_id(ctx: ToolContext, raw: str) -> tuple[str, str]:
+    """把 `run_id` 参数落成一个真 uuid；**不传就用本会话最近一次运行产出的 id**。
+
+    返回（run_id，错误文案）。多轮对话里模型看不到工具返回值里的 id（历史只装配消息正文），
+    所以"上次那批""刚才那版"必须由服务端兜底解析——否则 `read_run` / `revise_draft` 只能靠
+    用户手打 uuid 才用得起来（S7.9 冒烟实测过这个坑）。
+    """
+    text = raw.strip()
+    if text:
+        try:
+            uuid.UUID(text)
+        except (TypeError, ValueError):
+            return "", f"run_id 必须是一个 uuid，收到 {text!r}"
+        return text, ""
+    if ctx.session_id is None:
+        return "", "没传 run_id，也拿不到会话上下文；请把要读/要改的 run_id 带上"
+    found = await latest_run_id(ctx.session, ctx.session_id)
+    if not found:
+        return "", ("这个会话还没跑过分析——先让用户跑一次完整分析，才有结果可读、有初稿可改")
+    return found, ""
 
 
 async def _image_clue_for(ctx: ToolContext, attachment: dict[str, Any],
@@ -536,16 +564,16 @@ async def search_materials(ctx: ToolContext, args: dict[str, Any], *,
 async def read_run(ctx: ToolContext, args: dict[str, Any], *,
                    attachments: list[dict[str, Any]] | None = None,
                    on_progress: ProgressFn | None = None) -> ToolOutcome:
-    """「读历史运行」工具（S7.7）：按 run_id 读回已完成的结果；不调模型、不花钱。"""
+    """「读历史运行」工具（S7.7）：按 run_id 读回已完成的结果；不调模型、不花钱。
+
+    `run_id` 可省：不传就落到本会话最近一次运行产出的那个（见 `_resolve_run_id`）。
+    """
     steps: list[dict[str, Any]] = []
-    raw = str(args.get("run_id") or "").strip()
-    try:
-        run_uuid = uuid.UUID(raw)
-    except (TypeError, ValueError):
-        return ToolOutcome(status="failed", steps=steps,
-                           error=f"run_id 必须是一个 uuid，收到 {raw!r}")
+    raw, invalid = await _resolve_run_id(ctx, str(args.get("run_id") or ""))
+    if invalid:
+        return ToolOutcome(status="failed", steps=steps, error=invalid)
     _step(steps, "读取运行")
-    detail = await load_run(ctx.session, run_uuid)
+    detail = await load_run(ctx.session, uuid.UUID(raw))
     if detail is None:
         return ToolOutcome(status="failed", steps=steps,
                            error=f"找不到这次运行（run_id：{raw}），请确认 id 是否正确")
@@ -619,12 +647,10 @@ async def revise_draft(ctx: ToolContext, args: dict[str, Any], *,
         if on_progress is not None:
             await on_progress(stage, done, total)
 
-    raw_run = str(args.get("run_id") or "").strip()
-    try:
-        run_uuid = uuid.UUID(raw_run)
-    except (TypeError, ValueError):
-        return ToolOutcome(status="failed", steps=steps,
-                           error=f"run_id 必须是一个 uuid，收到 {raw_run!r}")
+    # 不传 run_id 就落到本会话最近一次运行——用户说「把刚才那版改得更口语一点」时才用得上
+    raw_run, invalid_run = await _resolve_run_id(ctx, str(args.get("run_id") or ""))
+    if invalid_run:
+        return ToolOutcome(status="failed", steps=steps, error=invalid_run)
     request = str(args.get("request") or "").strip()
     if not request:
         return ToolOutcome(status="failed", steps=steps,
@@ -645,7 +671,7 @@ async def revise_draft(ctx: ToolContext, args: dict[str, Any], *,
         return ToolOutcome(status="failed", steps=steps,
                            error="hotspot_index 必须是 ≥1 的整数（第几条热点）")
 
-    detail = await load_run(ctx.session, run_uuid)
+    detail = await load_run(ctx.session, uuid.UUID(raw_run))
     if detail is None:
         return ToolOutcome(status="failed", steps=steps,
                            error=f"找不到这次运行（run_id：{raw_run}），请确认 id 是否正确")

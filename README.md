@@ -87,6 +87,11 @@
 | 对话 SSE 接口（S7.4：`POST /api/chat/sessions/{id}/messages` 返回 `text/event-stream`，事件 `turn_started` / `tool_started` / `tool_progress` / `tool_finished` / `text_delta` / `turn_finished` / `error`；Redis pub/sub 传事件，**轮次跑在 detached 任务里**——断开只停转发，不再算这一轮） | ✅ 已完成（S7.4） |
 | 对话首页（S7.5：`/` 改成对话、分析台挪到 `/analyze`（**路由名仍是 `analysis`**）；消息列表 + 输入框（文字 + 可选一张图）+ 工具过程 + 流式增量 + 结果卡片（与结果页共用 `HotspotResult.vue`）+ 历史会话侧栏；刷新后自动打开最近一条会话） | ✅ 已完成（S7.5） |
 | 对话闭环测试与真机冒烟（S7.6：单测 + 真容器集成（发消息 → 触达工具 → 落库 → 读回 → 附件取回）+ Playwright 真机 19/19 断言：传图 + 一句话 → 工具过程 → 流式正文 → 结果卡片 5 条候选 → 刷新仍在，截图落 `runs/_smoke_s76/`） | ✅ 已完成（S7.6） |
+| 工具分发去硬编码（S7.7a：`services/chat_tools.py` 同时持有 `TOOLS` 与 `HANDLERS`，`workflows/chat.py` 里不再出现任何具体工具名——"加一个工具只改一处"从口号变成有源码扫描用例钉住的事实；工具内部的 prompt 版本也汇总进 `chat_messages`） | ✅ 已完成（S7.7a） |
+| 只读工具三件（S7.7：`parse_image_clue` 解析图片 / `search_materials` 查素材库 / `read_run` 读历史运行；都无副作用、可被模型选，参数与返回值登记进 prompt 契约的对话工具清单；一轮内按热点文本与附件路径缓存，同一件事不重复付费） | ✅ 已完成（S7.7） |
+| 拆解预览工具（S7.7b：`preview_element_coverage` 只做要素拆解 + **字面通道**覆盖估算，不调 embedding、不写稿、不落 `runs`；返回缺口与补拍建议，说明里写明"这一步不产出候选素材"） | ✅ 已完成（S7.7b） |
+| 改写文案工具（S7.8：新 prompt 资产 `copy_revise`（§03 逐字复用 `copy_draft` 的 12 条边界 + 越界必须拒绝）+ 工具 `revise_draft`；改后文案只回对话、**不覆盖 run 的初稿快照**） | ✅ 已完成（S7.8） |
+| 工具集测试与真机冒烟（S7.9：新增 `scripts/eval_chat_tools.py` 真模型工具选择评测（两臂对照，报告落 `evals/reports/chat-tools-*.md`）；`chat_supervisor` v1 → v2（能力边界改为以工具清单为准）并按 prompt 契约 §六 的对话类口径回归；真机 19/19：传图 + 问素材 → 完整分析 → 改写 → 刷新仍在，截图落 `runs/_smoke_s79/`） | ✅ 已完成（S7.9） |
 
 业务链路**已端到端跑通**：`docker compose up -d --wait` 起依赖 → `uv run celery -A xhs_agent.tasks.worker:app worker` 起 worker → `uv run python -m xhs_agent.serve` 起接口（先跑 7 步启动前置检查）→ `POST /api/analyze` 投递 → worker 自动消费（索引新鲜度 → 五节点分析 → 逐热点写回）→ `/api/jobs/{job_id}` 轮询 → `/api/runs/{run_id}` 取结构化结果、`/report` 取报告。另可运行 `uv run python -m xhs_agent.probe`、`uv run python scripts/index_materials.py`、`uv run python scripts/backfill_embeddings.py`、`uv run python scripts/eval_retrieval.py`、`uv run python scripts/smoke_skeleton.py`。路线图见文末。
 
@@ -260,13 +265,20 @@ uv run python -m xhs_agent.tasks.reconcile
 
 # 13.5 对话首页（S7.1–S7.6）：浏览器打开 http://127.0.0.1:8000/ 就是对话页
 #      （只跑 API 时 http://localhost:5173/ 走 Vite，同样落在这条路由上）。
-#      传一张图 + 一句话 → 模型自己决定调「跑完整分析」→ 工具过程与正文流式可见 →
-#      结果卡片回到对话里；刷新后自动打开最近一条会话，消息与结果都还在。
+#      传一张图 + 一句话 → 模型自己决定调哪个工具（跑完整分析 / 解析图片 / 查素材库 /
+#      读历史运行 / 预览爆点要素 / 改写文案）→ 工具过程与正文流式可见 → 结果卡片回到对话里；
+#      刷新后自动打开最近一条会话，消息与结果都还在。
 #      接口面：POST/GET /api/chat/sessions、GET /api/chat/sessions/{id}、
 #      POST /api/chat/sessions/{id}/messages（multipart → text/event-stream）、
 #      GET /api/chat/sessions/{id}/attachments/{message_id}/{index}。
 #      两条口径：① 轮次跑在 API 进程的 detached 任务里，关掉页面/断流**不打断**这一轮，
 #      回来看到的是终态消息；② 图片只用于这一次解析（不落素材库），附件落 runs/_chat/。
+#
+# 13.6 对话层的工具选择评测（S7.9）：改 `chat_supervisor` 的正文后跑这一条（prompt 契约 §六 的
+#      对话类口径，不是分析链路的七维度）：真模型跑一组固定消息，判定"该调的调、不该调的不调"，
+#      外加改写路径的越界拒绝。报告落 evals/reports/chat-tools-<日期>.md；约 0.1 元、不需要容器。
+uv run python scripts/eval_chat_tools.py --baseline HEAD~1 --note "这次为什么改"
+#      只跑前 3 条冒烟：--limit 3
 
 # 14. 一键跑通 Walking Skeleton（推荐先用它验证环境）
 #     自己起 uvicorn + Celery worker、素材库为空时种入示例素材包、投 case-01 的热点、
@@ -286,7 +298,7 @@ pnpm build            # 类型检查 + 构建，产物落 frontend/dist（由 Fa
 pnpm run gen:api      # 契约变了才跑：从 ../docs/contracts/openapi.yaml 重新生成 src/api/schema.d.ts
 pnpm run check:api    # 防漂移自检：重新生成 + git diff，有差异即非零（CI 的 frontend job 跑这条）
 pnpm run lint         # ESLint 9（只做正确性规则，不查格式）
-pnpm test             # Vitest 单测（117 条，jsdom，含主题对比度、图表 option、分析台/素材库/对话状态机、
+pnpm test             # Vitest 单测（118 条，jsdom，含主题对比度、图表 option、分析台/素材库/对话状态机、
                       # SSE 解析与对话独立滚动行为）
 pnpm run test:cov     # 单测 + 覆盖率报告（只报告不设门槛）
 ```
@@ -303,10 +315,15 @@ pnpm run test:cov     # 单测 + 覆盖率报告（只报告不设门槛）
 > 重扫描后人工说明仍在）、多选批量删除、回收站抽屉（恢复 / 单条真删 / 一键清空）。
 > 「扫描」按钮触发一次「增量同步 + 向量回填」，进度与失败原因用 `GET /api/materials/tasks/{task_id}` 查。
 
-> **对话首页（S7.1–S7.6）**：打开 `/`（顶栏第一项「聊天」）就是对话框。传一张图 + 一句话，
-> 模型自己决定要不要调工具：有图片就先解析成热点线索，再把「热点 + 线索」作为**一次完整分析**投给
-> worker（拆解节点被预置线索短路，不重复付费），工具过程（解析图片 → 提交分析 → 分析中）与模型正文
-> 都通过 SSE 流式显示，跑完把结果卡片（爆点要素 / 候选素材 / 覆盖缺口 / 文案初稿）直接贴在对话里。
+> **对话首页（S7.1–S7.9）**：打开 `/`（顶栏第一项「聊天」）就是对话框。传一张图 + 一句话，
+> 模型自己决定要不要调工具、调哪个：有图片就先解析成热点线索，再把「热点 + 线索」作为**一次完整分析**
+> 投给 worker（拆解节点被预置线索短路，不重复付费），工具过程（解析图片 → 提交分析 → 分析中）与模型
+> 正文都通过 SSE 流式显示，跑完把结果卡片（爆点要素 / 候选素材 / 覆盖缺口 / 文案初稿）直接贴在对话里。
+> 工具集一共六个：跑完整分析、解析图片、查素材库、读历史运行、预览爆点要素、改写文案（后五个都是
+> **只读 + 不写库**的，只有「跑完整分析」会产生运行记录；**改写只在对话里给新文案，不覆盖那次运行的
+> 初稿快照**）。用户在初稿上提修改意见（「标题再狠一点」「正文写短些」）时，`read_run` / `revise_draft`
+> 的 `run_id` **可以不传**——默认落到本会话最近一次运行，所以「把刚才那版改得更口语一点」这种话直接
+> 说得通（`run_id` 只出现在工具返回值里，装配给模型的历史只有消息正文——这条是 S7.9 冒烟暴露并当场修的）。
 > 左侧是历史会话，刷新后自动打开最近一条。两条边界：**关掉页面不会打断这一轮**（轮次跑在 API 进程的
 > detached 任务里，回来看到终态消息）；**不做「停止生成」**——要停就去运行历史看结果。分析台仍在
 > `/analyze`（顶栏第二项），对话里的分析结果与它共用同一套渲染。对话框本身是三段落布局：顶栏与页头固定，
@@ -431,7 +448,7 @@ Docker 不可用时会直接报错并说明原因（不静默跳过）。
 | P4 可观测与交付 | 结构化日志与调用追踪、容器化、CI |
 | P5 前端工程 | Vue 3 单页应用：分析台、结果详情、运行历史 + ECharts 可视化 |
 | P6 素材与图片 | 素材库页（查询 / 编辑 / 回收站 / 导入）+ 图片热点解析链路 |
-| P7 对话式入口 | 对话首页：原生 function calling + 会话存储 + SSE 流式 + 结果卡片（第一批已落地 S7.1–S7.6） |
+| P7 对话式入口 | 对话首页：原生 function calling + 会话存储 + SSE 流式 + 结果卡片 + **工具集**（第一、二批已落地 S7.1–S7.9：跑完整分析 / 解析图片 / 查素材库 / 读历史运行 / 预览爆点要素 / 改写文案） |
 | v1.1 及以后 | 多热点横向对比、历史回看、自动抓热榜、效果回流 |
 
 **完整的任务分解、依赖关系、验收标准与工作量估算见 `docs/backlog.md`** —— 本文件只列阶段，不重复维护任务清单。

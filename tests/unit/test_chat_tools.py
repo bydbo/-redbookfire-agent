@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import json
+import uuid
 from pathlib import Path
 from typing import Any, cast
 
@@ -110,8 +111,9 @@ class TestToolSchema:
         assert by_name[TOOL_PARSE_IMAGE]["properties"] == {}          # 只吃本轮附件
         assert by_name[TOOL_SEARCH_MATERIALS]["required"] == ["hotspot"]
         assert by_name[TOOL_PREVIEW_COVERAGE]["required"] == ["hotspot"]
-        assert by_name[TOOL_READ_RUN]["required"] == ["run_id"]
-        assert by_name[TOOL_REVISE_DRAFT]["required"] == ["run_id", "request"]
+        # run_id 可省：不传就落到本会话最近一次运行产出的那个（S7.9 起）
+        assert by_name[TOOL_READ_RUN]["required"] == []
+        assert by_name[TOOL_REVISE_DRAFT]["required"] == ["request"]
         assert by_name[TOOL_RUN_ANALYSIS]["required"] == []            # 只发图片时热点为空
 
     def test_revise_tool_says_it_does_not_overwrite_the_run(self) -> None:
@@ -422,3 +424,59 @@ class TestRevisePaths:
         outcome = await revise_draft(context(tmp_path), {"run_id": RUN_UUID,
                                                          "request": "改短点"})
         assert outcome.status == "failed" and "caller" in outcome.error
+
+
+class TestRunIdFallback:
+    """`run_id` 可省：不传就落到本会话最近一次运行产出的那个（S7.9 冒烟暴露的缺口）。"""
+
+    @pytest.fixture
+    def session_ctx(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Any:
+        """带伪会话上下文的 ToolContext + 可控的 `latest_run_id` / `load_run`。"""
+        holder: dict[str, Any] = {"latest": RUN_UUID, "detail": run_detail(), "asked": None}
+
+        async def fake_latest(_session: Any, session_id: Any) -> str:
+            holder["asked"] = session_id
+            return str(holder["latest"])
+
+        async def fake_load_run(_session: Any, _run_id: Any) -> Any:
+            return holder["detail"]
+
+        monkeypatch.setattr(chat_tools, "latest_run_id", fake_latest)
+        monkeypatch.setattr(chat_tools, "load_run", fake_load_run)
+        holder["ctx_with_session"] = lambda **kw: context(       # noqa: E731 - 用例内的构造器
+            tmp_path, session_id=uuid.uuid4(), **kw)
+        return holder
+
+    @pytest.mark.asyncio
+    async def test_read_run_without_id_uses_the_latest_run(self, session_ctx: Any) -> None:
+        outcome = await read_run(session_ctx["ctx_with_session"](), {})
+
+        assert outcome.status == "succeeded", outcome.error
+        assert outcome.payload["run_id"] == RUN_UUID
+        assert session_ctx["asked"] is not None                  # 真的去查了"最近一次运行"
+
+    @pytest.mark.asyncio
+    async def test_read_run_without_id_and_no_run_is_reported(self, session_ctx: Any) -> None:
+        session_ctx["latest"] = ""
+        outcome = await read_run(session_ctx["ctx_with_session"](), {})
+
+        assert outcome.status == "failed" and "还没跑过分析" in outcome.error
+
+    @pytest.mark.asyncio
+    async def test_revise_without_id_uses_the_latest_run(self, session_ctx: Any) -> None:
+        provider = CountingProvider(REVISED_PAYLOAD)
+        ctx = session_ctx["ctx_with_session"](caller=StructuredCaller(provider=provider))
+
+        outcome = await revise_draft(ctx, {"request": "改得更口语一点"})
+
+        assert outcome.status == "succeeded", outcome.error
+        assert outcome.payload["revised"]["body"] == "改后的正文"
+        assert outcome.payload["run_id"] == RUN_UUID
+
+    @pytest.mark.asyncio
+    async def test_revise_without_id_and_no_run_is_reported(self, session_ctx: Any) -> None:
+        session_ctx["latest"] = ""
+        outcome = await revise_draft(session_ctx["ctx_with_session"](),
+                                     {"request": "改得更口语一点"})
+
+        assert outcome.status == "failed" and "还没跑过分析" in outcome.error

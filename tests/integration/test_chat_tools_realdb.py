@@ -25,15 +25,18 @@ from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
 from xhs_agent.config import AppConfig, load_config
 from xhs_agent.db import Base
 from xhs_agent.db.models import Hotspot, Material, Run, RunHotspot, RunMatch
+from xhs_agent.services.chat import append_message, create_session
 from xhs_agent.services.chat_tools import (
     ToolContext,
     preview_element_coverage,
     revise_draft,
     search_materials,
 )
+from xhs_agent.services.chat_turns import build_tool_runner
 from xhs_agent.services.runs import submit_analysis
 from xhs_agent.tools import llm
 from xhs_agent.tools.llm import LLMResult, StructuredCaller
+from xhs_agent.workflows.chat import run_turn
 
 pytestmark = [pytest.mark.integration, pytest.mark.asyncio]
 
@@ -333,3 +336,120 @@ class TestReviseDraft:
                           caller=StructuredCaller(provider=CountingProvider()))
         outcome = await revise_draft(ctx, {"run_id": str(uuid.uuid4()), "request": "改短点"})
         assert outcome.status == "failed" and "找不到这次运行" in outcome.error
+
+    async def test_without_run_id_falls_back_to_the_session_latest(
+            self, db_session: AsyncSession, cfg: AppConfig) -> None:
+        """用户说「刚才那版」时不带 run_id：服务端按会话里最近一次运行兜底（S7.9 冒烟暴露）。"""
+        run_id, original = await seed_finished_run(db_session)
+        chat = await create_session(db_session)
+        chat_id = uuid.UUID(chat["session_id"])
+        await append_message(db_session, chat_id, role="assistant", content="跑完了。",
+                             status="succeeded", run_id=run_id)
+        provider = CountingProvider(REVISED_PAYLOAD)
+        ctx = ToolContext(cfg=cfg, session=db_session, session_id=chat_id,
+                          caller=StructuredCaller(provider=provider))
+
+        outcome = await revise_draft(ctx, {"request": "改得更口语一点"})
+
+        assert outcome.status == "succeeded", outcome.error
+        assert outcome.payload["run_id"] == run_id
+        assert outcome.payload["revised"]["body"] == REVISED_BODY
+        db_session.expire_all()
+        stored = (await db_session.execute(
+            select(RunHotspot.draft).where(RunHotspot.run_id == uuid.UUID(run_id))
+        )).scalar_one()
+        assert stored["body"] == original["body"]
+
+    async def test_without_run_id_in_a_fresh_session_is_reported(
+            self, db_session: AsyncSession, cfg: AppConfig) -> None:
+        chat = await create_session(db_session)
+        ctx = ToolContext(cfg=cfg, session=db_session,
+                          session_id=uuid.UUID(chat["session_id"]),
+                          caller=StructuredCaller(provider=CountingProvider()))
+
+        outcome = await revise_draft(ctx, {"request": "改得更口语一点"})
+
+        assert outcome.status == "failed" and "还没跑过分析" in outcome.error
+
+
+class HybridProvider(llm.BaseProvider):
+    """一个 provider 顶两个角色：supervisor（带 tools）+ 工具内部的文本调用（按 task 给剧本）。
+
+    `complete_with_tools` 走剧本（每一步给正文与 tool_calls），`complete` 按 task 回固定的
+    结构化 JSON——这样一轮对话里的"模型调用"全部可复现，离线也能跑真图真库。
+    """
+
+    name = "hybrid"
+
+    def __init__(self, steps: list[dict[str, Any]]) -> None:
+        super().__init__(model="hybrid-1")
+        self.steps = list(steps)
+        self.tasks: list[str] = []
+
+    async def complete(self, call: llm.LLMCall) -> LLMResult:
+        self.tasks.append(call.task)
+        payload = REVISED_PAYLOAD if call.task == "copy_revise" else CLUE_PAYLOAD
+        return LLMResult(text=json.dumps(payload, ensure_ascii=False), provider=self.name,
+                         model=self.model, prompt_tokens=100, completion_tokens=50,
+                         cost_cny=0.002)
+
+    async def complete_with_tools(self, call: llm.LLMCall,
+                                  on_delta: Any = None) -> LLMResult:
+        step = self.steps.pop(0) if self.steps else {"text": "（剧本用完了）"}
+        return LLMResult(text=str(step.get("text") or ""), provider=self.name,
+                         model=self.model, tool_calls=list(step.get("tool_calls") or []),
+                         prompt_tokens=100, completion_tokens=50, cost_cny=0.003)
+
+
+def tool_call(name: str, args: dict[str, Any]) -> dict[str, Any]:
+    return {"id": f"call-{name}", "name": name, "arguments": json.dumps(args, ensure_ascii=False)}
+
+
+class TestTurnPromptVersions:
+    """S7.7a 的汇总链路在真图上跑一遍：supervisor + 工具内部的 prompt 版本都要落进这一轮。"""
+
+    async def test_read_only_turn_records_both_versions(self, db_session: AsyncSession,
+                                                        cfg: AppConfig) -> None:
+        await seed_material(db_session, path="D:/materials/羽毛球-新手练习.mp4",
+                            title=MATERIAL_TITLE, description=MATERIAL_DESCRIPTION,
+                            tags=MATERIAL_TAGS)
+        await db_session.commit()
+        provider = HybridProvider([
+            {"text": "", "tool_calls": [tool_call("search_materials", {"hotspot": HOTSPOT})]},
+            {"text": "库里有一条能用的素材。"},
+        ])
+        runner = build_tool_runner(db_session, cfg=cfg, client=None, session_id=None,
+                                   attachments=[], dispatcher=None,
+                                   caller=StructuredCaller(provider=provider))
+
+        turn = await run_turn(cfg, provider=provider, history=[], user_text="我库里有没有能用的素材",
+                              run_tool=runner)
+
+        assert turn.status == "succeeded", turn.error
+        assert [item["tool"] for item in turn.tool_calls] == ["search_materials"]
+        assert turn.tool_calls[0]["status"] == "succeeded"
+        # supervisor 的版本（v2）+ 工具内部拆解的版本，都记进这一轮
+        assert turn.prompt_versions == {"chat_supervisor": 2, "hotspot_clue": 1}
+        assert provider.tasks == ["hotspot_clue"]
+        assert turn.run_id == ""                      # 只读工具不产生 run
+        assert turn.cost_cny > 0
+
+    async def test_revise_turn_records_the_revise_version(self, db_session: AsyncSession,
+                                                          cfg: AppConfig) -> None:
+        run_id, _original = await seed_finished_run(db_session)
+        provider = HybridProvider([
+            {"text": "", "tool_calls": [tool_call("revise_draft",
+                                                  {"run_id": run_id, "request": "改成避坑向"})]},
+            {"text": "改好了，这版更偏避坑。"},
+        ])
+        runner = build_tool_runner(db_session, cfg=cfg, client=None, session_id=None,
+                                   attachments=[], dispatcher=None,
+                                   caller=StructuredCaller(provider=provider))
+
+        turn = await run_turn(cfg, provider=provider, history=[], user_text="把刚才那版改得更避坑",
+                              run_tool=runner)
+
+        assert turn.status == "succeeded", turn.error
+        assert turn.tool_calls[0]["tool"] == "revise_draft"
+        assert turn.prompt_versions == {"chat_supervisor": 2, "copy_revise": 1}
+        assert provider.tasks == ["copy_revise"]
