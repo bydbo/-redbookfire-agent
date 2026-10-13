@@ -121,12 +121,16 @@ describe('streamMessage（SSE 逐帧解析）', () => {
     vi.stubGlobal('fetch', fetchMock)
     const seen: string[] = []
     const file = new File([new Uint8Array([1, 2, 3])], '热点.png', { type: 'image/png' })
+    const second = new File([new Uint8Array([4, 5, 6])], '第二张.png', { type: 'image/png' })
 
-    await streamMessage('s-1', { file }, (event) => seen.push(event.event))
+    await streamMessage('s-1', { files: [file, second] }, (event) => seen.push(event.event))
 
     expect(seen).toEqual(['turn_finished', 'error'])
     const form = callArgs(fetchMock).init.body as FormData
-    expect((form.get('file') as File).name).toBe('热点.png')
+    // 同名多值：`files` 逐个 append，顺序就是图号顺序（S7.14）
+    expect((form.getAll('files') as File[]).map((item) => item.name))
+      .toEqual(['热点.png', '第二张.png'])
+    expect(form.get('file')).toBeNull()
     expect(form.get('text')).toBeNull()
   })
 

@@ -1,18 +1,19 @@
 <script setup lang="ts">
-// 对话首页（S7.5）：传一张图 + 一句话 → 模型自己决定要不要调「跑完整分析」→ 过程流式可见 →
+// 对话首页（S7.5）：传图（最多 9 张，S7.18）+ 一句话 → 模型自己决定要不要调「跑完整分析」→ 过程流式可见 →
 // 结果卡片回到对话里。刷新后会话与消息仍在（库里读回来），运行中的那轮靠轮询补齐。
 import { NAlert, NButton, NCard, NEmpty, NInput, NSpin, NTag } from 'naive-ui'
 import { nextTick, onMounted, ref, watch } from 'vue'
 
 import type { ChatMessage } from '@/api/chat'
 import HotspotResult from '@/components/HotspotResult.vue'
+import ImageIntake from '@/components/ImageIntake.vue'
 import { useChatStore } from '@/stores/chat'
 
 const store = useChatStore()
 
 const draft = ref('')
-const picked = ref<File | null>(null)
-const fileInput = ref<HTMLInputElement | null>(null)
+const picked = ref<File[]>([])
+const intakeError = ref<string | null>(null)
 const messagesEl = ref<HTMLElement | null>(null)
 
 /** 贴底判据：距底 40px 以内算「用户还在底部」，此时新消息/流式增量才自动跟随。 */
@@ -63,30 +64,22 @@ watch(() => store.messages, (items) => {
   }
 }, { immediate: true })
 
-function pickFile(): void {
-  fileInput.value?.click()
-}
-
-function onFileChange(event: Event): void {
-  const input = event.target as HTMLInputElement
-  picked.value = input.files?.[0] ?? null
-  input.value = ''
-}
-
-function clearFile(): void {
-  picked.value = null
+/** 图片入口的校验提示（白名单 / 单张 / 张数 / 合计，S7.17）；空串表示清掉 */
+function onIntakeError(message: string): void {
+  intakeError.value = message || null
 }
 
 async function submit(): Promise<void> {
   const text = draft.value
   const file = picked.value
   draft.value = ''
-  picked.value = null
-  const invalid = await store.send({ text, file })
+  picked.value = []
+  const invalid = await store.send({ text, files: file })
   if (invalid !== null) {
     draft.value = text
     picked.value = file
   }
+  intakeError.value = null
 }
 
 function messageText(message: ChatMessage): string {
@@ -258,31 +251,32 @@ function sessionLabel(item: { title: string; session_id: string }): string {
             </div>
           </div>
 
-          <!-- 输入区：一句话 +（可选）一张图 -->
+          <!-- 输入区：一句话 +（可选）图（最多 9 张，S7.18） -->
           <n-card size="small" class="shrink-0">
             <div class="flex flex-col gap-3">
               <n-input
                 v-model:value="draft"
                 type="textarea"
                 :autosize="{ minRows: 2, maxRows: 6 }"
-                placeholder="想蹭哪条热点？说一句话就行（也可以只丢一张图）"
+                placeholder="想蹭哪条热点？说一句话就行（也可以只丢图，最多 9 张）"
                 :disabled="store.busy"
                 @keydown.enter.exact.prevent="submit"
               />
+              <!-- 选择 / 拖拽 / 粘贴（P0）都在这个组件里；最多 9 张，超限整批拒绝 -->
+              <ImageIntake
+                v-model:files="picked"
+                :max="9"
+                :disabled="store.busy"
+                title="丢几张图，合成一条热点"
+                hint="点这里选文件、把图片拖进来，或先点一下这里再 Ctrl/⌘+V 粘贴（jpg / png / webp，单张 ≤ 10 MB，最多 9 张、合计 ≤ 30 MB）"
+                label="选图片（最多 9 张）"
+                @error="onIntakeError"
+              />
+              <n-alert v-if="intakeError" type="warning" :title="intakeError" />
               <div class="flex flex-wrap items-center gap-2">
-                <input
-                  ref="fileInput"
-                  type="file"
-                  accept="image/jpeg,image/png,image/webp"
-                  class="hidden"
-                  @change="onFileChange"
-                >
-                <n-button size="small" :disabled="store.busy" @click="pickFile">
-                  选一张图
-                </n-button>
-                <n-tag v-if="picked" size="small" closable @close="clearFile">
-                  {{ picked.name }}
-                </n-tag>
+                <span class="text-xs text-ink-muted">
+                  已选 {{ picked.length }} / 9 张
+                </span>
                 <n-button
                   class="ml-auto"
                   size="small"

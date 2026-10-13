@@ -198,10 +198,10 @@ export const useChatStore = defineStore('chat', () => {
   }
 
   // 发一条消息（文字与图片至少给一个）。返回 null 表示已受理，否则是要给用户看的提示。
-  async function send(input: { text: string; file?: File | null }): Promise<string | null> {
+  async function send(input: { text: string; files?: File[] | null }): Promise<string | null> {
     const text = input.text.trim()
-    const file = input.file ?? null
-    if (text.length === 0 && file === null) return '请先说点什么，或者丢一张图进来'
+    const files = input.files ?? []
+    if (text.length === 0 && files.length === 0) return '请先说点什么，或者丢图进来'
     if (sending.value) return '上一轮还在跑，等它说完再发'
 
     if (currentId.value === null) {
@@ -216,7 +216,7 @@ export const useChatStore = defineStore('chat', () => {
     streamText.value = ''
     toolSteps.value = []
     try {
-      await streamMessage(sessionId, { text, file }, (event) => {
+      await streamMessage(sessionId, { text, files }, (event) => {
         onStreamEvent(event.event, event.data)
       })
     } catch (err) {

@@ -96,6 +96,11 @@
 | 越界处理（S7.11：机读能力清单 `prompts/chat_capabilities.json` —— 能力内 / 边界外可引导 / 合规红线三类 + 固定话术，红线不给绕过写法；`chat_supervisor` §02 用 `{{ capabilities }}` 注入、prompt v3；新增 ADR 0016） | ✅ 已完成（S7.11） |
 | 越界与多轮评测 + 成本口径（S7.12：用例集 `evals/chat/cases.json`（工具选择 10 / 越界 10 / 多轮 5 / 改写 3），`scripts/eval_chat_tools.py` 扩成四节、判定全为确定性规则；轮级成本门槛 ≤ 0.25 元/轮（含一次分析），同步产品方案与 prompt 契约 §六） | ✅ 已完成（S7.12） |
 | 第三批文档收口（S7.13：产品方案补对话式入口与可复现边界、项目结构补对话模块与能力清单、技术栈路线图与各契约同步） | ✅ 已完成（S7.13） |
+| 多图上传与契约（S7.14：messages 的 `file` → `files`（1–9 个 binary）；新增 `[chat].attachment_max_count = 9` 与 `attachment_total_max_mb = 30`；逐张校验、400 文案指明第几张、超限整批拒绝） | ✅ 已完成（S7.14） |
+| 多图合并解析（S7.15：新 prompt 资产 `image_hotspot_clue_multi` + `AsyncImageClient.complete_many` + `parse_image_clue_multi`；一次调用一份线索，要素 3–8 个且必须带 `evidence`（指图）；单图路径零改动） | ✅ 已完成（S7.15） |
+| 工具与跨轮回落改造（S7.16：图片工具从 `attachments[0]` 改为整组、缓存键按整组路径、`ToolContext.recent_attachments` 与 `latest_attachments` 按整组回落、成本只记那一次调用） | ✅ 已完成（S7.16） |
+| 共享图片入口组件（S7.17：`ImageIntake.vue` 收口选择 / 拖拽 / 粘贴 + 缩略图 + 逐张删除 + 上限校验；分析台 `max=1`、`thumbs=false`，行为与视觉与现状一致） | ✅ 已完成（S7.17） |
+| 对话页接入多图 + 测试与冒烟（S7.18：对话页 `max=9`；真机冒烟「粘贴 9 张 → 一份标签 → 跑一次分析 → 结果卡片」15/15，含 9 图 vs 单图对照，截图落 `runs/_smoke_s718/`） | ✅ 已完成（S7.18） |
 
 业务链路**已端到端跑通**：`docker compose up -d --wait` 起依赖 → `uv run celery -A xhs_agent.tasks.worker:app worker` 起 worker → `uv run python -m xhs_agent.serve` 起接口（先跑 7 步启动前置检查）→ `POST /api/analyze` 投递 → worker 自动消费（索引新鲜度 → 五节点分析 → 逐热点写回）→ `/api/jobs/{job_id}` 轮询 → `/api/runs/{run_id}` 取结构化结果、`/report` 取报告。另可运行 `uv run python -m xhs_agent.probe`、`uv run python scripts/index_materials.py`、`uv run python scripts/backfill_embeddings.py`、`uv run python scripts/eval_retrieval.py`、`uv run python scripts/smoke_skeleton.py`。路线图见文末。
 

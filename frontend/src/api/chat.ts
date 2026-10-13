@@ -47,7 +47,8 @@ export interface ChatStreamEvent {
 
 export interface ChatStreamInput {
   text?: string
-  file?: File | null
+  /** 一组图片（1–9 张，S7.14 起字段名是 `files`，同属一组） */
+  files?: File[] | null
 }
 
 // 把一帧 SSE 文本（event 行 + 若干 data 行）解析成事件；注释行（": ping"）与坏帧返回 null。
@@ -88,7 +89,7 @@ export async function streamMessage(
 ): Promise<void> {
   const form = new FormData()
   if (input.text) form.append('text', input.text)
-  if (input.file) form.append('file', input.file)
+  for (const file of input.files ?? []) form.append('files', file)
 
   const response = await fetch(
     apiUrl(`/chat/sessions/${encodeURIComponent(sessionId)}/messages`),

@@ -132,8 +132,24 @@ describe('useChatStore', () => {
 
   it('空消息被拦下，不发请求', async () => {
     const store = useChatStore()
-    await expect(store.send({ text: '   ' })).resolves.toBe('请先说点什么，或者丢一张图进来')
+    await expect(store.send({ text: '   ' })).resolves.toBe('请先说点什么，或者丢图进来')
     expect(streamMessage).not.toHaveBeenCalled()
+  })
+
+  it('多张图一起进 multipart（S7.14 的 files 字段）', async () => {
+    const store = useChatStore()
+    vi.mocked(createChatSession).mockResolvedValue({
+      session_id: 's-9', title: '', created_at: '', updated_at: '',
+    })
+    vi.mocked(streamMessage).mockResolvedValue(undefined)
+    const files = [
+      new File([new Uint8Array([1])], '图1.png', { type: 'image/png' }),
+      new File([new Uint8Array([2])], '图2.png', { type: 'image/png' }),
+    ]
+
+    await expect(store.send({ text: '', files })).resolves.toBeNull()
+
+    expect(vi.mocked(streamMessage).mock.calls[0][1]).toMatchObject({ text: '', files })
   })
 
   it('第一次发送会先建会话，再逐帧归约事件，最后回读消息', async () => {

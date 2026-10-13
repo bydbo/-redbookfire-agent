@@ -435,12 +435,15 @@ export interface paths {
         put?: never;
         /**
          * 发一条消息（SSE 流式）
-         * @description 一次 multipart 请求带上文字与（可选的）一张图片，返回 `text/event-stream`：
+         * @description 一次 multipart 请求带上文字与（可选的）**一组图片**（1–9 张，同属一组），返回
+         *     `text/event-stream`：
          *     `turn_started` → （可选）`tool_started` / `tool_progress` / `tool_finished` →
          *     `text_delta`（真 token 增量）→ `turn_finished`（带 run_id）；失败则发一条 `error`
          *     并结束这一轮。每一行 `data:` 是一个 JSON 对象。
          *     **断开浏览器只停转发**：这一轮照常跑完并落库（库里能看到 assistant 消息的终态）。
-         *     图片只接受 jpg / png / webp（按 magic bytes），单张上限 `[chat].attachment_max_mb`。
+         *     图片只接受 jpg / png / webp（按 magic bytes）；单张上限 `[chat].attachment_max_mb`、
+         *     数量上限 `[chat].attachment_max_count`、合计上限 `[chat].attachment_total_max_mb`——
+         *     超数量或超总量**整批拒绝**（400，不静默截断），400 文案指明是第几张。
          */
         post: operations["postChatMessage"];
         delete?: never;
@@ -1640,11 +1643,8 @@ export interface operations {
                 "multipart/form-data": {
                     /** @description 用户这条消息的文字（与图片至少给一个） */
                     text?: string;
-                    /**
-                     * Format: binary
-                     * @description 可选的热点图片（jpg / png / webp）
-                     */
-                    file?: string;
+                    /** @description 可选的热点图片（jpg / png / webp），一次 1–9 张，同属一组 */
+                    files?: string[];
                 };
             };
         };

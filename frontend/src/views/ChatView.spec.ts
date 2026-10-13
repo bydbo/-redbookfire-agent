@@ -273,4 +273,50 @@ describe('ChatView（S7.5 对话首页）', () => {
 
     expect(messages.scrollTop).toBe(1000)
   })
+
+  it('一次选 3 张图：缩略图都在，发送时整组进 multipart（S7.18）', async () => {
+    vi.mocked(createChatSession).mockResolvedValue({
+      session_id: 's-9', title: '', created_at: '', updated_at: '',
+    })
+    const wrapper = await mountView()
+    await clickButton(wrapper, '新对话')
+
+    const input = wrapper.find('input[type="file"]')
+    const files = [1, 2, 3].map((index) =>
+      new File([new Uint8Array([index])], `图${index}.png`, { type: 'image/png' }))
+    Object.defineProperty(input.element, 'files', { value: files, configurable: true })
+    await input.trigger('change')
+    await flushPromises()
+
+    expect(wrapper.findAll('.n-tag')).toHaveLength(3)
+    expect(wrapper.text()).toContain('已选 3 / 9 张')
+
+    await clickButton(wrapper, '发送')
+
+    const payload = vi.mocked(streamMessage).mock.calls[0][1]
+    expect((payload.files ?? []).map((file) => file.name)).toEqual(['图1.png', '图2.png', '图3.png'])
+  })
+
+  it('在输入区粘贴两张图：收进选中区、不触发发送（P0 验收项）', async () => {
+    vi.mocked(createChatSession).mockResolvedValue({
+      session_id: 's-9', title: '', created_at: '', updated_at: '',
+    })
+    const wrapper = await mountView()
+    await clickButton(wrapper, '新对话')
+
+    const event = new Event('paste', { bubbles: true, cancelable: true }) as ClipboardEvent
+    const items = [1, 2].map((index) => ({
+      kind: 'file',
+      type: 'image/png',
+      getAsFile: () => new File([new Uint8Array([index])], '', { type: 'image/png' }),
+    }))
+    Object.defineProperty(event, 'clipboardData', { value: { items } })
+    wrapper.find('[role="button"]').element.dispatchEvent(event)
+    await flushPromises()
+
+    // 粘贴的图进选中区（截图没名字 → 生成可读名），且绝不自动发送
+    expect(wrapper.findAll('.n-tag')).toHaveLength(2)
+    expect(wrapper.text()).toContain('粘贴图片-1.png')
+    expect(streamMessage).not.toHaveBeenCalled()
+  })
 })
