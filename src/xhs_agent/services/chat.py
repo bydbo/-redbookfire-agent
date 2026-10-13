@@ -14,7 +14,8 @@
 - 读消息时给每个附件补 `url`（`/api/chat/sessions/{id}/attachments/{message_id}/{index}`），
   前端可以直接当 `<img src>` 用；
 - 跨轮图片回落（S7.10）：用户说「上面那张图」时这一轮并没有附件，`latest_attachment` 取本会话
-  最近一张图片交给工具（与 `latest_run_id` 同一思路）；
+  最近一张图片交给工具（与 `latest_run_id` 同一思路）；S7.16 起 `latest_attachments` 取的是
+  **最近一条带图消息的整组**（多图热点一次解析一份线索）；
 - `status=running` 的 assistant 行代表"这一轮还没跑完"；进程重启遗留的行由
   `mark_stale_turns` 在读会话时兜底标成 `interrupted`。
 """
@@ -178,13 +179,13 @@ async def latest_run_id(session: AsyncSession, session_id: uuid.UUID) -> str:
     return str(row) if row else ""
 
 
-async def latest_attachment(session: AsyncSession,
-                            session_id: uuid.UUID) -> dict[str, Any] | None:
-    """本会话最近一张图片附件（跨轮图片回落用，S7.10）。
+async def latest_attachments(session: AsyncSession,
+                             session_id: uuid.UUID) -> list[dict[str, Any]]:
+    """本会话**最近一条带图消息的整组**图片（跨轮图片回落用，S7.10 起、S7.16 改成整组）。
 
-    用户说「上面那张图」时，这一轮并没有附件、模型也看不到早前的图片字节——由服务端兜底：
-    从最近的消息往回找第一张图片（最多看 `LOOKBACK_MESSAGES` 条），交给工具去解析。
-    没有就返回 None（工具按"这一轮没有图片"处理）。
+    用户说「上面那几张图」时，这一轮并没有附件、模型也看不到早前的图片字节——由服务端兜底：
+    从最近的消息往回找第一条带图的消息（最多看 `LOOKBACK_MESSAGES` 条），把**那一整组**交给
+    工具去解析（多图一次调用出一份线索）。没有就返回空列表（工具按"这一轮没有图片"处理）。
     """
     rows = (await session.execute(
         select(ChatMessage.attachments)
@@ -193,10 +194,11 @@ async def latest_attachment(session: AsyncSession,
         .order_by(ChatMessage.created_at.desc(), ChatMessage.id.desc())
         .limit(LOOKBACK_MESSAGES))).scalars().all()
     for attachments in rows:
-        for item in reversed(list(attachments or [])):
-            if str(item.get("kind") or "") == "image":
-                return dict(item)
-    return None
+        group = [dict(item) for item in (attachments or [])
+                 if str(item.get("kind") or "") == "image"]
+        if group:
+            return group
+    return []
 
 
 async def list_sessions(session: AsyncSession, *, limit: int = 50,

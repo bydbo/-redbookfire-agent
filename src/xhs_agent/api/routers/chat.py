@@ -3,7 +3,8 @@
 - `POST /api/chat/sessions`：建会话（标题留给首条用户消息）；
 - `GET /api/chat/sessions`：会话列表（最近活跃倒序 + 消息数 + 末条预览）；
 - `GET /api/chat/sessions/{session_id}`：会话详情（含消息；读的时候顺手把过期 `running` 标中断）；
-- `POST /api/chat/sessions/{session_id}/messages`：multipart（`text` / `file`）→ `text/event-stream`；
+- `POST /api/chat/sessions/{session_id}/messages`：multipart（`text` / `files`）→ `text/event-stream`
+  （`files` 可重复，1–9 张，同属一组；S7.14 起由 `file` 改名）；
 - `GET /api/chat/sessions/{session_id}/attachments/{message_id}/{index}`：取回附件原图。
 
 两条容易踩的口径：
@@ -25,6 +26,7 @@ from typing import Annotated, Any
 from fastapi import APIRouter, Depends, File, Form, Query, UploadFile
 from fastapi.responses import FileResponse, StreamingResponse
 
+from ...config import AppConfig
 from ...core.errors import BadRequestError, NotFoundError
 from ...services.chat import (
     append_message,
@@ -64,8 +66,11 @@ def _uuid(raw: str, *, what: str) -> uuid.UUID:
         raise NotFoundError(f"{what} 不存在：{raw}", {"id": raw}) from exc
 
 
-async def _read_image(file: UploadFile, *, max_bytes: int) -> bytes:
-    """读上传图片并做体积上限（边读边计，超限立刻 400）与空文件校验。"""
+async def _read_upload(file: UploadFile, *, index: int, max_bytes: int) -> bytes:
+    """读一张上传图片：单张体积上限（边读边计，超限立刻 400）与空文件校验。
+
+    文案一律带**第几张**（`index` 从 1 起）——多图时用户才知道是哪一张的问题（S7.14）。
+    """
     chunks: list[bytes] = []
     total = 0
     while True:
@@ -74,13 +79,59 @@ async def _read_image(file: UploadFile, *, max_bytes: int) -> bytes:
             break
         total += len(chunk)
         if total > max_bytes:
-            raise BadRequestError(f"图片超过 {max_bytes // (1024 * 1024)} MB 上限",
-                                  {"limit_bytes": max_bytes})
+            raise BadRequestError(
+                f"第 {index} 张超过 {max_bytes // (1024 * 1024)} MB 上限",
+                {"index": index, "limit_bytes": max_bytes})
         chunks.append(chunk)
     data = b"".join(chunks)
     if not data:
-        raise BadRequestError("图片为空：file 字段没有内容")
+        raise BadRequestError(f"第 {index} 张是空文件", {"index": index})
     return data
+
+
+async def _save_images(cfg: AppConfig, chat_id: uuid.UUID,
+                       uploads: list[UploadFile]) -> list[dict[str, Any]]:
+    """把这一批上传逐张校验并落盘（S7.14 多图热点）。
+
+    口径：**数量上限先拦**（整批拒绝、不截断）；再逐张校验单张体积与类型（按 magic bytes）；
+    读完一张就累计总大小，超合计上限立刻 400。所有 400 文案都指明是第几张。
+    """
+    limit_count = cfg.chat.attachment_max_count
+    if len(uploads) > limit_count:
+        raise BadRequestError(
+            f"请一次最多发 {limit_count} 张图片（收到 {len(uploads)} 张）",
+            {"count": len(uploads), "limit": limit_count})
+    max_bytes = cfg.chat.attachment_max_mb * 1024 * 1024
+    total_limit = cfg.chat.attachment_total_max_mb * 1024 * 1024
+    saved: list[dict[str, Any]] = []
+    total = 0
+    for index, upload in enumerate(uploads, start=1):
+        data = await _read_upload(upload, index=index, max_bytes=max_bytes)
+        total += len(data)
+        if total > total_limit:
+            raise BadRequestError(
+                f"这一批图片合计超过 {cfg.chat.attachment_total_max_mb} MB 上限",
+                {"total_bytes": total, "limit_bytes": total_limit})
+        mime = sniff_image_mime(data)
+        if not mime:
+            raise BadRequestError(
+                f"第 {index} 张不是 jpg / png / webp 图片（按文件内容判断）",
+                {"index": index, "content_type": upload.content_type or ""})
+        saved.append(await asyncio.to_thread(
+            save_attachment, cfg, chat_id, data,
+            name=upload.filename or f"热点{index}.png", mime=mime))
+    return saved
+
+
+def _attachment_note(attachments: list[dict[str, Any]]) -> str:
+    """附件说明（进模型消息与落库前的提示）：最多列 3 个名字 + 总张数（S7.14）。"""
+    if not attachments:
+        return ""
+    names = [str(item.get("name") or "") for item in attachments]
+    listed = "、".join(name for name in names[:3] if name)
+    count = len(attachments)
+    tail = f" 等 {count} 张" if count > 3 else ""
+    return f"{count} 张图片（{listed}{tail}）"
 
 
 @router.post("/chat/sessions", status_code=201, response_model=ChatSession,
@@ -130,13 +181,20 @@ async def get_chat_session(session_id: UuidPath, cfg: ConfigDep, session: Sessio
 async def post_chat_message(
         session_id: UuidPath, cfg: ConfigDep, session: SessionDep, dispatcher: DispatcherDep,
         text: Annotated[str | None, Form()] = None,
-        file: Annotated[UploadFile | None,
-                        File(json_schema_extra={"format": "binary"})] = None
+        # 用裸 `File()`：给列表加 `json_schema_extra={"format": "binary"}` 会让 format 落在
+        # **数组外层**（FastAPI 的既有行为），与契约里 `items` 的形状对不上；`list[UploadFile]`
+        # 本身带 `contentMediaType`，Swagger UI 照常渲染多文件选择器。
+        files: Annotated[list[UploadFile] | None, File()] = None
 ) -> StreamingResponse:
-    """发一条消息：落库 → 起 detached 的对话轮次 → 把事件总线转成 SSE 流。"""
+    """发一条消息：落库 → 起 detached 的对话轮次 → 把事件总线转成 SSE 流。
+
+    图片走 `files`（可重复，1–9 张，S7.14）：数量与体积先整批校验（400 文案指明第几张），
+    再逐张落盘；这一组图在整轮里是同一次解析、跨轮回落也按整组。
+    """
     chat_id = _uuid(session_id, what="会话")
     body = (text or "").strip()
-    if not body and file is None:
+    uploads = list(files or [])
+    if not body and not uploads:
         raise BadRequestError("这条消息既没有文字也没有图片")
     if len(body) > 500:
         raise BadRequestError("热点原文（这一条消息）不能超过 500 字", {"chars": len(body)})
@@ -145,18 +203,8 @@ async def post_chat_message(
     if detail is None:
         raise NotFoundError(f"会话不存在：{session_id}", {"session_id": session_id})
 
-    attachments: list[dict[str, Any]] = []
-    note = ""
-    if file is not None:
-        raw = await _read_image(file, max_bytes=cfg.chat.attachment_max_mb * 1024 * 1024)
-        mime = sniff_image_mime(raw)
-        if not mime:
-            raise BadRequestError("只支持 jpg / png / webp 图片（按文件内容判断）",
-                                  {"content_type": file.content_type or ""})
-        saved = await asyncio.to_thread(save_attachment, cfg, chat_id, raw,
-                                        name=file.filename or "热点.png", mime=mime)
-        attachments.append(saved)
-        note = f"1 张图片（{saved['name']}，{saved['mime']}）"
+    attachments = await _save_images(cfg, chat_id, uploads)
+    note = _attachment_note(attachments)
 
     # 原样交给装配器：带 tool_calls（模型据此拿到 run_id）与 attachments（提示"早前传过图"）。
     # 只读本会话的消息 → 跨会话天然不串味（S7.10）。

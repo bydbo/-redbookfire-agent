@@ -36,7 +36,7 @@ from ..config import AppConfig
 from ..core.errors import DependencyUnavailableError
 from ..db.session import create_engine_from_config, create_session_factory
 from ..services import chat_tools
-from ..services.chat import latest_attachment, update_message
+from ..services.chat import latest_attachments, update_message
 from ..services.chat_tools import ToolContext, ToolOutcome
 from ..tools.http import build_http_client
 from ..tools.llm import BaseProvider, StructuredCaller, build_provider
@@ -173,16 +173,16 @@ def build_turn_provider(cfg: AppConfig, client: Any) -> BaseProvider:
 def build_tool_runner(session: AsyncSession, *, cfg: AppConfig, client: Any,
                       session_id: uuid.UUID, attachments: list[dict[str, Any]],
                       dispatcher: Any, caller: Any = None,
-                      recent_attachment: dict[str, Any] | None = None) -> Any:
+                      recent_attachments: list[dict[str, Any]] | None = None) -> Any:
     """工具执行器：按 `chat_tools.HANDLERS` 分派（S7.7a）——这里也不写具体工具名。
 
     `caller` 是给只读工具用的文本模型入口（拆解热点等）；`cache` 让同一轮内的同一件事
-    只付一次钱（S7.7）。`recent_attachment` 是本会话最近一张图（S7.10 的跨轮图片回落）：
-    这一轮没有附件时，用户说「上面那张图」的工具调用才有东西可用。
+    只付一次钱（S7.7）。`recent_attachments` 是本会话最近**一组**图（S7.10 的跨轮图片回落，
+    S7.16 改成整组）：这一轮没有附件时，用户说「上面那几张图」的工具调用才有东西可用。
     """
     context = ToolContext(cfg=cfg, session=session, session_id=session_id,
                           enqueue=getattr(dispatcher, "enqueue", None), http=client,
-                          caller=caller, recent_attachment=recent_attachment)
+                          caller=caller, recent_attachments=list(recent_attachments or []))
 
     async def runner(name: str, args: dict[str, Any], *, on_progress: Any = None) -> Any:
         handler = chat_tools.HANDLERS.get(name)
@@ -224,15 +224,15 @@ async def run_turn_task(cfg: AppConfig, events: TurnEvents, *, session_id: uuid.
                     "message_id": str(message_id)})
                 async with build_http_client(cfg.llm.timeout_s) as client:
                     provider = build_turn_provider(cfg, client)
-                    # 跨轮图片回落（S7.10）：先把本会话最近一张图取出来，工具在"本轮没带图"
-                    # 时才有得用（用户说「上面那张图」正是这种情况）
-                    recent = await latest_attachment(session, session_id)
+                    # 跨轮图片回落（S7.10 / S7.16 按组）：先把本会话最近一组图取出来，工具在
+                    # "本轮没带图"时才有得用（用户说「上面那几张图」正是这种情况）
+                    recent = await latest_attachments(session, session_id)
                     runner = build_tool_runner(session, cfg=cfg, client=client,
                                                session_id=session_id,
                                                attachments=attachments or [],
                                                dispatcher=dispatcher,
                                                caller=StructuredCaller(provider=provider),
-                                               recent_attachment=recent)
+                                               recent_attachments=recent)
 
                     async def on_event(event: str, payload: dict[str, Any]) -> None:
                         await events.publish(event, payload)

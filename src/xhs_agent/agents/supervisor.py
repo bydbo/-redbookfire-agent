@@ -98,15 +98,27 @@ def _entry_text(item: dict[str, Any], *, digest: bool) -> str:
     return "\n".join(piece for piece in (text, line) if piece)
 
 
-def _earlier_images(history: list[dict[str, Any]]) -> list[str]:
-    """历史里的图片附件名（去重保序）——告诉模型「本会话早前传过图」。"""
-    names: list[str] = []
+def _earlier_image_note(history: list[dict[str, Any]]) -> str:
+    """历史图片提示：总张数 + **最近一组**的名字（最多列 3 个；S7.10 / S7.16）。
+
+    只报最近一组的名字：9 张 × 多轮会把这一行撑爆，而模型只需要知道「早前有图可用、最近那组
+    叫什么」。**整组**这一点很重要——回落时给工具的是那一整组，不是第一张。
+    """
+    total = 0
+    latest: list[str] = []
     for item in history:
-        for attachment in item.get("attachments") or []:
-            name = str(attachment.get("name") or "").strip()
-            if name and name not in names:
-                names.append(name)
-    return names
+        names = [str(attachment.get("name") or "").strip()
+                 for attachment in (item.get("attachments") or [])]
+        names = [name for name in names if name]
+        if not names:
+            continue
+        total += len(names)
+        latest = names          # 越晚的消息覆盖它 → 循环结束就是最近一组
+    if not latest:
+        return ""
+    listed = "、".join(latest[:3])
+    suffix = f" 等 {len(latest)} 张" if len(latest) > 3 else ""
+    return f"本会话早前传过 {total} 张图（最近一组：{listed}{suffix}）"
 
 
 def assemble_history(history: list[dict[str, Any]], *,
@@ -155,9 +167,9 @@ def build_messages(rendered: prompt_tool.RenderedPrompt, history: list[dict[str,
     messages.extend(assembled)
     current = user_text.strip() or "（这条消息没有文字，只有附件）"
     notes: list[str] = []
-    images = _earlier_images(history)
-    if images:
-        notes.append(f"本会话早前传过 {len(images)} 张图（{'、'.join(images)}）")
+    image_note = _earlier_image_note(history)
+    if image_note:
+        notes.append(image_note)
     if dropped:
         notes.append(f"本会话更早还有 {dropped} 条消息没装进上下文")
     if notes:

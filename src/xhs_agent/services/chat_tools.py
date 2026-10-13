@@ -21,9 +21,12 @@
 - **`run_id` 可省**（`read_run` / `revise_draft`）：不传就落到本会话**最近一次**运行产出的
   那个（`services/chat.py::latest_run_id`）——装配给模型的历史只有消息正文，工具返回值里的 id
   它看不到，用户说「上次那批」「刚才那版」时只能由服务端兜底（S7.9 冒烟实测到这条）；
-- **跨轮图片回落**（S7.10）：这一轮没有附件时，图片类工具用 `ToolContext.recent_attachment`
-  （本会话最近一张图，`services/chat.py::latest_attachment`）——用户说「上面那张图」才用得上。
-  `run_hotspot_analysis` **只在热点文本为空时**才用它，避免拿旧图线索去跑一条新热点；
+- **跨轮图片回落**（S7.10 / S7.16 按组）：这一轮没有附件时，图片类工具用
+  `ToolContext.recent_attachments`（本会话**最近一组**图，`services/chat.py::latest_attachments`）
+  ——用户说「上面那几张图」才用得上。`run_hotspot_analysis` **只在热点文本为空时**才用它，
+  避免拿旧图线索去跑一条新热点；
+- **一组图一次解析**（S7.16）：1 张走单图 prompt、多张走合并 prompt，都只调一次多模态接口；
+  同一组在本轮内只解析一次（缓存键是整组路径），成本只记那一次；
 - 有图片附件时先走 S6.6 的 `parse_image_clue`（多模态），把解析出的线索作为**预置线索**
   随 `submit_analysis(clues=...)` 提交——拆解节点短路，不重复付费（S6.7）；
 - 分析在 Celery worker 跑，本工具只等结果：轮询 `runs`（ADR 0011：库是权威源），
@@ -60,8 +63,11 @@ from ..config import AppConfig
 from ..core.errors import ApiError, BadRequestError
 from ..schemas import TYPE_LABELS, Element, HotspotClue, SchemaError
 from ..services.chat import latest_run_id, resolve_attachment
-from ..services.image_clue import TASK_ID as IMAGE_CLUE_TASK
-from ..services.image_clue import ImageClueParse, parse_image_clue
+from ..services.image_clue import (
+    ImageClueParse,
+    parse_image_clue,
+    parse_image_clue_multi,
+)
 from ..services.retrieval import literal_only_candidates, retrieve_candidates
 from ..services.runs import load_job, load_run, submit_analysis
 from ..tools.embedding import EmbeddingError
@@ -99,8 +105,8 @@ TOOLS: list[dict[str, Any]] = [
             "description": (
                 "把一个热点跑一遍完整分析：拆解爆点要素 → 在创作者本地的素材库里检索可蹭的素材 → "
                 "给出命中理由与覆盖缺口 → 写一版文案初稿。用户说「蹭一下这个热点」「看看有没有"
-                "素材」「写一版文案」时调用它。用户只发了图片、没写热点文字时，热点参数留空即可，"
-                "工具会用图片自己解析出描述。"
+                "素材」「写一版文案」时调用它。用户只发了图（1–9 张，没写热点文字）时，热点参数"
+                "留空即可，工具会用那组图自己解析出描述（多张合并成一份）。"
             ),
             "parameters": {
                 "type": "object",
@@ -126,9 +132,10 @@ TOOLS: list[dict[str, Any]] = [
         "function": {
             "name": TOOL_PARSE_IMAGE,
             "description": (
-                "把用户这一轮发来的图片拆成「热点描述 + 爆点要素」。**只解析图片**：不检索素材、"
-                "不写文案、不落库、不产生运行记录。用户只丢了一张图、想先看看图里是什么热点，"
-                "或者你想先确认图片内容再决定下一步时用它。"
+                "把用户这一轮发来的图拆成「热点描述 + 爆点要素」。用户一次可能发 1–9 张，"
+                "**整组当一条热点**一次解析（多张会合并成一份描述与一份要素，各自的画面在要素的"
+                "evidence 里标了图号）。**只解析图片**：不检索素材、不写文案、不落库、不产生运行"
+                "记录。用户只丢图、想先看看图里是什么热点，或者你想先确认图片内容再决定下一步时用它。"
             ),
             "parameters": {"type": "object", "properties": {}, "required": []},
         },
@@ -282,8 +289,9 @@ class ToolContext:
     sleep: Callable[[float], Awaitable[None]] = asyncio.sleep
     poll_interval_s: float = 1.5
     max_wait_s: float | None = None          # None = 取 [queue].task_time_limit_s
-    # 本会话最近一张图片附件（跨轮图片回落，S7.10）；运行器注入，离线测试直接给假实现
-    recent_attachment: dict[str, Any] | None = None
+    # 本会话最近**一组**图片附件（跨轮图片回落，S7.10 单张 → S7.16 整组）；
+    # 运行器注入，离线测试直接给假实现。空列表 = 本会话还没有图。
+    recent_attachments: list[dict[str, Any]] = field(default_factory=list)
 
 
 @dataclass
@@ -426,24 +434,41 @@ async def _resolve_run_id(ctx: ToolContext, raw: str) -> tuple[str, str]:
     return found, ""
 
 
-async def _image_clue_for(ctx: ToolContext, attachment: dict[str, Any],
-                          ) -> tuple[ImageClueParse, int]:
-    """解析图片（同一轮内同一张图只解析一次）；返回（解析结果，prompt 版本）。
+def _image_group(attachments: list[dict[str, Any]] | None,
+                 ctx: ToolContext) -> list[dict[str, Any]]:
+    """这一轮要用的图片组：**本轮带的优先**，本轮没带才回落到本会话最近一组（S7.16）。
 
-    缓存命中时把用量清零（与 `_clue_for` 同一口径）：钱只在真正发生的那一次调用上记，
-    「先解析图片、再跑完整分析」这类同轮组合不会把一次多模态调用记两遍。
+    单张与多张走同一条路（1 张就是只有一项的组），调用方不再关心数量。
     """
-    key = str(attachment.get("path") or "")
+    group = [item for item in (attachments or []) if item]
+    return group or list(ctx.recent_attachments or [])
+
+
+async def _image_clue_for(ctx: ToolContext,
+                          attachments: list[dict[str, Any]]) -> ImageClueParse:
+    """解析一组图片（同一轮内同一组只解析一次）；返回解析结果（含它自己的 prompt 版本）。
+
+    1 张走单图口径（`image_hotspot_clue`）、多张走合并口径（`image_hotspot_clue_multi`，
+    一次调用一份线索，S7.15/S7.16）。缓存键是**整组路径**——顺序变了算另一组（顺序即图号，
+    `evidence` 要指图）。缓存命中时把用量清零（与 `_clue_for` 同一口径）：钱只在真正发生的
+    那一次调用上记，「先解析图片、再跑完整分析」这类同轮组合不会把一次多模态调用记两遍。
+    """
+    group = [item for item in attachments if item]
+    key = "|".join(str(item.get("path") or "") for item in group)
     cached = ctx.cache.image_clues.get(key) if key else None
     if cached is not None:
-        parsed, version = cached
-        return replace(parsed, cost_cny=0.0, prompt_tokens=0, completion_tokens=0), version
-    data, mime = await _read_image(ctx, attachment)
-    parsed = await parse_image_clue(ctx.cfg, data, mime, http=ctx.http)
-    version = int(parsed.prompt_versions.get(IMAGE_CLUE_TASK) or 1)
+        parsed, _version = cached
+        return replace(parsed, cost_cny=0.0, prompt_tokens=0, completion_tokens=0)
+    images = [await _read_image(ctx, item) for item in group]
+    if len(images) == 1:
+        data, mime = images[0]
+        parsed = await parse_image_clue(ctx.cfg, data, mime, http=ctx.http)
+    else:
+        parsed = await parse_image_clue_multi(ctx.cfg, images, http=ctx.http)
+    version = int(next(iter(parsed.prompt_versions.values())) if parsed.prompt_versions else 1)
     if key:
         ctx.cache.image_clues[key] = (parsed, version)
-    return parsed, version
+    return parsed
 
 
 async def run_hotspot_analysis(ctx: ToolContext, args: dict[str, Any], *,
@@ -469,21 +494,21 @@ async def run_hotspot_analysis(ctx: ToolContext, args: dict[str, Any], *,
 
     versions: dict[str, int] = {}
     clue: dict[str, Any] | None = None
-    image: dict[str, Any] | None = attachments[0] if attachments else None
-    # 跨轮图片回落（S7.10）：这一轮没带图、用户也没给热点文本时才用本会话最近那张图——
-    # 有热点文本时绝不混入旧图，否则会拿旧图的线索去跑一条新热点
-    if image is None and not text:
-        image = ctx.recent_attachment
+    # 跨轮图片回落（S7.10 / S7.16 按组）：这一轮没带图、用户也没给热点文本时才用本会话最近
+    # 那一组图——有热点文本时绝不混入旧图，否则会拿旧图的线索去跑一条新热点
+    group = [item for item in (attachments or []) if item]
+    if not group and not text:
+        group = list(ctx.recent_attachments or [])
     image_cost = 0.0
     image_tokens = (0, 0)
-    if image is not None:
+    if group:
         await progress("解析图片")
         try:
-            parsed, image_version = await _image_clue_for(ctx, image)
+            parsed = await _image_clue_for(ctx, group)
         except (ApiError, LLMError, EmbeddingError) as exc:
             return ToolOutcome(status="failed", steps=steps,
                                error=f"图片没能解析出来：{_reason(exc)}")
-        versions[IMAGE_CLUE_TASK] = image_version
+        versions.update(parsed.prompt_versions)
         image_cost = float(parsed.cost_cny or 0.0)
         image_tokens = (int(parsed.prompt_tokens), int(parsed.completion_tokens))
         clue = parsed.clue.to_dict()
@@ -522,6 +547,7 @@ async def run_hotspot_analysis(ctx: ToolContext, args: dict[str, Any], *,
     summary["cost_cny"] = round(float(summary.get("cost_cny") or 0) + image_cost, 4)
     summary["prompt_tokens"] = int(summary.get("prompt_tokens") or 0) + image_tokens[0]
     summary["completion_tokens"] = int(summary.get("completion_tokens") or 0) + image_tokens[1]
+    summary["image_count"] = len(group)
     return ToolOutcome(status="succeeded", steps=steps,
                        payload=summary,
                        prompt_versions=versions)
@@ -532,27 +558,26 @@ async def parse_clue_from_image(ctx: ToolContext, args: dict[str, Any], *,
                                 on_progress: ProgressFn | None = None) -> ToolOutcome:
     """「解析图片」工具（S7.7）：只把图片拆成热点描述与要素，不检索、不落库。"""
     steps: list[dict[str, Any]] = []
-    image: dict[str, Any] | None = attachments[0] if attachments else None
-    if image is None:
-        image = ctx.recent_attachment          # 跨轮回落（S7.10）：用户说「上面那张图」时用得上
-    if image is None:
+    group = _image_group(attachments, ctx)     # 本轮带的优先，本轮没带回落最近一组（S7.16）
+    if not group:
         return ToolOutcome(status="failed", steps=steps,
                            error="这一轮没有图片附件（本会话也没有早前的图片），"
-                                 "请让用户先发一张图")
+                                 "请让用户先发图")
     _step(steps, "解析图片")
     if on_progress is not None:
         await on_progress("解析图片", 0, 0)
     try:
-        parsed, version = await _image_clue_for(ctx, image)
+        parsed = await _image_clue_for(ctx, group)
     except (ApiError, LLMError, EmbeddingError) as exc:
         return ToolOutcome(status="failed", steps=steps,
                            error=f"图片没能解析出来：{_reason(exc)}")
     payload = {"raw_text": parsed.raw_text, "elements": _elements_of(parsed.clue),
+               "image_count": len(group),
                "cost_cny": float(parsed.cost_cny or 0.0),
                "prompt_tokens": int(parsed.prompt_tokens),
                "completion_tokens": int(parsed.completion_tokens)}
     return ToolOutcome(status="succeeded", steps=steps, payload=payload,
-                       prompt_versions={IMAGE_CLUE_TASK: version})
+                       prompt_versions=dict(parsed.prompt_versions))
 
 
 async def search_materials(ctx: ToolContext, args: dict[str, Any], *,

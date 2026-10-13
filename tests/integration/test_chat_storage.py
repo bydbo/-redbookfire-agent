@@ -23,7 +23,7 @@ from xhs_agent.db import Base
 from xhs_agent.services.chat import (
     append_message,
     create_session,
-    latest_attachment,
+    latest_attachments,
     list_sessions,
     load_message,
     load_session,
@@ -268,33 +268,34 @@ class TestUsage:
         assert updated["cost_cny"] == pytest.approx(0.0123)     # 只改显式给了的字段
 
 
-class TestLatestAttachment:
-    """跨轮图片回落（S7.10）：本会话最近一张图，且绝不跨会话。"""
+class TestLatestAttachments:
+    """跨轮图片回落（S7.10 起、S7.16 改成整组）：最近**一条带图消息的整组**，且绝不跨会话。"""
 
-    async def test_returns_the_newest_image(self, db_session: AsyncSession,
-                                            cfg: AppConfig) -> None:
+    async def test_returns_the_whole_group_of_the_newest_message(
+            self, db_session: AsyncSession, cfg: AppConfig) -> None:
         created = await create_session(db_session)
         session_id = uuid.UUID(created["session_id"])
         older = save_attachment(cfg, session_id, b"\x89PNG-old", name="旧图.png",
                                 mime="image/png")
-        newer = save_attachment(cfg, session_id, b"\x89PNG-new", name="新图.png",
-                                mime="image/png")
+        newer = [save_attachment(cfg, session_id, b"\x89PNG-new", name=f"新图{index}.png",
+                                 mime="image/png") for index in (1, 2)]
 
         await append_message(db_session, session_id, role="user", content="第一张",
                              attachments=[older])
         await asyncio.sleep(0.01)          # 保证两条消息的 created_at 不同（排序才无歧义）
-        await append_message(db_session, session_id, role="user", content="第二张",
-                             attachments=[newer])
+        await append_message(db_session, session_id, role="user", content="第二组",
+                             attachments=newer)
 
-        found = await latest_attachment(db_session, session_id)
-        assert found is not None and found["name"] == "新图.png"
+        found = await latest_attachments(db_session, session_id)
+        # 整组、按发送顺序（顺序即图号，多图解析要靠它指图）
+        assert [item["name"] for item in found] == ["新图1.png", "新图2.png"]
 
-    async def test_none_when_the_session_has_no_image(self,
-                                                      db_session: AsyncSession) -> None:
+    async def test_empty_when_the_session_has_no_image(self,
+                                                       db_session: AsyncSession) -> None:
         created = await create_session(db_session)
         session_id = uuid.UUID(created["session_id"])
         await append_message(db_session, session_id, role="user", content="只有文字")
-        assert await latest_attachment(db_session, session_id) is None
+        assert await latest_attachments(db_session, session_id) == []
 
     async def test_never_crosses_sessions(self, db_session: AsyncSession,
                                           cfg: AppConfig) -> None:
@@ -304,6 +305,6 @@ class TestLatestAttachment:
         await append_message(db_session, second, role="user", content="乙会话的图",
                              attachments=[saved])
 
-        assert await latest_attachment(db_session, first) is None
-        found = await latest_attachment(db_session, second)
-        assert found is not None and found["name"] == "乙图.png"
+        assert await latest_attachments(db_session, first) == []
+        found = await latest_attachments(db_session, second)
+        assert [item["name"] for item in found] == ["乙图.png"]

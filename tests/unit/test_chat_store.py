@@ -86,6 +86,8 @@ class TestChatConfig:
         cfg = write_config(tmp_path)
         assert cfg.chat.max_tool_rounds == 3
         assert cfg.chat.attachment_max_mb == 10
+        assert cfg.chat.attachment_max_count == 9
+        assert cfg.chat.attachment_total_max_mb == 30
         assert cfg.chat.history_max_messages == 20
         assert cfg.chat.turn_stale_seconds == 300
 
@@ -93,11 +95,16 @@ class TestChatConfig:
         described = write_config(tmp_path).describe()
         assert described["chat"]["max_tool_rounds"] == 3
         assert described["chat"]["attachment_max_mb"] == 10
+        assert described["chat"]["attachment_max_count"] == 9
+        assert described["chat"]["attachment_total_max_mb"] == 30
 
     @pytest.mark.parametrize("body", [
         "[chat]\nmax_tool_rounds = 0\n",
         "[chat]\nmax_tool_rounds = 11\n",
         "[chat]\nattachment_max_mb = 0\n",
+        "[chat]\nattachment_max_count = 0\n",
+        "[chat]\nattachment_max_count = 10\n",
+        "[chat]\nattachment_total_max_mb = 0\n",
         "[chat]\nhistory_max_messages = 0\n",
         "[chat]\nturn_stale_seconds = 5\n",
     ])

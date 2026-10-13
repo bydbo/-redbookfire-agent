@@ -111,6 +111,8 @@ allowed_extensions = [
 # 以及「跑着的这一轮多久算中断」（API 重启等场景，读会话时兜底标记）。
 max_tool_rounds = 3
 attachment_max_mb = 10
+attachment_max_count = 9            # 一条消息最多几张图（多图热点，S7.14）
+attachment_total_max_mb = 30        # 这一批图片的合计上限（MB）
 history_max_messages = 20            # 历史里保留原文的最近消息条数（更早的降级成摘要）
 history_token_budget = 6000          # 历史部分的 token 预算（粗估）；超了先摘要、再裁剪（S7.10）
 turn_stale_seconds = 300

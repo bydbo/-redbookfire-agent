@@ -199,7 +199,7 @@ class TestChatApi:
 
         response = client.post(f"/api/chat/sessions/{session_id}/messages",
                                data={"text": "帮我蹭一下这个热点"},
-                               files={"file": ("热点.png", PNG, "image/png")})
+                               files={"files": ("热点.png", PNG, "image/png")})
         assert response.status_code == 200, response.text
         assert response.headers["content-type"].startswith("text/event-stream")
         events = parse_sse(response.text)
@@ -330,7 +330,7 @@ class TestChatApi:
         # 不是 jpg / png / webp
         bad = client.post(f"/api/chat/sessions/{session_id}/messages",
                           data={"text": "看看这张"},
-                          files={"file": ("x.gif", b"GIF89a" + b"\x00" * 8, "image/gif")})
+                          files={"files": ("x.gif", b"GIF89a" + b"\x00" * 8, "image/gif")})
         assert bad.status_code == 400
         # 文字超 500 字
         too_long = client.post(f"/api/chat/sessions/{session_id}/messages",
@@ -369,10 +369,10 @@ class TestMemoryAndUsage:
         assert "甲会话的暗号ZZZ" not in seen            # 只装配本会话的消息
         assert "乙会话开始" in seen
 
-    def test_recent_attachment_is_passed_to_the_runner(
+    def test_recent_attachments_are_passed_to_the_runner(
             self, client: TestClient, provider: ScriptedProvider,
             monkeypatch: pytest.MonkeyPatch) -> None:
-        """第二轮说「上面那张图」时，运行器要拿到本会话最近那张图（S7.10 的跨轮回落）。"""
+        """第二轮说「上面那张图」时，运行器要拿到本会话最近**整组**图（S7.10 / S7.16）。"""
         captured: list[dict[str, Any]] = []
 
         def fake_builder(_session: Any, **kwargs: Any) -> FakeToolRunner:
@@ -386,14 +386,131 @@ class TestMemoryAndUsage:
         session_id = new_session(client)
 
         client.post(f"/api/chat/sessions/{session_id}/messages", data={"text": "看看这张"},
-                    files={"file": ("热点.png", PNG, "image/png")})
+                    files={"files": ("热点.png", PNG, "image/png")})
         client.post(f"/api/chat/sessions/{session_id}/messages", data={"text": "上面那张图"})
 
         # 第一轮：这张图既是本轮附件、也已经是「本会话最近一张图」——接口先落库用户消息（含附件）
         # 再起 turn，所以回落在同一轮里也查得到它
         assert captured[0]["attachments"][0]["name"] == "热点.png"
-        assert captured[0]["recent_attachment"]["name"] == "热点.png"
+        assert [item["name"] for item in captured[0]["recent_attachments"]] == ["热点.png"]
         # 第二轮没有附件：回落仍然拿得到上一轮那张图（S7.10 的修复点）
         assert captured[1]["attachments"] == []
-        recent = captured[1]["recent_attachment"]
-        assert recent is not None and recent["name"] == "热点.png"
+        recent = captured[1]["recent_attachments"]
+        assert [item["name"] for item in recent] == ["热点.png"]
+
+    def test_a_group_of_images_falls_back_as_a_whole(
+            self, client: TestClient, provider: ScriptedProvider,
+            monkeypatch: pytest.MonkeyPatch) -> None:
+        """多图（S7.16）：回落给工具的是**整组**（按发送顺序），不是第一张。"""
+        captured: list[dict[str, Any]] = []
+
+        def fake_builder(_session: Any, **kwargs: Any) -> FakeToolRunner:
+            captured.append(kwargs)
+            return FakeToolRunner(ToolOutcome(status="succeeded", payload={}))
+
+        monkeypatch.setattr(chat_turns, "build_tool_runner", fake_builder)
+        provider.steps = [{"text": "这组图我收到了"}, {"text": "就是刚才那几张"}]
+        session_id = new_session(client)
+        uploads = [("files", (f"图{index}.png", PNG + bytes([index]), "image/png"))
+                   for index in range(1, 4)]
+
+        client.post(f"/api/chat/sessions/{session_id}/messages", data={"text": "看看这组图"},
+                    files=uploads)
+        client.post(f"/api/chat/sessions/{session_id}/messages", data={"text": "上面那几张图"})
+
+        assert captured[1]["attachments"] == []
+        assert [item["name"] for item in captured[1]["recent_attachments"]] == \
+            ["图1.png", "图2.png", "图3.png"]
+
+
+class TestMultiImage:
+    """多图热点（S7.14）：`files` 一组 1–9 张；超数量/超总量整批拒绝，400 文案指明位置。"""
+
+    @staticmethod
+    def _post(client: TestClient, session_id: str,
+              uploads: list[tuple[str, tuple[str, bytes, str]]],
+              *, text: str = "看看这组图") -> Any:
+        return client.post(f"/api/chat/sessions/{session_id}/messages",
+                           data={"text": text}, files=uploads)
+
+    def test_nine_images_land_as_one_group(self, client: TestClient,
+                                           provider: ScriptedProvider,
+                                           cfg: AppConfig) -> None:
+        provider.steps = [{"text": "收到这 9 张"}]
+        session_id = new_session(client)
+        uploads = [("files", (f"图{index}.png", PNG + bytes([index]), "image/png"))
+                   for index in range(1, 10)]
+
+        response = self._post(client, session_id, uploads)
+
+        assert response.status_code == 200, response.text
+        user_message = client.get(f"/api/chat/sessions/{session_id}").json()["messages"][0]
+        attachments = user_message["attachments"]
+        assert [item["name"] for item in attachments] == \
+            [f"图{index}.png" for index in range(1, 10)]
+        assert [item["kind"] for item in attachments] == ["image"] * 9
+        # 每张都能按「会话 + 消息 + 下标」原样取回（下标即发送顺序）
+        for index, item in enumerate(attachments):
+            assert item["url"].endswith(f"/attachments/{user_message['message_id']}/{index}")
+            fetched = client.get(item["url"])
+            assert fetched.status_code == 200
+            assert fetched.content == PNG + bytes([index + 1])
+        assert len(list((Path(cfg.runs_dir()) / "_chat" / session_id).glob("*.png"))) == 9
+        # 附件说明报了张数；名字超过 3 个时走「等 N 张」，不会把 9 个名字全塞进上下文
+        note = str(provider.calls[0].messages[-1]["content"])
+        assert "9 张图片（图1.png、图2.png、图3.png 等 9 张）" in note
+
+    def test_too_many_images_are_rejected_as_a_batch(self, client: TestClient) -> None:
+        session_id = new_session(client)
+        uploads = [("files", (f"图{index}.png", PNG, "image/png")) for index in range(10)]
+
+        response = self._post(client, session_id, uploads)
+
+        assert response.status_code == 400
+        assert "最多发 9 张" in response.json()["message"]
+
+    def test_non_image_names_the_position(self, client: TestClient) -> None:
+        session_id = new_session(client)
+        uploads = [("files", ("图1.png", PNG, "image/png")),
+                   ("files", ("图2.gif", b"GIF89a" + b"\x00" * 8, "image/gif"))]
+
+        response = self._post(client, session_id, uploads)
+
+        assert response.status_code == 400
+        assert "第 2 张" in response.json()["message"]
+
+    def test_empty_file_names_the_position(self, client: TestClient) -> None:
+        session_id = new_session(client)
+        uploads = [("files", ("图1.png", PNG, "image/png")),
+                   ("files", ("图2.png", b"", "image/png"))]
+
+        response = self._post(client, session_id, uploads)
+
+        assert response.status_code == 400
+        assert "第 2 张" in response.json()["message"]
+
+    def test_single_size_limit_names_the_position(self, client: TestClient,
+                                                  cfg: AppConfig) -> None:
+        cfg.chat.attachment_max_mb = 1                     # 默认 10 MB，这里收紧到 1 MB
+        session_id = new_session(client)
+        big = PNG + b"\x00" * (1024 * 1024)
+        uploads = [("files", ("图1.png", PNG, "image/png")),
+                   ("files", ("图2.png", big, "image/png"))]
+
+        response = self._post(client, session_id, uploads)
+
+        assert response.status_code == 400
+        assert "第 2 张超过 1 MB 上限" in response.json()["message"]
+
+    def test_total_size_limit_rejects_the_batch(self, client: TestClient,
+                                                cfg: AppConfig) -> None:
+        cfg.chat.attachment_total_max_mb = 1
+        session_id = new_session(client)
+        half = PNG + b"\x00" * (600 * 1024)
+        uploads = [("files", ("图1.png", half, "image/png")),
+                   ("files", ("图2.png", half, "image/png"))]
+
+        response = self._post(client, session_id, uploads)
+
+        assert response.status_code == 400
+        assert "合计超过 1 MB 上限" in response.json()["message"]

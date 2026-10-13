@@ -357,6 +357,10 @@ class ChatConfig(_Section):
     max_tool_rounds: int = Field(3, ge=1, le=10)
     # 对话里传的图片单张上限（MB）；与热点图片解析的 10MB 口径一致
     attachment_max_mb: int = Field(10, ge=1, le=100)
+    # 一条消息最多几张图（S7.14：多图热点一次最多 9 张）；超数量整批拒绝、不截断
+    attachment_max_count: int = Field(9, ge=1, le=9)
+    # 一条消息里所有图片的合计上限（MB）；与单张上限分别生效
+    attachment_total_max_mb: int = Field(30, ge=1, le=200)
     # 装配给 supervisor 的历史里**保留原文**的最近消息条数；更早的降级成摘要（S7.10）
     history_max_messages: int = Field(20, ge=1, le=200)
     # 历史部分的 token 预算（粗估，口径见 `tools/llm.py::estimate_tokens`）：
@@ -475,6 +479,8 @@ class AppConfig(_Section):
             "chat": {
                 "max_tool_rounds": self.chat.max_tool_rounds,
                 "attachment_max_mb": self.chat.attachment_max_mb,
+                "attachment_max_count": self.chat.attachment_max_count,
+                "attachment_total_max_mb": self.chat.attachment_total_max_mb,
                 "history_max_messages": self.chat.history_max_messages,
                 "history_token_budget": self.chat.history_token_budget,
                 "turn_stale_seconds": self.chat.turn_stale_seconds,

@@ -105,7 +105,7 @@ class TestBuildMessages:
         assert messages[1]["role"] == "user"
         last = str(messages[-1]["content"])
         assert last.startswith("上面那张图，帮我蹭一下")
-        assert "[历史] 本会话早前传过 1 张图（热点.png）" in last
+        assert "[历史] 本会话早前传过 1 张图（最近一组：热点.png）" in last
         assert "[附件] 1 张图片（新图.png）" in last
 
     def test_over_budget_note_is_told_to_the_model(self) -> None:
