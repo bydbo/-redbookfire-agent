@@ -3,10 +3,12 @@ import {
   NAlert, NButton, NCard, NCheckbox, NDrawer, NDrawerContent, NEmpty, NInput, NModal,
   NPagination, NPopconfirm, NProgress, NSelect, NSpin, NTag,
 } from 'naive-ui'
-import { computed, onMounted, ref } from 'vue'
+import { computed, onMounted, ref, watch } from 'vue'
 
 import type { MaterialItem, MaterialSource, MaterialType } from '@/api/materials'
+import type { Element } from '@/api/analysis'
 import { apiUrl } from '@/api/client'
+import { ELEMENT_TYPE_LABELS } from '@/api/analysis'
 import { useMaterialsStore } from '@/stores/materials'
 
 const store = useMaterialsStore()
@@ -139,6 +141,38 @@ async function saveEdit(): Promise<void> {
     description: editDescription.value,
     tags: store.editTags,
   })
+}
+
+// ---------- 详情弹窗 ----------
+
+/** 详情里正在看第几张关键帧；换素材或重新打开时归零。 */
+const detailFrameIndex = ref(0)
+const detailFrameFailed = ref(false)
+
+const detailFrames = computed(() => store.detail?.keyframes ?? [])
+const detailPreviewUrl = computed(() => {
+  const current = store.detail
+  if (!current || detailFrames.value.length === 0) return null
+  return apiUrl(`/materials/${current.id}/keyframes/${detailFrameIndex.value}`)
+})
+
+watch(() => store.detail?.id, () => {
+  detailFrameIndex.value = 0
+  detailFrameFailed.value = false
+})
+
+function showFrame(index: number): void {
+  detailFrameIndex.value = index
+  detailFrameFailed.value = false
+}
+
+/** 详情里的「编辑」：`MaterialDetail` 是列表项的超集，直接复用既有的编辑弹窗。 */
+function editFromDetail(): void {
+  if (store.detail) openEdit(store.detail)
+}
+
+function elementLabel(type: Element['type']): string {
+  return ELEMENT_TYPE_LABELS[type]
 }
 
 // ---------- 回收站 ----------
@@ -336,7 +370,16 @@ const trashError = computed(() => store.actionError)
         >
           <n-card v-for="item in store.items" :key="item.id" size="small">
             <div class="flex flex-col gap-2">
-              <div class="relative h-36 w-full overflow-hidden rounded-lg bg-surface-muted">
+              <!-- 点缩略图 = 看详情（S6.1 的 `GET /api/materials/{id}`，含关键帧与爆点要素） -->
+              <div
+                class="relative h-36 w-full cursor-pointer overflow-hidden rounded-lg bg-surface-muted"
+                role="button"
+                tabindex="0"
+                title="查看详情"
+                @click="store.openDetail(item.id)"
+                @keydown.enter.prevent="store.openDetail(item.id)"
+                @keydown.space.prevent="store.openDetail(item.id)"
+              >
                 <img
                   v-if="thumbnailUrl(item) && !frameFailed[item.id]"
                   :src="thumbnailUrl(item) ?? ''"
@@ -354,10 +397,15 @@ const trashError = computed(() => store.actionError)
                   class="absolute right-2 top-2 rounded bg-surface px-1"
                   :checked="store.selection.includes(item.id)"
                   @update:checked="store.toggleSelected(item.id)"
+                  @click.stop
                 />
               </div>
 
-              <div class="truncate font-medium text-ink-strong" :title="item.title">
+              <div
+                class="cursor-pointer truncate font-medium text-ink-strong hover:text-brand"
+                :title="`查看「${item.title || '未命名'}」详情`"
+                @click="store.openDetail(item.id)"
+              >
                 {{ item.title || '（未命名）' }}
               </div>
               <div class="flex flex-wrap items-center gap-1">
@@ -374,6 +422,9 @@ const trashError = computed(() => store.actionError)
                 <span>{{ timeText(item.indexed_at) }}</span>
               </div>
               <div class="flex items-center gap-2">
+                <n-button size="tiny" type="primary" quaternary @click="store.openDetail(item.id)">
+                  详情
+                </n-button>
                 <n-button size="tiny" @click="openEdit(item)">
                   编辑
                 </n-button>
@@ -402,7 +453,15 @@ const trashError = computed(() => store.actionError)
                 :checked="store.selection.includes(item.id)"
                 @update:checked="store.toggleSelected(item.id)"
               />
-              <div class="h-12 w-20 shrink-0 overflow-hidden rounded bg-surface-muted">
+              <div
+                class="h-12 w-20 shrink-0 cursor-pointer overflow-hidden rounded bg-surface-muted"
+                role="button"
+                tabindex="0"
+                title="查看详情"
+                @click="store.openDetail(item.id)"
+                @keydown.enter.prevent="store.openDetail(item.id)"
+                @keydown.space.prevent="store.openDetail(item.id)"
+              >
                 <img
                   v-if="thumbnailUrl(item) && !frameFailed[item.id]"
                   :src="thumbnailUrl(item) ?? ''"
@@ -412,7 +471,11 @@ const trashError = computed(() => store.actionError)
                 >
               </div>
               <div class="min-w-0 flex-1">
-                <div class="truncate font-medium text-ink-strong">
+                <div
+                  class="cursor-pointer truncate font-medium text-ink-strong hover:text-brand"
+                  :title="`查看「${item.title || '未命名'}」详情`"
+                  @click="store.openDetail(item.id)"
+                >
                   {{ item.title || '（未命名）' }}
                 </div>
                 <div class="mt-1 flex flex-wrap items-center gap-1 text-xs text-ink-muted">
@@ -429,6 +492,9 @@ const trashError = computed(() => store.actionError)
                 </div>
               </div>
               <div class="flex shrink-0 items-center gap-2">
+                <n-button size="tiny" type="primary" quaternary @click="store.openDetail(item.id)">
+                  详情
+                </n-button>
                 <n-button size="tiny" @click="openEdit(item)">
                   编辑
                 </n-button>
@@ -521,6 +587,175 @@ const trashError = computed(() => store.actionError)
             </n-button>
             <n-button size="small" type="primary" :loading="store.editSaving" @click="saveEdit">
               保存
+            </n-button>
+          </div>
+        </template>
+      </n-card>
+    </n-modal>
+
+    <!-- 详情弹窗：爆点要素与全部关键帧只有单条接口（S6.1）有，列表接口没有 -->
+    <n-modal
+      :show="store.detailOpen"
+      @update:show="(value) => { if (!value) store.closeDetail() }"
+    >
+      <n-card class="w-[46rem] max-w-full" title="素材详情" :bordered="false">
+        <n-spin :show="store.detailLoading">
+          <n-alert v-if="store.detailError" type="error" :title="store.detailError" />
+          <div v-else-if="store.detail" class="flex flex-col gap-4">
+            <div class="relative overflow-hidden rounded-lg bg-surface-muted">
+              <img
+                v-if="detailPreviewUrl && !detailFrameFailed"
+                :src="detailPreviewUrl"
+                :alt="store.detail.title || '素材预览'"
+                class="max-h-80 w-full object-contain"
+                @error="detailFrameFailed = true"
+              >
+              <div v-else class="flex h-40 w-full items-center justify-center text-xs text-ink-muted">
+                无预览（这条素材没有关键帧）
+              </div>
+            </div>
+
+            <div v-if="detailFrames.length > 1" class="flex flex-wrap items-center gap-2">
+              <span class="text-xs text-ink-muted">关键帧 {{ detailFrames.length }} 张：</span>
+              <img
+                v-for="(frame, index) in detailFrames"
+                :key="frame"
+                :src="apiUrl(`/materials/${store.detail?.id}/keyframes/${index}`)"
+                :alt="`关键帧 ${index + 1}`"
+                class="h-14 w-20 cursor-pointer rounded border object-cover"
+                :class="index === detailFrameIndex ? 'border-brand' : 'border-line'"
+                @click="showFrame(index)"
+              >
+            </div>
+
+            <div class="flex flex-col gap-2">
+              <div class="flex flex-wrap items-center gap-2">
+                <span class="text-base font-medium text-ink-strong">
+                  {{ store.detail.title || '（未命名）' }}
+                </span>
+                <n-tag size="small" :type="store.detail.type === 'video' ? 'info' : 'success'">
+                  {{ TYPE_LABELS[store.detail.type] }}
+                </n-tag>
+                <n-tag size="small">
+                  {{ SOURCE_LABELS[store.detail.source] }}
+                </n-tag>
+              </div>
+              <p class="text-sm text-ink">
+                {{ store.detail.description || '（没有描述，可在「编辑」里补一句它能怎么用）' }}
+              </p>
+              <div class="flex flex-wrap items-center gap-1">
+                <n-tag v-for="tag in store.detail.tags" :key="tag" size="tiny">
+                  {{ tag }}
+                </n-tag>
+                <span v-if="store.detail.tags.length === 0" class="text-xs text-ink-muted">
+                  无标签
+                </span>
+              </div>
+            </div>
+
+            <dl class="grid grid-cols-2 gap-x-4 gap-y-2 text-xs sm:grid-cols-3">
+              <div>
+                <dt class="text-ink-muted">
+                  主题目录
+                </dt>
+                <dd class="text-ink-strong">
+                  {{ store.detail.dir || '根目录' }}
+                </dd>
+              </div>
+              <div>
+                <dt class="text-ink-muted">
+                  入库时间
+                </dt>
+                <dd class="text-ink-strong">
+                  {{ timeText(store.detail.indexed_at) }}
+                </dd>
+              </div>
+              <div>
+                <dt class="text-ink-muted">
+                  文件大小
+                </dt>
+                <dd class="text-ink-strong">
+                  {{ sizeText(store.detail.size_bytes) }}
+                </dd>
+              </div>
+              <div>
+                <dt class="text-ink-muted">
+                  尺寸
+                </dt>
+                <dd class="text-ink-strong">
+                  {{ store.detail.width }} × {{ store.detail.height }}
+                </dd>
+              </div>
+              <div>
+                <dt class="text-ink-muted">
+                  时长
+                </dt>
+                <dd class="text-ink-strong">
+                  {{ durationText(store.detail.duration_s) || '—' }}
+                </dd>
+              </div>
+              <div>
+                <dt class="text-ink-muted">
+                  声音
+                </dt>
+                <dd class="text-ink-strong">
+                  {{ store.detail.has_audio ? '有' : '无' }}
+                </dd>
+              </div>
+              <div class="col-span-2 break-all sm:col-span-3">
+                <dt class="text-ink-muted">
+                  路径
+                </dt>
+                <dd class="text-ink-strong">
+                  {{ store.detail.path }}
+                </dd>
+              </div>
+            </dl>
+
+            <div>
+              <h3 class="mb-2 text-sm font-semibold text-ink-strong">
+                爆点要素
+              </h3>
+              <n-empty
+                v-if="store.detail.elements.length === 0"
+                description="这条素材还没有爆点要素"
+              />
+              <div v-else class="flex flex-col gap-2">
+                <div
+                  v-for="(element, index) in store.detail.elements"
+                  :key="index"
+                  class="flex flex-wrap items-center gap-2 rounded-lg border border-line px-3 py-2 text-xs"
+                >
+                  <n-tag size="tiny" type="warning">
+                    {{ elementLabel(element.type) }}
+                  </n-tag>
+                  <span class="font-medium text-ink-strong">{{ element.value }}</span>
+                  <span class="text-ink-muted">权重 {{ element.weight.toFixed(2) }}</span>
+                  <span class="text-ink-muted">置信 {{ element.confidence.toFixed(2) }}</span>
+                  <span v-if="element.evidence" class="text-ink-muted">依据：{{ element.evidence }}</span>
+                </div>
+              </div>
+            </div>
+          </div>
+        </n-spin>
+
+        <template #footer>
+          <div class="flex items-center justify-between gap-2">
+            <div class="flex items-center gap-2">
+              <n-button size="small" :disabled="!store.detail" @click="editFromDetail">
+                编辑
+              </n-button>
+              <n-popconfirm positive-text="确认" negative-text="取消" @positive-click="store.trashDetail()">
+                <template #trigger>
+                  <n-button size="small" quaternary type="error" :disabled="!store.detail">
+                    移入回收站
+                  </n-button>
+                </template>
+                移入回收站（可恢复），确认删除「{{ store.detail?.title }}」？
+              </n-popconfirm>
+            </div>
+            <n-button size="small" @click="store.closeDetail()">
+              关闭
             </n-button>
           </div>
         </template>

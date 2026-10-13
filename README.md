@@ -80,7 +80,7 @@
 | 素材元数据编辑（S6.2：`PATCH /api/materials/{id}` 白名单三字段，**写库 + 写同名 `.txt` 旁车**——磁盘是唯一来源，重扫描后人工说明仍在；标签去重去空、上限 14 个） | ✅ 已完成（S6.2） |
 | 删除与回收站（S6.3：移入 `_trash/`（连同旁车）并删索引行、列出回收站、恢复 = 重新入库（新 uuid）、单条 / 一键真删；新增 `xhs_agent.index_materials` 任务与 **Celery 结果后端**（ADR 0014，分析任务显式 `ignore_result`）） | ✅ 已完成（S6.3） |
 | 扫描与上传导入（S6.4：`POST /api/materials/scan` 触发「增量同步 + 向量回填」；`POST /api/materials/uploads` **流式**落到 `<素材根>/<YYYY-MM>/`（同名加序号、超 `[upload].max_size_gb` 退 413）；`GET /api/materials/tasks/{id}` 查阶段 / 计数 / 失败原因；镜像装 ffmpeg） | ✅ 已完成（S6.4） |
-| 素材库页（S6.5：第 4 页 `/materials`——搜索 / 类型 / 来源 / 主题 chips、网格↔列表、拖拽上传带进度、编辑弹窗、多选批量删除、回收站抽屉；真机冒烟 20/20：导入 3 条 → 自动打标 → 改标签（库 + 旁车）→ 删入回收站 → 恢复（新 uuid）→ 清空） | ✅ 已完成（S6.5） |
+| 素材库页（S6.5：第 4 页 `/materials`——搜索 / 类型 / 来源 / 主题 chips、网格↔列表、拖拽上传带进度、编辑弹窗、多选批量删除、回收站抽屉；真机冒烟 20/20：导入 3 条 → 自动打标 → 改标签（库 + 旁车）→ 删入回收站 → 恢复（新 uuid）→ 清空。**详情弹窗补齐**：点卡片 / 缩略图走 `GET /api/materials/{id}`，看全部关键帧与爆点要素——此前这条接口前端一直没人调，点卡片毫无反应） | ✅ 已完成（S6.5 + 详情补齐） |
 | 原生工具调用与真 token 流式（S7.1：`LLMCall` 增 `tools` / `stream`，`LLMResult` 增 `tool_calls`；流式已回吐正文后不重试；记账口径与普通调用一致。DoR 已实测 `deepseek-flash` 支持 `tools` / `tool_calls`，结论见 ADR 0015） | ✅ 已完成（S7.1） |
 | 对话会话与消息存储（S7.2：数据契约 §3.6 / §3.7 + 迁移 **0004** + `services/chat.py`；附件落 `runs/_chat/<session_id>/` 且只存引用；过期 `running` 行按 `[chat].turn_stale_seconds` 兜底标 `interrupted`） | ✅ 已完成（S7.2） |
 | 对话编排图（S7.3：LangGraph `supervisor ⇄ tools`，轮次上限 `[chat].max_tool_rounds`；第一批只挂「跑完整分析」，有图片先走 S6.6 解析再按 S6.7 预置线索提交，**拆解节点短路**；新增 prompt 资产 `chat_supervisor`） | ✅ 已完成（S7.3） |
@@ -302,7 +302,7 @@ pnpm build            # 类型检查 + 构建，产物落 frontend/dist（由 Fa
 pnpm run gen:api      # 契约变了才跑：从 ../docs/contracts/openapi.yaml 重新生成 src/api/schema.d.ts
 pnpm run check:api    # 防漂移自检：重新生成 + git diff，有差异即非零（CI 的 frontend job 跑这条）
 pnpm run lint         # ESLint 9（只做正确性规则，不查格式）
-pnpm test             # Vitest 单测（118 条，jsdom，含主题对比度、图表 option、分析台/素材库/对话状态机、
+pnpm test             # Vitest 单测（123 条，jsdom，含主题对比度、图表 option、分析台/素材库/对话状态机、
                       # SSE 解析与对话独立滚动行为）
 pnpm run test:cov     # 单测 + 覆盖率报告（只报告不设门槛）
 ```
@@ -317,6 +317,9 @@ pnpm run test:cov     # 单测 + 覆盖率报告（只报告不设门槛）
 > 单个默认 ≤ 2 GB，落点 `<素材根>/YYYY-MM/`，同名自动加序号）、按主题目录 / 类型 / 打标来源 /
 > 关键词筛选、网格↔列表切换、编辑标题 / 描述 / 标签（**同时写数据库与同名 `.txt` 旁车**，
 > 重扫描后人工说明仍在）、多选批量删除、回收站抽屉（恢复 / 单条真删 / 一键清空）。
+> **点卡片（缩略图 / 标题 / 「详情」按钮）打开详情弹窗**：大图预览 + 视频全部关键帧可切换、
+> 完整元信息（目录 / 尺寸 / 时长 / 大小 / 入库时间 / 磁盘路径）、描述与标签，以及**这条素材的爆点要素**
+> （类型 / 取值 / 权重 / 置信 / 依据）——爆点要素与多张关键帧只有单条详情接口给，列表接口没有。
 > 「扫描」按钮触发一次「增量同步 + 向量回填」，进度与失败原因用 `GET /api/materials/tasks/{task_id}` 查。
 
 > **对话首页（S7.1–S7.9）**：打开 `/`（顶栏第一项「聊天」）就是对话框。传一张图 + 一句话，

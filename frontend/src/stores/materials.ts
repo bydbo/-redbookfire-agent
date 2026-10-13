@@ -4,6 +4,7 @@ import { computed, ref } from 'vue'
 import { ApiRequestError } from '@/api/client'
 import type {
   MaterialItem,
+  MaterialDetail,
   MaterialSource,
   MaterialTask,
   MaterialType,
@@ -11,6 +12,7 @@ import type {
   UpdateMaterialRequest,
 } from '@/api/materials'
 import {
+  getMaterial,
   getMaterialTask,
   listMaterials,
   listTrash,
@@ -94,6 +96,12 @@ export const useMaterialsStore = defineStore('materials', () => {
   const editing = ref<MaterialItem | null>(null)
   const editTags = ref<string[]>([])
   const editSaving = ref(false)
+
+  /** 单条详情（含爆点要素）；`detailOpen` 与 `detail` 分开，便于打开时先出骨架再填内容。 */
+  const detail = ref<MaterialDetail | null>(null)
+  const detailOpen = ref(false)
+  const detailLoading = ref(false)
+  const detailError = ref<string | null>(null)
 
   const page = computed(() => Math.floor(offset.value / PAGE_SIZE) + 1)
   const pageCount = computed(() => Math.max(1, Math.ceil(total.value / PAGE_SIZE)))
@@ -318,6 +326,42 @@ export const useMaterialsStore = defineStore('materials', () => {
     }
   }
 
+  // ---------- 单条详情 ----------
+
+  /**
+   * 打开单条详情（S6.1 的 `GET /api/materials/{id}`）。
+   *
+   * 列表接口只返回 `MaterialItem`，**爆点要素与关键帧明细只有详情接口有**——素材库页过去
+   * 一直没接这条接口，点卡片因此毫无反应（这就是"前端和后端断了"的来源）。
+   * 失败原因写进 `detailError`，由弹窗自己显示，不覆盖列表的 `failure`。
+   */
+  async function openDetail(materialId: string): Promise<void> {
+    detailOpen.value = true
+    detail.value = null
+    detailError.value = null
+    detailLoading.value = true
+    try {
+      detail.value = await getMaterial(materialId)
+    } catch (err) {
+      detailError.value = describeError(err)
+    } finally {
+      detailLoading.value = false
+    }
+  }
+
+  function closeDetail(): void {
+    detailOpen.value = false
+    detail.value = null
+    detailError.value = null
+  }
+
+  /** 详情弹窗里的删除：成功就关掉弹窗（弹的是已删的那条），失败留在原地并写明原因。 */
+  async function trashDetail(): Promise<void> {
+    const target = detail.value
+    if (!target) return
+    if (await trashOne(target.id)) closeDetail()
+  }
+
   // ---------- 回收站 ----------
 
   async function refreshTrash(): Promise<void> {
@@ -420,10 +464,12 @@ export const useMaterialsStore = defineStore('materials', () => {
     items, dirs, total, offset, filters, viewMode, loading, failure, selection,
     uploads, scanning, taskNote, actionError, trash, trashOpen, trashLoading,
     editing, editTags, editSaving, page, pageCount, selectedOnPage, allSelected, busy,
+    detail, detailOpen, detailLoading, detailError,
     load, applyFilters, clearFilters, goPage, setView,
     toggleSelected, selectAllOnPage, clearSelection,
     scan, uploadFiles, clearUploads,
     openEdit, closeEdit, saveEdit,
+    openDetail, closeDetail, trashDetail,
     openTrash, closeTrash, refreshTrash, trashOne, trashSelected, restoreOne,
     purgePaths, purgeAll,
   }

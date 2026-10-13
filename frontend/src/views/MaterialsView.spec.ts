@@ -3,7 +3,8 @@ import { createPinia, setActivePinia } from 'pinia'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
 import type { MaterialItem, MaterialList, TrashList } from '@/api/materials'
-import { listMaterials, listTrash, scanMaterials } from '@/api/materials'
+import { getMaterial, listMaterials, listTrash, scanMaterials } from '@/api/materials'
+import { ApiRequestError } from '@/api/client'
 import { useMaterialsStore } from '@/stores/materials'
 import MaterialsView from '@/views/MaterialsView.vue'
 
@@ -66,6 +67,7 @@ describe('MaterialsView（S6.5）', () => {
     vi.mocked(listMaterials).mockReset().mockResolvedValue(listing())
     vi.mocked(listTrash).mockReset().mockResolvedValue(EMPTY_TRASH)
     vi.mocked(scanMaterials).mockReset().mockResolvedValue({ task_id: 'task-1' })
+    vi.mocked(getMaterial).mockReset()
   })
 
   it('渲染工具条、上传区与网格卡片', async () => {
@@ -162,5 +164,40 @@ describe('MaterialsView（S6.5）', () => {
     await zone.trigger('drop', { dataTransfer: { files: [file] } })
 
     expect(spy).toHaveBeenCalledWith([file])
+  })
+
+  it('点缩略图打开详情（列表接口没有爆点要素，必须走单条接口）', async () => {
+    vi.mocked(getMaterial).mockResolvedValue({
+      ...item('a'),
+      elements: [{ type: 'scene', value: '公园晨跑', weight: 0.6, confidence: 0.7,
+                   evidence: '关键词命中' }],
+    })
+    const wrapper = await mountView()
+
+    await wrapper.find('[title="查看详情"]').trigger('click')
+    await flushPromises()
+
+    expect(getMaterial).toHaveBeenCalledWith('a')
+    expect(useMaterialsStore().detailOpen).toBe(true)
+
+    // 弹窗用 teleport 渲染到 body：从 document 上断言语义（wrapper 里看不到）
+    const body = document.body.textContent ?? ''
+    expect(body).toContain('素材详情')
+    expect(body).toContain('爆点要素')
+    expect(body).toContain('公园晨跑')
+    expect(body).toContain('场景')          // 要素类型标签
+    expect(body).toContain('移入回收站')
+  })
+
+  it('详情拉取失败时弹窗里显示原因', async () => {
+    vi.mocked(getMaterial).mockRejectedValue(
+      new ApiRequestError('素材不存在：a', 'not_found', 404))
+    const wrapper = await mountView()
+    const detailButton = wrapper.findAll('button').find((button) => button.text() === '详情')
+
+    await detailButton?.trigger('click')
+    await flushPromises()
+
+    expect(document.body.textContent ?? '').toContain('素材不存在：a')
   })
 })

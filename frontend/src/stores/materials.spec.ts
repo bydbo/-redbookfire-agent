@@ -3,6 +3,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest'
 
 import type { MaterialItem, MaterialTask } from '@/api/materials'
 import {
+  getMaterial,
   getMaterialTask,
   listMaterials,
   listTrash,
@@ -218,6 +219,53 @@ describe('useMaterialsStore', () => {
     expect(updateMaterial).toHaveBeenCalledWith('a', { title: '新标题' })
     expect(store.editing).toBeNull()
     expect(listMaterials).toHaveBeenCalled()
+  })
+
+  it('打开详情走单条接口（爆点要素只有这里有），关闭时清空内容', async () => {
+    vi.mocked(getMaterial).mockReset().mockResolvedValue({
+      ...item('a'),
+      elements: [{ type: 'scene', value: '公园晨跑', weight: 0.6, confidence: 0.7,
+                   evidence: '关键词命中' }],
+    })
+    const store = useMaterialsStore()
+
+    const pending = store.openDetail('a')
+    expect(store.detailOpen).toBe(true)
+    expect(store.detailLoading).toBe(true)
+    await pending
+
+    expect(getMaterial).toHaveBeenCalledWith('a')
+    expect(store.detail?.elements[0].value).toBe('公园晨跑')
+    expect(store.detailLoading).toBe(false)
+
+    store.closeDetail()
+    expect(store.detailOpen).toBe(false)
+    expect(store.detail).toBeNull()
+    expect(store.detailError).toBeNull()
+  })
+
+  it('详情拉取失败只写 detailError，不污染列表的 failure', async () => {
+    vi.mocked(getMaterial).mockReset().mockRejectedValue(
+      new ApiRequestError('素材不存在：missing', 'not_found', 404))
+    const store = useMaterialsStore()
+
+    await store.openDetail('missing')
+
+    expect(store.detailError).toBe('素材不存在：missing')
+    expect(store.detail).toBeNull()
+    expect(store.failure).toBeNull()
+  })
+
+  it('详情里删除成功会自动关掉弹窗', async () => {
+    vi.mocked(getMaterial).mockReset().mockResolvedValue({ ...item('a'), elements: [] })
+    const store = useMaterialsStore()
+    await store.openDetail('a')
+
+    await store.trashDetail()
+
+    expect(trashMaterial).toHaveBeenCalledWith('a')
+    expect(store.detailOpen).toBe(false)
+    expect(store.detail).toBeNull()
   })
 
   it('回收站：打开会拉列表，恢复走任务并刷新两边，清空调 all', async () => {
