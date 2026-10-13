@@ -7,6 +7,7 @@ import { useRouter } from 'vue-router'
 
 import type { Element } from '@/api/analysis'
 import { ELEMENT_TYPE_LABELS, ELEMENT_TYPES } from '@/api/analysis'
+import ImageIntake from '@/components/ImageIntake.vue'
 import { useAnalysisStore } from '@/stores/analysis'
 import { useAppStore } from '@/stores/app'
 
@@ -83,38 +84,25 @@ const elementTypeOptions = ELEMENT_TYPES.map((type) => ({ label: ELEMENT_TYPE_LA
 const imagePhase = computed(() => analysisStore.imagePhase)
 const imageResult = computed(() => analysisStore.imageResult)
 
-const fileInput = ref<HTMLInputElement | null>(null)
-const dragging = ref(false)
 const imageError = ref<string | null>(null)
 
-function pickImage(): void {
-  fileInput.value?.click()
-}
-
-/** 选择文件 / 拖拽 / 粘贴三个入口都汇到 store.parseImage；不重试，失败由用户点「重解析」。 */
+/** 图片入口统一走 `ImageIntake`（S7.17）：选择 / 拖拽 / 粘贴都在组件里，这里只消费结果。 */
 function startParse(file: File): void {
   imageError.value = null
   void analysisStore.parseImage(file)
 }
 
-function onFileChange(event: Event): void {
-  const input = event.target as HTMLInputElement
-  const file = input.files?.[0]
-  input.value = ''            // 清空后可连续选同一个文件
-  if (file) startParse(file)
-}
-
-function onDrop(event: DragEvent): void {
-  dragging.value = false
-  const file = event.dataTransfer?.files?.[0]
-  if (file) startParse(file)
-}
-
-function onPaste(event: ClipboardEvent): void {
-  const file = event.clipboardData?.files?.[0]
+/** 组件收进来的图：立刻交出去解析，并清空选中区——分析台一直是"选完就解析、不常驻缩略图"。 */
+const intakeFiles = ref<File[]>([])
+watch(intakeFiles, (files) => {
+  const file = files[0]
   if (!file) return
-  event.preventDefault()
+  intakeFiles.value = []
   startParse(file)
+})
+
+function onIntakeError(message: string): void {
+  imageError.value = message || null
 }
 
 function onReparse(): void {
@@ -246,35 +234,17 @@ function setElementWeight(index: number, value: number | null): void {
       <!-- 图片入口（S6.8）：解析结果只留在内存里，用户确认/编辑后才随 clues 提交 -->
       <n-card title="从图片拆热点">
         <div class="flex flex-col gap-4">
-          <div
-            class="flex flex-col items-center gap-2 rounded-lg border border-dashed px-4 py-6 text-center"
-            :class="dragging ? 'border-brand bg-surface' : 'border-line bg-surface'"
-            tabindex="0"
-            role="button"
-            @click="pickImage"
-            @keydown.enter.prevent="pickImage"
-            @dragover.prevent="dragging = true"
-            @dragleave.prevent="dragging = false"
-            @drop.prevent="onDrop"
-            @paste="onPaste"
-          >
-            <p class="text-sm font-medium text-ink-strong">
-              丢一张图，自动拆成热点标签
-            </p>
-            <p class="text-xs text-ink-muted">
-              点这里选文件、把图片拖进来，或先点一下这里再 Ctrl/⌘+V 粘贴（jpg / png / webp，单个 ≤ 10 MB）
-            </p>
-            <n-button size="small" :loading="imagePhase === 'parsing'" @click.stop="pickImage">
-              选择图片
-            </n-button>
-            <input
-              ref="fileInput"
-              type="file"
-              accept="image/jpeg,image/png,image/webp"
-              class="hidden"
-              @change="onFileChange"
-            >
-          </div>
+          <!-- 选择 / 拖拽 / 粘贴收在共享组件里（S7.17）；分析台保持单图，`thumbs` 关掉与现状一致 -->
+          <ImageIntake
+            v-model:files="intakeFiles"
+            :max="1"
+            :thumbs="false"
+            :disabled="imagePhase === 'parsing'"
+            title="丢一张图，自动拆成热点标签"
+            hint="点这里选文件、把图片拖进来，或先点一下这里再 Ctrl/⌘+V 粘贴（jpg / png / webp，单个 ≤ 10 MB）"
+            label="选择图片"
+            @error="onIntakeError"
+          />
 
           <div v-if="imagePhase === 'parsing'" class="flex items-center gap-2 text-sm text-ink">
             <n-spin size="small" />
