@@ -12,8 +12,9 @@
 
 输入：`AppConfig`（读 `[vision]` 段与密钥）。
 输出：同步 `describe(frames, hint)` → `{"title", "tags", "description"}` 或 None；
-      异步 `AsyncImageClient.complete(rendered, data, mime)` → `ImageCompletion`（文本 + 用量，
-      失败抛 `VisionError`）；用量供 S7.10 把图片解析成本计入轮级成本。
+      异步 `AsyncImageClient.complete(rendered, data, mime)`（单图）/ `complete_many(rendered, images)`
+      （1–9 张，一次调用，S7.15）→ `ImageCompletion`（文本 + 用量，失败抛 `VisionError`）；
+      用量供 S7.10 把图片解析成本计入轮级成本。
 prompt 来源：`src/xhs_agent/prompts/material_tagging.md`（五段结构，见
 `docs/contracts/prompt契约.md`）——本模块**不再内联 prompt 文本**。
 能力裁剪：开关关闭、没有密钥、机器没有 ffmpeg 时 `make_describer` 直接返回 None，
@@ -27,7 +28,7 @@ import json
 import os
 import urllib.error
 import urllib.request
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from typing import Any
 
@@ -171,15 +172,34 @@ class AsyncImageClient:
 
     async def complete(self, rendered: prompt_tools.RenderedPrompt, data: bytes,
                        mime: str) -> ImageCompletion:
-        """发一次多模态调用，返回文本与用量；任何失败都抛 `VisionError`。"""
+        """发一次多模态调用（单图），返回文本与用量；任何失败都抛 `VisionError`。"""
+        return await self._complete(rendered, [(data, mime)])
+
+    async def complete_many(self, rendered: prompt_tools.RenderedPrompt,
+                            images: Sequence[tuple[bytes, str]]) -> ImageCompletion:
+        """发一次多模态调用（1–9 张图，按顺序附上），返回文本与用量；失败抛 `VisionError`（S7.15）。
+
+        多图是**一次**调用：N 张图按顺序进同一个 user 消息的 content 数组，模型只出一份文本
+        （一份描述 + 一份线索）。顺序即编号（图1、图2…）——prompt 里要求 `evidence` 指图，
+        所以这里的顺序不能重排。
+        """
+        items = list(images)
+        if not items:
+            raise VisionError("complete_many 至少要一张图")
+        return await self._complete(rendered, items)
+
+    async def _complete(self, rendered: prompt_tools.RenderedPrompt,
+                        images: Sequence[tuple[bytes, str]]) -> ImageCompletion:
+        """单图与多图共用的调用体：文本 + N 张图 → 模型文本与用量。"""
+        content: list[dict[str, Any]] = [{"type": "text", "text": rendered.user}]
+        for data, mime in images:
+            content.append({"type": "image_url",
+                            "image_url": {"url": _data_url_from_bytes(data, mime)}})
         payload = {
             "model": self.cfg.model,
             "messages": [
                 {"role": "system", "content": rendered.system},
-                {"role": "user", "content": [
-                    {"type": "text", "text": rendered.user},
-                    {"type": "image_url", "image_url": {"url": _data_url_from_bytes(data, mime)}},
-                ]},
+                {"role": "user", "content": content},
             ],
             "temperature": 0.2,
             "max_tokens": 1200,

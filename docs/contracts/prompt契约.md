@@ -15,6 +15,7 @@
 | `material_select` | 线索 + 候选素材 → 命中解释与建议用法 | `agents/explain.py`（S3.1 落地） |
 | `copy_draft` | 线索 + 选中素材 → 文案初稿 | `agents/draft.py`（S3.1 落地） |
 | `image_hotspot_clue` | 一张图 → 热点描述 + 爆点线索（多模态） | `services/image_clue.py`（S6.6 落地，S7.3 补登记） |
+| `image_hotspot_clue_multi` | **一组图**（1–9 张）→ 一份热点描述 + 一份爆点线索（多模态，S7.15） | `services/image_clue.py`（`parse_image_clue_multi`） |
 | `chat_supervisor` | 对话层：读用户消息 → 决定直接回答或调工具 → 把结果讲成人话 | `agents/supervisor.py`（S7.3 落地） |
 | `copy_revise` | 已有初稿 + 用户要求 → 改后初稿（要求越界时只回拒绝理由，不给变通写法） | `agents/revise.py`（S7.8 落地） |
 

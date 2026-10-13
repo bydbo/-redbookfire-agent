@@ -50,14 +50,16 @@ def _drop_section(text: str, title: str) -> str:
 
 
 class TestAssets:
-    def test_available_tasks_lists_seven_assets(self):
+    def test_available_tasks_lists_eight_assets(self):
         assert prompt_tools.available_tasks() == (
             "chat_supervisor", "copy_draft", "copy_revise", "hotspot_clue",
-            "image_hotspot_clue", "material_select", "material_tagging")
+            "image_hotspot_clue", "image_hotspot_clue_multi", "material_select",
+            "material_tagging")
 
-    def test_image_hotspot_clue_has_no_placeholders(self):
-        """图片热点拆解没有文本变量（图随消息附上），`requires` 因此是空的。"""
-        loaded = prompt_tools.load("image_hotspot_clue")
+    @pytest.mark.parametrize("task_id", ["image_hotspot_clue", "image_hotspot_clue_multi"])
+    def test_image_hotspot_clue_has_no_placeholders(self, task_id: str):
+        """图片热点拆解没有文本变量（图随消息附上），`requires` 因此是空的（S7.15 多图同）。"""
+        loaded = prompt_tools.load(task_id)
         assert loaded.version == 1
         assert loaded.requires == ()
         assert loaded.placeholders() == set()

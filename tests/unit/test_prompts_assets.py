@@ -10,12 +10,13 @@ from xhs_agent.services import chat_tools
 from xhs_agent.tools import prompt as prompt_tool
 
 AGENT_TASKS = ("hotspot_clue", "material_select", "copy_draft", "chat_supervisor",
-               "copy_revise")
+               "copy_revise", "image_hotspot_clue_multi")
 ALL_TASKS = (*AGENT_TASKS, "material_tagging", "image_hotspot_clue")
 PLACEHOLDER_MARKERS = ("待 S3.1 填写", "待填写")
 # 版本号只随内容变更递增（prompt 契约 §三 / §六）——钉住当前值，顺手改正文却忘了升版本会被挡下
 EXPECTED_VERSIONS = {"hotspot_clue": 1, "material_select": 1, "copy_draft": 1,
-                     "chat_supervisor": 3, "copy_revise": 1}
+                     "chat_supervisor": 3, "copy_revise": 1,
+                     "image_hotspot_clue_multi": 1}
 CONTRACT_PATH = (Path(__file__).resolve().parents[2]
                  / "docs" / "contracts" / "prompt契约.md")
 
@@ -112,3 +113,24 @@ class TestCapabilityCatalog:
             assert item["reply"] in both
         # §01 System 段必须声明界限来源在清单上（契约要求的"System 段引用它"）
         assert "能力清单" in rendered.system
+
+
+class TestMultiImagePrompt:
+    """多图合并口径（S7.15）：一次一份、共同优先、独特降权、`evidence` 必须指图。"""
+
+    def test_constraints_carry_the_merge_rules(self):
+        constraints = prompt_tool.load("image_hotspot_clue_multi").sections["constraints"]
+        assert "共同优先" in constraints
+        assert "独特降权" in constraints
+        assert "0.4" in constraints                      # 独特要素的权重上限
+        assert "以偏概全" in constraints                  # 不许把单张的东西说成整组
+        assert "3–8" in constraints
+        assert "evidence" in constraints
+
+    def test_task_asks_for_exactly_one_result(self):
+        task = prompt_tool.load("image_hotspot_clue_multi").sections["task"]
+        assert "一份" in task
+
+    def test_output_schema_points_at_the_image_number(self):
+        schema = prompt_tool.load("image_hotspot_clue_multi").sections["output_schema"]
+        assert "图N" in schema and "evidence" in schema and "3–8" in schema

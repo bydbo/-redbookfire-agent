@@ -18,7 +18,7 @@ from xhs_agent.api.routers import analysis as analysis_router
 from xhs_agent.config import AppConfig, load_config
 from xhs_agent.core.errors import DependencyUnavailableError, UpstreamError
 from xhs_agent.services import image_clue as image_clue_service
-from xhs_agent.services.image_clue import parse_image_clue
+from xhs_agent.services.image_clue import parse_image_clue, parse_image_clue_multi
 from xhs_agent.tools.vision import ImageCompletion, sniff_image_mime
 
 # 三种受支持格式的最小字节头（内容本身不需要是真图片：校验只看 magic bytes）
@@ -151,6 +151,104 @@ class TestParseImageClue:
         async with httpx.AsyncClient(transport=model_transport(body)) as client:
             with pytest.raises(UpstreamError):
                 await parse_image_clue(cfg, JPEG, "image/jpeg", http=client)
+
+
+MULTI_CLUE_PAYLOAD: dict[str, Any] = {
+    "raw_text": "球拍、球场与球鞋三张近景拼出一场社区羽毛球",
+    "clue": {
+        "why_it_works": ["器材特写与球场镜头并置，专业感与日常感形成反差"],
+        "mechanisms": [{"name": "反差", "explain": "器材特写与普通球场并存"}],
+        "elements": [
+            {"type": "visual", "value": "球拍特写", "weight": 0.9, "confidence": 0.9,
+             "evidence": "图1：球拍与手背的特写"},
+            {"type": "scene", "value": "社区球场", "weight": 0.8, "confidence": 0.85,
+             "evidence": "图2：场地全景，有人在打球"},
+            {"type": "visual", "value": "地面线条", "weight": 0.35, "confidence": 0.6,
+             "evidence": "图3：球鞋踩在场线边"},
+        ],
+        "match_keywords": ["羽毛球", "球拍", "球场"],
+        "borrow_angles": ["用器材特写开场，再切场上镜头"],
+    },
+}
+
+
+def _multi_text(elements: list[dict[str, Any]]) -> str:
+    """按给定要素拼一份多图解析的模型输出（用例里只改要素部分）。"""
+    payload = json.loads(json.dumps(MULTI_CLUE_PAYLOAD))
+    payload["clue"]["elements"] = elements
+    return json.dumps(payload, ensure_ascii=False)
+
+
+class TestParseImageClueMulti:
+    """多图合并解析（S7.15）：一次调用出一份线索 + 多图专属校验。"""
+
+    @pytest.mark.asyncio
+    async def test_posts_every_image_in_order_and_returns_one_clue(
+            self, tmp_path, monkeypatch) -> None:
+        cfg = build_config(tmp_path, monkeypatch)
+        capture: dict[str, Any] = {}
+        images = [(JPEG, "image/jpeg"), (PNG, "image/png"), (WEBP, "image/webp")]
+
+        async with httpx.AsyncClient(
+                transport=model_transport(_multi_text(MULTI_CLUE_PAYLOAD["clue"]["elements"]),
+                                          capture)) as client:
+            parsed = await parse_image_clue_multi(cfg, images, http=client)
+
+        assert parsed.raw_text == MULTI_CLUE_PAYLOAD["raw_text"]
+        assert parsed.clue.elements[0].value == "球拍特写"
+        assert parsed.prompt_versions == {"image_hotspot_clue_multi": 1}
+        assert parsed.prompt_tokens > 0 and parsed.cost_cny >= 0
+
+        payload = capture["payload"]
+        # 用的是多图那份 prompt（合并口径在 03 Constraints 里）
+        assert "共同优先" in payload["messages"][0]["content"]
+        content = payload["messages"][1]["content"]
+        assert content[0]["type"] == "text"
+        order = [item["image_url"]["url"].split(";")[0] for item in content[1:]]
+        assert order == ["data:image/jpeg", "data:image/png", "data:image/webp"]
+
+    @pytest.mark.asyncio
+    async def test_disabled_vision_is_dependency_unavailable(self, tmp_path,
+                                                             monkeypatch) -> None:
+        cfg = build_config(tmp_path, monkeypatch, enabled=False)
+        with pytest.raises(DependencyUnavailableError):
+            await parse_image_clue_multi(cfg, [(JPEG, "image/jpeg")])
+
+    @pytest.mark.asyncio
+    async def test_empty_image_list_is_rejected(self, tmp_path, monkeypatch) -> None:
+        cfg = build_config(tmp_path, monkeypatch)
+        with pytest.raises(ValueError):
+            await parse_image_clue_multi(cfg, [])
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("count", [2, 9])
+    async def test_element_count_out_of_range_is_upstream_error(
+            self, tmp_path, monkeypatch, count: int) -> None:
+        cfg = build_config(tmp_path, monkeypatch)
+        element = MULTI_CLUE_PAYLOAD["clue"]["elements"][0]
+        text = _multi_text([dict(element) for _ in range(count)])
+        async with httpx.AsyncClient(transport=model_transport(text)) as client:
+            with pytest.raises(UpstreamError) as info:
+                await parse_image_clue_multi(cfg, [(JPEG, "image/jpeg")], http=client)
+        assert "要素数量" in info.value.message
+
+    @pytest.mark.asyncio
+    async def test_missing_evidence_is_upstream_error(self, tmp_path, monkeypatch) -> None:
+        cfg = build_config(tmp_path, monkeypatch)
+        elements = [dict(item) for item in MULTI_CLUE_PAYLOAD["clue"]["elements"]]
+        elements[1]["evidence"] = ""
+        async with httpx.AsyncClient(transport=model_transport(_multi_text(elements))) as client:
+            with pytest.raises(UpstreamError) as info:
+                await parse_image_clue_multi(cfg, [(JPEG, "image/jpeg")], http=client)
+        assert "缺少 evidence" in info.value.message
+
+    @pytest.mark.asyncio
+    async def test_upstream_http_error_is_reported(self, tmp_path, monkeypatch) -> None:
+        cfg = build_config(tmp_path, monkeypatch)
+        async with httpx.AsyncClient(transport=error_transport(500, "模型炸了")) as client:
+            with pytest.raises(UpstreamError) as info:
+                await parse_image_clue_multi(cfg, [(JPEG, "image/jpeg")], http=client)
+        assert "HTTP 500" in info.value.message
 
 
 class FakeVisionClient:

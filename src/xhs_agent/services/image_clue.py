@@ -1,8 +1,11 @@
-"""图片热点解析（S6.6）：一张图 → 热点描述 + 爆点线索。
+"""图片热点解析（S6.6 单图 / S7.15 多图）：图 → 热点描述 + 爆点线索。
 
 用途：给 `POST /api/hotspots/image-clue` 用。返回的线索**不落库**——用户确认（可编辑）后
       随 `POST /api/analyze` 的 `clues` 字段提交（S6.7），那时才写进 `hotspots.clue`。
-输入：`AppConfig`、图片字节与按 magic bytes 认出的 MIME；`http` 可注入（测试复用一个连接池）。
+      对话层另有两条：`parse_image_clue`（单图，工具 `parse_image_clue`）与
+      `parse_image_clue_multi`（**一组 1–9 张**，一次调用合成一份线索，S7.15）。
+输入：`AppConfig`、图片字节与按 magic bytes 认出的 MIME（多图是 `(bytes, mime)` 序列，按顺序）；
+      `http` 可注入（测试复用一个连接池）。
 输出：`ImageClueParse`（`raw_text` / `clue` / `prompt_versions` / 用量与成本）。
 
 口径：
@@ -18,7 +21,7 @@
 
 from __future__ import annotations
 
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Sequence
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from typing import Any
@@ -39,6 +42,10 @@ from ..tools.vision import (
 from ..util import extract_json
 
 TASK_ID = "image_hotspot_clue"
+# 多图热点（S7.15）：一次调用合成一份线索，自己的 prompt 资产与校验口径
+MULTI_TASK_ID = "image_hotspot_clue_multi"
+MULTI_MIN_ELEMENTS = 3
+MULTI_MAX_ELEMENTS = 8
 MAX_RAW_TEXT_CHARS = 500
 
 
@@ -115,6 +122,72 @@ async def parse_image_clue(cfg: AppConfig, data: bytes, mime: str, *,
                           prompt_tokens=completion.prompt_tokens,
                           completion_tokens=completion.completion_tokens,
                           cost_cny=_cost_cny(cfg, completion))
+
+
+async def parse_image_clue_multi(cfg: AppConfig, images: Sequence[tuple[bytes, str]], *,
+                                 http: httpx.AsyncClient | None = None) -> ImageClueParse:
+    """把**一组**图片（1–9 张，按发送顺序）一次多模态调用拆成一份热点描述与一份线索（S7.15）。
+
+    与单图路径同口径：503（未启用 / 缺密钥）、502（上游或契约问题）、`MAX_RAW_TEXT_CHARS`、
+    返回同一个 `ImageClueParse`；`prompt_versions` 记 `image_hotspot_clue_multi`。
+
+    **多图专属校验**（不满足即 502，用户点「重解析」就是显式重试）：
+    ① 要素 3–8 个；② 每个要素的 `evidence` 非空（prompt 要求写成「图N：观察」）。
+
+    刻意**不复用** `parse_image_clue` 的函数体：S7.15 要求单图路径零改动，因此这一份是独立实现，
+    只共用模块级的 `_client_or_stack` / `_parse_payload` / `_cost_cny` 与常量。
+    """
+    if not images:
+        raise ValueError("parse_image_clue_multi 至少要一张图片")
+    if not images_ready(cfg):
+        raise DependencyUnavailableError(
+            "图片热点解析未启用：需要 [vision].enabled = true 与密钥",
+            {"vision_enabled": cfg.vision.enabled, "api_key_env": cfg.vision.api_key_env})
+
+    rendered = prompt_tool.render(MULTI_TASK_ID)
+    async with _client_or_stack(cfg, http) as client:
+        api = build_image_client(cfg, client=client)
+        if api is None:   # pragma: no cover - images_ready 已经拦过一遍，这里只是兜底
+            raise DependencyUnavailableError("图片热点解析未启用：缺少可用的多模态客户端")
+        try:
+            completion = await api.complete_many(rendered, images)
+        except VisionError as exc:
+            raise UpstreamError(f"图片解析失败：{exc}",
+                                {"detail": str(exc)[:200]}) from exc
+
+    payload = _parse_payload(completion.text)
+    raw_text = str(payload.get("raw_text") or "").strip()
+    if not raw_text:
+        raise UpstreamError("图片解析失败：模型没有给出热点描述（raw_text 为空）")
+    if len(raw_text) > MAX_RAW_TEXT_CHARS:
+        raise UpstreamError(
+            f"图片解析失败：热点描述超过 {MAX_RAW_TEXT_CHARS} 字上限（{len(raw_text)} 字）")
+    clue_payload = payload.get("clue")
+    if not isinstance(clue_payload, dict):
+        raise UpstreamError("图片解析失败：返回里缺少 clue 对象")
+    try:
+        clue = HotspotClue.from_dict(clue_payload, hotspot_raw=raw_text)
+    except SchemaError as exc:
+        raise UpstreamError(f"图片解析失败：线索结构不合契约（{exc}）") from exc
+    _check_multi_clue(clue)
+    return ImageClueParse(raw_text=raw_text, clue=clue,
+                          prompt_versions={rendered.task_id: rendered.version},
+                          prompt_tokens=completion.prompt_tokens,
+                          completion_tokens=completion.completion_tokens,
+                          cost_cny=_cost_cny(cfg, completion))
+
+
+def _check_multi_clue(clue: HotspotClue) -> None:
+    """多图专属校验（S7.15）：要素 3–8 个，且每个都必须带非空 `evidence`（指图）。"""
+    count = len(clue.elements)
+    if not (MULTI_MIN_ELEMENTS <= count <= MULTI_MAX_ELEMENTS):
+        raise UpstreamError(
+            f"多图解析失败：要素数量必须是 {MULTI_MIN_ELEMENTS}–{MULTI_MAX_ELEMENTS} 个"
+            f"（实际 {count} 个）")
+    for index, element in enumerate(clue.elements, start=1):
+        if not str(element.evidence or "").strip():
+            raise UpstreamError(
+                f"多图解析失败：第 {index} 个要素缺少 evidence（必须指明来自哪一张图）")
 
 
 def _parse_payload(text: str) -> dict[str, Any]:
