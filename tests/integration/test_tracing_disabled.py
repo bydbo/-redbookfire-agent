@@ -123,3 +123,26 @@ class TestTracingDisabled:
             select(Run).where(Run.id == uuid.UUID(submission.run_id)))).scalar_one()
         assert run.status == "succeeded" and run.error is None
         assert run.llm_calls == 1 and run.cost_cny > 0
+
+    async def test_batch_succeeds_when_client_init_fails(self, db_session: AsyncSession,
+                                                         tmp_path: Path,
+                                                         monkeypatch) -> None:
+        """三件套齐全但客户端建不出来（凭据 / 网络问题）：只关追踪，批次照常成功（S7.22）。"""
+        monkeypatch.setattr(tracing, "build_client",
+                            lambda _cfg: (_ for _ in ()).throw(RuntimeError("连不上 Langfuse")))
+        cfg = write_config(tmp_path)
+        cfg._env = EnvView({}, {"LANGFUSE_PUBLIC_KEY": "pk-lf-test",
+                                "LANGFUSE_SECRET_KEY": "sk-lf-test",
+                                "LANGFUSE_HOST": "https://cloud.langfuse.com"})
+        submission = await submit_analysis(db_session, ["某明星打羽毛球"])
+        raws = [raw for _position, raw in await planned_hotspots(db_session, submission.run_id)]
+
+        result = await run_analysis(raws, cfg=cfg, session=db_session, run_id=submission.run_id,
+                                    caller=StructuredCaller(provider=FakeProvider()),
+                                    embedder=FakeEmbedder())
+
+        assert result.status == "succeeded"
+        assert isinstance(get_tracer(cfg), NullTracer)     # 初始化失败 = 本次进程关闭追踪
+        run = (await db_session.execute(
+            select(Run).where(Run.id == uuid.UUID(submission.run_id)))).scalar_one()
+        assert run.status == "succeeded" and run.error is None

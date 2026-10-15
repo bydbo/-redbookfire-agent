@@ -341,6 +341,12 @@ class TestTurnProgress:
         assert plain["progress"] is None
         assert plain["trace_id"] is None
 
+        # 半成品快照（崩溃兜底路径可能写入）在读取侧也要折成 null，不能让响应模型 500
+        malformed = await append_message(db_session, session_id, role="assistant",
+                                         progress={"status": ""})
+        assert malformed is not None
+        assert malformed["progress"] is None
+
     async def test_mark_stale_marks_progress_interrupted(self,
                                                          db_session: AsyncSession) -> None:
         created = await create_session(db_session)

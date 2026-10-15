@@ -403,3 +403,24 @@ class TestRunStageSnapshot:
         assert job["stage"]["last_finished_stage"] == "material_sync"
         assert job["stage"]["error_category"] == "embedding_error"
         assert job["current_step"] is None            # 没有在跑的阶段：如实为空
+
+    @pytest.mark.asyncio
+    async def test_retry_delivery_is_visible_until_the_next_stage(
+            self, db_session: AsyncSession) -> None:
+        """重试投递（S7.22）：同步阶段快照带投递重试号，便于区分"重试中"与"卡住"。
+
+        五节点阶段由 LangGraph 执行、带的是**节点尝试序号**（`attempt`），不含投递重试号——
+        进入下一阶段后 `retries` 自然归零，两个口径不互相冒充。
+        """
+        run_id = await start_run(db_session, ["重试热点"])
+        await set_run_stage(db_session, run_id, stage="material_sync", status="running",
+                            retries=2)
+
+        job = await load_job(db_session, await _job_id_of(db_session, run_id))
+        assert job["stage"]["retries"] == 2
+        assert job["current_step"] == "素材同步"
+
+        await set_run_stage(db_session, run_id, stage="clue", status="running", attempt=1)
+        job = await load_job(db_session, await _job_id_of(db_session, run_id))
+        assert job["current_step"] == "拆解"
+        assert job["stage"]["retries"] == 0            # 节点阶段不带投递重试号

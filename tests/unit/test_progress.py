@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 
 from xhs_agent.core import progress
 
@@ -108,3 +109,24 @@ class TestErrorCategory:
         assert "llm_error" in progress.ERROR_CATEGORIES
         assert set(progress.TERMINAL_STAGE_STATUSES) == {
             "succeeded", "failed", "skipped", "interrupted"}
+
+    def test_error_text_paths_and_prompts_never_enter_snapshot(self):
+        """S7.22 白名单：错误正文 / 路径 / URL / 提示词一律折成 `internal`，不落快照（约定 §9）。"""
+        leaked = [
+            "C:\\Users\\me\\素材\\私密.docx",
+            "/home/me/secret/素材.png",
+            "上报地址 https://cloud.langfuse.com/trace/abc",
+            "提示词：把这个素材写成爆款文案",
+        ]
+        for text in leaked:
+            snapshot = progress.apply(None, stage="retrieve", status="failed",
+                                      error_category=text)
+            assert snapshot["error_category"] == "internal"
+            assert text not in json.dumps(snapshot, ensure_ascii=False)
+
+    def test_every_mapped_exception_lands_in_the_whitelist(self):
+        """`error_category()` 的输出恒在白名单内（含取消 / 超时这两个非 `Exception` 分支）。"""
+        cases = [asyncio.CancelledError(), TimeoutError(), RuntimeError("x"),
+                 OSError("x"), Exception("x"), KeyboardInterrupt()]
+        for exc in cases:
+            assert progress.error_category(exc) in progress.ERROR_CATEGORIES

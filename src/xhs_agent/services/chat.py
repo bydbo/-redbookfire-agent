@@ -127,6 +127,18 @@ def _attachment_views(session_id: str, message_id: str,
     return out
 
 
+def _progress_view(raw: dict[str, Any] | None) -> dict[str, Any] | None:
+    """阶段快照投影：只有带 `stage` 与合法 `status` 的快照才对外给；其余折成 `null`（S7.21）。
+
+    旧行是 `{}`、崩溃兜底可能写入半成品——读侧统一兜住，避免响应模型因坏快照直接 500。
+    """
+    data = dict(raw or {})
+    status = str(data.get("status") or "")
+    if not str(data.get("stage") or "") or status not in progress_tool.STAGE_STATUSES:
+        return None
+    return data
+
+
 def message_view(row: ChatMessage) -> dict[str, Any]:
     """ORM 行 → 契约 `ChatMessage` 形状（附件补 url，时间转 ISO）。"""
     session_id = str(row.session_id)
@@ -145,7 +157,7 @@ def message_view(row: ChatMessage) -> dict[str, Any]:
         "turn_id": str(row.turn_id) if row.turn_id else None,
         "trace_id": row.trace_id,
         # 旧行 / 还没写快照时是空对象，对外折成 null（契约允许）；有快照才给 `StageInfo`
-        "progress": dict(row.progress) if row.progress else None,
+        "progress": _progress_view(row.progress),
         "cost_cny": float(row.cost_cny or 0),
         "latency_ms": int(row.latency_ms or 0),
         "prompt_tokens": int(row.prompt_tokens or 0),

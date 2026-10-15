@@ -101,6 +101,10 @@
 | 工具与跨轮回落改造（S7.16：图片工具从 `attachments[0]` 改为整组、缓存键按整组路径、`ToolContext.recent_attachments` 与 `latest_attachments` 按整组回落、成本只记那一次调用） | ✅ 已完成（S7.16） |
 | 共享图片入口组件（S7.17：`ImageIntake.vue` 收口选择 / 拖拽 / 粘贴 + 缩略图 + 逐张删除 + 上限校验；分析台 `max=1`、`thumbs=false`，行为与视觉与现状一致） | ✅ 已完成（S7.17） |
 | 对话页接入多图 + 测试与冒烟（S7.18：对话页 `max=9`；真机冒烟「粘贴 9 张 → 一份标签 → 跑一次分析 → 结果卡片」15/15，含 9 图 vs 单图对照，截图落 `runs/_smoke_s718/`） | ✅ 已完成（S7.18） |
+| 观测契约与追踪门面（S7.19：冻结阶段生命周期 / 事件 payload / 当前阶段快照 / 关联标识与用量口径；`core/progress.py` 统一合并语义与安全错误类别白名单；`Tracer` 扩 `turn` / `tool` / `node` / `finish_turn` / `trace_id`，`TracingProvider` 补 `complete_with_tools` 且流式增量原样透传） | ✅ 已完成（S7.19） |
+| 节点状态与跨进程接线（S7.20：`chat.turn` → `tool.*` → worker 节点三层 span；SSE 增 `stage` 事件；五节点 / 素材同步 / 向量回填 / 查询 embedding 各有状态与耗时；traceparent 取自投递时刻的当前 span（工具 span 子树内），`turn_id` 走独立业务头并绑日志；任务详情 `current_step` 不再恒为 `None`；迁移 0006） | ✅ 已完成（S7.20） |
+| 当前状态持久化与消息回看（S7.21：`chat_messages` 加 `turn_id` / `trace_id` / `progress`（迁移 0007）+ `runs.stage` 快照；刷新后按消息恢复阶段 / 耗时 / 失败类别 / 调用链入口；前端显示「第 N 阶段 · 已 x 秒」「耗时较长」提示与「查看调用链」链接；追踪关闭时状态仍可见、链接如实不显示） | ✅ 已完成（S7.21） |
+| 分层验收与真云回放（S7.22：单测补白名单 / 取消超时 / 日志上下文复位等分支；集成钉住 detached 轮次继续、Celery 父子 span（worker 挂投递时工具 span）、重试、两会话并发不串线、追踪初始化失败不阻断；新增 `scripts/check_trace_chain.py` 按消息 trace 读回并核对层级 / 用量 / 耗时；`docs/可观测.md` 收口字段字典与排查手册；真机 + 真云证据落 `runs/_smoke_s722/`） | ✅ 已完成（S7.22） |
 
 业务链路**已端到端跑通**：`docker compose up -d --wait` 起依赖 → `uv run celery -A xhs_agent.tasks.worker:app worker` 起 worker → `uv run python -m xhs_agent.serve` 起接口（先跑 7 步启动前置检查）→ `POST /api/analyze` 投递 → worker 自动消费（索引新鲜度 → 五节点分析 → 逐热点写回）→ `/api/jobs/{job_id}` 轮询 → `/api/runs/{run_id}` 取结构化结果、`/report` 取报告。另可运行 `uv run python -m xhs_agent.probe`、`uv run python scripts/index_materials.py`、`uv run python scripts/backfill_embeddings.py`、`uv run python scripts/eval_retrieval.py`、`uv run python scripts/smoke_skeleton.py`。路线图见文末。
 
@@ -410,7 +414,7 @@ project/
 ## 测试与开发规范
 
 ```powershell
-# 质量门：lint + 类型检查（mypy 严格模式覆盖 core / db / services / tools / api / tasks 等 53 个文件）
+# 质量门：lint + 类型检查（mypy 严格模式覆盖 core / db / services / tools / api / tasks 等 55 个文件）
 uv run ruff check .
 uv run mypy
 
@@ -440,6 +444,7 @@ Docker 不可用时会直接报错并说明原因（不静默跳过）。
 
 - `AGENTS.md` —— 权威规范，动手前必读
 - `docs/开发规范.md` —— 同一套规则的详细解释版
+- `docs/可观测.md` —— 可观测使用手册：三层职责、阶段口径、日志字段字典、排查手册
 - `docs/项目结构.md` —— 目录与文件职责
 - `docs/AI开发说明.md` —— 怎么和 AI 协作开发这个项目
 - `docs/产品方案.md` —— 产品定位、流程、指标与技术架构
@@ -460,7 +465,7 @@ Docker 不可用时会直接报错并说明原因（不静默跳过）。
 | P4 可观测与交付 | 结构化日志与调用追踪、容器化、CI |
 | P5 前端工程 | Vue 3 单页应用：对话首页、分析台、结果详情、运行历史、素材库 + ECharts 可视化 |
 | P6 素材与图片 | 素材库页（查询 / 编辑 / 回收站 / 导入）+ 图片热点解析链路 |
-| P7 对话式入口 | 对话首页：原生 function calling + 会话存储 + SSE 流式 + 结果卡片 + **工具集**（第一、二批已落地 S7.1–S7.9：跑完整分析 / 解析图片 / 查素材库 / 读历史运行 / 预览爆点要素 / 改写文案；**第三批多轮记忆与越界话术未开始**） |
+| P7 对话式入口 | 对话首页：原生 function calling + 会话存储 + SSE 流式 + 结果卡片 + **工具集**（第一、二批 S7.1–S7.9：跑完整分析 / 解析图片 / 查素材库 / 读历史运行 / 预览爆点要素 / 改写文案；第三批 S7.10–S7.13：多轮记忆、越界话术与评测；第四批 S7.14–S7.18：多图上传与合并解析；**第五批 S7.19–S7.22：对话全链路可观测——阶段 / 耗时 / 失败类别 / 调用链回看**） |
 | v1.1 及以后 | 多热点横向对比、历史回看、自动抓热榜、效果回流 |
 
 **完整的任务分解、依赖关系、验收标准与工作量估算见 `docs/backlog.md`** —— 本文件只列阶段，不重复维护任务清单。

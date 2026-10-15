@@ -15,16 +15,19 @@ import asyncio
 import json
 import uuid
 from collections.abc import AsyncIterator
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import pytest
+from opentelemetry import trace as otel_trace
 
 from xhs_agent.api.routers import chat as chat_router
 from xhs_agent.config import AppConfig, load_config
 from xhs_agent.core.errors import DependencyUnavailableError
-from xhs_agent.core.tracing import NullTracer, TracingProvider
-from xhs_agent.services import chat_turns
+from xhs_agent.core.tracing import Generation, NullTracer, TracingProvider
+from xhs_agent.services import chat_tools, chat_turns
+from xhs_agent.services.chat_tools import ToolOutcome
 from xhs_agent.services.chat_turns import TurnEvents, redis_url, sse_frame, start_turn
 from xhs_agent.tools import llm
 from xhs_agent.tools.llm import LLMResult
@@ -376,6 +379,67 @@ async def test_start_turn_marks_message_failed_on_crash(
     assert engine.disposed == 1
 
 
+# ---------- S7.22：取消 / 超时按业务状态契约收尾 ----------
+
+
+@pytest.mark.asyncio
+async def test_start_turn_maps_timeout_to_interrupted_terminal_state(
+        cfg: AppConfig, fake_redis: FakeRedis, monkeypatch: pytest.MonkeyPatch) -> None:
+    """超时（`TimeoutError`）收尾：消息标 `failed`，阶段快照从 running 折成 `interrupted`。
+
+    设计约定 §5：取消与超时按既有业务状态契约映射，不能永远停在 running——正在跑的
+    阶段由 `progress.interrupt` 收口，错误类别按白名单记 `timeout`，不落错误正文。
+    """
+    saved: list[tuple[uuid.UUID, dict[str, Any]]] = []
+
+    async def fake_update(_session: Any, message_id: uuid.UUID,
+                          **fields: Any) -> dict[str, Any]:
+        saved.append((message_id, fields))
+        return {}
+
+    async def slow_then_boom(*_args: Any, **kwargs: Any) -> Any:
+        on_event = kwargs["on_event"]
+        await on_event("stage", {"stage": "retrieve", "status": "running", "attempt": 1})
+        raise TimeoutError("模型超时")
+
+    engine = DummyEngine()
+    monkeypatch.setattr(chat_turns, "update_message", fake_update)
+    monkeypatch.setattr(chat_turns, "latest_attachments", no_recent_attachments)
+    monkeypatch.setattr(chat_turns, "create_engine_from_config", lambda _cfg: engine)
+    monkeypatch.setattr(chat_turns, "create_session_factory", lambda _engine: dummy_factory)
+    monkeypatch.setattr(chat_turns, "build_turn_provider",
+                        lambda _cfg, _client, tracer=None: ScriptedProvider())
+    monkeypatch.setattr(chat_turns, "run_turn", slow_then_boom)
+
+    events = TurnEvents(cfg, turn_id="t-6")
+    await events.open()
+    received: list[dict[str, Any]] = []
+    pump = asyncio.create_task(_collect(events, received))
+    message_id = uuid.uuid4()
+    task = start_turn(cfg, events, session_id=uuid.uuid4(), message_id=message_id,
+                      history=[], user_text="跑一下")
+    try:
+        await asyncio.wait_for(task, timeout=5)
+        await _wait_until(lambda: any(item["event"] == "error" for item in received))
+    finally:
+        pump.cancel()
+        await events.aclose()
+
+    # 阶段先落 running（可见"在检索"），随后随失败一起收成 interrupted
+    running_writes = [fields for _mid, fields in saved
+                      if (fields.get("progress") or {}).get("status") == "running"]
+    assert running_writes and running_writes[0]["progress"]["stage"] == "retrieve"
+    final = saved[-1][1]
+    assert final["status"] == "failed" and "模型超时" in final["error"]
+    assert final["progress"]["status"] == "interrupted"
+    assert final["progress"]["error_category"] == "timeout"
+    error_event = received[-1]
+    assert error_event["event"] == "error"
+    assert error_event["data"]["error_category"] == "timeout"
+    assert error_event["data"]["turn_id"] == "t-6"
+    assert engine.disposed == 1
+
+
 # ---------- 5. S7.19：对话 provider 默认套追踪 ----------
 
 
@@ -426,3 +490,50 @@ async def test_enqueue_with_turn_leaves_legacy_dispatcher_untouched() -> None:
 
 def test_enqueue_with_turn_without_dispatcher_stays_none() -> None:
     assert chat_turns._enqueue_with_turn(None, "turn-9") is None
+
+
+# ---------- 7. S7.20：工具 span 与投递的父子关系 ----------
+
+
+@pytest.mark.asyncio
+async def test_tool_runner_opens_tool_span_and_enqueue_uses_it(
+        cfg: AppConfig, otel_exporter: Any, monkeypatch: pytest.MonkeyPatch) -> None:
+    """工具调用跑在 `tool.<name>` span 内——投递的 traceparent 就取自它（S7.20 验收口径）。"""
+    from xhs_agent.api.deps import CeleryDispatcher
+
+    captured: dict[str, Any] = {}
+    holder: dict[str, int] = {}
+
+    class RecordingApp:
+        def send_task(self, *args: Any, **kwargs: Any) -> None:
+            captured.update(kwargs.get("headers") or {})
+
+    class OtelToolTracer:
+        """只实现 `tool()`：用真 OTel span 模拟 Langfuse「当前 span」的语义。"""
+
+        enabled = True
+
+        @contextmanager
+        def tool(self, *, name: str, metadata: dict[str, Any]) -> Any:
+            with otel_trace.get_tracer("xhs_agent.test").start_as_current_span(name) as span:
+                holder["span_id"] = span.get_span_context().span_id
+                yield Generation(metadata=dict(metadata))
+
+    async def fake_handler(ctx: Any, _args: dict[str, Any], *,
+                           attachments: Any = None, on_progress: Any = None) -> ToolOutcome:
+        await ctx.enqueue("job-1")             # 投递发生在工具 span 内
+        return ToolOutcome(status="succeeded")
+
+    monkeypatch.setitem(chat_tools.HANDLERS, chat_tools.TOOL_RUN_ANALYSIS, fake_handler)
+    dispatcher = CeleryDispatcher(cfg)
+    dispatcher._app = RecordingApp()           # type: ignore[assignment]
+
+    runner = chat_turns.build_tool_runner(
+        cast(Any, None), cfg=cfg, client=object(), session_id=uuid.uuid4(),
+        attachments=[], dispatcher=dispatcher, turn_id="turn-9",
+        tracer=OtelToolTracer())
+    outcome = await runner(chat_tools.TOOL_RUN_ANALYSIS, {})
+
+    assert outcome.status == "succeeded"
+    assert captured["x-xhs-turn-id"] == "turn-9"
+    assert format(holder["span_id"], "016x") in str(captured["traceparent"])

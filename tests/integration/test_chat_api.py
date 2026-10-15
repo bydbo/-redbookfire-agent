@@ -98,6 +98,37 @@ def tool_call(arguments: str = '{"hotspot": "夜跑", "topk": 5}') -> dict[str, 
     return {"id": "call-1", "name": TOOL_RUN_ANALYSIS, "arguments": arguments}
 
 
+class OverlapProvider(llm.BaseProvider):
+    """并发重叠探针：两个轮次都进到模型调用才放行，并按输入区分回复（S7.22 并发验收）。"""
+
+    name = "overlap"
+
+    def __init__(self) -> None:
+        super().__init__(model="overlap-1")
+        self.started = 0
+        self.overlapped = False
+        self._gate = asyncio.Event()
+
+    async def complete(self, call: llm.LLMCall) -> LLMResult:      # pragma: no cover
+        raise AssertionError("对话用例不该走 complete()")
+
+    async def complete_with_tools(self, call: llm.LLMCall,
+                                  on_delta: Any = None) -> LLMResult:
+        self.started += 1
+        if self.started >= 2:                  # 两个轮次同时在飞：放行
+            self.overlapped = True
+            self._gate.set()
+        await asyncio.wait_for(self._gate.wait(), timeout=10)
+        # supervisor 调用的 `user` 字段为空，本轮用户消息是 messages 的最后一条
+        messages = list(getattr(call, "messages", None) or [])
+        latest = str(messages[-1].get("content") or "") if messages else ""
+        marker = "甲会话" if "甲会话" in latest else "乙会话"
+        if on_delta is not None:
+            await on_delta(f"{marker}的回复")
+        return LLMResult(text=f"{marker}的回复", provider=self.name, model=self.model,
+                         prompt_tokens=10, completion_tokens=5, cost_cny=0.002)
+
+
 def parse_sse(body: str) -> list[tuple[str, dict[str, Any]]]:
     """把 `text/event-stream` 正文拆成 `[(事件名, data), ...]`（跳过 `:` 心跳）。"""
     events: list[tuple[str, dict[str, Any]]] = []
@@ -345,6 +376,56 @@ class TestChatApi:
         # S7.21：快照与消息同一生命周期——被标中断的行，阶段快照一并标 interrupted
         assert assistant[0]["progress"]["status"] == "interrupted"
         assert assistant[0]["progress"]["stage"] == "retrieve"
+
+    @pytest.mark.asyncio
+    async def test_two_concurrent_sessions_do_not_cross_contexts(
+            self, client: TestClient, cfg: AppConfig, db_engine: AsyncEngine,
+            monkeypatch: pytest.MonkeyPatch) -> None:
+        """两个会话的轮次真并发在飞：`turn_id` / 正文 / 阶段快照各归各的，互不串线（S7.22）。
+
+        模型替身用"两边都到齐才放行"的门闩制造真实重叠窗口——串上下文（日志 / span /
+        快照）的问题只在并发窗口里才现形；单跑一个会话是测不出来的。
+        """
+        provider = OverlapProvider()
+        monkeypatch.setattr(chat_turns, "build_turn_provider",
+                            lambda _cfg, _client, tracer=None: provider)
+        session_ids = [uuid.UUID(new_session(client)) for _ in range(2)]
+        texts = ["甲会话：蹭一下夜跑热点", "乙会话：蹭一下羽毛球热点"]
+
+        factory = async_sessionmaker(db_engine, expire_on_commit=False)
+        message_ids: list[uuid.UUID] = []
+        async with factory() as session:
+            for session_id, text in zip(session_ids, texts, strict=True):
+                await chat_service.append_message(session, session_id, role="user",
+                                                  content=text)
+                assistant = await chat_service.append_message(
+                    session, session_id, role="assistant", status="running")
+                assert assistant is not None
+                message_ids.append(uuid.UUID(str(assistant["message_id"])))
+
+        events = [TurnEvents(cfg, turn_id=str(uuid.uuid4())) for _ in range(2)]
+        tasks = [
+            start_turn(cfg, events[index], session_id=session_ids[index],
+                       message_id=message_ids[index], history=[], user_text=texts[index])
+            for index in range(2)
+        ]
+        await asyncio.wait_for(asyncio.gather(*tasks), timeout=60)
+
+        assert provider.overlapped, "两个轮次没有同时在飞，并发窗口没建立"
+        async with factory() as session:
+            details = [await chat_service.load_session(session, sid) for sid in session_ids]
+
+        replies: list[str] = []
+        for index, detail in enumerate(details):
+            assert detail is not None
+            assistant = detail["messages"][-1]
+            replies.append(assistant["content"])
+            assert assistant["status"] == "succeeded"
+            assert assistant["turn_id"] == events[index].turn_id   # 各绑各的轮次
+            assert assistant["progress"]["stage"] == "final_reply"
+            assert assistant["progress"]["status"] == "succeeded"
+        assert events[0].turn_id != events[1].turn_id
+        assert replies == ["甲会话的回复", "乙会话的回复"]              # 正文没串
 
     def test_error_branches(self, client: TestClient) -> None:
         session_id = new_session(client)

@@ -394,8 +394,10 @@ async def run_turn_task(cfg: AppConfig, events: TurnEvents, *, session_id: uuid.
             logger.exception("对话轮次异常：%s", events.turn_id)
             error = f"{type(exc).__name__}: {exc}"[:200]
             category = error_category_of(exc)
+            interrupted = progress_tool.interrupt(snapshot)
             await _mark_failed(factory, message_id=message_id, error=error,
-                               progress=progress_tool.interrupt(snapshot))
+                               progress=(dict(interrupted) if interrupted.get("status")
+                                         else None))
             with tracer.turn(name="chat.turn", metadata={"failed": True},
                              turn_id=events.turn_id):
                 await _fail(events, message_id=message_id, error=error,
@@ -437,12 +439,14 @@ async def _finish(session: AsyncSession, events: TurnEvents, turn: ChatTurn, *,
     if turn.status != "succeeded":
         # 失败阶段已由 `stage` 事件写进快照，这里不臆造 final_reply；补 trace 关联与终态
         final = progress_tool.normalize(snapshot)
-        await update_message(session, message_id, status="failed",
-                             error=turn.error or "这一轮失败了",
-                             latency_ms=turn.latency_ms,
-                             prompt_versions=turn.prompt_versions,
-                             trace_id=trace_id or None,
-                             progress=dict(final))
+        fields: dict[str, Any] = {"status": "failed",
+                                  "error": turn.error or "这一轮失败了",
+                                  "latency_ms": turn.latency_ms,
+                                  "prompt_versions": turn.prompt_versions,
+                                  "trace_id": trace_id or None}
+        if final.get("status"):                  # 空快照不写，读侧会把它折成 null
+            fields["progress"] = dict(final)
+        await update_message(session, message_id, **fields)
         await events.publish("stage", {
             "turn_id": events.turn_id, "message_id": str(message_id),
             "stage": "final_reply", "label": label_for("final_reply"), "status": "failed",

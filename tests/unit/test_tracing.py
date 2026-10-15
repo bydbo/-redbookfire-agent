@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from contextlib import contextmanager
 from typing import Any
@@ -373,6 +374,19 @@ class TestTurnSpans:
             tracer.finish_turn(status="failed", totals={}, error="坏了")
         assert any("turn 收尾失败" in item.getMessage() for item in caplog.records)
 
+    def test_tool_and_node_update_failures_are_swallowed(self, tmp_path, caplog):
+        """S7.22：建 span / 结束 span 失败只留 warning，业务照常走完（旁路隔离）。"""
+        tracer, client = self._tracer(tmp_path)
+        client.fail_updates = True
+        with caplog.at_level(logging.WARNING, logger="xhs_agent.tracing"):
+            with tracer.tool(name="tool.run_hotspot_analysis",
+                             metadata={"tool": "run_hotspot_analysis"}) as fields:
+                fields.level = "ERROR"
+                fields.status_message = "tool_failed"
+            with tracer.node(name="node.clue", metadata={"attempt": 1}) as fields:
+                fields.status_message = "internal"
+        assert sum("span 上报失败" in item.getMessage() for item in caplog.records) == 2
+
     def test_trace_id_and_url(self, tmp_path):
         tracer, _client = self._tracer(tmp_path)
         assert tracer.current_trace_id() == "trace-0123456789abcdef"
@@ -453,6 +467,17 @@ class TestTracingProvider:
             await provider.complete_with_tools(FakeCall())
         update = client.generation_updates[0]
         assert update["level"] == "ERROR" and "流断了" in update["status_message"]
+
+    @pytest.mark.asyncio
+    async def test_cancel_marks_generation_error_and_reraises(self, tmp_path):
+        """取消（`CancelledError` 是 `BaseException`）也要收尾 generation，且原样抛出。"""
+        provider, _inner, client = await self._call(tmp_path,
+                                                    error=asyncio.CancelledError("取消"))
+        with pytest.raises(asyncio.CancelledError):
+            await provider.complete_with_tools(FakeCall())
+        update = client.generation_updates[0]
+        assert update["level"] == "ERROR"
+        assert "CancelledError" in update["status_message"]
 
     @pytest.mark.asyncio
     async def test_unknown_usage_is_marked_not_zeroed(self, tmp_path):
