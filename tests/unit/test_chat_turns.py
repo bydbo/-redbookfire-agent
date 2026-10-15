@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import uuid
 from collections.abc import AsyncIterator
 from contextlib import contextmanager
@@ -25,12 +26,19 @@ from opentelemetry import trace as otel_trace
 from xhs_agent.api.routers import chat as chat_router
 from xhs_agent.config import AppConfig, load_config
 from xhs_agent.core.errors import DependencyUnavailableError
-from xhs_agent.core.tracing import Generation, NullTracer, TracingProvider
+from xhs_agent.core.logging import current_turn_id
+from xhs_agent.core.tracing import (
+    Generation,
+    LangfuseTracer,
+    NullTracer,
+    TracingProvider,
+)
 from xhs_agent.services import chat_tools, chat_turns
 from xhs_agent.services.chat_tools import ToolOutcome
 from xhs_agent.services.chat_turns import TurnEvents, redis_url, sse_frame, start_turn
 from xhs_agent.tools import llm
 from xhs_agent.tools.llm import LLMResult
+from xhs_agent.workflows.chat import ChatTurn
 
 REDIS_URL = "redis://localhost:6379/0"
 
@@ -379,16 +387,87 @@ async def test_start_turn_marks_message_failed_on_crash(
     assert engine.disposed == 1
 
 
+class _BrokenSdkClient:
+    """整体故障的假 SDK：建观测 / 上报 / flush / 取 trace 全抛（OBS-01 兜底验收）。"""
+
+    def start_as_current_observation(self, **_kwargs: Any) -> Any:
+        raise RuntimeError("SDK 建观测失败")
+
+    def update_current_generation(self, **_kwargs: Any) -> None:
+        raise RuntimeError("SDK 上报失败")
+
+    def update_current_span(self, **_kwargs: Any) -> None:
+        raise RuntimeError("SDK 上报失败")
+
+    def flush(self) -> None:
+        raise RuntimeError("SDK flush 失败")
+
+    def get_current_trace_id(self) -> str:
+        raise RuntimeError("SDK 取 trace 失败")
+
+    def get_trace_url(self, *, trace_id: str | None = None) -> str:
+        raise RuntimeError("SDK 取链接失败")
+
+
+@pytest.mark.asyncio
+async def test_crash_path_survives_whole_sdk_failure(
+        cfg: AppConfig, fake_redis: FakeRedis, monkeypatch: pytest.MonkeyPatch) -> None:
+    """R1（OBS-01）：追踪 SDK 整体故障时，失败兜底照常落库 + 广播，不再崩一次。"""
+    saved: list[tuple[uuid.UUID, dict[str, Any]]] = []
+
+    async def fake_update(_session: Any, message_id: uuid.UUID,
+                          **fields: Any) -> dict[str, Any]:
+        saved.append((message_id, fields))
+        return {}
+
+    async def boom(*_args: Any, **_kwargs: Any) -> Any:
+        raise RuntimeError("boom")
+
+    engine = DummyEngine()
+    monkeypatch.setattr(chat_turns, "update_message", fake_update)
+    monkeypatch.setattr(chat_turns, "latest_attachments", no_recent_attachments)
+    monkeypatch.setattr(chat_turns, "create_engine_from_config", lambda _cfg: engine)
+    monkeypatch.setattr(chat_turns, "create_session_factory", lambda _engine: dummy_factory)
+    monkeypatch.setattr(chat_turns, "build_turn_provider",
+                        lambda _cfg, _client, tracer=None: ScriptedProvider())
+    monkeypatch.setattr(chat_turns, "run_turn", boom)
+    monkeypatch.setattr(chat_turns, "get_tracer",
+                        lambda _cfg: LangfuseTracer(cfg, client=_BrokenSdkClient()))
+
+    events = TurnEvents(cfg, turn_id="t-sdk")
+    await events.open()
+    received: list[dict[str, Any]] = []
+    pump = asyncio.create_task(_collect(events, received))
+    message_id = uuid.uuid4()
+    task = start_turn(cfg, events, session_id=uuid.uuid4(), message_id=message_id,
+                      history=[], user_text="跑一下")
+    try:
+        await asyncio.wait_for(task, timeout=5)
+        await _wait_until(lambda: any(item["event"] == "error" for item in received))
+    finally:
+        pump.cancel()
+        await events.aclose()
+
+    assert [item["event"] for item in received] == ["turn_started", "error"]
+    assert saved[-1][1]["status"] == "failed"
+    assert "boom" in saved[-1][1]["error"]
+    assert engine.disposed == 1
+
+
+
+
+
 # ---------- S7.22：取消 / 超时按业务状态契约收尾 ----------
 
 
 @pytest.mark.asyncio
-async def test_start_turn_maps_timeout_to_interrupted_terminal_state(
+async def test_start_turn_maps_timeout_to_failed_terminal_state(
         cfg: AppConfig, fake_redis: FakeRedis, monkeypatch: pytest.MonkeyPatch) -> None:
-    """超时（`TimeoutError`）收尾：消息标 `failed`，阶段快照从 running 折成 `interrupted`。
+    """超时（`TimeoutError`）收尾（R2 / OBS-03）：消息标 `failed`，真实失败阶段终结为 failed。
 
-    设计约定 §5：取消与超时按既有业务状态契约映射，不能永远停在 running——正在跑的
-    阶段由 `progress.interrupt` 收口，错误类别按白名单记 `timeout`，不落错误正文。
+    设计约定 §5：取消与超时按既有业务状态契约映射，不能永远停在 running——超时是失败
+    （`failed` + 类别 `timeout`），取消才是 `interrupted`（类别 `cancelled`）；错误事件带
+    真实失败阶段而不是空串。
     """
     saved: list[tuple[uuid.UUID, dict[str, Any]]] = []
 
@@ -431,11 +510,14 @@ async def test_start_turn_maps_timeout_to_interrupted_terminal_state(
     assert running_writes and running_writes[0]["progress"]["stage"] == "retrieve"
     final = saved[-1][1]
     assert final["status"] == "failed" and "模型超时" in final["error"]
-    assert final["progress"]["status"] == "interrupted"
+    assert final["progress"]["status"] == "failed"          # 失败阶段终结为 failed
+    assert final["progress"]["stage"] == "retrieve"         # 真实失败阶段，不臆造 final_reply
     assert final["progress"]["error_category"] == "timeout"
+    assert final["progress"]["nodes"][0]["status"] == "failed"
     error_event = received[-1]
     assert error_event["event"] == "error"
     assert error_event["data"]["error_category"] == "timeout"
+    assert error_event["data"]["stage"] == "retrieve"       # OBS-03：真实失败位置
     assert error_event["data"]["turn_id"] == "t-6"
     assert engine.disposed == 1
 
@@ -537,3 +619,229 @@ async def test_tool_runner_opens_tool_span_and_enqueue_uses_it(
     assert outcome.status == "succeeded"
     assert captured["x-xhs-turn-id"] == "turn-9"
     assert format(holder["span_id"], "016x") in str(captured["traceparent"])
+
+
+# ---------- R2（OBS-03 / 04 / 09）：一个入口、真实失败阶段、取消终态 ----------
+
+
+class _CountingTracer(NullTracer):
+    """数业务入口 + 固定 trace id：OBS-04 验收用（同一轮只允许一个 `chat.turn`）。"""
+
+    def __init__(self) -> None:
+        self.turns = 0
+
+    def turn(self, *, name: str, metadata: Any, turn_id: str = ""):   # type: ignore[override]
+        self.turns += 1
+
+        @contextmanager
+        def _noop():
+            yield None
+
+        return _noop()
+
+    def current_trace_id(self) -> str:
+        return "trace-fixed-1"
+
+
+class _FlakyFactory:
+    """第一次可用、之后连库都打不开：验证收尾写库失败的兜底（OBS-04 点 4）。"""
+
+    def __init__(self, inner: Any) -> None:
+        self._inner = inner
+        self.calls = 0
+
+    def __call__(self) -> Any:
+        self.calls += 1
+        if self.calls > 1:
+            raise RuntimeError("数据库不可用")
+        return self._inner()
+
+
+def _patch_turn_harness(monkeypatch: pytest.MonkeyPatch, engine: DummyEngine,
+                        update: Any, tracer: Any) -> None:
+    monkeypatch.setattr(chat_turns, "update_message", update)
+    monkeypatch.setattr(chat_turns, "latest_attachments", no_recent_attachments)
+    monkeypatch.setattr(chat_turns, "create_engine_from_config", lambda _cfg: engine)
+    monkeypatch.setattr(chat_turns, "create_session_factory", lambda _engine: dummy_factory)
+    monkeypatch.setattr(chat_turns, "build_turn_provider",
+                        lambda _cfg, _client, tracer=None: ScriptedProvider())
+    monkeypatch.setattr(chat_turns, "get_tracer", lambda _cfg: tracer)
+
+
+@pytest.mark.asyncio
+async def test_cancelled_turn_finalizes_interrupted_and_propagates(
+        cfg: AppConfig, fake_redis: FakeRedis, monkeypatch: pytest.MonkeyPatch) -> None:
+    """OBS-09：真实 `Task.cancel()` → 消息 `interrupted`（类别 cancelled）→ 取消继续传播。"""
+    saved: list[tuple[uuid.UUID, dict[str, Any]]] = []
+
+    async def fake_update(_session: Any, message_id: uuid.UUID,
+                          **fields: Any) -> dict[str, Any]:
+        saved.append((message_id, fields))
+        return {}
+
+    started = asyncio.Event()
+
+    async def hanging(*_args: Any, **kwargs: Any) -> Any:
+        on_event = kwargs["on_event"]
+        await on_event("stage", {"stage": "supervisor", "status": "running", "attempt": 1})
+        started.set()
+        await asyncio.sleep(3600)
+
+    engine = DummyEngine()
+    _patch_turn_harness(monkeypatch, engine, fake_update, NullTracer())
+    monkeypatch.setattr(chat_turns, "run_turn", hanging)
+
+    events = TurnEvents(cfg, turn_id="t-cancel")
+    await events.open()
+    received: list[dict[str, Any]] = []
+    pump = asyncio.create_task(_collect(events, received))
+    message_id = uuid.uuid4()
+    task = start_turn(cfg, events, session_id=uuid.uuid4(), message_id=message_id,
+                      history=[], user_text="跑一下")
+    try:
+        await asyncio.wait_for(started.wait(), timeout=5)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(task, timeout=5)          # 有界：收尾后立即传播取消
+        await _wait_until(lambda: any(item["event"] == "error" for item in received))
+    finally:
+        pump.cancel()
+        await events.aclose()
+
+    final = saved[-1][1]
+    assert final["status"] == "interrupted"
+    assert final["progress"]["status"] == "interrupted"
+    assert final["progress"]["stage"] == "supervisor"
+    assert final["progress"]["error_category"] == "cancelled"
+    error_event = received[-1]
+    assert error_event["event"] == "error"
+    assert error_event["data"]["error_category"] == "cancelled"
+    assert error_event["data"]["stage"] == "supervisor"
+    assert error_event["data"]["turn_id"] == "t-cancel"
+    assert engine.disposed == 1
+    assert current_turn_id() == ""                           # 日志上下文复位
+
+
+@pytest.mark.asyncio
+async def test_single_turn_entry_and_trace_id_persisted_on_crash(
+        cfg: AppConfig, fake_redis: FakeRedis, monkeypatch: pytest.MonkeyPatch) -> None:
+    """OBS-04：异常路径只有一个业务入口；trace_id 进入 turn 后尽早捕获并落库。"""
+    saved: list[tuple[uuid.UUID, dict[str, Any]]] = []
+
+    async def fake_update(_session: Any, message_id: uuid.UUID,
+                          **fields: Any) -> dict[str, Any]:
+        saved.append((message_id, fields))
+        return {}
+
+    async def boom(*_args: Any, **_kwargs: Any) -> Any:
+        raise RuntimeError("boom")
+
+    engine = DummyEngine()
+    tracer = _CountingTracer()
+    _patch_turn_harness(monkeypatch, engine, fake_update, tracer)
+    monkeypatch.setattr(chat_turns, "run_turn", boom)
+
+    events = TurnEvents(cfg, turn_id="t-one")
+    await events.open()
+    received: list[dict[str, Any]] = []
+    pump = asyncio.create_task(_collect(events, received))
+    message_id = uuid.uuid4()
+    task = start_turn(cfg, events, session_id=uuid.uuid4(), message_id=message_id,
+                      history=[], user_text="跑一下")
+    try:
+        await asyncio.wait_for(task, timeout=5)
+        await _wait_until(lambda: any(item["event"] == "error" for item in received))
+    finally:
+        pump.cancel()
+        await events.aclose()
+
+    assert tracer.turns == 1                                 # 不重建第二个 chat.turn
+    assert [item["event"] for item in received] == ["turn_started", "error"]
+    assert saved[0][1]["trace_id"] == "trace-fixed-1"        # 尽早落库
+    assert saved[-1][1]["trace_id"] == "trace-fixed-1"
+    assert received[-1]["data"]["trace_id"] == "trace-fixed-1"
+
+
+@pytest.mark.asyncio
+async def test_failed_turn_keeps_real_stage_and_never_fakes_final_reply(
+        cfg: AppConfig, fake_redis: FakeRedis, monkeypatch: pytest.MonkeyPatch) -> None:
+    """OBS-03：返回失败不做 final_reply；终态快照与事件停在真实失败阶段。"""
+    saved: list[tuple[uuid.UUID, dict[str, Any]]] = []
+
+    async def fake_update(_session: Any, message_id: uuid.UUID,
+                          **fields: Any) -> dict[str, Any]:
+        saved.append((message_id, fields))
+        return {}
+
+    async def failing(*_args: Any, **kwargs: Any) -> Any:
+        on_event = kwargs["on_event"]
+        await on_event("stage", {"stage": "supervisor", "status": "running", "attempt": 1})
+        await on_event("stage", {"stage": "supervisor", "status": "failed", "attempt": 1,
+                                 "error_category": "llm_error"})
+        return ChatTurn(status="failed", error="模型拒绝了", error_category="llm_error",
+                        latency_ms=12)
+
+    engine = DummyEngine()
+    _patch_turn_harness(monkeypatch, engine, fake_update, NullTracer())
+    monkeypatch.setattr(chat_turns, "run_turn", failing)
+
+    events = TurnEvents(cfg, turn_id="t-fail")
+    await events.open()
+    received: list[dict[str, Any]] = []
+    pump = asyncio.create_task(_collect(events, received))
+    message_id = uuid.uuid4()
+    task = start_turn(cfg, events, session_id=uuid.uuid4(), message_id=message_id,
+                      history=[], user_text="跑一下")
+    try:
+        await asyncio.wait_for(task, timeout=5)
+        await _wait_until(lambda: any(item["event"] == "error" for item in received))
+    finally:
+        pump.cancel()
+        await events.aclose()
+
+    stage_events = [item["data"] for item in received if item["event"] == "stage"]
+    assert all(item["stage"] != "final_reply" for item in stage_events)   # 不臆造收尾阶段
+    final = saved[-1][1]
+    assert final["status"] == "failed" and final["latency_ms"] == 12
+    assert final["progress"]["stage"] == "supervisor"
+    assert final["progress"]["status"] == "failed"
+    assert final["progress"]["error_category"] == "llm_error"
+    error_event = received[-1]
+    assert error_event["data"]["stage"] == "supervisor"
+    assert error_event["data"]["error_category"] == "llm_error"
+
+
+@pytest.mark.asyncio
+async def test_finalize_write_failure_is_logged_not_claimed(
+        cfg: AppConfig, fake_redis: FakeRedis, monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture) -> None:
+    """OBS-04 点 4：收尾写库失败 → 明确记录"未保存"，事件照常广播，不谎称已落库。"""
+    async def fake_update(_session: Any, message_id: uuid.UUID,
+                          **fields: Any) -> dict[str, Any]:
+        return {}
+
+    async def boom(*_args: Any, **_kwargs: Any) -> Any:
+        raise RuntimeError("boom")
+
+    engine = DummyEngine()
+    _patch_turn_harness(monkeypatch, engine, fake_update, NullTracer())
+    monkeypatch.setattr(chat_turns, "run_turn", boom)
+    flaky = _FlakyFactory(dummy_factory)
+    monkeypatch.setattr(chat_turns, "create_session_factory", lambda _engine: flaky)
+
+    events = TurnEvents(cfg, turn_id="t-flaky")
+    await events.open()
+    received: list[dict[str, Any]] = []
+    pump = asyncio.create_task(_collect(events, received))
+    task = start_turn(cfg, events, session_id=uuid.uuid4(), message_id=uuid.uuid4(),
+                      history=[], user_text="跑一下")
+    try:
+        with caplog.at_level(logging.WARNING, logger="xhs_agent.chat"):
+            await asyncio.wait_for(task, timeout=5)
+            await _wait_until(lambda: any(item["event"] == "error" for item in received))
+    finally:
+        pump.cancel()
+        await events.aclose()
+
+    assert any("轮次收尾写库失败" in item.getMessage() for item in caplog.records)
+    assert received[-1]["event"] == "error"

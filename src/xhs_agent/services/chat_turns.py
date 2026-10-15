@@ -63,6 +63,8 @@ logger = logging.getLogger("xhs_agent.chat")
 
 CHANNEL_PREFIX = "xhs_agent:chat:"
 HEARTBEAT_S = 15.0
+# 取消收尾的写库上限（秒）：真有界——超时 / 再取消由陈旧对账兜底（OBS-09 / OBS-11）
+CANCEL_FINALIZE_TIMEOUT_S = 5.0
 
 # detached 任务必须自己保活，否则可能被 GC 掉（结果会"半路消失"）
 _RUNNING: set[asyncio.Task[None]] = set()
@@ -286,124 +288,139 @@ async def run_turn_task(cfg: AppConfig, events: TurnEvents, *, session_id: uuid.
                         dispatcher: Any = None) -> None:
     """任务体：自建 engine / httpx，跑完这一轮并把结果写回消息、广播事件。
 
-    S7.19 / S7.20：整轮包在 `chat.turn` span 里（detached 任务继承到请求上下文就挂其下，
-    不继承也能自成因）；`turn_id` 绑进日志上下文并在 `finally` 复位；结束时按真实终态
-    收尾 span（成功 / 失败都有终态，不永远挂在 running）。
-    S7.21：`turn_id` 尽早落库，阶段变化合并进 `chat_messages.progress`——**只在切换时写**，
-    不逐 token、不逐轮询；收尾写 `trace_id`，刷新后仍能定位阶段与失败原因。
+    S7.19 / S7.20：整轮包在**同一个** `chat.turn` span 里——成功、返回失败、异常、取消都在
+    这一个业务入口内收尾，不再重建第二条轮次；`turn_id` 绑进日志上下文并在 `finally` 复位。
+    S7.21：`turn_id` 与 `trace_id` **尽早落库**，阶段变化合并进 `chat_messages.progress`
+    ——只在切换时写，不逐 token、不逐轮询。
+    R2（OBS-03 / 04 / 09）：先按轮次结果分流（失败不做 `final_reply`）；消息字段与终端事件
+    由**同一个终态快照**生成；`trace_id` 在进入 turn 后立即捕获并尽早写库；`CancelledError`
+    单独收尾为 `interrupted`（类别 `cancelled`）后**原样重新抛出**，绝不吞掉停机控制流。
     """
     engine = create_engine_from_config(cfg)
     token = bind_turn_id(events.turn_id)
     tracer = get_tracer(cfg)
     snapshot = progress_tool.normalize({})
     written = ""
+    factory = create_session_factory(engine)
+    status = "failed"
+    category = "internal"
+    totals: dict[str, Any] = {}
     try:
-        factory = create_session_factory(engine)
-        try:
-            async with factory() as session:
-                await events.publish("turn_started", {
-                    "turn_id": events.turn_id, "session_id": str(session_id),
-                    "message_id": str(message_id), "started_at": now_iso()})
-                # S7.21：尽早关联 turn_id，让"运行中"的消息在库里就能按轮次追查
-                await update_message(session, message_id, turn_id=events.turn_id)
+        with tracer.turn(name="chat.turn",
+                         metadata={"session_id": str(session_id),
+                                   "message_id": str(message_id)},
+                         turn_id=events.turn_id):
+            trace_id = tracer.current_trace_id()      # 进入 turn 后尽早取（OBS-04）
+            try:
+                async with factory() as session:
+                    await events.publish("turn_started", {
+                        "turn_id": events.turn_id, "session_id": str(session_id),
+                        "message_id": str(message_id), "started_at": now_iso()})
+                    # S7.21 / OBS-04：尽早关联 turn_id 与 trace_id——失败消息也保留 trace 关联
+                    await update_message(session, message_id, turn_id=events.turn_id,
+                                         trace_id=trace_id or None)
 
-                async def persist(*, stage: str, status: str, attempt: int = 1,
-                                  latency_ms: int = 0, error_category: str = "",
-                                  run_id: str = "") -> None:
-                    """合并一条阶段更新；只有快照确实变化才写库（S7.21 的写库节流点）。
+                    async def persist(*, stage: str, status: str, attempt: int = 1,
+                                      latency_ms: int = 0, error_category: str = "",
+                                      run_id: str = "") -> None:
+                        """合并一条阶段更新；只有快照确实变化才写库（S7.21 的写库节流点）。
 
-                    切到新阶段时把上一个还在跑的阶段收成 `succeeded`——否则快照的 `nodes`
-                    里会留下永远 running 的旧阶段（阶段是顺序推进的：能走到下一步说明上一步成功）。
-                    """
-                    nonlocal snapshot, written
-                    previous_stage = str(snapshot.get("stage") or "")
-                    if (status == "running" and previous_stage and previous_stage != stage
-                            and snapshot.get("status") == "running"):
-                        snapshot = progress_tool.end(
-                            snapshot, stage=previous_stage, status="succeeded",
-                            attempt=int(snapshot.get("attempt") or 1))
-                    snapshot = progress_tool.apply(snapshot, stage=stage, status=status,
-                                                   attempt=attempt, latency_ms=latency_ms,
-                                                   error_category=error_category, run_id=run_id)
-                    marker = json.dumps(snapshot, ensure_ascii=False, sort_keys=True)
-                    if marker == written:
-                        return
-                    written = marker
-                    await update_message(session, message_id, progress=dict(snapshot))
+                        切到新阶段时把上一个还在跑的阶段收成 `succeeded`——否则快照的 `nodes`
+                        里会留下永远 running 的旧阶段（阶段是顺序推进的：能走到下一步说明上一步成功）。
+                        """
+                        nonlocal snapshot, written
+                        previous_stage = str(snapshot.get("stage") or "")
+                        if (status == "running" and previous_stage and previous_stage != stage
+                                and snapshot.get("status") == "running"):
+                            snapshot = progress_tool.end(
+                                snapshot, stage=previous_stage, status="succeeded",
+                                attempt=int(snapshot.get("attempt") or 1))
+                        snapshot = progress_tool.apply(snapshot, stage=stage, status=status,
+                                                       attempt=attempt, latency_ms=latency_ms,
+                                                       error_category=error_category,
+                                                       run_id=run_id)
+                        marker = json.dumps(snapshot, ensure_ascii=False, sort_keys=True)
+                        if marker == written:
+                            return
+                        written = marker
+                        await update_message(session, message_id, progress=dict(snapshot))
 
-                async with build_http_client(cfg.llm.timeout_s) as client:
-                    provider = build_turn_provider(cfg, client, tracer=tracer)
-                    # 跨轮图片回落（S7.10 / S7.16 按组）：先把本会话最近一组图取出来，工具在
-                    # "本轮没带图"时才有得用（用户说「上面那几张图」正是这种情况）
-                    recent = await latest_attachments(session, session_id)
-                    runner = build_tool_runner(session, cfg=cfg, client=client,
-                                               session_id=session_id,
-                                               attachments=attachments or [],
-                                               dispatcher=dispatcher,
-                                               caller=StructuredCaller(provider=provider),
-                                               recent_attachments=recent,
-                                               turn_id=events.turn_id, tracer=tracer)
+                    async with build_http_client(cfg.llm.timeout_s) as client:
+                        provider = build_turn_provider(cfg, client, tracer=tracer)
+                        # 跨轮图片回落（S7.10 / S7.16 按组）：先把本会话最近一组图取出来，工具在
+                        # "本轮没带图"时才有得用（用户说「上面那几张图」正是这种情况）
+                        recent = await latest_attachments(session, session_id)
+                        runner = build_tool_runner(session, cfg=cfg, client=client,
+                                                   session_id=session_id,
+                                                   attachments=attachments or [],
+                                                   dispatcher=dispatcher,
+                                                   caller=StructuredCaller(provider=provider),
+                                                   recent_attachments=recent,
+                                                   turn_id=events.turn_id, tracer=tracer)
 
-                    async def on_event(event: str, payload: dict[str, Any]) -> None:
-                        body = dict(payload)
-                        if event != "text_delta":    # 每个 token 都补关联字段没有意义
-                            body.setdefault("turn_id", events.turn_id)
-                            body.setdefault("message_id", str(message_id))
-                        if event == "stage":
-                            await persist(stage=str(body.get("stage") or ""),
-                                          status=str(body.get("status") or "running"),
-                                          attempt=int(body.get("attempt") or 1),
-                                          error_category=str(body.get("error_category") or ""),
-                                          run_id=str(body.get("run_id") or ""))
-                        elif event == "tool_progress" and body.get("stage_key"):
-                            # 排队等待 / 素材同步 / 向量回填 / 五节点：worker 阶段随轮询可见
-                            await persist(stage=str(body["stage_key"]), status="running",
-                                          attempt=int(body.get("attempt") or 1))
-                        elif event == "tool_finished" and body.get("stage_key"):
-                            await persist(stage=str(body["stage_key"]),
-                                          status=("succeeded"
-                                                  if body.get("status") == "succeeded"
-                                                  else "failed"),
-                                          attempt=int(body.get("attempt") or 1),
-                                          latency_ms=int(body.get("latency_ms") or 0))
-                        await events.publish(event, body)
+                        async def on_event(event: str, payload: dict[str, Any]) -> None:
+                            body = dict(payload)
+                            if event != "text_delta":    # 每个 token 都补关联字段没有意义
+                                body.setdefault("turn_id", events.turn_id)
+                                body.setdefault("message_id", str(message_id))
+                            if event == "stage":
+                                await persist(stage=str(body.get("stage") or ""),
+                                              status=str(body.get("status") or "running"),
+                                              attempt=int(body.get("attempt") or 1),
+                                              error_category=str(body.get("error_category") or ""),
+                                              run_id=str(body.get("run_id") or ""))
+                            elif event == "tool_progress" and body.get("stage_key"):
+                                # 排队等待 / 素材同步 / 向量回填 / 五节点：worker 阶段随轮询可见
+                                await persist(stage=str(body["stage_key"]), status="running",
+                                              attempt=int(body.get("attempt") or 1))
+                            elif event == "tool_finished" and body.get("stage_key"):
+                                await persist(stage=str(body["stage_key"]),
+                                              status=("succeeded"
+                                                      if body.get("status") == "succeeded"
+                                                      else "failed"),
+                                              attempt=int(body.get("attempt") or 1),
+                                              latency_ms=int(body.get("latency_ms") or 0))
+                            await events.publish(event, body)
 
-                    with tracer.turn(name="chat.turn",
-                                     metadata={"session_id": str(session_id),
-                                               "message_id": str(message_id)},
-                                     turn_id=events.turn_id):
+                        # R2（OBS-03）：先按轮次结果分流——失败不做 `final_reply`
                         turn = await run_turn(cfg, provider=provider, history=history,
                                               user_text=user_text, run_tool=runner,
                                               attachment_note=attachment_note,
                                               on_event=on_event)
-                        # 收尾阶段（S7.20）：正文已流式回吐，这一步只做写库与终态整理
-                        await events.publish("stage", {
-                            "turn_id": events.turn_id, "message_id": str(message_id),
-                            "stage": "final_reply", "label": label_for("final_reply"),
-                            "status": "running", "attempt": 1, "started_at": now_iso(),
-                            "run_id": turn.run_id or None})
-                        await persist(stage="final_reply", status="running",
-                                      run_id=turn.run_id or "")
+                        if turn.status == "succeeded":
+                            # 收尾阶段（S7.20）：正文已流式回吐，这一步只做写库与终态整理
+                            await events.publish("stage", {
+                                "turn_id": events.turn_id, "message_id": str(message_id),
+                                "stage": "final_reply", "label": label_for("final_reply"),
+                                "status": "running", "attempt": 1, "started_at": now_iso(),
+                                "run_id": turn.run_id or None})
+                            await persist(stage="final_reply", status="running",
+                                          run_id=turn.run_id or "")
                         status = await _finish(session, events, turn, message_id=message_id,
-                                               session_id=session_id, tracer=tracer,
-                                               snapshot=snapshot)
-                        tracer.finish_turn(status=status, totals=_turn_totals(turn),
-                                           turn_id=events.turn_id,
-                                           error=turn.error if status != "succeeded" else "")
-        except Exception as exc:                 # noqa: BLE001 - 整轮失败要落库 + 广播，不炸进程
-            logger.exception("对话轮次异常：%s", events.turn_id)
-            error = f"{type(exc).__name__}: {exc}"[:200]
-            category = error_category_of(exc)
-            interrupted = progress_tool.interrupt(snapshot)
-            await _mark_failed(factory, message_id=message_id, error=error,
-                               progress=(dict(interrupted) if interrupted.get("status")
-                                         else None))
-            with tracer.turn(name="chat.turn", metadata={"failed": True},
-                             turn_id=events.turn_id):
-                await _fail(events, message_id=message_id, error=error,
-                            error_category=category, tracer=tracer)
-                tracer.finish_turn(status="failed", totals={}, turn_id=events.turn_id,
-                                   error=error)
+                                               session_id=session_id, snapshot=snapshot,
+                                               trace_id=trace_id)
+                        category = turn.error_category or ("internal"
+                                                           if status != "succeeded" else "")
+                        totals = _turn_totals(turn)
+            except asyncio.CancelledError:
+                # R2（OBS-09）：真实取消 → 有界时间内尽力写 interrupted，然后原样继续传播
+                status, category = "interrupted", "cancelled"
+                await _finalize_turn(factory, events, message_id=message_id, snapshot=snapshot,
+                                     trace_id=trace_id, status="interrupted",
+                                     error_category=category,
+                                     error="这一轮被取消（停机 / 任务取消），已按中断收尾",
+                                     budget_s=CANCEL_FINALIZE_TIMEOUT_S)
+                raise
+            except Exception as exc:                 # noqa: BLE001 - 整轮失败要落库 + 广播
+                logger.exception("对话轮次异常：%s", events.turn_id)
+                status, category = "failed", error_category_of(exc)
+                await _finalize_turn(factory, events, message_id=message_id, snapshot=snapshot,
+                                     trace_id=trace_id, status="failed",
+                                     error_category=category,
+                                     error=f"{type(exc).__name__}: {exc}"[:200])
+            finally:
+                tracer.finish_turn(status=status, totals=totals, turn_id=events.turn_id,
+                                   error="" if status == "succeeded" else category)
     finally:
         reset_turn_id(token)
         await events.close_publisher()
@@ -418,27 +435,75 @@ def _turn_totals(turn: ChatTurn) -> dict[str, Any]:
             "usage_complete": True}
 
 
-async def _mark_failed(factory: Any, *, message_id: uuid.UUID, error: str,
-                       progress: dict[str, Any] | None = None) -> None:
-    """兜底把 assistant 行标 `failed`（best-effort：连库都写不了就只剩事件）。"""
-    fields: dict[str, Any] = {"status": "failed", "error": error}
-    if progress is not None:
-        fields["progress"] = dict(progress)
-    with suppress(Exception):
+def _terminal_snapshot(snapshot: dict[str, Any], *, status: str,
+                       error_category: str) -> dict[str, Any]:
+    """把当前快照收成终态（OBS-03）：只终结**确实存在**的当前阶段，绝不臆造阶段。
+
+    - 当前阶段还在 `running`：终结为 `status`（`failed` / `interrupted`），带安全类别；
+    - 已是终态：保留原样（缺类别时补上，供前端失败说明与排查使用）；
+    - 从未有过任何阶段：原样返回（读侧会把空快照折成 `null`）。
+    """
+    data = progress_tool.normalize(snapshot)
+    stage = str(data.get("stage") or "")
+    if not stage:
+        return data
+    if data.get("status") == "running":
+        return progress_tool.end(data, stage=stage, status=status,
+                                 attempt=int(data.get("attempt") or 1),
+                                 error_category=error_category)
+    if error_category and not data.get("error_category"):
+        data["error_category"] = error_category
+    return data
+
+
+async def _finalize_turn(factory: Any, events: TurnEvents, *, message_id: uuid.UUID,
+                         snapshot: dict[str, Any], trace_id: str, status: str,
+                         error_category: str, error: str,
+                         budget_s: float | None = None) -> None:
+    """异常 / 取消的统一收尾（OBS-03 / 04 / 09）：同一条终态快照生成消息字段与事件。
+
+    - 消息：`status`（`failed` / `interrupted`）+ 错误文本 + **尽早捕获的 `trace_id`** +
+      终态快照（真实失败阶段，不再无条件写 `final_reply`）；
+    - 事件：`error` 带真实失败阶段与安全类别；
+    - 写库尽力而为：连库都写不了就只留事件（陈旧对账兜底）；取消路径给写库加**有界**上限。
+    """
+    final = _terminal_snapshot(snapshot, status=status, error_category=error_category)
+    fields: dict[str, Any] = {"status": status, "error": error, "trace_id": trace_id or None}
+    if final.get("status"):
+        fields["progress"] = dict(final)
+
+    async def _write() -> None:
         async with factory() as session:
             await update_message(session, message_id, **fields)
+
+    try:
+        if budget_s is None:
+            await _write()
+        else:
+            async with asyncio.timeout(budget_s):
+                await _write()
+    except Exception:                            # noqa: BLE001 - 尽力而为：写不了由陈旧对账兜底
+        logger.warning("轮次收尾写库失败（status=%s，交给陈旧对账兜底）：%s",
+                       status, events.turn_id)
+    await _fail(events, message_id=message_id, error=error, error_category=error_category,
+                stage=str(final.get("stage") or ""), trace_id=trace_id)
 
 
 async def _finish(session: AsyncSession, events: TurnEvents, turn: ChatTurn, *,
                   message_id: uuid.UUID, session_id: uuid.UUID,
-                  tracer: Tracer | None = None,
-                  snapshot: dict[str, Any] | None = None) -> str:
-    """写回消息并发终态事件（S7.20 起带 `turn_id` / `trace_id` / 阶段）；返回本轮终态。"""
-    active = tracer if tracer is not None else NullTracer()
-    trace_id = active.current_trace_id()
+                  snapshot: dict[str, Any] | None = None,
+                  trace_id: str = "") -> str:
+    """按轮次结果分流写回（OBS-03）；消息字段与终端事件由**同一个终态快照**生成。
+
+    - 成功：`final_reply` 收尾（只覆盖写库与整理，不宣称生成耗时）→ `stage` 成功事件 +
+      `turn_finished`；
+    - 失败：终结真实失败阶段（不臆造 `final_reply`）→ 只发 `error` 事件（带真实失败阶段、
+      安全类别与已捕获的 trace 关联）。
+    """
     if turn.status != "succeeded":
-        # 失败阶段已由 `stage` 事件写进快照，这里不臆造 final_reply；补 trace 关联与终态
-        final = progress_tool.normalize(snapshot)
+        category = turn.error_category or "internal"
+        final = _terminal_snapshot(progress_tool.normalize(snapshot), status="failed",
+                                   error_category=category)
         fields: dict[str, Any] = {"status": "failed",
                                   "error": turn.error or "这一轮失败了",
                                   "latency_ms": turn.latency_ms,
@@ -447,13 +512,9 @@ async def _finish(session: AsyncSession, events: TurnEvents, turn: ChatTurn, *,
         if final.get("status"):                  # 空快照不写，读侧会把它折成 null
             fields["progress"] = dict(final)
         await update_message(session, message_id, **fields)
-        await events.publish("stage", {
-            "turn_id": events.turn_id, "message_id": str(message_id),
-            "stage": "final_reply", "label": label_for("final_reply"), "status": "failed",
-            "attempt": 1, "updated_at": now_iso(),
-            "error_category": turn.error_category or "internal"})
         await _fail(events, message_id=message_id, error=turn.error or "这一轮失败了",
-                    error_category=turn.error_category or "internal", tracer=active)
+                    error_category=category, stage=str(final.get("stage") or ""),
+                    trace_id=trace_id)
         return "failed"
     final = progress_tool.end(progress_tool.normalize(snapshot), stage="final_reply",
                               status="succeeded")
@@ -478,11 +539,14 @@ async def _finish(session: AsyncSession, events: TurnEvents, turn: ChatTurn, *,
 
 
 async def _fail(events: TurnEvents, *, message_id: uuid.UUID, error: str,
-                error_category: str = "internal", tracer: Tracer | None = None) -> None:
-    """失败终端事件：带轮次关联信息（失败阶段 / 安全类别 / trace），方便回看与排查。"""
-    active = tracer if tracer is not None else NullTracer()
+                error_category: str = "internal", stage: str = "",
+                trace_id: str = "") -> None:
+    """失败终端事件：真实失败阶段 + 安全类别 + 已捕获的 trace 关联（OBS-03 / 04）。
+
+    `trace_id` 显式传入：异常展开后不再重读追踪上下文，也不依赖"当前 span"还在不在。
+    """
     await events.publish("error", {"turn_id": events.turn_id,
                                    "message_id": str(message_id),
                                    "code": "internal_error", "message": error,
-                                   "stage": "", "error_category": error_category,
-                                   "trace_id": active.current_trace_id()})
+                                   "stage": stage, "error_category": error_category,
+                                   "trace_id": trace_id})

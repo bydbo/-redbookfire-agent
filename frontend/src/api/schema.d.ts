@@ -846,7 +846,7 @@ export interface components {
         };
         /** @description 阶段快照里的一次阶段执行记录（S7.20 / S7.21）。 */
         StageNode: {
-            /** @description 阶段键（supervisor / image_parse / submit_analysis / queue_wait / material_sync / embedding_backfill / clue / retrieve / gaps / draft / report / final_reply） */
+            /** @description 阶段键（supervisor / image_parse / submit_analysis / queue_wait / material_sync / embedding_backfill / clue / retrieve / gaps / draft / report / final_reply）；final_reply 只出现在成功轮次，覆盖写库与终态整理区间，不代表回复生成耗时（生成区间看对应 supervisor 尝试） */
             stage: string;
             /** @description 中文标签 */
             label?: string;
