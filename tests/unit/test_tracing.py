@@ -7,8 +7,8 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
-from contextlib import contextmanager
 from typing import Any
 
 import pytest
@@ -43,28 +43,59 @@ class FakeObservation:
         self.kwargs = dict(kwargs)
 
 
+class FakeObservationContext:
+    """假观测上下文（R1）：支持手动 enter / exit，并记录退出时收到的异常参数。
+
+    `exit_args` 是 OBS-01/02 的关键证据：业务异常**绝不能**交给 SDK 的 `__exit__`
+    （否则 SDK 底层的 OTel span 会自动 `record_exception` 把正文写进云端载荷）。
+    """
+
+    def __init__(self, client: FakeClient, kwargs: dict[str, Any]) -> None:
+        self.client = client
+        self.kwargs = dict(kwargs)
+
+    def __enter__(self) -> FakeObservation:
+        if self.client.fail_enter:
+            raise RuntimeError("假装进入失败")
+        observation = FakeObservation(self.kwargs)
+        self.client.observations.append(
+            {"parent": len(self.client.stack),
+             **{k: v for k, v in self.kwargs.items() if k != "metadata"},
+             "metadata": dict(self.kwargs.get("metadata") or {})})
+        self.client.stack.append(observation)
+        return observation
+
+    def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> bool:
+        self.client.exit_args.append((exc_type, exc))
+        self.client.stack.pop()
+        if self.client.fail_exit:
+            raise RuntimeError("假装退出失败")
+        return False
+
+
 class FakeClient:
-    """记录 span 的父子层级与收尾字段（模拟 Langfuse SDK 的四个方法）。"""
+    """记录 span 的父子层级与收尾字段（模拟 Langfuse SDK 的四个方法）。
+
+    故障注入（R1 验收用）：`fail_create` 建观测抛错、`fail_enter` 进入抛错、
+    `fail_exit` 退出抛错、`fail_updates` 上报抛错。
+    """
 
     def __init__(self) -> None:
         self.stack: list[FakeObservation] = []
         self.observations: list[dict[str, Any]] = []   # 含 parent 深度、入参
         self.generation_updates: list[dict[str, Any]] = []
         self.span_updates: list[dict[str, Any]] = []
+        self.exit_args: list[tuple[Any, Any]] = []     # 每次观测退出时收到的异常参数
         self.flushes = 0
+        self.fail_create = False
+        self.fail_enter = False
+        self.fail_exit = False
         self.fail_updates = False
 
-    @contextmanager
-    def start_as_current_observation(self, **kwargs: Any):
-        observation = FakeObservation(kwargs)
-        self.observations.append({"parent": len(self.stack), **{k: v for k, v in kwargs.items()
-                                                               if k != "metadata"},
-                                  "metadata": dict(kwargs.get("metadata") or {})})
-        self.stack.append(observation)
-        try:
-            yield observation
-        finally:
-            self.stack.pop()
+    def start_as_current_observation(self, **kwargs: Any) -> FakeObservationContext:
+        if self.fail_create:
+            raise RuntimeError("假装创建失败")
+        return FakeObservationContext(self, kwargs)
 
     def update_current_generation(self, **kwargs: Any) -> None:
         if self.fail_updates:
@@ -275,7 +306,7 @@ class TestLangfuseTracerShape:
             fields.cost_details = {"input": 0.1, "output": 0.2, "total": 0.3}
             fields.metadata["attempts"] = 2
             fields.level = "ERROR"
-            fields.status_message = "上游 503"
+            fields.status_message = "llm_error"   # 白名单内的安全类别
 
         generation = client.observations[2]
         assert generation["as_type"] == "generation" and generation["parent"] == 2
@@ -284,7 +315,7 @@ class TestLangfuseTracerShape:
                                                                 "total": 150}
         assert client.generation_updates[0]["cost_details"]["total"] == pytest.approx(0.3)
         assert client.generation_updates[0]["level"] == "ERROR"
-        assert client.generation_updates[0]["status_message"] == "上游 503"
+        assert client.generation_updates[0]["status_message"] == "llm_error"
         assert "input" not in client.generation_updates[0]      # 默认不带正文
 
     def test_finish_run_writes_totals_to_trace(self, tmp_path):
@@ -294,14 +325,14 @@ class TestLangfuseTracerShape:
                                                       "completion_tokens": 150,
                                                       "cost_cny": 0.0003, "latency_ms": 1200},
                               run_id="run-9", prompt_versions={"hotspot_clue": 1},
-                              error="上游 503")
+                              error="llm_error")
         payload = client.span_updates[0]
         assert payload["metadata"]["status"] == "failed"
         assert payload["metadata"]["llm_calls"] == 3
         assert payload["metadata"]["cost_cny"] == pytest.approx(0.0003)
         assert payload["metadata"]["run_id"] == "run-9"
         assert payload["metadata"]["prompt_versions"] == {"hotspot_clue": 1}
-        assert payload["level"] == "ERROR" and payload["status_message"] == "上游 503"
+        assert payload["level"] == "ERROR" and payload["status_message"] == "llm_error"
 
     def test_finish_run_logs_trace_link(self, tmp_path, caplog):
         """运行结束时日志里带 trace 链接，便于按 run_id 回放（S4.2）。"""
@@ -424,7 +455,8 @@ class TestTracingProvider:
         provider, _inner, client = await self._call(tmp_path, result=FakeResult(error="上游 503"))
         await provider.complete(FakeCall())
         update = client.generation_updates[0]
-        assert update["level"] == "ERROR" and update["status_message"] == "上游 503"
+        # OBS-02：返回错误正文不进载荷，只发固定安全类别
+        assert update["level"] == "ERROR" and update["status_message"] == "llm_error"
 
     @pytest.mark.asyncio
     async def test_exception_marks_generation_error_and_reraises(self, tmp_path):
@@ -432,7 +464,8 @@ class TestTracingProvider:
         with pytest.raises(RuntimeError):
             await provider.complete(FakeCall())
         update = client.generation_updates[0]
-        assert update["level"] == "ERROR" and "炸了" in update["status_message"]
+        # OBS-02：异常正文不进载荷，投影成安全类别（RuntimeError → internal）
+        assert update["level"] == "ERROR" and update["status_message"] == "internal"
 
     @pytest.mark.asyncio
     async def test_capture_content_includes_prompt_and_output(self, tmp_path):
@@ -466,7 +499,7 @@ class TestTracingProvider:
         with pytest.raises(RuntimeError):
             await provider.complete_with_tools(FakeCall())
         update = client.generation_updates[0]
-        assert update["level"] == "ERROR" and "流断了" in update["status_message"]
+        assert update["level"] == "ERROR" and update["status_message"] == "internal"
 
     @pytest.mark.asyncio
     async def test_cancel_marks_generation_error_and_reraises(self, tmp_path):
@@ -477,7 +510,7 @@ class TestTracingProvider:
             await provider.complete_with_tools(FakeCall())
         update = client.generation_updates[0]
         assert update["level"] == "ERROR"
-        assert "CancelledError" in update["status_message"]
+        assert update["status_message"] == "cancelled"
 
     @pytest.mark.asyncio
     async def test_unknown_usage_is_marked_not_zeroed(self, tmp_path):
@@ -492,3 +525,229 @@ class TestTracingProvider:
             tmp_path, result=FakeResult(usage_status="actual"))
         await provider.complete(FakeCall())
         assert client.generation_updates[0]["metadata"]["usage_status"] == "actual"
+
+
+# ---------- R1（OBS-01）：安全观测上下文 ----------
+
+
+class TestSafeObservationIsolation:
+    """SDK 创建 / 进入 / 退出失败都不影响业务：业务块**只执行一次**、结果不变。"""
+
+    SENTINEL = "SYNTHETIC_PRIVATE_TEXT /private/material.png sk-live-fake-credential"
+
+    def _tracer(self, tmp_path, *, capture: bool = False):
+        env = dict(KEYS)
+        if capture:
+            env["LANGFUSE_CAPTURE_CONTENT"] = "true"
+        client = FakeClient()
+        return LangfuseTracer(make_config(tmp_path, env), client=client), client
+
+    def test_creation_failure_runs_business_once_for_all_six_observations(self, tmp_path,
+                                                                         caplog):
+        tracer, client = self._tracer(tmp_path)
+        calls: list[str] = []
+        with caplog.at_level(logging.WARNING, logger="xhs_agent.tracing"):
+            with tracer.run(name="analyze", metadata={}):
+                calls.append("run")
+            with tracer.hotspot(index=1, metadata={}):
+                calls.append("hotspot")
+            with tracer.turn(name="chat.turn", metadata={}, turn_id="t-1"):
+                calls.append("turn")
+            with tracer.tool(name="tool.x", metadata={}) as fields:
+                fields.level = "ERROR"
+                calls.append("tool")
+            with tracer.node(name="node.x", metadata={}) as fields:
+                fields.status_message = "internal"
+                calls.append("node")
+            with tracer.generation(name="g", model="m", metadata={}) as fields:
+                fields.usage_details = {"total": 1}
+                calls.append("generation")
+        before = (len(client.generation_updates), len(client.span_updates))
+        client.fail_create = True
+        with caplog.at_level(logging.WARNING, logger="xhs_agent.tracing"):
+            with tracer.run(name="analyze", metadata={}):
+                calls.append("run")
+            with tracer.hotspot(index=1, metadata={}):
+                calls.append("hotspot")
+            with tracer.turn(name="chat.turn", metadata={}, turn_id="t-1"):
+                calls.append("turn")
+            with tracer.tool(name="tool.x", metadata={}) as fields:
+                fields.status_message = "internal"
+                calls.append("tool")
+            with tracer.node(name="node.x", metadata={}) as fields:
+                fields.status_message = "internal"
+                calls.append("node")
+            with tracer.generation(name="g", model="m", metadata={}) as fields:
+                fields.usage_details = {"total": 1}
+                fields.status_message = "llm_error"
+                calls.append("generation")
+
+        assert calls == ["run", "hotspot", "turn", "tool", "node", "generation"] * 2
+        # 建观测失败：第二次没有多出任何字段写回（免得把更新误挂到外层 span）
+        assert (len(client.generation_updates), len(client.span_updates)) == before
+        assert sum("观测创建失败" in item.getMessage() for item in caplog.records) >= 6
+
+    def test_enter_failure_is_isolated_like_creation_failure(self, tmp_path, caplog):
+        tracer, client = self._tracer(tmp_path)
+        client.fail_enter = True
+        with (caplog.at_level(logging.WARNING, logger="xhs_agent.tracing"),
+              tracer.tool(name="tool.x", metadata={}) as fields):
+            fields.status_message = "internal"
+            business = "done"
+        assert business == "done"
+        assert client.span_updates == [] and client.observations == []
+        assert any("观测创建失败" in item.getMessage() for item in caplog.records)
+
+    def test_exit_failure_keeps_business_result_and_updates(self, tmp_path, caplog):
+        tracer, client = self._tracer(tmp_path)
+        client.fail_exit = True
+        with (caplog.at_level(logging.WARNING, logger="xhs_agent.tracing"),
+              tracer.generation(name="g", model="m", metadata={}) as fields):
+            fields.usage_details = {"total": 1}
+            value = "业务结果"
+        assert value == "业务结果"
+        assert client.generation_updates[0]["usage_details"] == {"total": 1}
+        assert any("观测收尾失败" in item.getMessage() for item in caplog.records)
+        assert client.stack == []                        # 上下文已恢复
+
+    def test_exit_failure_does_not_override_business_exception(self, tmp_path):
+        tracer, client = self._tracer(tmp_path)
+        client.fail_exit = True
+        with (pytest.raises(ValueError, match="业务炸了"),
+              tracer.run(name="analyze", metadata={})):
+            raise ValueError("业务炸了")
+
+    def test_cancel_propagates_and_observation_still_closes(self, tmp_path):
+        tracer, client = self._tracer(tmp_path)
+        with (pytest.raises(asyncio.CancelledError),
+              tracer.turn(name="chat.turn", metadata={}, turn_id="t-2")):
+            raise asyncio.CancelledError()
+        assert client.stack == []
+        assert client.exit_args == [(None, None)]        # 取消**不**交给 SDK
+
+    def test_sdk_never_receives_business_exception(self, tmp_path):
+        """OBS-02 的关键机制：业务异常不进 SDK 的 `__exit__`，底层 OTel 无从自动记录。"""
+        tracer, client = self._tracer(tmp_path)
+        with (pytest.raises(RuntimeError),
+              tracer.generation(name="g", model="m", metadata={})):
+            raise RuntimeError(self.SENTINEL)
+        assert client.exit_args == [(None, None)]
+
+    def test_fallback_turn_creation_failure_does_not_crash(self, tmp_path):
+        """失败兜底再次建 turn（同 tracer）也不崩：六种观测一起故障注入跑两遍。"""
+        tracer, client = self._tracer(tmp_path)
+        client.fail_create = True
+        closed = []
+        with (tracer.turn(name="chat.turn", metadata={}, turn_id="t-3"),
+              tracer.turn(name="chat.turn", metadata={"failed": True}, turn_id="t-3")):
+            closed.append("fallback-ok")
+        assert closed == ["fallback-ok"]
+
+
+# ---------- R1（OBS-02）：安全错误投影（哨兵断言） ----------
+
+
+class TestSafeErrorProjection:
+    SENTINEL = "SYNTHETIC_PRIVATE_TEXT /private/material.png sk-live-fake-credential"
+
+    def _tracer(self, tmp_path, *, capture: bool = False):
+        env = dict(KEYS)
+        if capture:
+            env["LANGFUSE_CAPTURE_CONTENT"] = "true"
+        client = FakeClient()
+        return LangfuseTracer(make_config(tmp_path, env), client=client), client
+
+    def _dump(self, client: FakeClient) -> str:
+        return json.dumps({"spans": client.span_updates,
+                           "generations": client.generation_updates}, ensure_ascii=False)
+
+    def test_sentinel_never_reaches_handwritten_cloud_fields(self, tmp_path):
+        """错误正文 / 路径 / 模拟凭据不落云端字段：run / turn / tool / node / generation 全覆盖。"""
+        tracer, client = self._tracer(tmp_path)
+        tracer.finish_run(status="failed", totals={}, run_id="r-1", error=self.SENTINEL)
+        tracer.finish_turn(status="failed", totals={}, turn_id="t-1", error=self.SENTINEL)
+        with tracer.tool(name="tool.x", metadata={}) as fields:
+            fields.status_message = self.SENTINEL
+        with tracer.node(name="node.x", metadata={}) as fields:
+            fields.status_message = self.SENTINEL
+        with tracer.generation(name="g", model="m", metadata={}) as fields:
+            fields.status_message = self.SENTINEL
+
+        dump = self._dump(client)
+        assert self.SENTINEL not in dump
+        assert all(item["status_message"] == "internal" for item in client.span_updates)
+        assert client.generation_updates[0]["status_message"] == "internal"
+
+    def test_safe_categories_pass_through(self, tmp_path):
+        tracer, client = self._tracer(tmp_path)
+        tracer.finish_turn(status="failed", totals={}, error="timeout")
+        with tracer.tool(name="tool.x", metadata={}) as fields:
+            fields.status_message = "tool_failed"
+        assert client.span_updates[0]["status_message"] == "timeout"
+        assert client.span_updates[1]["status_message"] == "tool_failed"
+
+    def test_real_otel_db_span_does_not_record_exception_text(self, otel_exporter):
+        """db_span 关闭 OTel 自动异常记录：地址 / 值正文不出现在导出事件里（OBS-02 #4）。"""
+        from xhs_agent.core.tracing import db_span
+
+        otel_exporter.clear()
+        with (pytest.raises(RuntimeError),
+              db_span("db.test", operation="insert", tables=("runs",))):
+            raise RuntimeError(self.SENTINEL)
+        (span,) = [item for item in otel_exporter.get_finished_spans() if item.name == "db.test"]
+        events = [dict(event.attributes or {}) for event in (span.events or [])]
+        assert self.SENTINEL not in json.dumps(
+            {"attrs": dict(span.attributes or {}), "events": events,
+             "status": str(span.status)}, ensure_ascii=False)
+        assert not any("exception" in str(event) for event in events)
+
+    @pytest.mark.asyncio
+    async def test_provider_exception_and_error_result_project_text(self, tmp_path):
+        tracer, client = self._tracer(tmp_path)
+        provider = TracingProvider(FakeInnerProvider(error=RuntimeError(self.SENTINEL)),
+                                   tracer, price_in_per_m=1.0, price_out_per_m=1.0)
+        with pytest.raises(RuntimeError):
+            await provider.complete(FakeCall())
+        with pytest.raises(RuntimeError):
+            await provider.complete_with_tools(FakeCall())
+        assert [item["status_message"] for item in client.generation_updates] == \
+            ["internal", "internal"]
+        assert self.SENTINEL not in self._dump(client)
+
+        provider2 = TracingProvider(FakeInnerProvider(result=FakeResult(error=self.SENTINEL)),
+                                    tracer, price_in_per_m=1.0, price_out_per_m=1.0)
+        await provider2.complete(FakeCall())
+        assert client.generation_updates[2]["status_message"] == "llm_error"
+        assert self.SENTINEL not in self._dump(client)
+
+    def test_capture_true_still_projects_error_fields(self, tmp_path):
+        """显式开启正文采集只放开 input / output；错误字段在任何开关下都只发安全类别。"""
+        tracer, client = self._tracer(tmp_path, capture=True)
+        tracer.finish_turn(status="failed", totals={}, error=self.SENTINEL)
+        with tracer.generation(name="g", model="m", metadata={}) as fields:
+            fields.input = {"system": "系统提示", "user": "用户输入"}
+            fields.output = "正文"
+            fields.status_message = self.SENTINEL
+        assert client.span_updates[0]["status_message"] == "internal"
+        update = client.generation_updates[0]
+        assert update["status_message"] == "internal"
+        assert update["input"]["user"] == "用户输入"      # 显式开关仍带正文
+        assert self.SENTINEL not in update["input"]["user"]
+
+    @pytest.mark.asyncio
+    async def test_deltas_and_result_unchanged_when_sdk_creation_fails(self, tmp_path):
+        """流式增量、返回值与追踪关闭时一致（业务只跑一次）。"""
+        tracer, client = self._tracer(tmp_path)
+        client.fail_create = True
+        inner = FakeInnerProvider(result=FakeResult(text="正文",
+                                                    tool_calls=[{"id": "1", "name": "x"}]))
+        provider = TracingProvider(inner, tracer, price_in_per_m=1.0, price_out_per_m=1.0)
+        deltas: list[str] = []
+
+        async def on_delta(piece: str) -> None:
+            deltas.append(piece)
+
+        result = await provider.complete_with_tools(StreamCall(), on_delta=on_delta)
+        assert result.text == "正文" and inner.delta_calls == 2
+        assert deltas == ["增量", "文本"]
+        assert client.generation_updates == []           # 观测没建起来：不写回

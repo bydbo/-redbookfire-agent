@@ -297,8 +297,9 @@ async def run_analysis(hotspots: list[str], *, cfg: AppConfig, session, store: R
                     embedder=embedder, now=now, style=style, retry_policy=retry_policy,
                     run_id=run_id, topk=topk, tracer=active)
             except BaseException as exc:   # 整批崩掉（热点级失败在 _run_analysis 内已兜住）
+                # R1（OBS-02）：收尾只写安全类别，异常正文留在本地日志与 runs.error
                 active.finish_run(status="failed", totals={}, run_id=str(run_id or ""),
-                                  error=f"{type(exc).__name__}: {exc}")
+                                  error=error_category_of(exc))
                 active.flush()
                 raise
             active.finish_run(status=result.status, totals=result.totals, run_id=result.run_id,

@@ -23,6 +23,12 @@
 - **业务代码不直接 `import langfuse`**：一律走本模块的 `Tracer` 协议，离线测试注入假实现。
 - **span 也不散落**（S4.3）：数据库 span 用 `db_span`，跨进程传播用 `current_trace_headers` /
   `use_trace_carrier`，业务代码不直接 import 任何 `opentelemetry.instrumentation.*`。
+- **安全观测上下文**（R1 / OBS-01）：创建 / 进入 / 退出观测失败只记 warning，业务照常执行且
+  **只执行一次**；业务异常不交给 SDK 的 `__exit__`（避免 SDK 自动 record_exception 外发异常正文），
+  错误状态统一用安全的 `level / status_message` 表达；SDK 清理不覆盖原业务异常、不吞控制异常。
+- **安全错误投影**（R1 / OBS-02）：所有**手写外发字段**（`status_message`）经 `safe_error_text`
+  投影——只允许错误类别白名单（`internal` 兜底）与固定安全词；异常正文 / 用户原文 / 路径 /
+  凭据永不进云端载荷。旁路失败告警只带异常**类型名**，不带 `exc_info`（堆栈同样可能含正文）。
 """
 
 from __future__ import annotations
@@ -41,6 +47,7 @@ from opentelemetry import propagate
 from opentelemetry import trace as otel_trace
 
 from ..config import AppConfig
+from .progress import ERROR_CATEGORIES, error_category
 
 logger = logging.getLogger("xhs_agent.tracing")
 
@@ -123,9 +130,14 @@ def db_span(name: str, *, operation: str, tables: Sequence[str]) -> Iterator[Non
 
     用 OTel API 直接建 span（scope `xhs_agent.db`），因此没有 provider 时也就是空操作，
     既能在本项目的 Langfuse 后端里看到，也能被任何其它 OTLP 后端接走。
+
+    R1（OBS-02）：显式关掉 OTel 的自动异常记录（`record_exception` /
+    `set_status_on_exception`）——驱动异常正文可能内嵌行值（如唯一键里的素材路径），
+    而 DB span 是会导出到云的；错误诊断走本地日志与调用方的安全类别。
     """
     tracer = otel_trace.get_tracer(DB_TRACER_NAME)
-    with tracer.start_as_current_span(name) as span:
+    with tracer.start_as_current_span(name, record_exception=False,
+                                      set_status_on_exception=False) as span:
         if span.is_recording():
             _annotate_db_span(span, operation=operation, tables=tables)
         yield None
@@ -165,8 +177,8 @@ def current_trace_headers() -> dict[str, str]:
     carrier: dict[str, str] = {}
     try:
         propagate.inject(carrier)
-    except Exception:   # noqa: BLE001 - 传播失败不影响业务
-        logger.warning("W3C traceparent 注入失败（不影响分析）", exc_info=True)
+    except Exception as exc:   # noqa: BLE001 - 传播失败不影响业务
+        logger.warning("W3C traceparent 注入失败（不影响分析）：%s", type(exc).__name__)
         return {}
     return {key: str(value) for key, value in carrier.items() if value}
 
@@ -291,8 +303,38 @@ def build_client(cfg: AppConfig) -> Any:
                     should_export_span=should_export_span)
 
 
+# ---------- R1（OBS-01 / OBS-02）：安全错误投影 ----------
+#: 允许作为**外发** `status_message` 的固定安全词：错误类别白名单 + 工具失败的固定标记。
+#: 白名单之外的一律折成 `internal`——异常正文 / 用户原文 / 路径绝不进云端载荷（设计约定 §9）。
+_SAFE_STATUS_WORDS = frozenset((*ERROR_CATEGORIES, "tool_failed"))
+
+
+def safe_error_text(value: Any) -> str:
+    """把「类别名或任意错误文本」投影成安全类别；白名单外一律折成 `internal`。
+
+    用于所有手写云字段（status_message）：调用方即使误传异常正文，也不会离开本进程。
+    """
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    return text if text in _SAFE_STATUS_WORDS else "internal"
+
+
+def safe_error_of(exc: BaseException) -> str:
+    """异常 → 安全类别（`llm_error` / `timeout` / `internal` …），不含任何正文。"""
+    return error_category(exc)
+
+
 class LangfuseTracer:
-    """把 span 交给 Langfuse SDK 的实现；客户端可注入（离线单测用假客户端）。"""
+    """把 span 交给 Langfuse SDK 的实现；客户端可注入（离线单测用假客户端）。
+
+    R1（OBS-01）：所有观测（run / hotspot / generation / turn / tool / node）都走同一套
+    **安全观测上下文** `_safe_observation`——SDK 的创建 / 进入 / 退出失败只记 warning，
+    业务块照常执行且**只执行一次**；`flush` 与各 `_apply_*` 上报同样吞掉异常。
+    R1（OBS-02）：外发 `status_message` 一律经 `safe_error_text` 投影（只允许安全类别），
+    且**不把业务异常交给 SDK 的 `__exit__`**——避免 SDK 自动 `record_exception` 把异常正文 /
+    堆栈写进云端载荷；错误状态由调用方用安全的 `level / status_message` 表达。
+    """
 
     enabled = True
 
@@ -301,22 +343,73 @@ class LangfuseTracer:
         self.capture = capture_content(cfg)
         self._client = client if client is not None else build_client(cfg)
 
+    # ---------- R1：安全观测上下文（OBS-01）----------
+    _OMIT = object()
+
+    @contextmanager
+    def _safe_observation(self, *, name: str, as_type: str,
+                          metadata: dict[str, Any] | None = None, model: str = "",
+                          input_value: Any = _OMIT) -> Iterator[bool]:
+        """创建 / 进入 / 退出任一失败都不影响业务的观测上下文（见类 docstring 的口径）。
+
+        产出值为"观测是否真正建立"：建立失败时调用方**跳过字段写回**（避免把更新误挂到
+        外层 span 上），业务块照常执行且只执行一次。
+        """
+        instance: Any = None
+        entered = False
+        try:
+            kwargs: dict[str, Any] = {"name": name, "as_type": as_type,
+                                      "metadata": dict(metadata or {})}
+            if model:
+                kwargs["model"] = model
+            if input_value is not self._OMIT:
+                kwargs["input"] = input_value
+            instance = self._client.start_as_current_observation(**kwargs)
+            instance.__enter__()
+            entered = True
+        except Exception as exc:                 # noqa: BLE001 - 建观测失败：空观测继续业务
+            self._warn_safe("观测创建失败", exc)
+            instance = None
+        try:
+            yield entered
+        except BaseException:
+            # 业务异常**不交给 SDK**（防自动采集正文）；控制异常（取消等）原样继续传播
+            if instance is not None:
+                self._close_safe(instance)
+            raise
+        else:
+            if instance is not None:
+                self._close_safe(instance)
+
+    def _close_safe(self, instance: Any) -> None:
+        """结束观测：失败只记 warning，绝不覆盖已经发生的业务结果 / 异常。
+
+        连 `BaseException` 一起吞：这里处在业务异常 / 取消的传播路径上，清理动作不能
+        改写原始结局（同步的 `__exit__` 不会产生可用的取消语义）。
+        """
+        try:
+            instance.__exit__(None, None, None)
+        except BaseException as exc:             # noqa: BLE001
+            self._warn_safe("观测收尾失败", exc)
+
+    @staticmethod
+    def _warn_safe(message: str, exc: BaseException) -> None:
+        """旁路故障告警：只带异常**类型名**，不带正文 / 堆栈（OBS-02 的日志边界）。"""
+        logger.warning("%s（不影响业务）：%s", message, type(exc).__name__)
+
     # ---------- 结构化上报 ----------
     @contextmanager
     def run(self, *, name: str, metadata: dict[str, Any]) -> Iterator[None]:
         """开一条 trace（v4 里根 span 就是 trace）。"""
-        with self._client.start_as_current_observation(name=name, as_type="span",
-                                                       metadata=dict(metadata)):
+        with self._safe_observation(name=name, as_type="span", metadata=metadata):
             yield None
 
     @contextmanager
     def hotspot(self, *, index: int, metadata: dict[str, Any],
                 content: str = "") -> Iterator[None]:
         """一个热点的 span；只有 `capture_content` 打开时才带原文。"""
-        with self._client.start_as_current_observation(
-                name=f"hotspot-{index}", as_type="span",
-                input=content if (self.capture and content) else None,
-                metadata=dict(metadata)):
+        with self._safe_observation(name=f"hotspot-{index}", as_type="span", metadata=metadata,
+                                    input_value=content if (self.capture and content) else None):
             yield None
 
     @contextmanager
@@ -324,12 +417,13 @@ class LangfuseTracer:
                    metadata: dict[str, Any]) -> Iterator[Generation]:
         """一次模型调用的 generation：块内填 `Generation`，退出时写回 SDK。"""
         fields = Generation(metadata=dict(metadata))
-        with self._client.start_as_current_observation(name=name, as_type="generation",
-                                                       model=model, metadata=dict(metadata)):
+        with self._safe_observation(name=name, as_type="generation", model=model,
+                                    metadata=metadata) as available:
             try:
                 yield fields
             finally:
-                self._apply_generation(fields)
+                if available:                    # 观测没建起来就不写回（免得挂到外层 span）
+                    self._apply_generation(fields)
 
     def _apply_generation(self, fields: Generation) -> None:
         payload: dict[str, Any] = {}
@@ -347,13 +441,14 @@ class LangfuseTracer:
         if fields.level:
             payload["level"] = fields.level
         if fields.status_message:
-            payload["status_message"] = fields.status_message[:1000]
+            # OBS-02：手写云字段统一投影，异常正文 / 用户原文不进载荷
+            payload["status_message"] = safe_error_text(fields.status_message)[:1000]
         if not payload:
             return
         try:
             self._client.update_current_generation(**payload)
-        except Exception:   # noqa: BLE001 - 上报失败只记日志，绝不影响分析结果
-            logger.warning("Langfuse generation 上报失败（不影响分析结果）", exc_info=True)
+        except Exception as exc:   # noqa: BLE001 - 上报失败只记日志，绝不影响分析结果
+            self._warn_safe("generation 上报失败", exc)
 
     def finish_run(self, *, status: str, totals: dict[str, Any], run_id: str = "",
                    prompt_versions: dict[str, int] | None = None, error: str = "") -> None:
@@ -376,11 +471,11 @@ class LangfuseTracer:
             "level": LEVEL_ERROR if status != "succeeded" else LEVEL_DEFAULT,
         }
         if error:
-            payload["status_message"] = error[:1000]
+            payload["status_message"] = safe_error_text(error)[:1000]   # OBS-02：只发安全类别
         try:
             self._client.update_current_span(**payload)
-        except Exception:   # noqa: BLE001
-            logger.warning("Langfuse trace 收尾失败（不影响分析结果）", exc_info=True)
+        except Exception as exc:   # noqa: BLE001
+            self._warn_safe("trace 收尾失败", exc)
         self._log_trace(run_id)
 
     def _log_trace(self, run_id: str) -> None:
@@ -402,31 +497,32 @@ class LangfuseTracer:
         payload = dict(metadata)
         if turn_id:
             payload.setdefault("turn_id", turn_id)
-        with self._client.start_as_current_observation(name=name, as_type="span",
-                                                       metadata=payload):
+        with self._safe_observation(name=name, as_type="span", metadata=payload):
             yield None
 
     @contextmanager
     def tool(self, *, name: str, metadata: dict[str, Any]) -> Iterator[Generation]:
         """一次工具调用的 span（提交分析时的 traceparent 就取自它，S7.20）。"""
         fields = Generation(metadata=dict(metadata))
-        with self._client.start_as_current_observation(name=name, as_type="span",
-                                                       metadata=dict(metadata)):
+        with self._safe_observation(name=name, as_type="span",
+                                    metadata=metadata) as available:
             try:
                 yield fields
             finally:
-                self._apply_span(fields)
+                if available:
+                    self._apply_span(fields)
 
     @contextmanager
     def node(self, *, name: str, metadata: dict[str, Any]) -> Iterator[Generation]:
         """一个执行节点的 span：分析五节点、worker 前后置、检索子步（S7.19 / S7.20）。"""
         fields = Generation(metadata=dict(metadata))
-        with self._client.start_as_current_observation(name=name, as_type="span",
-                                                       metadata=dict(metadata)):
+        with self._safe_observation(name=name, as_type="span",
+                                    metadata=metadata) as available:
             try:
                 yield fields
             finally:
-                self._apply_span(fields)
+                if available:
+                    self._apply_span(fields)
 
     def _apply_span(self, fields: Generation) -> None:
         """把 span 块内填的 level / status_message / metadata 写回（失败只记日志）。"""
@@ -436,13 +532,13 @@ class LangfuseTracer:
         if fields.level:
             payload["level"] = fields.level
         if fields.status_message:
-            payload["status_message"] = fields.status_message[:1000]
+            payload["status_message"] = safe_error_text(fields.status_message)[:1000]
         if not payload:
             return
         try:
             self._client.update_current_span(**payload)
-        except Exception:   # noqa: BLE001 - 上报失败只记日志，绝不影响业务
-            logger.warning("Langfuse span 上报失败（不影响业务）", exc_info=True)
+        except Exception as exc:   # noqa: BLE001 - 上报失败只记日志，绝不影响业务
+            self._warn_safe("span 上报失败", exc)
 
     def finish_turn(self, *, status: str, totals: dict[str, Any], turn_id: str = "",
                     error: str = "") -> None:
@@ -466,11 +562,11 @@ class LangfuseTracer:
             "level": LEVEL_ERROR if status != "succeeded" else LEVEL_DEFAULT,
         }
         if error:
-            payload["status_message"] = str(error)[:1000]
+            payload["status_message"] = safe_error_text(error)[:1000]   # OBS-02：只发安全类别
         try:
             self._client.update_current_span(**payload)
-        except Exception:   # noqa: BLE001 - 上报失败只记日志，绝不影响这一轮
-            logger.warning("Langfuse turn 收尾失败（不影响对话）", exc_info=True)
+        except Exception as exc:   # noqa: BLE001 - 上报失败只记日志，绝不影响这一轮
+            self._warn_safe("turn 收尾失败", exc)
         self._log_turn_trace(turn_id)
 
     def current_trace_id(self) -> str:
@@ -504,8 +600,8 @@ class LangfuseTracer:
     def flush(self) -> None:
         try:
             self._client.flush()
-        except Exception:   # noqa: BLE001
-            logger.warning("Langfuse flush 失败（不影响分析结果）", exc_info=True)
+        except Exception as exc:   # noqa: BLE001
+            logger.warning("Langfuse flush 失败（不影响分析结果）：%s", type(exc).__name__)
 
 
 # 进程级单例（见模块 docstring 的"进程级懒加载单例"）：`_warned` 保证缺键时只警告一次
@@ -528,8 +624,9 @@ def get_tracer(cfg: AppConfig) -> Tracer:
             else:
                 try:
                     _tracer = LangfuseTracer(cfg)
-                except Exception:   # noqa: BLE001 - 初始化失败也只是关闭追踪
-                    logger.warning("Langfuse 客户端初始化失败，本次进程不上报追踪", exc_info=True)
+                except Exception as exc:   # noqa: BLE001 - 初始化失败也只是关闭追踪
+                    logger.warning("Langfuse 客户端初始化失败，本次进程不上报追踪：%s",
+                                   type(exc).__name__)
                     _tracer = NullTracer()
     return _tracer
 
@@ -597,7 +694,8 @@ class TracingProvider:
                 result = await self.inner.complete(call)
             except BaseException as exc:
                 fields.level = LEVEL_ERROR
-                fields.status_message = f"{type(exc).__name__}: {exc}"
+                fields.status_message = safe_error_of(exc)   # OBS-02：类别，不带正文
+                fields.metadata["error_category"] = safe_error_of(exc)
                 raise
             self._fill_generation(fields, call, result)
             return result
@@ -617,7 +715,8 @@ class TracingProvider:
                 result = await self.inner.complete_with_tools(call, on_delta=on_delta)
             except BaseException as exc:
                 fields.level = LEVEL_ERROR
-                fields.status_message = f"{type(exc).__name__}: {exc}"
+                fields.status_message = safe_error_of(exc)   # OBS-02：类别，不带正文
+                fields.metadata["error_category"] = safe_error_of(exc)
                 raise
             fields.metadata["tool_calls"] = len(list(getattr(result, "tool_calls", []) or []))
             self._fill_generation(fields, call, result)
@@ -642,8 +741,10 @@ class TracingProvider:
             fields.metadata["usage_status"] = "unknown"
         error = str(getattr(result, "error", "") or "")
         if error:
+            # OBS-02：供应商错误正文可能含用户输入 / 路径——只上安全类别（固定 llm_error）
             fields.level = LEVEL_ERROR
-            fields.status_message = error
+            fields.status_message = "llm_error"
+            fields.metadata["error_category"] = "llm_error"
         if self.capture:
             fields.input = {"system": str(getattr(call, "system", "")),
                             "user": str(getattr(call, "user", ""))}
