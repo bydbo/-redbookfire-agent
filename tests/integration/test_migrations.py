@@ -27,7 +27,7 @@ from alembic import command
 pytestmark = pytest.mark.integration
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
-REVISION = "0006"
+REVISION = "0007"
 
 
 @pytest.fixture
@@ -112,6 +112,20 @@ class TestUpgrade:
         assert "stage" not in await _columns(db_engine, "runs")
         await _alembic(command.upgrade, alembic_config, "head")
         assert "stage" in await _columns(db_engine, "runs")
+
+    @pytest.mark.asyncio
+    async def test_chat_message_progress_round_trip(self, alembic_config: Config,
+                                                    db_engine: AsyncEngine) -> None:
+        """S7.21：0007 加 `turn_id` / `trace_id` / `progress`；downgrade 只回滚 schema。"""
+        await _alembic(command.upgrade, alembic_config, "head")
+        columns = await _columns(db_engine, "chat_messages")
+        assert {"turn_id", "trace_id", "progress"} <= columns
+        await _alembic(command.downgrade, alembic_config, "0006")
+        columns = await _columns(db_engine, "chat_messages")
+        assert not ({"turn_id", "trace_id", "progress"} & columns)
+        await _alembic(command.upgrade, alembic_config, "head")
+        assert {"turn_id", "trace_id", "progress"} <= await _columns(db_engine,
+                                                                     "chat_messages")
 
 
 class TestDowngrade:

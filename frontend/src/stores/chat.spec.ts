@@ -5,7 +5,7 @@ import type { RunDetail } from '@/api/analysis'
 import { getRun } from '@/api/analysis'
 import type { ChatMessage, ChatSessionDetail, ChatSessionList } from '@/api/chat'
 import { createChatSession, getChatSession, listChatSessions, streamMessage } from '@/api/chat'
-import { TOOL_LABELS, toolLabel, useChatStore } from '@/stores/chat'
+import { TOOL_LABELS, errorCategoryLabel, stageLabel, toolLabel, useChatStore } from '@/stores/chat'
 
 vi.mock('@/api/chat', () => ({
   createChatSession: vi.fn(),
@@ -227,5 +227,82 @@ describe('useChatStore', () => {
     expect(toolLabel('preview_element_coverage')).toBe('预览爆点要素')
     expect(toolLabel('revise_draft')).toBe('改写文案')
     expect(toolLabel('brand_new_tool')).toBe('brand_new_tool')
+  })
+
+  it('阶段与错误类别有中文标签（未登记原样回落）', () => {
+    expect(stageLabel('material_sync')).toBe('素材同步')
+    expect(stageLabel('final_reply')).toBe('整理回复')
+    expect(stageLabel('custom_stage')).toBe('custom_stage')
+    expect(errorCategoryLabel('embedding_error')).toBe('向量化失败')
+    expect(errorCategoryLabel('internal')).toBe('内部错误')
+    expect(errorCategoryLabel('brand_new')).toBe('brand_new')
+  })
+
+  it('阶段事件更新当前阶段，tool_progress 的 stage_key 也并入（S7.21）', async () => {
+    vi.mocked(createChatSession).mockResolvedValue({
+      session_id: 's-9', title: '', created_at: '', updated_at: '',
+    })
+    vi.mocked(listChatSessions).mockResolvedValue(listing())
+    vi.mocked(getChatSession).mockResolvedValue(detail([]))
+    const observed: { stage: string; status: string } = { stage: '', status: '' }
+    vi.mocked(streamMessage).mockImplementation(async (_id, _input, onEvent) => {
+      onEvent({
+        event: 'stage',
+        data: { stage: 'supervisor', label: '理解与决策', status: 'running', attempt: 1,
+                started_at: '2026-10-15T08:00:00+00:00' },
+      })
+      onEvent({
+        event: 'tool_progress',
+        data: { stage_key: 'material_sync', stage: '素材同步', status: 'running', attempt: 1 },
+      })
+      const store = useChatStore()
+      observed.stage = store.progress?.stage ?? ''
+      onEvent({
+        event: 'stage',
+        data: { stage: 'final_reply', label: '整理回复', status: 'succeeded', attempt: 1,
+                updated_at: '2026-10-15T08:00:05+00:00' },
+      })
+      observed.status = store.progress?.status ?? ''
+    })
+    const store = useChatStore()
+
+    await store.send({ text: '帮我蹭一下这个热点' })
+
+    expect(observed.stage).toBe('material_sync')
+    expect(observed.status).toBe('succeeded')
+    expect(store.stageElapsedMs).toBe(0)              // 终态后不再计时
+  })
+
+  it('打开会话时从 message.progress 恢复阶段、尝试次数与失败类别（S7.21）', async () => {
+    vi.mocked(getChatSession).mockResolvedValue(detail([
+      message({
+        status: 'running',
+        progress: {
+          stage: 'retrieve', label: '检索', status: 'running', attempt: 2,
+          started_at: '2026-10-15T08:00:00+00:00', updated_at: '2026-10-15T08:00:03+00:00',
+        },
+      }),
+    ]))
+    const store = useChatStore()
+    await store.openSession('s-1')
+
+    expect(store.progress?.stage).toBe('retrieve')
+    expect(store.progress?.label).toBe('检索')
+    expect(store.progress?.attempt).toBe(2)
+
+    vi.mocked(getChatSession).mockResolvedValue(detail([
+      message({
+        status: 'failed', error: '分析失败',
+        progress: {
+          stage: 'embedding_backfill', label: '向量回填', status: 'failed', attempt: 1,
+          error_category: 'embedding_error', updated_at: '2026-10-15T08:00:04+00:00',
+        },
+      }),
+    ]))
+    await store.refreshMessages()
+
+    expect(store.progress?.status).toBe('failed')
+    expect(store.progress?.errorCategory).toBe('embedding_error')
+    expect(store.stageElapsedMs).toBe(0)
   })
 })

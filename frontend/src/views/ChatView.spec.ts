@@ -274,6 +274,49 @@ describe('ChatView（S7.5 对话首页）', () => {
     expect(messages.scrollTop).toBe(1000)
   })
 
+  it('运行中显示当前阶段与尝试次数；失败消息给阶段与 trace 回看（S7.21）', async () => {
+    vi.mocked(getChatSession).mockResolvedValue(detail([
+      message({
+        message_id: 'm-f', status: 'failed', error: '分析失败',
+        trace_url: 'https://cloud.langfuse.com/trace/t-1',
+        progress: {
+          stage: 'retrieve', label: '检索', status: 'failed', attempt: 1,
+          error_category: 'embedding_error', updated_at: '2026-10-15T08:00:03+00:00',
+        },
+      }),
+      message({
+        message_id: 'm-r', status: 'running',
+        progress: {
+          stage: 'material_sync', label: '素材同步', status: 'running', attempt: 2,
+          started_at: '2026-10-15T08:00:00+00:00', updated_at: '2026-10-15T08:00:03+00:00',
+        },
+      }),
+    ]))
+    const wrapper = await mountView()
+
+    expect(wrapper.text()).toContain('失败于「检索」')
+    expect(wrapper.text()).toContain('向量化失败')
+    expect(wrapper.find('a[href="https://cloud.langfuse.com/trace/t-1"]').exists()).toBe(true)
+    expect(wrapper.text()).toContain('素材同步')
+    expect(wrapper.text()).toContain('第 2 次尝试')
+  })
+
+  it('阶段跑太久只提示「耗时较长」，不判定失败（S7.21）', async () => {
+    vi.mocked(getChatSession).mockResolvedValue(detail([
+      message({
+        message_id: 'm-r', status: 'running',
+        progress: {
+          stage: 'queue_wait', label: '排队等待', status: 'running', attempt: 1,
+          started_at: '2020-01-01T00:00:00+00:00', updated_at: '2020-01-01T00:00:01+00:00',
+        },
+      }),
+    ]))
+    const wrapper = await mountView()
+
+    expect(wrapper.text()).toContain('耗时较长')
+    expect(wrapper.text()).toContain('排队等待')
+  })
+
   it('一次选 3 张图：缩略图都在，发送时整组进 multipart（S7.18）', async () => {
     vi.mocked(createChatSession).mockResolvedValue({
       session_id: 's-9', title: '', created_at: '', updated_at: '',

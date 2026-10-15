@@ -57,6 +57,8 @@ COLUMN_SPECS: dict[str, dict[str, str]] = {
         "prompt_versions": "jsonb", "run_id": "uuid", "cost_cny": "numeric",
         "latency_ms": "int4", "prompt_tokens": "int4", "completion_tokens": "int4",
         "error": "text", "created_at": "timestamptz",
+        # S7.21：轮次关联（turn_id / trace_id）与阶段快照（progress）
+        "turn_id": "uuid", "trace_id": "text", "progress": "jsonb",
     },
 }
 
@@ -67,7 +69,7 @@ NULLABLE_COLUMNS: dict[str, set[str]] = {
     "run_hotspots": {"draft", "error"},
     "run_matches": set(),
     "chat_sessions": set(),
-    "chat_messages": {"run_id", "error"},
+    "chat_messages": {"run_id", "error", "turn_id", "trace_id"},
 }
 
 # 数据契约 §4.1 的 16 条索引（唯一约束在 PG 里也是索引）

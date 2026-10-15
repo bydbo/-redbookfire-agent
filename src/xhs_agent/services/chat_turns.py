@@ -37,6 +37,7 @@ import redis.asyncio as aioredis
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..config import AppConfig
+from ..core import progress as progress_tool
 from ..core.errors import DependencyUnavailableError
 from ..core.logging import bind_turn_id, reset_turn_id
 from ..core.progress import error_category as error_category_of
@@ -288,10 +289,14 @@ async def run_turn_task(cfg: AppConfig, events: TurnEvents, *, session_id: uuid.
     S7.19 / S7.20：整轮包在 `chat.turn` span 里（detached 任务继承到请求上下文就挂其下，
     不继承也能自成因）；`turn_id` 绑进日志上下文并在 `finally` 复位；结束时按真实终态
     收尾 span（成功 / 失败都有终态，不永远挂在 running）。
+    S7.21：`turn_id` 尽早落库，阶段变化合并进 `chat_messages.progress`——**只在切换时写**，
+    不逐 token、不逐轮询；收尾写 `trace_id`，刷新后仍能定位阶段与失败原因。
     """
     engine = create_engine_from_config(cfg)
     token = bind_turn_id(events.turn_id)
     tracer = get_tracer(cfg)
+    snapshot = progress_tool.normalize({})
+    written = ""
     try:
         factory = create_session_factory(engine)
         try:
@@ -299,6 +304,33 @@ async def run_turn_task(cfg: AppConfig, events: TurnEvents, *, session_id: uuid.
                 await events.publish("turn_started", {
                     "turn_id": events.turn_id, "session_id": str(session_id),
                     "message_id": str(message_id), "started_at": now_iso()})
+                # S7.21：尽早关联 turn_id，让"运行中"的消息在库里就能按轮次追查
+                await update_message(session, message_id, turn_id=events.turn_id)
+
+                async def persist(*, stage: str, status: str, attempt: int = 1,
+                                  latency_ms: int = 0, error_category: str = "",
+                                  run_id: str = "") -> None:
+                    """合并一条阶段更新；只有快照确实变化才写库（S7.21 的写库节流点）。
+
+                    切到新阶段时把上一个还在跑的阶段收成 `succeeded`——否则快照的 `nodes`
+                    里会留下永远 running 的旧阶段（阶段是顺序推进的：能走到下一步说明上一步成功）。
+                    """
+                    nonlocal snapshot, written
+                    previous_stage = str(snapshot.get("stage") or "")
+                    if (status == "running" and previous_stage and previous_stage != stage
+                            and snapshot.get("status") == "running"):
+                        snapshot = progress_tool.end(
+                            snapshot, stage=previous_stage, status="succeeded",
+                            attempt=int(snapshot.get("attempt") or 1))
+                    snapshot = progress_tool.apply(snapshot, stage=stage, status=status,
+                                                   attempt=attempt, latency_ms=latency_ms,
+                                                   error_category=error_category, run_id=run_id)
+                    marker = json.dumps(snapshot, ensure_ascii=False, sort_keys=True)
+                    if marker == written:
+                        return
+                    written = marker
+                    await update_message(session, message_id, progress=dict(snapshot))
+
                 async with build_http_client(cfg.llm.timeout_s) as client:
                     provider = build_turn_provider(cfg, client, tracer=tracer)
                     # 跨轮图片回落（S7.10 / S7.16 按组）：先把本会话最近一组图取出来，工具在
@@ -317,6 +349,23 @@ async def run_turn_task(cfg: AppConfig, events: TurnEvents, *, session_id: uuid.
                         if event != "text_delta":    # 每个 token 都补关联字段没有意义
                             body.setdefault("turn_id", events.turn_id)
                             body.setdefault("message_id", str(message_id))
+                        if event == "stage":
+                            await persist(stage=str(body.get("stage") or ""),
+                                          status=str(body.get("status") or "running"),
+                                          attempt=int(body.get("attempt") or 1),
+                                          error_category=str(body.get("error_category") or ""),
+                                          run_id=str(body.get("run_id") or ""))
+                        elif event == "tool_progress" and body.get("stage_key"):
+                            # 排队等待 / 素材同步 / 向量回填 / 五节点：worker 阶段随轮询可见
+                            await persist(stage=str(body["stage_key"]), status="running",
+                                          attempt=int(body.get("attempt") or 1))
+                        elif event == "tool_finished" and body.get("stage_key"):
+                            await persist(stage=str(body["stage_key"]),
+                                          status=("succeeded"
+                                                  if body.get("status") == "succeeded"
+                                                  else "failed"),
+                                          attempt=int(body.get("attempt") or 1),
+                                          latency_ms=int(body.get("latency_ms") or 0))
                         await events.publish(event, body)
 
                     with tracer.turn(name="chat.turn",
@@ -333,8 +382,11 @@ async def run_turn_task(cfg: AppConfig, events: TurnEvents, *, session_id: uuid.
                             "stage": "final_reply", "label": label_for("final_reply"),
                             "status": "running", "attempt": 1, "started_at": now_iso(),
                             "run_id": turn.run_id or None})
+                        await persist(stage="final_reply", status="running",
+                                      run_id=turn.run_id or "")
                         status = await _finish(session, events, turn, message_id=message_id,
-                                               session_id=session_id, tracer=tracer)
+                                               session_id=session_id, tracer=tracer,
+                                               snapshot=snapshot)
                         tracer.finish_turn(status=status, totals=_turn_totals(turn),
                                            turn_id=events.turn_id,
                                            error=turn.error if status != "succeeded" else "")
@@ -342,7 +394,8 @@ async def run_turn_task(cfg: AppConfig, events: TurnEvents, *, session_id: uuid.
             logger.exception("对话轮次异常：%s", events.turn_id)
             error = f"{type(exc).__name__}: {exc}"[:200]
             category = error_category_of(exc)
-            await _mark_failed(factory, message_id=message_id, error=error)
+            await _mark_failed(factory, message_id=message_id, error=error,
+                               progress=progress_tool.interrupt(snapshot))
             with tracer.turn(name="chat.turn", metadata={"failed": True},
                              turn_id=events.turn_id):
                 await _fail(events, message_id=message_id, error=error,
@@ -363,24 +416,33 @@ def _turn_totals(turn: ChatTurn) -> dict[str, Any]:
             "usage_complete": True}
 
 
-async def _mark_failed(factory: Any, *, message_id: uuid.UUID, error: str) -> None:
+async def _mark_failed(factory: Any, *, message_id: uuid.UUID, error: str,
+                       progress: dict[str, Any] | None = None) -> None:
     """兜底把 assistant 行标 `failed`（best-effort：连库都写不了就只剩事件）。"""
+    fields: dict[str, Any] = {"status": "failed", "error": error}
+    if progress is not None:
+        fields["progress"] = dict(progress)
     with suppress(Exception):
         async with factory() as session:
-            await update_message(session, message_id, status="failed", error=error)
+            await update_message(session, message_id, **fields)
 
 
 async def _finish(session: AsyncSession, events: TurnEvents, turn: ChatTurn, *,
                   message_id: uuid.UUID, session_id: uuid.UUID,
-                  tracer: Tracer | None = None) -> str:
+                  tracer: Tracer | None = None,
+                  snapshot: dict[str, Any] | None = None) -> str:
     """写回消息并发终态事件（S7.20 起带 `turn_id` / `trace_id` / 阶段）；返回本轮终态。"""
     active = tracer if tracer is not None else NullTracer()
     trace_id = active.current_trace_id()
     if turn.status != "succeeded":
+        # 失败阶段已由 `stage` 事件写进快照，这里不臆造 final_reply；补 trace 关联与终态
+        final = progress_tool.normalize(snapshot)
         await update_message(session, message_id, status="failed",
                              error=turn.error or "这一轮失败了",
                              latency_ms=turn.latency_ms,
-                             prompt_versions=turn.prompt_versions)
+                             prompt_versions=turn.prompt_versions,
+                             trace_id=trace_id or None,
+                             progress=dict(final))
         await events.publish("stage", {
             "turn_id": events.turn_id, "message_id": str(message_id),
             "stage": "final_reply", "label": label_for("final_reply"), "status": "failed",
@@ -389,12 +451,15 @@ async def _finish(session: AsyncSession, events: TurnEvents, turn: ChatTurn, *,
         await _fail(events, message_id=message_id, error=turn.error or "这一轮失败了",
                     error_category=turn.error_category or "internal", tracer=active)
         return "failed"
+    final = progress_tool.end(progress_tool.normalize(snapshot), stage="final_reply",
+                              status="succeeded")
     await update_message(session, message_id, content=turn.reply, status="succeeded",
                          tool_calls=turn.tool_calls, prompt_versions=turn.prompt_versions,
                          run_id=turn.run_id or None, cost_cny=turn.cost_cny,
                          latency_ms=turn.latency_ms,
                          prompt_tokens=turn.prompt_tokens,
-                         completion_tokens=turn.completion_tokens)
+                         completion_tokens=turn.completion_tokens,
+                         trace_id=trace_id or None, progress=dict(final))
     await events.publish("stage", {
         "turn_id": events.turn_id, "message_id": str(message_id),
         "stage": "final_reply", "label": label_for("final_reply"), "status": "succeeded",

@@ -221,7 +221,8 @@ class TestChatApi:
         progresses = [data for name, data in events if name == "tool_progress"]
         assert progresses[0]["stage_key"] == "image_parse"
         assert progresses[1]["stage"] == "分析中" and progresses[1]["done"] == 50
-        assert progresses[1]["stage_key"] == "queue_wait"
+        # 「分析中」只是进度文案，不映射阶段键（避免阶段在轮询里来回跳）
+        assert progresses[1]["stage_key"] == ""
         assert [data["text"] for name, data in events if name == "text_delta"] == \
             ["跑了", "完整分析，命中 5 条。"]
         finished = events[-1][1]
@@ -239,6 +240,15 @@ class TestChatApi:
         assert assistant["run_id"] == RUN_ID
         assert assistant["cost_cny"] == pytest.approx(0.054)
         assert assistant["prompt_versions"] == {"chat_supervisor": 3}
+        # S7.21：轮次标识 / 阶段快照 / trace 关联都落库（刷新后据此恢复阶段）
+        assert assistant["turn_id"] and assistant["turn_id"] == finished["turn_id"]
+        snapshot = assistant["progress"]
+        assert snapshot["stage"] == "final_reply" and snapshot["status"] == "succeeded"
+        node_stages = {node["stage"]: node["status"] for node in snapshot["nodes"]}
+        assert node_stages["supervisor"] == "succeeded"
+        assert node_stages["image_parse"] == "succeeded"   # 切到下一阶段时上一阶段收成终态
+        assert assistant["trace_id"] is None               # 追踪关闭：如实为空，不伪造
+        assert assistant["trace_url"] is None
         entry = assistant["tool_calls"][0]
         assert entry["tool"] == TOOL_RUN_ANALYSIS and entry["status"] == "succeeded"
         assert entry["run_id"] == RUN_ID and entry["args"] == {"hotspot": "夜跑", "topk": 5}
@@ -320,6 +330,9 @@ class TestChatApi:
         session_id = new_session(client)
         db_session.add(ChatMessage(session_id=uuid.UUID(session_id), role="assistant",
                                    content="", status="running",
+                                   progress={"stage": "retrieve", "label": "检索",
+                                             "status": "running", "attempt": 1,
+                                             "started_at": "2026-10-15T08:00:00+00:00"},
                                    created_at=datetime.now(UTC) - timedelta(seconds=10_000)))
         db_session.add(ChatMessage(session_id=uuid.UUID(session_id), role="assistant",
                                    content="刚刚才开始跑", status="running"))
@@ -329,6 +342,9 @@ class TestChatApi:
         assistant = [item for item in detail["messages"] if item["role"] == "assistant"]
         assert [item["status"] for item in assistant] == ["interrupted", "running"]
         assert "没跑完" in assistant[0]["error"]
+        # S7.21：快照与消息同一生命周期——被标中断的行，阶段快照一并标 interrupted
+        assert assistant[0]["progress"]["status"] == "interrupted"
+        assert assistant[0]["progress"]["stage"] == "retrieve"
 
     def test_error_branches(self, client: TestClient) -> None:
         session_id = new_session(client)

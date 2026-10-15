@@ -154,13 +154,19 @@ def _build_graph(*, provider: BaseProvider, run_tool: ToolRunner, max_rounds: in
             await emit("tool_started", {"tool": name, "args": call["args"], "call_id": call_id,
                                         "attempt": attempt, "started_at": now_iso()})
             started = time.monotonic()
+            # 工具最后一次上报的阶段键（S7.21）：`tool_finished` 用它把快照里的阶段收成终态
+            stage_holder: dict[str, str] = {"key": ""}
 
             async def progress(stage: str, done: int = 0, total: int = 0,
                                _call: dict[str, Any] = call, _call_id: str = call_id,
-                               _attempt: int = attempt) -> None:
+                               _attempt: int = attempt,
+                               _holder: dict[str, str] = stage_holder) -> None:
+                key = progress_tool.key_for_label(stage)
+                if key:
+                    _holder["key"] = key
                 await emit("tool_progress", {
-                    "tool": _call["name"], "stage": stage,
-                    "stage_key": progress_tool.key_for_label(stage), "status": "running",
+                    "tool": _call["name"], "stage": stage, "stage_key": key,
+                    "status": "running",
                     "done": done, "total": total, "call_id": _call_id, "attempt": _attempt,
                     "updated_at": now_iso()})
 
@@ -173,6 +179,7 @@ def _build_graph(*, provider: BaseProvider, run_tool: ToolRunner, max_rounds: in
                 "tool": name,
                 "call_id": call_id,
                 "attempt": attempt,
+                "stage_key": stage_holder["key"],
                 "status": outcome.status,
                 "args": call["args"],
                 "run_id": outcome.payload.get("run_id"),

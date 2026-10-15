@@ -7,7 +7,7 @@ import { nextTick, onMounted, ref, watch } from 'vue'
 import type { ChatMessage } from '@/api/chat'
 import HotspotResult from '@/components/HotspotResult.vue'
 import ImageIntake from '@/components/ImageIntake.vue'
-import { useChatStore } from '@/stores/chat'
+import { errorCategoryLabel, stageLabel, useChatStore } from '@/stores/chat'
 
 const store = useChatStore()
 
@@ -98,6 +98,24 @@ function statusLabel(message: ChatMessage): string | null {
     default:
       return null
   }
+}
+
+function formatElapsed(ms: number): string {
+  const seconds = Math.max(0, Math.round(ms / 1000))
+  if (seconds < 60) return `${seconds} 秒`
+  return `${Math.floor(seconds / 60)} 分 ${seconds % 60} 秒`
+}
+
+/** 失败提示：有阶段快照时补「失败于哪个阶段 + 安全错误类别」（S7.21）。 */
+function failureHint(message: ChatMessage): string {
+  const base = message.error || statusLabel(message) || '这一轮没有结果'
+  const snapshot = message.progress
+  if (!snapshot || String(snapshot.status ?? '') !== 'failed') return base
+  const parts = [`失败于「${stageLabel(String(snapshot.stage ?? ''))}」`]
+  if (String(snapshot.error_category ?? '') !== '') {
+    parts.push(errorCategoryLabel(String(snapshot.error_category)))
+  }
+  return `${base}（${parts.join(' · ')}）`
 }
 
 function sessionLabel(item: { title: string; session_id: string }): string {
@@ -203,23 +221,34 @@ function sessionLabel(item: { title: string; session_id: string }): string {
                   </span>
                 </div>
 
-                <div v-if="message.status === 'running'" class="mt-2 flex items-center gap-2 text-xs text-ink-muted">
-                  <n-spin size="small" />
-                  <span>{{ statusLabel(message) }}</span>
+                <div v-if="message.status === 'running'" class="mt-2 flex flex-col gap-1 text-xs text-ink-muted">
+                  <div class="flex flex-wrap items-center gap-2">
+                    <n-spin size="small" />
+                    <span>{{ statusLabel(message) }}</span>
+                    <template v-if="store.progress">
+                      <span>
+                        · {{ store.progress.label }}
+                        <template v-if="store.progress.attempt > 1">
+                          （第 {{ store.progress.attempt }} 次尝试）
+                        </template>
+                      </span>
+                      <span v-if="store.stageElapsedMs > 0">· 已 {{ formatElapsed(store.stageElapsedMs) }}</span>
+                    </template>
+                  </div>
+                  <span v-if="store.stageLongRunning">
+                    耗时较长：可能还在排队或素材同步，稍等即可，不必刷新页面。
+                  </span>
                 </div>
-                <n-alert
-                  v-else-if="message.status !== 'succeeded'"
-                  class="mt-2"
-                  type="warning"
-                  :title="message.error || statusLabel(message) || '这一轮没有结果'"
-                />
+                <div v-else-if="message.status !== 'succeeded'" class="mt-2 flex flex-col gap-1">
+                  <n-alert type="warning" :title="failureHint(message)" />
+                </div>
               </div>
 
               <!-- 持久化的工具过程（刷新后回看） -->
               <div v-if="message.tool_calls.length > 0" class="mr-auto flex flex-wrap gap-1">
                 <n-tag
                   v-for="call in message.tool_calls"
-                  :key="`${call.tool}-${call.run_id ?? ''}`"
+                  :key="`${call.call_id ?? call.tool}-${call.run_id ?? ''}`"
                   size="tiny"
                   :type="call.status === 'succeeded' ? 'success' : 'warning'"
                 >
@@ -227,6 +256,17 @@ function sessionLabel(item: { title: string; session_id: string }): string {
                   {{ call.status === 'succeeded' ? '已跑完' : '失败了' }}
                 </n-tag>
               </div>
+
+              <!-- 调用链回看（S7.21）：只有有效 trace 关联时才显示；追踪关闭时整行不出现 -->
+              <a
+                v-if="message.trace_url"
+                class="mr-auto text-xs text-ink-muted underline"
+                :href="message.trace_url"
+                target="_blank"
+                rel="noreferrer"
+              >
+                查看调用链
+              </a>
 
               <!-- 结果卡片：和结果页共用 `HotspotResult` -->
               <template v-if="message.run_id && store.runs[message.run_id]">

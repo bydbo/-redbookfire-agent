@@ -32,6 +32,56 @@ export function toolLabel(name: string): string {
   return TOOL_LABELS[name] ?? name
 }
 
+// 阶段键的中文标签（后端 `core/progress.py::STAGE_LABELS` 的展示映射；未登记的原样显示）
+export const STAGE_LABELS: Record<string, string> = {
+  supervisor: '理解与决策',
+  image_parse: '解析图片',
+  submit_analysis: '提交分析',
+  queue_wait: '排队等待',
+  material_sync: '素材同步',
+  embedding_backfill: '向量回填',
+  embedding_query: '向量化查询',
+  clue: '拆解',
+  retrieve: '检索',
+  gaps: '缺口',
+  draft: '撰稿',
+  report: '报告',
+  final_reply: '整理回复',
+}
+
+export function stageLabel(key: string): string {
+  return STAGE_LABELS[key] ?? key
+}
+
+// 安全错误类别 → 中文（后端只给类别、不给错误正文；S7.19 白名单口径）
+export const ERROR_CATEGORY_LABELS: Record<string, string> = {
+  llm_error: '模型调用失败',
+  embedding_error: '向量化失败',
+  schema_error: '输出结构不合法',
+  config_error: '配置错误',
+  timeout: '超时',
+  cancelled: '已取消',
+  dependency_unavailable: '依赖不可用',
+  internal: '内部错误',
+}
+
+export function errorCategoryLabel(key: string): string {
+  return ERROR_CATEGORY_LABELS[key] ?? key
+}
+
+/** 当前阶段视图（S7.21）：来自 SSE `stage` 事件或刷新后的 `message.progress` 快照。 */
+export interface StageView {
+  stage: string
+  label: string
+  status: string
+  attempt: number
+  startedAt: string
+  errorCategory: string
+}
+
+/** 跑起来超过这个时长就提示「耗时较长」——只是提示，不据此断定失败。 */
+export const LONG_STAGE_MS = 60_000
+
 // 对话首页的状态：会话列表 / 当前会话的消息 / 本轮流式增量与工具步骤 / 命中过的结果卡片。
 export const useChatStore = defineStore('chat', () => {
   const sessions = ref<ChatSessionSummary[]>([])
@@ -46,6 +96,37 @@ export const useChatStore = defineStore('chat', () => {
   const streamText = ref('')
   const toolSteps = ref<ToolStep[]>([])
   const error = ref<string | null>(null)
+
+  // 当前阶段（S7.21）：SSE 实时更新 + 刷新后从 message.progress 恢复；已耗时每秒刷新
+  const progress = ref<StageView | null>(null)
+  const clock = ref(Date.now())
+  let clockTimer: number | undefined
+
+  function startClock(): void {
+    if (clockTimer === undefined) {
+      clockTimer = window.setInterval(() => {
+        clock.value = Date.now()
+      }, 1000)
+    }
+  }
+
+  function stopClock(): void {
+    if (clockTimer !== undefined) {
+      window.clearInterval(clockTimer)
+      clockTimer = undefined
+    }
+  }
+
+  const stageElapsedMs = computed(() => {
+    const item = progress.value
+    if (item === null || item.status !== 'running') return 0
+    const started = Date.parse(item.startedAt)
+    if (Number.isNaN(started)) return 0
+    return Math.max(0, clock.value - started)
+  })
+  const stageLongRunning = computed(
+    () => progress.value?.status === 'running' && stageElapsedMs.value >= LONG_STAGE_MS,
+  )
 
   // run_id → RunDetail（结果卡片）；null 表示「取不到」（还没写回 / 已被清理）
   const runs = ref<Record<string, RunDetail | null>>({})
@@ -65,6 +146,43 @@ export const useChatStore = defineStore('chat', () => {
 
   function hasRunning(items: ChatMessage[]): boolean {
     return items.some((item) => item.status === 'running')
+  }
+
+  /** 把一份「类快照」对象合进当前阶段（SSE 事件或 `message.progress` 都走这里）。 */
+  function applyProgressLike(raw: Record<string, unknown> | null | undefined): void {
+    if (raw === null || raw === undefined) return
+    const stage = String(raw.stage ?? '')
+    if (stage === '') return
+    const attempt = Number(raw.attempt ?? 1)
+    const previous = progress.value
+    const sameStage = previous !== null && previous.stage === stage && previous.attempt === attempt
+    const startedAt = String(raw.started_at ?? '') || (sameStage ? previous.startedAt : '')
+    progress.value = {
+      stage,
+      label: String(raw.label ?? '') || stageLabel(stage),
+      status: String(raw.status ?? 'running'),
+      attempt,
+      // 事件里可能只有 updated_at（如 tool_progress）：同阶段沿用旧起点，新阶段从此刻起算
+      startedAt: startedAt !== '' ? startedAt : new Date().toISOString(),
+      errorCategory: String(raw.error_category ?? ''),
+    }
+    if (progress.value.status === 'running') startClock()
+    else stopClock()
+  }
+
+  /** 刷新 / 轮询后：从最近一条带快照的 assistant 消息恢复阶段；没有就清空。 */
+  function syncProgressFromMessages(items: ChatMessage[]): void {
+    const latest = [...items].reverse().find(
+      (item) => item.role === 'assistant'
+        && item.progress !== null && item.progress !== undefined
+        && String(item.progress.stage ?? '') !== '',
+    )
+    if (latest?.progress) {
+      applyProgressLike(latest.progress as unknown as Record<string, unknown>)
+    } else if (!hasRunning(items)) {
+      progress.value = null
+      stopClock()
+    }
   }
 
   function stopPolling(): void {
@@ -90,6 +208,7 @@ export const useChatStore = defineStore('chat', () => {
     try {
       const detail = await getChatSession(currentId.value)
       messages.value = detail.messages
+      syncProgressFromMessages(detail.messages)
       if (!hasRunning(detail.messages)) stopPolling()
     } catch {
       stopPolling()
@@ -117,6 +236,7 @@ export const useChatStore = defineStore('chat', () => {
       messages.value = []
       streamText.value = ''
       toolSteps.value = []
+      progress.value = null
       error.value = null
       await loadSessions()
       return null
@@ -142,9 +262,11 @@ export const useChatStore = defineStore('chat', () => {
     error.value = null
     streamText.value = ''
     toolSteps.value = []
+    progress.value = null
     try {
       const detail = await getChatSession(sessionId)
       messages.value = detail.messages
+      syncProgressFromMessages(detail.messages)
       if (hasRunning(detail.messages)) startPolling()
     } catch (err) {
       messages.value = []
@@ -159,6 +281,7 @@ export const useChatStore = defineStore('chat', () => {
     try {
       const detail = await getChatSession(currentId.value)
       messages.value = detail.messages
+      syncProgressFromMessages(detail.messages)
     } catch {
       // 刷新失败不打断这一轮：流式增量仍在屏幕上，终态再对齐一次
     }
@@ -169,6 +292,10 @@ export const useChatStore = defineStore('chat', () => {
       case 'turn_started':
         void refreshMessages()
         break
+      case 'stage':
+        // 阶段生命周期（理解与决策 / 整理回复）：刷新后由 message.progress 恢复同一份快照
+        applyProgressLike(data)
+        break
       case 'tool_started':
         toolSteps.value.push({ stage: `开始：${toolLabel(String(data.tool ?? ''))}`, done: 0, total: 0 })
         break
@@ -178,6 +305,16 @@ export const useChatStore = defineStore('chat', () => {
           done: Number(data.done ?? 0),
           total: Number(data.total ?? 0),
         })
+        if (String(data.stage_key ?? '') !== '') {
+          // 排队等待 / 素材同步 / 向量回填 / 五节点：以阶段键更新当前阶段
+          applyProgressLike({
+            stage: String(data.stage_key),
+            label: stageLabel(String(data.stage_key)),
+            status: 'running',
+            attempt: data.attempt,
+            updated_at: data.updated_at,
+          })
+        }
         break
       case 'tool_finished':
         toolSteps.value.push({
@@ -215,6 +352,7 @@ export const useChatStore = defineStore('chat', () => {
     error.value = null
     streamText.value = ''
     toolSteps.value = []
+    progress.value = null
     try {
       await streamMessage(sessionId, { text, files }, (event) => {
         onStreamEvent(event.event, event.data)
@@ -249,10 +387,12 @@ export const useChatStore = defineStore('chat', () => {
 
   function reset(): void {
     stopPolling()
+    stopClock()
     currentId.value = null
     messages.value = []
     streamText.value = ''
     toolSteps.value = []
+    progress.value = null
     error.value = null
   }
 
@@ -260,6 +400,7 @@ export const useChatStore = defineStore('chat', () => {
     sessions, sessionsLoading, sessionsError,
     currentId, currentSession, messages, messagesLoading,
     sending, busy, streamText, toolSteps, error, runs,
+    progress, stageElapsedMs, stageLongRunning,
     loadSessions, init, newSession, openSession, refreshMessages, send, ensureRun, reset,
     stopPolling, toolLabel,
   }

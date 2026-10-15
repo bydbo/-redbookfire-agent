@@ -308,3 +308,58 @@ class TestLatestAttachments:
         assert await latest_attachments(db_session, first) == []
         found = await latest_attachments(db_session, second)
         assert [item["name"] for item in found] == ["乙图.png"]
+
+
+class TestTurnProgress:
+    """S7.21：`turn_id` / `trace_id` / `progress` 的读写与过期语义。"""
+
+    async def test_append_and_update_round_trip(self, db_session: AsyncSession) -> None:
+        created = await create_session(db_session)
+        session_id = uuid.UUID(created["session_id"])
+        turn_id = str(uuid.uuid4())
+        message = await append_message(
+            db_session, session_id, role="assistant", status="running",
+            turn_id=turn_id,
+            progress={"stage": "supervisor", "status": "running",
+                      "started_at": "2026-10-15T08:00:00+00:00"})
+        assert message is not None
+        assert message["turn_id"] == turn_id
+        assert message["trace_id"] is None                 # 追踪关闭 / 未收尾：如实为空
+        assert message["progress"]["stage"] == "supervisor"
+
+        updated = await update_message(
+            db_session, uuid.UUID(message["message_id"]), status="succeeded",
+            trace_id="trace-abc",
+            progress={"stage": "final_reply", "status": "succeeded"})
+        assert updated is not None
+        assert updated["trace_id"] == "trace-abc"
+        assert updated["progress"]["stage"] == "final_reply"
+
+        # 旧行口径：不带新字段的消息，读出空快照（对外折成 null）与空 trace，不报错
+        plain = await append_message(db_session, session_id, role="user", content="旧口径")
+        assert plain is not None
+        assert plain["progress"] is None
+        assert plain["trace_id"] is None
+
+    async def test_mark_stale_marks_progress_interrupted(self,
+                                                         db_session: AsyncSession) -> None:
+        created = await create_session(db_session)
+        session_id = uuid.UUID(created["session_id"])
+        message = await append_message(
+            db_session, session_id, role="assistant", status="running",
+            progress={"stage": "draft", "status": "running", "attempt": 1})
+        assert message is not None
+        # 把 created_at 拨到很久以前，触发 `turn_stale_seconds` 的过期判定
+        await db_session.execute(text(
+            "UPDATE chat_messages SET created_at = now() - interval '2 hours' WHERE id = :i"),
+            {"i": uuid.UUID(message["message_id"])})
+        await db_session.commit()
+
+        changed = await mark_stale_turns(db_session, stale_seconds=300)
+        assert changed == 1
+
+        loaded = await load_message(db_session, uuid.UUID(message["message_id"]))
+        assert loaded is not None
+        assert loaded["status"] == "interrupted"
+        assert loaded["progress"]["status"] == "interrupted"    # 快照与消息同一生命周期
+        assert loaded["progress"]["stage"] == "draft"

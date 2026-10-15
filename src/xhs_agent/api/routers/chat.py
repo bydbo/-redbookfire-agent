@@ -28,6 +28,7 @@ from fastapi.responses import FileResponse, StreamingResponse
 
 from ...config import AppConfig
 from ...core.errors import BadRequestError, NotFoundError
+from ...core.tracing import get_tracer
 from ...services.chat import (
     append_message,
     create_session,
@@ -168,6 +169,12 @@ async def get_chat_session(session_id: UuidPath, cfg: ConfigDep, session: Sessio
     detail = await load_session(session, chat_id, limit=limit)
     if detail is None:
         raise NotFoundError(f"会话不存在：{session_id}", {"session_id": session_id})
+    # S7.21：有有效 trace 关联且追踪可用时才给回看地址；追踪关闭 / 旧数据下为 None，
+    # 但阶段与失败信息照常可见（它们来自数据库，不依赖 Langfuse）。
+    tracer = get_tracer(cfg)
+    for message in detail["messages"]:
+        trace_id = str(message.get("trace_id") or "")
+        message["trace_url"] = tracer.trace_url(trace_id) if trace_id else None
     return detail
 
 

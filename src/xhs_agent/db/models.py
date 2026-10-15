@@ -231,7 +231,8 @@ class ChatMessage(Base):
     工具过程不单独建行：一个 assistant 消息的 `tool_calls` 里带齐本轮调了什么、结果与耗时。
     `run_id` 刻意**不加外键**——run 被删（例如素材回收站那类维护动作）不该动到历史消息。
     `prompt_tokens` / `completion_tokens` 是本轮用量（supervisor + 工具内部调用 + 本轮分析），
-    S7.10 起与 `cost_cny` 一起落库。
+    S7.10 起与 `cost_cny` 一起落库。S7.21 起 `turn_id` / `trace_id` / `progress` 让刷新后
+    仍能定位"这一轮跑到哪、为什么失败、去哪个 trace 回看"。
     """
 
     __tablename__ = "chat_messages"
@@ -249,6 +250,11 @@ class ChatMessage(Base):
     prompt_versions: Mapped[dict[str, int]] = mapped_column(
         JSONB, nullable=False, server_default=text("'{}'"))
     run_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
+    # S7.21：本轮标识与 trace 关联（都不加外键）；阶段快照结构与 runs.stage 相同
+    turn_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
+    trace_id: Mapped[str | None] = mapped_column(Text, nullable=True)
+    progress: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False,
+                                                     server_default=text("'{}'"))
     cost_cny: Mapped[Decimal] = mapped_column(Numeric(10, 4), nullable=False,
                                               server_default=text("0"))
     latency_ms: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))

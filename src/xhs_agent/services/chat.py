@@ -28,10 +28,11 @@ from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from typing import Any
 
-from sqlalchemy import func, select, update
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..config import PROJECT_ROOT, AppConfig
+from ..core import progress as progress_tool
 from ..core.errors import NotFoundError
 from ..db.models import ChatMessage, ChatSession
 
@@ -141,6 +142,10 @@ def message_view(row: ChatMessage) -> dict[str, Any]:
         "prompt_versions": {str(key): int(value)
                             for key, value in (row.prompt_versions or {}).items()},
         "run_id": str(row.run_id) if row.run_id else None,
+        "turn_id": str(row.turn_id) if row.turn_id else None,
+        "trace_id": row.trace_id,
+        # 旧行 / 还没写快照时是空对象，对外折成 null（契约允许）；有快照才给 `StageInfo`
+        "progress": dict(row.progress) if row.progress else None,
         "cost_cny": float(row.cost_cny or 0),
         "latency_ms": int(row.latency_ms or 0),
         "prompt_tokens": int(row.prompt_tokens or 0),
@@ -270,7 +275,9 @@ async def append_message(session: AsyncSession, session_id: uuid.UUID, *, role: 
                          prompt_versions: dict[str, int] | None = None,
                          run_id: str | None = None, cost_cny: float = 0.0,
                          latency_ms: int = 0, prompt_tokens: int = 0,
-                         completion_tokens: int = 0,
+                         completion_tokens: int = 0, turn_id: str | None = None,
+                         trace_id: str | None = None,
+                         progress: dict[str, Any] | None = None,
                          error: str | None = None) -> dict[str, Any] | None:
     """追加一条消息并刷新会话的 `updated_at`；会话不存在返回 None（接口层折 404）。
 
@@ -289,6 +296,9 @@ async def append_message(session: AsyncSession, session_id: uuid.UUID, *, role: 
         tool_calls=list(tool_calls or []),
         prompt_versions=dict(prompt_versions or {}),
         run_id=uuid.UUID(str(run_id)) if run_id else None,
+        turn_id=uuid.UUID(str(turn_id)) if turn_id else None,
+        trace_id=str(trace_id) if trace_id else None,
+        progress=dict(progress or {}),
         cost_cny=Decimal(f"{float(cost_cny or 0):.4f}"),
         latency_ms=int(latency_ms or 0),
         prompt_tokens=int(prompt_tokens or 0),
@@ -311,6 +321,8 @@ async def update_message(session: AsyncSession, message_id: uuid.UUID, *, conten
                          latency_ms: int | None = None,
                          prompt_tokens: int | None = None,
                          completion_tokens: int | None = None,
+                         turn_id: str | None = None, trace_id: str | None = None,
+                         progress: dict[str, Any] | None = None,
                          error: str | None = None) -> dict[str, Any] | None:
     """更新一条消息（只改显式给了的字段）；不存在返回 None。"""
     row = (await session.execute(
@@ -328,6 +340,12 @@ async def update_message(session: AsyncSession, message_id: uuid.UUID, *, conten
                                for key, value in prompt_versions.items()}
     if run_id is not None:
         row.run_id = uuid.UUID(str(run_id))
+    if turn_id is not None:
+        row.turn_id = uuid.UUID(str(turn_id))
+    if trace_id is not None:
+        row.trace_id = str(trace_id) or None
+    if progress is not None:
+        row.progress = dict(progress)
     if cost_cny is not None:
         row.cost_cny = Decimal(f"{float(cost_cny):.4f}")
     if latency_ms is not None:
@@ -348,17 +366,25 @@ async def mark_stale_turns(session: AsyncSession, *, stale_seconds: int,
 
     API 进程重启会带走进程内的 turn（S7.4 的 detached 任务），库里就留下永远 `running` 的行。
     读会话时顺手兜底：超过 `[chat].turn_stale_seconds` 的一律标中断，前端不再无限等。
+    S7.21：同一行的阶段快照（`progress`）也标成 `interrupted`——刷新后看到的是"停在哪一阶段"，
+    而不是一个永远 `running` 的快照；过期判定复用 `turn_stale_seconds`，不新增配置。
     """
     cutoff = datetime.now(UTC) - timedelta(seconds=int(stale_seconds))
-    statement = (update(ChatMessage)
+    statement = (select(ChatMessage)
                  .where(ChatMessage.role == "assistant",
                         ChatMessage.status == "running",
-                        ChatMessage.created_at < cutoff)
-                 .values(status="interrupted",
-                         error="这一轮没跑完就断了（进程重启或长时间无响应）"))
+                        ChatMessage.created_at < cutoff))
     if session_id is not None:
         statement = statement.where(ChatMessage.session_id == session_id)
-    result = await session.execute(statement)
+    rows = list((await session.execute(statement)).scalars().all())
+    if not rows:
+        return 0
+    detail = "这一轮没跑完就断了（进程重启或长时间无响应）"
+    for row in rows:
+        row.status = "interrupted"
+        row.error = detail
+        snapshot = progress_tool.normalize(row.progress)
+        if snapshot.get("status") == "running":
+            row.progress = progress_tool.interrupt(snapshot)
     await session.commit()
-    # `Session.execute(update(...))` 运行时返回 CursorResult（有 rowcount），类型标注只到 Result
-    return int(getattr(result, "rowcount", 0) or 0)
+    return len(rows)

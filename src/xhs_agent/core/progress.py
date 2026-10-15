@@ -48,11 +48,13 @@ STAGE_STATUSES: tuple[str, ...] = ("running", "succeeded", "failed", "skipped", 
 TERMINAL_STAGE_STATUSES: tuple[str, ...] = ("succeeded", "failed", "skipped", "interrupted")
 MAX_NODES = 30
 
-#: 工具内部的中文进度标签 → 阶段键（S7.20）；未登记的标签返回空串（前端退回显示原标签）
+#: 工具内部的中文进度标签 → 阶段键（S7.20）；未登记的标签返回空串（前端退回显示原标签）。
+#: 注意「分析中」是工具的临时进度文案（带 done/total），**不映射阶段键**——排队等待由
+#: `runs.status = queued` 推导、worker 阶段由各自的标签（素材同步 / 拆解…）上报，
+#: 否则轮询时会把当前阶段来回切回"排队等待"。
 PROGRESS_LABEL_KEYS: dict[str, str] = {
     "解析图片": "image_parse",
     "提交分析": "submit_analysis",
-    "分析中": "queue_wait",
     "拆解要素": "clue",
     "检索素材": "retrieve",
     "素材同步": "material_sync",
