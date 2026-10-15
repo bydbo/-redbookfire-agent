@@ -2,7 +2,9 @@
 
 用途：`get_tracer(cfg)` 拿进程级追踪器（缺键时是 `NullTracer`）；`run_analysis` 用它开
       「运行 → 热点 → 模型调用」三层结构，`TracingProvider` 负责每次文本模型调用的 generation。
-      S4.3 再加三件：`install_fastapi_instrumentation(app)` 给 API 装 ASGI 服务端 span、
+      S7.19 起再补对话链路三层：`chat.turn` → 工具 / 分析节点 → generation，`turn_id` 与
+      `finish_turn` 让一轮对话也能按 trace 回放；S4.3 的三件：
+      `install_fastapi_instrumentation(app)` 给 API 装 ASGI 服务端 span、
       `db_span(...)` 记数据库操作（**不含 SQL 语句**）、`current_trace_headers()` /
       `use_trace_carrier(...)` 用 W3C traceparent 把 API 与 Celery worker 连成一条 trace。
 输入：`AppConfig`——Langfuse 三件套从环境变量 / `config/.env` 读（《配置契约》§2.2）；
@@ -210,8 +212,23 @@ class Tracer(Protocol):
     def generation(self, *, name: str, model: str,
                    metadata: dict[str, Any]) -> AbstractContextManager[Generation]: ...
 
+    # ---- S7.19：对话轮次 / 工具 / 节点三层（span 父子关系见 `docs/可观测.md`）----
+    def turn(self, *, name: str, metadata: dict[str, Any],
+             turn_id: str = "") -> AbstractContextManager[None]: ...
+
+    def tool(self, *, name: str, metadata: dict[str, Any]) -> AbstractContextManager[None]: ...
+
+    def node(self, *, name: str, metadata: dict[str, Any]) -> AbstractContextManager[None]: ...
+
     def finish_run(self, *, status: str, totals: dict[str, Any], run_id: str = "",
                    prompt_versions: dict[str, int] | None = None, error: str = "") -> None: ...
+
+    def finish_turn(self, *, status: str, totals: dict[str, Any], turn_id: str = "",
+                    error: str = "") -> None: ...
+
+    def current_trace_id(self) -> str: ...
+
+    def trace_url(self, trace_id: str) -> str | None: ...
 
     def flush(self) -> None: ...
 
@@ -232,8 +249,28 @@ class NullTracer:
                    metadata: dict[str, Any]) -> AbstractContextManager[Generation]:
         return nullcontext(Generation(metadata=dict(metadata)))
 
+    def turn(self, *, name: str, metadata: dict[str, Any],
+             turn_id: str = "") -> AbstractContextManager[None]:
+        return nullcontext(None)
+
+    def tool(self, *, name: str, metadata: dict[str, Any]) -> AbstractContextManager[None]:
+        return nullcontext(None)
+
+    def node(self, *, name: str, metadata: dict[str, Any]) -> AbstractContextManager[None]:
+        return nullcontext(None)
+
     def finish_run(self, *, status: str, totals: dict[str, Any], run_id: str = "",
                    prompt_versions: dict[str, int] | None = None, error: str = "") -> None:
+        return None
+
+    def finish_turn(self, *, status: str, totals: dict[str, Any], turn_id: str = "",
+                    error: str = "") -> None:
+        return None
+
+    def current_trace_id(self) -> str:
+        return ""
+
+    def trace_url(self, trace_id: str) -> str | None:
         return None
 
     def flush(self) -> None:
@@ -353,6 +390,88 @@ class LangfuseTracer:
             logger.info("调用追踪：run %s 的 trace %s%s", run_id or "-", trace_id,
                         f"（{url}）" if url else "")
 
+    # ---------- S7.19：对话轮次 / 工具 / 节点 ----------
+    @contextmanager
+    def turn(self, *, name: str, metadata: dict[str, Any],
+             turn_id: str = "") -> Iterator[None]:
+        """一条对话轮次的 span：detached 任务继承到请求上下文时挂其下，不继承也能自成因。"""
+        payload = dict(metadata)
+        if turn_id:
+            payload.setdefault("turn_id", turn_id)
+        with self._client.start_as_current_observation(name=name, as_type="span",
+                                                       metadata=payload):
+            yield None
+
+    @contextmanager
+    def tool(self, *, name: str, metadata: dict[str, Any]) -> Iterator[None]:
+        """一次工具调用的 span（提交分析时的 traceparent 就取自它，S7.20）。"""
+        with self._client.start_as_current_observation(name=name, as_type="span",
+                                                       metadata=dict(metadata)):
+            yield None
+
+    @contextmanager
+    def node(self, *, name: str, metadata: dict[str, Any]) -> Iterator[None]:
+        """一个执行节点的 span：分析五节点、worker 前后置、检索子步（S7.19 / S7.20）。"""
+        with self._client.start_as_current_observation(name=name, as_type="span",
+                                                       metadata=dict(metadata)):
+            yield None
+
+    def finish_turn(self, *, status: str, totals: dict[str, Any], turn_id: str = "",
+                    error: str = "") -> None:
+        """轮次收尾：把状态与汇总写到 `chat.turn` 上，并打一条带 trace 链接的日志。"""
+        metadata: dict[str, Any] = {
+            "status": status,
+            "tool_calls": int(totals.get("tool_calls") or 0),
+            "llm_calls": int(totals.get("llm_calls") or 0),
+            "prompt_tokens": int(totals.get("prompt_tokens") or 0),
+            "completion_tokens": int(totals.get("completion_tokens") or 0),
+            "cost_cny": round(float(totals.get("cost_cny") or 0.0), 4),
+            "latency_ms": int(totals.get("latency_ms") or 0),
+            # 用量不完整（失败 / usage 缺失）时如实标记，不把估算包装成准确值（约定 §7）
+            "usage_complete": bool(totals.get("usage_complete", True)),
+        }
+        if turn_id:
+            metadata["turn_id"] = turn_id
+        payload: dict[str, Any] = {
+            "metadata": metadata,
+            "level": LEVEL_ERROR if status != "succeeded" else LEVEL_DEFAULT,
+        }
+        if error:
+            payload["status_message"] = str(error)[:1000]
+        try:
+            self._client.update_current_span(**payload)
+        except Exception:   # noqa: BLE001 - 上报失败只记日志，绝不影响这一轮
+            logger.warning("Langfuse turn 收尾失败（不影响对话）", exc_info=True)
+        self._log_turn_trace(turn_id)
+
+    def current_trace_id(self) -> str:
+        """当前 span 所属 trace 的 id（S7.21 落 `chat_messages.trace_id`）；失败返回空串。"""
+        try:
+            return str(self._client.get_current_trace_id() or "")
+        except Exception:   # noqa: BLE001 - 取不到 id 不影响业务
+            return ""
+
+    def trace_url(self, trace_id: str) -> str | None:
+        """trace 的 UI 回看地址；追踪关闭 / 取不到时返回 None（前端据此隐藏链接）。"""
+        if not trace_id:
+            return None
+        try:
+            url = self._client.get_trace_url(trace_id=trace_id)
+        except Exception:   # noqa: BLE001
+            return None
+        return str(url) if url else None
+
+    def _log_turn_trace(self, turn_id: str) -> None:
+        """把 turn 的 trace id 与 UI 链接写进日志：按 turn_id 排查时不用翻 Langfuse 界面找。"""
+        try:
+            trace_id = self._client.get_current_trace_id()
+            url = self._client.get_trace_url(trace_id=trace_id) if trace_id else None
+        except Exception:   # noqa: BLE001 - 取链接失败不影响上报
+            return
+        if trace_id:
+            logger.info("调用追踪：turn %s 的 trace %s%s", turn_id or "-", trace_id,
+                        f"（{url}）" if url else "")
+
     def flush(self) -> None:
         try:
             self._client.flush()
@@ -451,21 +570,52 @@ class TracingProvider:
                 fields.level = LEVEL_ERROR
                 fields.status_message = f"{type(exc).__name__}: {exc}"
                 raise
-            prompt_tokens = int(getattr(result, "prompt_tokens", 0) or 0)
-            completion_tokens = int(getattr(result, "completion_tokens", 0) or 0)
-            in_cost = prompt_tokens / 1_000_000 * self.price_in_per_m
-            out_cost = completion_tokens / 1_000_000 * self.price_out_per_m
-            fields.usage_details = {"input": prompt_tokens, "output": completion_tokens,
-                                    "total": prompt_tokens + completion_tokens}
-            fields.cost_details = {"input": in_cost, "output": out_cost,
-                                   "total": in_cost + out_cost}
-            fields.metadata["attempts"] = int(getattr(result, "attempts", 1) or 1)
-            error = str(getattr(result, "error", "") or "")
-            if error:
-                fields.level = LEVEL_ERROR
-                fields.status_message = error
-            if self.capture:
-                fields.input = {"system": str(getattr(call, "system", "")),
-                                "user": str(getattr(call, "user", ""))}
-                fields.output = str(getattr(result, "text", "") or "")
+            self._fill_generation(fields, call, result)
             return result
+
+    async def complete_with_tools(self, call: Any, on_delta: Any = None) -> Any:
+        """`complete_with_tools` 的追踪包装（S7.19）：一次逻辑调用一个 generation。
+
+        增量回调**原样透传**（不包一层——每个 token 都过包装器只会白白加开销）；
+        模型流式中断 / 取消按异常收尾，`finally` 由 `with` 块把 status_message / level 写回。
+        返回的 `LLMResult` 与未包装时逐字段一致。
+        """
+        task = str(getattr(call, "task", "llm"))
+        metadata = {"provider": self.name, "task": task,
+                    "stream": bool(getattr(call, "stream", False))}
+        with self.tracer.generation(name=task, model=self.model, metadata=metadata) as fields:
+            try:
+                result = await self.inner.complete_with_tools(call, on_delta=on_delta)
+            except BaseException as exc:
+                fields.level = LEVEL_ERROR
+                fields.status_message = f"{type(exc).__name__}: {exc}"
+                raise
+            fields.metadata["tool_calls"] = len(list(getattr(result, "tool_calls", []) or []))
+            self._fill_generation(fields, call, result)
+            return result
+
+    def _fill_generation(self, fields: Generation, call: Any, result: Any) -> None:
+        """把一次调用的用量 / 成本 / 尝试次数 / 状态写回 generation（不重复计费）。"""
+        prompt_tokens = int(getattr(result, "prompt_tokens", 0) or 0)
+        completion_tokens = int(getattr(result, "completion_tokens", 0) or 0)
+        in_cost = prompt_tokens / 1_000_000 * self.price_in_per_m
+        out_cost = completion_tokens / 1_000_000 * self.price_out_per_m
+        fields.usage_details = {"input": prompt_tokens, "output": completion_tokens,
+                                "total": prompt_tokens + completion_tokens}
+        fields.cost_details = {"input": in_cost, "output": out_cost,
+                               "total": in_cost + out_cost}
+        fields.metadata["attempts"] = int(getattr(result, "attempts", 1) or 1)
+        usage_status = str(getattr(result, "usage_status", "") or "")
+        if usage_status:
+            fields.metadata["usage_status"] = usage_status
+        elif prompt_tokens == 0 and completion_tokens == 0:
+            # 失败 / usage 缺失：如实标"未知"，不填 0 冒充准确（约定 §7）
+            fields.metadata["usage_status"] = "unknown"
+        error = str(getattr(result, "error", "") or "")
+        if error:
+            fields.level = LEVEL_ERROR
+            fields.status_message = error
+        if self.capture:
+            fields.input = {"system": str(getattr(call, "system", "")),
+                            "user": str(getattr(call, "user", ""))}
+            fields.output = str(getattr(result, "text", "") or "")

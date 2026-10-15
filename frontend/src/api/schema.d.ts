@@ -437,9 +437,16 @@ export interface paths {
          * 发一条消息（SSE 流式）
          * @description 一次 multipart 请求带上文字与（可选的）**一组图片**（1–9 张，同属一组），返回
          *     `text/event-stream`：
-         *     `turn_started` → （可选）`tool_started` / `tool_progress` / `tool_finished` →
+         *     `turn_started` → （可选）`stage` / `tool_started` / `tool_progress` / `tool_finished` →
          *     `text_delta`（真 token 增量）→ `turn_finished`（带 run_id）；失败则发一条 `error`
          *     并结束这一轮。每一行 `data:` 是一个 JSON 对象。
+         *     **事件字段只增不减**（S7.19–S7.21）：全部事件带 `turn_id`；`tool_started` 带
+         *     `call_id` / `attempt` / `started_at`；`tool_progress` 另带 `stage_key` / `status` /
+         *     `updated_at` / `elapsed_ms`；`tool_finished` 带 `call_id` / `ended_at` /
+         *     `error_category`；`turn_finished` 带 `trace_id` / `last_finished_stage`；`error` 带
+         *     `stage` / `error_category` / `trace_id`；新增的 `stage` 事件带 `message_id` / `stage` /
+         *     `label` / `status` / `attempt` / `run_id` / `job_id` / `last_finished_stage` 等阶段
+         *     快照字段。
          *     **断开浏览器只停转发**：这一轮照常跑完并落库（库里能看到 assistant 消息的终态）。
          *     图片只接受 jpg / png / webp（按 magic bytes）；单张上限 `[chat].attachment_max_mb`、
          *     数量上限 `[chat].attachment_max_count`、合计上限 `[chat].attachment_total_max_mb`——
@@ -518,8 +525,10 @@ export interface components {
             status: "queued" | "running" | "succeeded" | "failed";
             /** @description 0–1 的完成比例 */
             progress: number;
-            /** @description 当前所处步骤（拆解 / 检索 / 缺口 / 撰稿 / 报告） */
+            /** @description 当前阶段的中文标签（素材同步 / 向量回填 / 拆解 / 检索 / 缺口 / 撰稿 / 报告）；未开始或已收尾为空 */
             current_step?: string;
+            /** @description 当前阶段快照（S7.20）；`current_step` 是它的 `label` 投影 */
+            stage?: components["schemas"]["StageInfo"] | null;
             error?: components["schemas"]["ErrorResponse"] | null;
         };
         RunSummary: {
@@ -784,6 +793,10 @@ export interface components {
         /** @description 一次工具调用的过程记录（挂在 assistant 消息上）。 */
         ChatToolCall: {
             tool: string;
+            /** @description 本次工具调用的标识（与 `tool_started` / `tool_progress` / `tool_finished` 事件同值，S7.20） */
+            call_id?: string;
+            /** @description 该工具在本次轮次内的第几次执行（重试 / 多轮递增，默认 1） */
+            attempt?: number;
             /** @enum {string} */
             status: "succeeded" | "failed";
             args: {
@@ -820,8 +833,56 @@ export interface components {
             completion_tokens?: number;
             latency_ms?: number;
             error?: string | null;
+            /** @description 本轮对话的标识（S7.21；旧行为 null） */
+            turn_id?: string | null;
+            /** @description 本轮的 Langfuse trace id（S7.21）；追踪关闭、失败或旧行为 null */
+            trace_id?: string | null;
+            /** @description 调用链回看地址（S7.21）；有有效 trace 关联且追踪可用时才有值 */
+            trace_url?: string | null;
+            /** @description 当前 / 最后的阶段快照（S7.21），刷新后据此恢复阶段；仅阶段切换时更新 */
+            progress?: components["schemas"]["StageInfo"] | null;
             /** Format: date-time */
             created_at: string;
+        };
+        /** @description 阶段快照里的一次阶段执行记录（S7.20 / S7.21）。 */
+        StageNode: {
+            /** @description 阶段键（supervisor / image_parse / submit_analysis / queue_wait / material_sync / embedding_backfill / clue / retrieve / gaps / draft / report / final_reply） */
+            stage: string;
+            /** @description 中文标签 */
+            label?: string;
+            /** @enum {string} */
+            status: "running" | "succeeded" | "failed" | "skipped" | "interrupted";
+            attempt?: number;
+            /** Format: date-time */
+            started_at?: string;
+            ended_at?: string | null;
+            latency_ms?: number;
+            /** @description 安全错误类别（llm_error / embedding_error / schema_error / config_error / timeout / cancelled / dependency_unavailable / internal），不含错误正文 */
+            error_category?: string;
+        };
+        /**
+         * @description 当前阶段快照（S7.20 / S7.21）：应用内事件与可刷新状态是运行状态的事实源，
+         *     只记阶段切换，不逐 token；`nodes` 按 `(stage, attempt)` 去重，旧尝试的迟到更新不覆盖新状态。
+         */
+        StageInfo: {
+            /** @description 当前（或最后）阶段键；无阶段信息时为空串 */
+            stage: string;
+            /** @description 当前阶段的中文标签 */
+            label?: string;
+            /** @enum {string} */
+            status: "running" | "succeeded" | "failed" | "skipped" | "interrupted";
+            /** Format: date-time */
+            started_at?: string;
+            /** Format: date-time */
+            updated_at?: string;
+            attempt?: number;
+            retries?: number;
+            error_category?: string;
+            /** @description 最后完成的阶段键 */
+            last_finished_stage?: string;
+            run_id?: string | null;
+            job_id?: string | null;
+            nodes?: components["schemas"]["StageNode"][];
         };
         ChatSessionDetail: {
             /** Format: uuid */

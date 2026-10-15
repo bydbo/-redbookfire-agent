@@ -66,6 +66,9 @@ class LLMResult:
     cost_cny: float = 0.0
     attempts: int = 1
     error: str = ""
+    # S7.19：用量来源口径——actual（供应商给了 usage）/ estimated（按字符估算）/
+    # unknown（失败或没有可用文本，token 无意义）。只进追踪元数据，不改记账字段。
+    usage_status: str = ""
     # S7.1：模型要求调用的工具（`{id, name, arguments}`，arguments 是原始 JSON 字符串）
     tool_calls: list[dict[str, Any]] = field(default_factory=list)
 
@@ -163,6 +166,13 @@ class OpenAICompatibleProvider(BaseProvider):
                                 or estimate_tokens(text))
         cost = (prompt_tokens / 1_000_000 * self.cfg.price_in_per_m
                 + completion_tokens / 1_000_000 * self.cfg.price_out_per_m)
+        if usage and (usage.get("prompt_tokens") is not None
+                      or usage.get("completion_tokens") is not None):
+            usage_status = "actual"
+        elif error and not text:
+            usage_status = "unknown"
+        else:
+            usage_status = "estimated"
         return LLMResult(
             text=text,
             provider=self.name,
@@ -173,6 +183,7 @@ class OpenAICompatibleProvider(BaseProvider):
             cost_cny=cost,
             attempts=attempt,
             error=error,
+            usage_status=usage_status,
             tool_calls=list(tool_calls),
         )
 

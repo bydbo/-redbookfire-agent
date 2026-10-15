@@ -89,19 +89,30 @@ class FakeResult:
     """与 `tools.llm.LLMResult` 同形（TracingProvider 只鸭子类型依赖它）。"""
 
     def __init__(self, *, prompt_tokens: int = 100, completion_tokens: int = 50,
-                 error: str = "", text: str = "正文") -> None:
+                 error: str = "", text: str = "正文",
+                 tool_calls: list[dict[str, Any]] | None = None,
+                 usage_status: str = "") -> None:
         self.prompt_tokens = prompt_tokens
         self.completion_tokens = completion_tokens
         self.error = error
         self.text = text
         self.attempts = 1
         self.model = "fake-1"
+        self.tool_calls = list(tool_calls or [])
+        self.usage_status = usage_status
 
 
 class FakeCall:
     task = "hotspot_clue"
     system = "系统提示"
     user = "用户输入"
+    stream = False
+
+
+class StreamCall(FakeCall):
+    """流式调用（S7.1 的 `stream=True` 路径）。"""
+
+    stream = True
 
 
 class FakeInnerProvider:
@@ -113,11 +124,22 @@ class FakeInnerProvider:
         self.result = result or FakeResult()
         self.error = error
         self.calls = 0
+        self.delta_calls = 0
 
     async def complete(self, call: Any) -> FakeResult:
         self.calls += 1
         if self.error is not None:
             raise self.error
+        return self.result
+
+    async def complete_with_tools(self, call: Any, on_delta: Any = None) -> FakeResult:
+        self.calls += 1
+        if self.error is not None:
+            raise self.error
+        for piece in ("增量", "文本"):
+            if on_delta is not None:
+                self.delta_calls += 1
+                await on_delta(piece)
         return self.result
 
 
@@ -165,9 +187,15 @@ class TestNullTracerAndSingleton:
         assert tracer.enabled is False
         with (tracer.run(name="analyze", metadata={}),
               tracer.hotspot(index=1, metadata={}, content="热点"),
-              tracer.generation(name="hotspot_clue", model="m", metadata={}) as fields):
+              tracer.generation(name="hotspot_clue", model="m", metadata={}) as fields,
+              tracer.turn(name="chat.turn", metadata={}, turn_id="turn-1"),
+              tracer.tool(name="tool.x", metadata={}),
+              tracer.node(name="node.clue", metadata={})):
             assert isinstance(fields, Generation)
         tracer.finish_run(status="succeeded", totals={})
+        tracer.finish_turn(status="succeeded", totals={}, turn_id="turn-1")
+        assert tracer.current_trace_id() == ""
+        assert tracer.trace_url("trace-1") is None
         tracer.flush()
 
     def test_get_tracer_without_keys_warns_once(self, tmp_path, caplog):
@@ -296,6 +324,62 @@ class TestLangfuseTracerShape:
         assert len(caplog.records) >= 2                 # 两处失败各留一条 warning
 
 
+class TestTurnSpans:
+    """S7.19：对话轮次 / 工具 / 节点三层 span 与轮次收尾。"""
+
+    def _tracer(self, tmp_path) -> tuple[LangfuseTracer, FakeClient]:
+        client = FakeClient()
+        return LangfuseTracer(make_config(tmp_path, KEYS), client=client), client
+
+    def test_turn_tool_node_nesting_and_turn_id_metadata(self, tmp_path):
+        tracer, client = self._tracer(tmp_path)
+        with (tracer.turn(name="chat.turn", metadata={"session_id": "s1"}, turn_id="turn-9"),
+              tracer.tool(name="tool.run_hotspot_analysis",
+                          metadata={"tool": "run_hotspot_analysis"}),
+              tracer.node(name="node.clue", metadata={"attempt": 1})):
+            pass
+
+        turn, tool, node = client.observations
+        assert turn["name"] == "chat.turn" and turn["as_type"] == "span"
+        assert turn["metadata"]["turn_id"] == "turn-9"
+        assert tool["parent"] == 1 and tool["as_type"] == "span"
+        assert node["parent"] == 2 and node["as_type"] == "span"
+
+    def test_finish_turn_writes_totals_and_logs_link(self, tmp_path, caplog):
+        tracer, client = self._tracer(tmp_path)
+        with (caplog.at_level(logging.INFO, logger="xhs_agent.tracing"),
+              tracer.turn(name="chat.turn", metadata={}, turn_id="turn-3")):
+            tracer.finish_turn(status="succeeded",
+                               totals={"tool_calls": 1, "llm_calls": 2, "prompt_tokens": 300,
+                                       "completion_tokens": 120, "cost_cny": 0.0456,
+                                       "latency_ms": 900, "usage_complete": False},
+                               turn_id="turn-3")
+
+        payload = client.span_updates[0]
+        assert payload["metadata"]["status"] == "succeeded"
+        assert payload["metadata"]["turn_id"] == "turn-3"
+        assert payload["metadata"]["tool_calls"] == 1
+        assert payload["metadata"]["cost_cny"] == pytest.approx(0.0456)
+        assert payload["metadata"]["usage_complete"] is False
+        assert any("turn-3" in item.getMessage()
+                   and "trace-0123456789abcdef" in item.getMessage()
+                   for item in caplog.records)
+
+    def test_finish_turn_failure_is_swallowed(self, tmp_path, caplog):
+        tracer, client = self._tracer(tmp_path)
+        client.fail_updates = True
+        with (caplog.at_level(logging.WARNING, logger="xhs_agent.tracing"),
+              tracer.turn(name="chat.turn", metadata={})):
+            tracer.finish_turn(status="failed", totals={}, error="坏了")
+        assert any("turn 收尾失败" in item.getMessage() for item in caplog.records)
+
+    def test_trace_id_and_url(self, tmp_path):
+        tracer, _client = self._tracer(tmp_path)
+        assert tracer.current_trace_id() == "trace-0123456789abcdef"
+        assert tracer.trace_url("t-1") == "https://cloud.langfuse.com/trace/t-1"
+        assert tracer.trace_url("") is None
+
+
 class TestTracingProvider:
     async def _call(self, tmp_path, *, capture: bool = False, result=None, error=None):
         env = dict(KEYS)
@@ -343,3 +427,43 @@ class TestTracingProvider:
         update = client.generation_updates[0]
         assert update["input"] == {"system": "系统提示", "user": "用户输入"}
         assert update["output"] == "正文"
+
+    @pytest.mark.asyncio
+    async def test_complete_with_tools_passes_deltas_and_counts_tools(self, tmp_path):
+        provider, inner, client = await self._call(
+            tmp_path,
+            result=FakeResult(tool_calls=[{"id": "1", "name": "x", "arguments": "{}"}]))
+        deltas: list[str] = []
+
+        async def on_delta(piece: str) -> None:
+            deltas.append(piece)
+
+        result = await provider.complete_with_tools(StreamCall(), on_delta=on_delta)
+        assert result.text == "正文" and deltas == ["增量", "文本"]
+        assert inner.calls == 1 and inner.delta_calls == 2
+        update = client.generation_updates[0]
+        assert update["metadata"]["tool_calls"] == 1
+        assert update["metadata"]["stream"] is True
+        assert update["usage_details"]["total"] == 150
+
+    @pytest.mark.asyncio
+    async def test_complete_with_tools_marks_exception_and_reraises(self, tmp_path):
+        provider, _inner, client = await self._call(tmp_path, error=RuntimeError("流断了"))
+        with pytest.raises(RuntimeError):
+            await provider.complete_with_tools(FakeCall())
+        update = client.generation_updates[0]
+        assert update["level"] == "ERROR" and "流断了" in update["status_message"]
+
+    @pytest.mark.asyncio
+    async def test_unknown_usage_is_marked_not_zeroed(self, tmp_path):
+        provider, _inner, client = await self._call(
+            tmp_path, result=FakeResult(prompt_tokens=0, completion_tokens=0, error="上游 503"))
+        await provider.complete(FakeCall())
+        assert client.generation_updates[0]["metadata"]["usage_status"] == "unknown"
+
+    @pytest.mark.asyncio
+    async def test_actual_usage_status_is_kept(self, tmp_path):
+        provider, _inner, client = await self._call(
+            tmp_path, result=FakeResult(usage_status="actual"))
+        await provider.complete(FakeCall())
+        assert client.generation_updates[0]["metadata"]["usage_status"] == "actual"

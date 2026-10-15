@@ -47,6 +47,40 @@ class _Response(BaseModel):
     model_config = ConfigDict(extra="allow")
 
 
+# ---- 阶段快照（S7.20 / S7.21）----
+StageStatus = Literal["running", "succeeded", "failed", "skipped", "interrupted"]
+
+
+class StageNode(_Response):
+    """阶段快照里的一次阶段执行记录（契约 `StageNode`）。"""
+
+    stage: str
+    status: StageStatus
+    label: str = ""
+    attempt: int = Field(default=1, ge=1)
+    started_at: DateTimeStr | None = None
+    ended_at: DateTimeStr | None = None
+    latency_ms: int = Field(default=0, ge=0)
+    error_category: str = ""
+
+
+class StageInfo(_Response):
+    """当前阶段快照（契约 `StageInfo`）；`current_step` 是它的 `label` 投影。"""
+
+    stage: str
+    status: StageStatus
+    label: str = ""
+    started_at: DateTimeStr | None = None
+    updated_at: DateTimeStr | None = None
+    attempt: int = Field(default=1, ge=1)
+    retries: int = Field(default=0, ge=0)
+    error_category: str = ""
+    last_finished_stage: str = ""
+    run_id: UuidStr | None = None
+    job_id: str | None = None
+    nodes: list[StageNode] = Field(default_factory=list)
+
+
 class AnalyzeRequest(BaseModel):
     """`POST /api/analyze` 请求体（契约 `AnalyzeRequest`，未知字段一律拒绝）。
 
@@ -100,6 +134,7 @@ class JobStatus(_Response):
     status: RunStatus
     progress: float
     current_step: str | None = None
+    stage: StageInfo | None = None
     error: ErrorResponse | None = None
 
 
@@ -338,6 +373,8 @@ class ChatToolCall(_Response):
     tool: str
     status: Literal["succeeded", "failed"]
     args: dict[str, Any]
+    call_id: str = ""
+    attempt: int = Field(default=1, ge=1)
     run_id: UuidStr | None = None
     cost_cny: float = 0.0
     # 这次工具调用用掉的 token（含图片解析与分析那次 run 的用量，S7.10）
@@ -367,6 +404,11 @@ class ChatMessage(_Response):
     completion_tokens: int = 0
     latency_ms: int = 0
     error: str | None = None
+    # S7.21：本轮标识、trace 关联与可刷新的阶段快照（旧行为 None / None / 空快照）
+    turn_id: UuidStr | None = None
+    trace_id: str | None = None
+    trace_url: str | None = None
+    progress: StageInfo | None = None
 
 
 class ChatSession(_Response):

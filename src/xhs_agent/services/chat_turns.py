@@ -27,13 +27,14 @@ import logging
 import uuid
 from collections.abc import AsyncIterator
 from contextlib import suppress
-from typing import Any
+from typing import Any, cast
 
 import redis.asyncio as aioredis
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..config import AppConfig
 from ..core.errors import DependencyUnavailableError
+from ..core.tracing import Tracer, TracingProvider, capture_content, get_tracer
 from ..db.session import create_engine_from_config, create_session_factory
 from ..services import chat_tools
 from ..services.chat import latest_attachments, update_message
@@ -165,9 +166,21 @@ class TurnEvents:
 
 # ---------- 可注入点（测试替换这两处，生产走真实实现） ----------
 
-def build_turn_provider(cfg: AppConfig, client: Any) -> BaseProvider:
-    """对话层用的模型 provider。"""
-    return build_provider(cfg, client=client)
+def build_turn_provider(cfg: AppConfig, client: Any, *,
+                        tracer: Tracer | None = None) -> BaseProvider:
+    """对话层用的模型 provider：默认套一层追踪（S7.19）。
+
+    与分析链路同一口径（`workflows/analysis.py`）：追松开时每次 supervisor 调用一个
+    generation，`complete_with_tools` 的流式增量原样透传；三件套缺失 / 上报失败都不影响
+    这一轮（`TracingProvider` 内部吞掉异常）。`cast` 只是给 mypy 一个交代——`TracingProvider`
+    是鸭子类型，`core/` 不反向依赖 `tools/`。
+    """
+    inner = build_provider(cfg, client=client)
+    return cast(BaseProvider, TracingProvider(
+        inner, tracer if tracer is not None else get_tracer(cfg),
+        capture=capture_content(cfg),
+        price_in_per_m=cfg.llm.price_in_per_m,
+        price_out_per_m=cfg.llm.price_out_per_m))
 
 
 def build_tool_runner(session: AsyncSession, *, cfg: AppConfig, client: Any,

@@ -1,4 +1,4 @@
-"""日志层单测（S4.1）：structlog 管线、两个 id 恒在、run_id 上下文绑定。
+"""日志层单测（S4.1 / S7.19）：structlog 管线、三个 id 恒在、run_id / turn_id 上下文绑定。
 
 离线、不读真实密钥、不连库：只在一个自建 handler 上验证输出形状。
 """
@@ -18,11 +18,14 @@ from xhs_agent.core.logging import (
     LOG_LEVELS,
     TraceIdFilter,
     bind_run_id,
+    bind_turn_id,
     configure_logging,
     current_request_id,
     current_run_id,
+    current_turn_id,
     request_id_var,
     reset_run_id,
+    reset_turn_id,
 )
 
 LOGGER_NAME = "xhs_agent.test.logging"
@@ -70,12 +73,12 @@ class TestJsonFormat:
         assert row["logger"] == LOGGER_NAME
         assert isinstance(row["timestamp"], str) and row["timestamp"].endswith("Z")
 
-    def test_both_ids_are_always_present(self, capture) -> None:
+    def test_all_ids_are_always_present(self, capture) -> None:
         configure_logging("INFO", "json")
         logging.getLogger(LOGGER_NAME).info("没有上下文")
 
         (row,) = rows(capture)
-        assert row["request_id"] == "" and row["run_id"] == ""
+        assert row["request_id"] == "" and row["run_id"] == "" and row["turn_id"] == ""
 
     def test_ids_come_from_context_vars(self, capture) -> None:
         configure_logging("INFO", "json")
@@ -135,6 +138,41 @@ class TestRunIdContext:
         finally:
             reset_run_id(token)
             request_id_var.set("")
+
+
+class TestTurnIdContext:
+    def test_bind_and_reset_are_nested(self) -> None:
+        assert current_turn_id() == ""
+        outer = bind_turn_id("turn-outer")
+        inner = bind_turn_id("turn-inner")
+        assert current_turn_id() == "turn-inner"
+        reset_turn_id(inner)
+        assert current_turn_id() == "turn-outer"
+        reset_turn_id(outer)
+        assert current_turn_id() == ""
+
+    def test_turn_id_flows_into_json_log(self, capture) -> None:
+        configure_logging("INFO", "json")
+        token = bind_turn_id("turn-1")
+        try:
+            logging.getLogger(LOGGER_NAME).info("带 turn 上下文")
+        finally:
+            reset_turn_id(token)
+
+        (row,) = rows(capture)
+        assert row["turn_id"] == "turn-1"
+        assert row["run_id"] == ""                   # 与 run_id 互不影响
+
+    def test_explicit_extra_is_not_overwritten(self, capture) -> None:
+        configure_logging("INFO", "json")
+        token = bind_turn_id("turn-from-context")
+        try:
+            logging.getLogger(LOGGER_NAME).info("显式指定", extra={"turn_id": "turn-explicit"})
+        finally:
+            reset_turn_id(token)
+
+        (row,) = rows(capture)
+        assert row["turn_id"] == "turn-explicit"
 
 
 class TestConfigureLogging:

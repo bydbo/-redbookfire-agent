@@ -23,6 +23,7 @@ import pytest
 from xhs_agent.api.routers import chat as chat_router
 from xhs_agent.config import AppConfig, load_config
 from xhs_agent.core.errors import DependencyUnavailableError
+from xhs_agent.core.tracing import NullTracer, TracingProvider
 from xhs_agent.services import chat_turns
 from xhs_agent.services.chat_turns import TurnEvents, redis_url, sse_frame, start_turn
 from xhs_agent.tools import llm
@@ -373,3 +374,21 @@ async def test_start_turn_marks_message_failed_on_crash(
     assert "boom" in saved[-1][1]["error"]
     assert "boom" in received[-1]["data"]["message"]
     assert engine.disposed == 1
+
+
+# ---------- 5. S7.19：对话 provider 默认套追踪 ----------
+
+
+def test_build_turn_provider_wraps_with_tracer(
+        cfg: AppConfig, monkeypatch: pytest.MonkeyPatch) -> None:
+    """对话层 provider 默认套 `TracingProvider`（S7.19）：追松开时 supervisor 调用有 generation。
+
+    追踪关闭（`NullTracer`）时包装器仍在、行为等价——这样生产路径只有一条。
+    """
+    tracer = NullTracer()
+    monkeypatch.setattr(chat_turns, "build_provider",
+                        lambda _cfg, client=None: ScriptedProvider())
+    provider = chat_turns.build_turn_provider(cfg, client=object(), tracer=tracer)
+    assert isinstance(provider, TracingProvider)
+    assert provider.tracer is tracer
+    assert provider.name == "scripted"

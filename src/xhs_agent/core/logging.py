@@ -1,19 +1,21 @@
 """日志：标准库 logging 的调用 API + structlog 的格式化管线（S4.1）。
 
 用途：`configure_logging(level, log_format)` 幂等配置根 logger 与框架 logger（uvicorn / celery）；
-      `TraceIdFilter` 给每条记录补上 `request_id` 与 `run_id`（缺省空串），一次请求 / 一次运行的
-      日志因此可以按 id 串起来。
+      `TraceIdFilter` 给每条记录补上 `request_id` / `run_id` / `turn_id`（缺省空串），一次请求 /
+      一次运行 / 一轮对话的日志因此可以按 id 串起来。
 输入：日志级别（`DEBUG` / `INFO` / `WARNING` / `ERROR`，非法值退回 `INFO`）与输出格式
       （`console` / `json`，非法值退回 `console`）。
-输出：无（配置 logging 的副作用）；`current_request_id()` / `current_run_id()` 读当前上下文。
-      `bind_run_id()` / `reset_run_id()` 用于把 run_id 绑进（与解绑）当前上下文。
+输出：无（配置 logging 的副作用）；`current_request_id()` / `current_run_id()` /
+      `current_turn_id()` 读当前上下文。`bind_run_id()` / `reset_run_id()` 与
+      `bind_turn_id()` / `reset_turn_id()` 用于把 id 绑进（与解绑）当前上下文。
 
-口径（S4.1 定下，改动需同步 `docs/开发规范.md`）：
+口径（S4.1 定下，S7.19 加 turn_id；改动需同步 `docs/开发规范.md` 与 `docs/可观测.md`）：
 
 - **调用点仍用标准库 logging**（`logging.getLogger(...).info("…%s", x)` 全部保留），structlog 只做
   格式化管线（`ProcessorFormatter` + `JSONRenderer` / `ConsoleRenderer`），**不调**
   `structlog.get_logger()`——这样与 uvicorn / pytest 各自的日志装配不打架。
-- **`request_id` 与 `run_id` 两个键恒在**：不在上下文里时为空串，JSON 输出可直接用 `jq` 过滤。
+- **`request_id` / `run_id` / `turn_id` 三个键恒在**：不在上下文里时为空串，JSON 输出可直接用
+  `jq` 过滤；`turn_id` 由对话轮次显式绑定（Celery 里走独立业务头，不指望 traceparent 自动带入）。
 - `log_format = "json"` 时一行一个 JSON 对象（容器 / CI 用）；默认 `console` 保留本机可读性。
 - 异常栈只进日志（JSON 的 `exception` 字段），不进 HTTP 响应。
 - 不写日志文件、不加自己的 handler——日志走 stdout / stderr 由容器收集。
@@ -40,6 +42,7 @@ FRAMEWORK_LOGGERS: tuple[str, ...] = ("uvicorn", "uvicorn.error", "uvicorn.acces
 
 request_id_var: ContextVar[str] = ContextVar("request_id", default="")
 run_id_var: ContextVar[str] = ContextVar("run_id", default="")
+turn_id_var: ContextVar[str] = ContextVar("turn_id", default="")
 
 
 def current_request_id() -> str:
@@ -52,6 +55,11 @@ def current_run_id() -> str:
     return run_id_var.get()
 
 
+def current_turn_id() -> str:
+    """当前对话轮次的 id（S7.19）；不在轮次上下文里返回空串。"""
+    return turn_id_var.get()
+
+
 def bind_run_id(value: str) -> Token[str]:
     """把 run_id 绑进当前上下文；返回的 token 交给 `reset_run_id` 解绑。"""
     return run_id_var.set(str(value or ""))
@@ -62,8 +70,18 @@ def reset_run_id(token: Token[str]) -> None:
     run_id_var.reset(token)
 
 
+def bind_turn_id(value: str) -> Token[str]:
+    """把 turn_id 绑进当前上下文（S7.19）；返回的 token 交给 `reset_turn_id` 解绑。"""
+    return turn_id_var.set(str(value or ""))
+
+
+def reset_turn_id(token: Token[str]) -> None:
+    """解绑 `bind_turn_id` 绑上的 turn_id（恢复绑定前的值）。"""
+    turn_id_var.reset(token)
+
+
 class TraceIdFilter(logging.Filter):
-    """给每条日志记录补上 `request_id` 与 `run_id`（缺省空串，避免格式化时 KeyError）。
+    """给每条日志记录补上 `request_id` / `run_id` / `turn_id`（缺省空串，避免格式化时 KeyError）。
 
     调用方用 `extra={...}` 显式给的值不被覆盖——那是调用方明确指定的。
     """
@@ -73,6 +91,8 @@ class TraceIdFilter(logging.Filter):
             record.request_id = current_request_id()
         if not getattr(record, "run_id", ""):
             record.run_id = current_run_id()
+        if not getattr(record, "turn_id", ""):
+            record.turn_id = current_turn_id()
         return True
 
 
@@ -82,20 +102,22 @@ RequestIdFilter = TraceIdFilter
 
 def _ensure_trace_ids(logger: Any, method_name: str,
                       event_dict: MutableMapping[str, Any]) -> MutableMapping[str, Any]:
-    """structlog 处理器：保证 `request_id` / `run_id` 两个键恒在（缺省空串）。"""
+    """structlog 处理器：保证 `request_id` / `run_id` / `turn_id` 三个键恒在（缺省空串）。"""
     if not event_dict.get("request_id"):
         event_dict["request_id"] = ""
     if not event_dict.get("run_id"):
         event_dict["run_id"] = ""
+    if not event_dict.get("turn_id"):
+        event_dict["turn_id"] = ""
     return event_dict
 
 
 def _pre_chain() -> list[Processor]:
     """标准库记录进入 structlog 管线前要走的处理器（每次重建：TimeStamper 无状态但便宜）。"""
     return [
-        # ExtraAdder 把 filter 写在记录上的两个 id 带进 event_dict（否则标准库记录只映射
-        # `event` 一个字段）；只放行这两个键，避免把 LogRecord 的杂项字段灌进 JSON。
-        structlog.stdlib.ExtraAdder(allow=("request_id", "run_id")),
+        # ExtraAdder 把 filter 写在记录上的三个 id 带进 event_dict（否则标准库记录只映射
+        # `event` 一个字段）；只放行这三个键，避免把 LogRecord 的杂项字段灌进 JSON。
+        structlog.stdlib.ExtraAdder(allow=("request_id", "run_id", "turn_id")),
         structlog.stdlib.add_log_level,
         structlog.stdlib.add_logger_name,
         structlog.processors.TimeStamper(fmt="iso", utc=True),
