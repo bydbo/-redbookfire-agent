@@ -183,11 +183,16 @@ class TestTurn:
         assert runner.calls == [(TOOL_RUN_ANALYSIS, {"hotspot": "夜跑"})]
         # 成本 = 两次 supervisor 调用 + 一次分析
         assert turn.cost_cny == pytest.approx(0.002 + 0.05)
-        # 事件：工具开始 → 进度 → 结束
-        assert events.names() == ["tool_started", "tool_progress", "tool_progress",
-                                  "tool_finished"]
-        assert events.items[0][1]["args"] == {"hotspot": "夜跑"}
-        assert events.items[1][1]["stage"] == "解析图片"
+        # 事件：决策阶段（running/succeeded）→ 工具开始 → 进度 → 结束 → 决策阶段（S7.20）
+        assert events.names() == ["stage", "stage", "tool_started", "tool_progress",
+                                  "tool_progress", "tool_finished", "stage", "stage"]
+        assert events.items[0][1]["stage"] == "supervisor"
+        assert events.items[0][1]["status"] == "running"
+        assert events.items[2][1]["args"] == {"hotspot": "夜跑"}
+        assert events.items[2][1]["call_id"] == "call-1"
+        assert events.items[2][1]["attempt"] == 1
+        assert events.items[3][1]["stage"] == "解析图片"
+        assert events.items[3][1]["stage_key"] == "image_parse"
         # 第二轮把工具结果作为 tool 消息喂回去
         second = provider.calls[1].messages
         assert second[-2]["role"] == "assistant" and second[-2]["tool_calls"][0]["id"] == "call-1"

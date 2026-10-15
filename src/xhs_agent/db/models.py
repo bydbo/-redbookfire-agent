@@ -138,6 +138,9 @@ class Run(Base):
     latency_ms: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
     prompt_versions: Mapped[dict[str, int]] = mapped_column(JSONB, nullable=False,
                                                             server_default=text("'{}'"))
+    # S7.20：当前阶段快照（结构见 `core/progress.py` 与数据契约 §3.3）；只记阶段切换
+    stage: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False,
+                                                  server_default=text("'{}'"))
     error: Mapped[str | None] = mapped_column(Text, nullable=True)
 
     __table_args__ = (

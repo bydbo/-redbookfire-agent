@@ -30,6 +30,7 @@ from sqlalchemy import delete, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..config import AppConfig
+from ..core import progress as progress_tool
 from ..core.tracing import traced_db
 from ..db.models import Hotspot, Material, Run, RunHotspot, RunMatch
 from ..schemas import SchemaError
@@ -160,10 +161,35 @@ async def _run_row(session: AsyncSession, run_id: uuid.UUID) -> Run | None:
     return (await session.execute(select(Run).where(Run.id == run_id))).scalar_one_or_none()
 
 
+@traced_db("db.set_run_stage", operation="update", tables=("runs",))
+async def set_run_stage(session: AsyncSession, run_id: uuid.UUID | str, *, stage: str,
+                        status: str, attempt: int = 1, retries: int = 0,
+                        latency_ms: int = 0, error_category: str = "") -> bool:
+    """把一次运行的阶段快照写进 `runs.stage`（S7.20）；查不到该 run 返回 `False`。
+
+    合并口径全在 `core/progress.py`：迟到（`attempt` 更小）的更新被忽略、`nodes` 按
+    `(stage, attempt)` 去重封顶。只写快照列并提交，**不动** `runs.status` / 统计 / `error`——
+    那些仍由 `RunRecorder` 收尾。调用方（worker / 工作流）负责给出阶段键与状态。
+    """
+    run = (await session.execute(
+        select(Run).where(Run.id == uuid.UUID(str(run_id))))).scalar_one_or_none()
+    if run is None:
+        return False
+    run.stage = progress_tool.apply(run.stage, stage=stage, status=status, attempt=attempt,
+                                    retries=retries, error_category=error_category,
+                                    latency_ms=latency_ms, run_id=str(run.id))
+    try:
+        await session.commit()
+    except BaseException:
+        await session.rollback()
+        raise
+    return True
+
+
 @traced_db("db.load_job", operation="select",
            tables=("runs", "run_hotspots", "hotspots"))
 async def load_job(session: AsyncSession, job_id: str) -> dict[str, Any] | None:
-    """`JobStatus` 形状：状态、进度（已完成热点数 / 热点总数）与失败原因。"""
+    """`JobStatus` 形状：状态、进度（已完成热点数 / 热点总数）、当前阶段与失败原因。"""
     run = (await session.execute(
         select(Run).where(Run.job_id == job_id))).scalar_one_or_none()
     if run is None:
@@ -173,12 +199,15 @@ async def load_job(session: AsyncSession, job_id: str) -> dict[str, Any] | None:
     done = (await session.execute(select(func.count()).select_from(RunHotspot)
                                   .where(RunHotspot.run_id == run.id,
                                          RunHotspot.status.in_(_DONE_STATUSES)))).scalar_one()
+    snapshot = progress_tool.normalize(run.stage)
     payload: dict[str, Any] = {
         "job_id": run.job_id,
         "run_id": str(run.id),
         "status": run.status,
         "progress": round(done / total, 4) if total else 0.0,
-        "current_step": None,
+        # S7.20：阶段快照是"现在在哪个环节"的事实源；旧行（stage 为空对象）两字段仍照旧
+        "current_step": progress_tool.current_step(snapshot),
+        "stage": snapshot if (snapshot["stage"] or snapshot["nodes"]) else None,
     }
     if run.status == FAILED and run.error:
         payload["error"] = {"code": "internal_error", "message": run.error,
@@ -461,6 +490,14 @@ class RunRecorder:
     async def topk(self) -> int:
         """本次运行的截断上限（来自提交时的 `topk`）。"""
         return int((await self._run()).topk)
+
+    async def set_stage(self, *, stage: str, status: str, attempt: int = 1,
+                        retries: int = 0, latency_ms: int = 0,
+                        error_category: str = "") -> None:
+        """写本次运行的阶段快照（S7.20）；口径与 DB span 全在模块级 `set_run_stage`。"""
+        await set_run_stage(self.session, self.run_id, stage=stage, status=status,
+                            attempt=attempt, retries=retries, latency_ms=latency_ms,
+                            error_category=error_category)
 
     @traced_db("db.run_recorder.start", operation="update", tables=("runs",))
     async def start(self) -> None:

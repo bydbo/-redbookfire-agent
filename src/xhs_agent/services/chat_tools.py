@@ -60,6 +60,7 @@ from ..agents.revise import TASK_ID as REVISE_TASK
 from ..agents.revise import ReviseOutcome
 from ..agents.revise import revise_draft as revise_agent
 from ..config import AppConfig
+from ..core import progress as progress_tool
 from ..core.errors import ApiError, BadRequestError
 from ..schemas import TYPE_LABELS, Element, HotspotClue, SchemaError
 from ..services.chat import latest_run_id, resolve_attachment
@@ -810,10 +811,17 @@ async def _read_image(ctx: ToolContext, attachment: dict[str, Any]) -> tuple[byt
 
 async def _wait_for_run(ctx: ToolContext, job_id: str,
                         progress: Callable[[str, int, int], Awaitable[None]]) -> str:
-    """轮询 `runs` 到终态；返回 `succeeded` / `failed` / `timeout`。"""
+    """轮询 `runs` 到终态；返回 `succeeded` / `failed` / `timeout`。
+
+    S7.20：每次读到**新的阶段**（`runs.stage` 快照 / `queued` 推导的排队等待）就顺着既有的
+    `progress` 通道报一次中文标签——对话侧据此发 `tool_progress` 事件，因此
+    「提交 → 排队等待 → 素材同步 → 向量回填 → 拆解 / 检索 / 缺口 / 撰稿 / 报告」逐段可见。
+    阶段状态与尝试序号仍以 `GET /api/jobs/{job_id}` 的 `stage` 字段为准。
+    """
     limit = ctx.max_wait_s if ctx.max_wait_s is not None else float(
         ctx.cfg.queue.task_time_limit_s)
     deadline = time.monotonic() + limit
+    last_stage = ""
     while True:
         # 同一个 session 里必须显式过期：否则 ORM 会把内存里的旧对象原样返回（poll 永远不变）。
         # `expire_all()` 是同步方法（只清身份映射，不发 SQL）。
@@ -825,7 +833,16 @@ async def _wait_for_run(ctx: ToolContext, job_id: str,
         if time.monotonic() >= deadline:
             return "timeout"
         percent = int(round(float((job or {}).get("progress") or 0) * 100))
-        await progress("分析中", percent, 100)
+        snapshot = (job or {}).get("stage") or {}
+        stage_key = str(snapshot.get("stage") or "")
+        if not stage_key and status == "queued":
+            stage_key = "queue_wait"            # 排队等待由状态推导，不落单独阶段
+        if stage_key and stage_key != last_stage:
+            last_stage = stage_key
+            # 阶段切换的那一次用阶段标签代替"分析中"：每条轮询仍只发一个进度事件
+            await progress(progress_tool.label_for(stage_key), percent, 100)
+        else:
+            await progress("分析中", percent, 100)
         await ctx.sleep(ctx.poll_interval_s)
 
 

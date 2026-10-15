@@ -55,7 +55,13 @@ class RunStore:
 
     # ---------- 步骤 ----------
     @contextmanager
-    def step(self, name: str, detail: str = "") -> Iterator[dict[str, Any]]:
+    def step(self, name: str, detail: str = "", *,
+             skipped: bool = False) -> Iterator[dict[str, Any]]:
+        """包住一个步骤；`skipped=True` 时正常退出也记 `skipped`（如复用线索短路拆解，S7.20）。
+
+        失败（含 `KeyboardInterrupt` 等 BaseException）记 `failed` 并原样上抛；
+        trace.jsonl 的 `step_started` / `step_finished` / `step_failed` 事件同步落盘。
+        """
         record: dict[str, Any] = {
             "name": name,
             "detail": detail,
@@ -84,7 +90,7 @@ class RunStore:
             self.log("step_failed", {"name": name, "error": record["error"]})
             raise
         else:
-            record["status"] = "succeeded"
+            record["status"] = "skipped" if skipped else "succeeded"
         finally:
             record["ended_at"] = now_iso()
             record["latency_ms"] = int((time.time() - started) * 1000)

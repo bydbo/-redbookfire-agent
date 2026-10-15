@@ -185,6 +185,28 @@ class TestCeleryDispatcher:
         assert recorded["kwargs"]["headers"] == {}
 
     @pytest.mark.asyncio
+    async def test_enqueue_passes_turn_id_as_business_header(self, tmp_path):
+        """S7.20：`turn_id` 走独立业务头，不与 W3C carrier 混用。"""
+        from xhs_agent.api.deps import CeleryDispatcher
+        from xhs_agent.core.progress import TURN_ID_HEADER
+
+        recorded: dict = {}
+
+        class RecordingApp:
+            def send_task(self, *args, **kwargs):
+                recorded["kwargs"] = kwargs
+
+        cfg = make_config(tmp_path)
+        cfg._env = EnvView({}, {"REDIS_URL": "redis://127.0.0.1:6379/0"})
+        dispatcher = CeleryDispatcher(cfg)
+        dispatcher._app = RecordingApp()        # type: ignore[assignment]
+        await dispatcher.enqueue("job-1", turn_id="turn-9")
+
+        headers = recorded["kwargs"]["headers"]
+        assert headers[TURN_ID_HEADER] == "turn-9"
+        assert "traceparent" not in headers     # 无活动 span：不伪造 trace 关联
+
+    @pytest.mark.asyncio
     async def test_analyze_is_sent_with_ignore_result(self, tmp_path):
         """S6.3 / ADR 0014：分析任务的投递显式 `ignore_result=True`。
 

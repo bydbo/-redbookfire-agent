@@ -17,8 +17,10 @@
 
 from __future__ import annotations
 
+import time
 import uuid
-from collections.abc import Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -28,8 +30,11 @@ from langgraph.types import RetryPolicy
 from ..agents import DEFAULT_STYLE, explain_candidates, extract_clue, write_draft
 from ..config import PROJECT_ROOT, AppConfig
 from ..core.logging import bind_run_id, reset_run_id
+from ..core.progress import error_category as error_category_of
 from ..core.tracing import (
+    LEVEL_ERROR,
     TRACE_NAME,
+    NullTracer,
     Tracer,
     TracingProvider,
     capture_content,
@@ -49,6 +54,13 @@ from .state import AnalysisState
 # 计划步骤：写进 RunStore.plan，用于 pending_steps() 的未完成步骤计算
 NODE_STEPS: tuple[str, ...] = ("拆解", "检索", "缺口", "撰稿", "报告")
 
+# 节点中文名 → 阶段快照 / 事件里的稳定键（S7.20）；标签仍由快照的 `label` 带出
+NODE_KEYS: dict[str, str] = {"拆解": "clue", "检索": "retrieve", "缺口": "gaps",
+                             "撰稿": "draft", "报告": "report"}
+
+# 阶段上报回调：`{"stage", "status", "attempt", "latency_ms", "error_category"}`
+StageReporter = Callable[[dict[str, Any]], Awaitable[None]]
+
 
 def retry_on_error(exc: Exception) -> bool:
     """节点级重试的判定：契约/编程错误不重试，其余（网络、上游、超时）重试。
@@ -63,6 +75,58 @@ def retry_on_error(exc: Exception) -> bool:
 
 
 DEFAULT_RETRY = RetryPolicy(max_attempts=3, retry_on=retry_on_error)
+
+
+class StageTracker:
+    """节点执行的统一埋点（S7.20）：把一次节点运行同时落到三处。
+
+    1. `RunStore.step` —— 本地产物 `trace.jsonl`（与历史口径一致）；
+    2. Langfuse `node.<key>` span —— 失败时标 ERROR（只记安全错误类别，不含错误正文）；
+    3. `runs.stage` 快照 —— 经调用方注入的 `on_stage` 回调（`RunRecorder.set_stage`），
+       让 `/api/jobs/{id}` 与对话轮询能看到"正在哪个环节"。
+
+    节点名沿用 `NODE_STEPS` 的中文名，快照里换成稳定键（`NODE_KEYS`）；
+    同一节点的多次执行（LangGraph 重试）`attempt` 递增，快照的迟到更新由 `core/progress.py` 挡住。
+    """
+
+    def __init__(self, store: RunStore, tracer: Tracer,
+                 on_stage: StageReporter | None = None) -> None:
+        self.store = store
+        self.tracer = tracer
+        self.on_stage = on_stage
+        self._attempts: dict[str, int] = {}
+
+    @asynccontextmanager
+    async def stage(self, name: str, *, detail: str = "",
+                    skipped: bool = False) -> AsyncIterator[dict[str, Any]]:
+        key = NODE_KEYS.get(name, name)
+        attempt = self._attempts.get(name, 0) + 1
+        self._attempts[name] = attempt
+        started = time.monotonic()
+        await self._report(key, "running", attempt, 0, "")
+        with self.tracer.node(name=f"node.{key}",
+                              metadata={"stage": key, "attempt": attempt}) as fields:
+            try:
+                with self.store.step(name, detail=detail, skipped=skipped) as record:
+                    yield record
+            except BaseException as exc:
+                category = error_category_of(exc)
+                fields.level = LEVEL_ERROR
+                fields.status_message = category
+                await self._report(key, "failed", attempt,
+                                   int((time.monotonic() - started) * 1000), category)
+                raise
+            else:
+                status = "skipped" if skipped else "succeeded"
+                await self._report(key, status, attempt,
+                                   int((time.monotonic() - started) * 1000), "")
+
+    async def _report(self, key: str, status: str, attempt: int, latency_ms: int,
+                      error_category: str) -> None:
+        if self.on_stage is None:
+            return
+        await self.on_stage({"stage": key, "status": status, "attempt": attempt,
+                             "latency_ms": latency_ms, "error_category": error_category})
 
 
 @dataclass
@@ -105,9 +169,12 @@ def _meta_from_retrieval(state: AnalysisState) -> dict:
 
 def build_graph(*, caller: StructuredCaller, retrieve: Callable[[HotspotClue], Awaitable],
                 store: RunStore, base_dir: str = PROJECT_ROOT,
-                style: str = DEFAULT_STYLE, retry_policy: RetryPolicy | None = None):
+                style: str = DEFAULT_STYLE, retry_policy: RetryPolicy | None = None,
+                tracer: Tracer | None = None,
+                on_stage: StageReporter | None = None):
     """装配五节点图。依赖（模型调用 / 检索 / 运行记录）全部可注入，便于离线单测。"""
     policy = retry_policy if retry_policy is not None else DEFAULT_RETRY
+    tracker = StageTracker(store, tracer if tracer is not None else NullTracer(), on_stage)
 
     def _record_llm(before: int) -> None:
         """把本节点新产生的模型调用记录进 RunStore（进度上报）。"""
@@ -116,12 +183,12 @@ def build_graph(*, caller: StructuredCaller, retrieve: Callable[[HotspotClue], A
 
     async def clue_node(state: AnalysisState) -> dict:
         # 线索复用：同一个热点第二次分析时直接用库里已存的快照，省掉一次模型调用
-        # （数据契约 §3.2「避免重复付费」）。步骤照记，pending 计算不受影响。
+        # （数据契约 §3.2「避免重复付费」）。步骤照记并标 skipped（S7.20），pending 计算不受影响。
         if state.get("clue"):
-            with store.step(NODE_STEPS[0], detail="复用已有线索"):
+            async with tracker.stage(NODE_STEPS[0], detail="复用已有线索", skipped=True):
                 pass
             return {}
-        with store.step(NODE_STEPS[0], detail=state.get("hotspot_raw", "")):
+        async with tracker.stage(NODE_STEPS[0], detail=state.get("hotspot_raw", "")):
             before = len(caller.records)
             outcome = await extract_clue(state["hotspot_raw"], caller)
             _record_llm(before)
@@ -130,7 +197,7 @@ def build_graph(*, caller: StructuredCaller, retrieve: Callable[[HotspotClue], A
 
     async def retrieve_node(state: AnalysisState) -> dict:
         clue = HotspotClue.from_dict(state["clue"], hotspot_raw=state.get("hotspot_raw", ""))
-        with store.step(NODE_STEPS[1], detail=clue.hotspot_raw):
+        async with tracker.stage(NODE_STEPS[1], detail=clue.hotspot_raw):
             outcome: RetrievalOutcome = await retrieve(clue)
             before = len(caller.records)
             explained = await explain_candidates(clue, list(outcome.candidates), caller)
@@ -149,7 +216,7 @@ def build_graph(*, caller: StructuredCaller, retrieve: Callable[[HotspotClue], A
         }
 
     async def gaps_node(state: AnalysisState) -> dict:
-        with store.step(NODE_STEPS[2]):
+        async with tracker.stage(NODE_STEPS[2]):
             coverage = (state.get("retrieval") or {}).get("coverage") or {}
             advice = gaps_tool.gap_advice(coverage)
         return {"gap_advice": advice}
@@ -158,7 +225,7 @@ def build_graph(*, caller: StructuredCaller, retrieve: Callable[[HotspotClue], A
         clue = HotspotClue.from_dict(state["clue"], hotspot_raw=state.get("hotspot_raw", ""))
         candidates = (state.get("retrieval") or {}).get("candidates") or []
         chosen = candidates[0].get("material") if candidates else None
-        with store.step(NODE_STEPS[3], detail=clue.hotspot_raw):
+        async with tracker.stage(NODE_STEPS[3], detail=clue.hotspot_raw):
             before = len(caller.records)
             outcome = await write_draft(clue, chosen, caller, style=style)
             _record_llm(before)
@@ -169,7 +236,7 @@ def build_graph(*, caller: StructuredCaller, retrieve: Callable[[HotspotClue], A
         return update
 
     async def report_node(state: AnalysisState) -> dict:
-        with store.step(NODE_STEPS[4], detail=state.get("hotspot_raw", "")):
+        async with tracker.stage(NODE_STEPS[4], detail=state.get("hotspot_raw", "")):
             model = dict(state.get("report_model") or {})
             entry = hotspot_entry(
                 clue=state.get("clue") or {},
@@ -293,11 +360,19 @@ async def _run_analysis(hotspots: list[str], *, cfg: AppConfig, session, store: 
 
         async def retrieve(clue: HotspotClue):
             # http 透传给检索层：它要在造向量客户端时复用本次运行的连接池（S3.5）
+            # tracer 透传：查询 embedding 子步要有耗时与成功 / 失败状态（S7.20）
             return await retrieve_candidates(session, cfg, clue, embedder=embedder, now=now,
-                                             topk=effective_topk, http=http)
+                                             topk=effective_topk, http=http, tracer=tracer)
+
+        async def on_stage(payload: dict[str, Any]) -> None:
+            """节点阶段快照（S7.20）：无写回模式（离线 / 评测）时不落库，只留 span 与 trace.jsonl。"""
+            if recorder is None:
+                return
+            await recorder.set_stage(**payload)
 
         graph = build_graph(caller=caller, retrieve=retrieve, store=store,
-                            style=style, retry_policy=retry_policy)
+                            style=style, retry_policy=retry_policy,
+                            tracer=tracer, on_stage=on_stage)
         model = build_report_model(
             run_id=store.run_id,
             created_at=store.state["created_at"],

@@ -216,9 +216,11 @@ class Tracer(Protocol):
     def turn(self, *, name: str, metadata: dict[str, Any],
              turn_id: str = "") -> AbstractContextManager[None]: ...
 
-    def tool(self, *, name: str, metadata: dict[str, Any]) -> AbstractContextManager[None]: ...
+    def tool(self, *, name: str,
+             metadata: dict[str, Any]) -> AbstractContextManager[Generation]: ...
 
-    def node(self, *, name: str, metadata: dict[str, Any]) -> AbstractContextManager[None]: ...
+    def node(self, *, name: str,
+             metadata: dict[str, Any]) -> AbstractContextManager[Generation]: ...
 
     def finish_run(self, *, status: str, totals: dict[str, Any], run_id: str = "",
                    prompt_versions: dict[str, int] | None = None, error: str = "") -> None: ...
@@ -253,11 +255,13 @@ class NullTracer:
              turn_id: str = "") -> AbstractContextManager[None]:
         return nullcontext(None)
 
-    def tool(self, *, name: str, metadata: dict[str, Any]) -> AbstractContextManager[None]:
-        return nullcontext(None)
+    def tool(self, *, name: str,
+             metadata: dict[str, Any]) -> AbstractContextManager[Generation]:
+        return nullcontext(Generation(metadata=dict(metadata)))
 
-    def node(self, *, name: str, metadata: dict[str, Any]) -> AbstractContextManager[None]:
-        return nullcontext(None)
+    def node(self, *, name: str,
+             metadata: dict[str, Any]) -> AbstractContextManager[Generation]:
+        return nullcontext(Generation(metadata=dict(metadata)))
 
     def finish_run(self, *, status: str, totals: dict[str, Any], run_id: str = "",
                    prompt_versions: dict[str, int] | None = None, error: str = "") -> None:
@@ -403,18 +407,42 @@ class LangfuseTracer:
             yield None
 
     @contextmanager
-    def tool(self, *, name: str, metadata: dict[str, Any]) -> Iterator[None]:
+    def tool(self, *, name: str, metadata: dict[str, Any]) -> Iterator[Generation]:
         """一次工具调用的 span（提交分析时的 traceparent 就取自它，S7.20）。"""
+        fields = Generation(metadata=dict(metadata))
         with self._client.start_as_current_observation(name=name, as_type="span",
                                                        metadata=dict(metadata)):
-            yield None
+            try:
+                yield fields
+            finally:
+                self._apply_span(fields)
 
     @contextmanager
-    def node(self, *, name: str, metadata: dict[str, Any]) -> Iterator[None]:
+    def node(self, *, name: str, metadata: dict[str, Any]) -> Iterator[Generation]:
         """一个执行节点的 span：分析五节点、worker 前后置、检索子步（S7.19 / S7.20）。"""
+        fields = Generation(metadata=dict(metadata))
         with self._client.start_as_current_observation(name=name, as_type="span",
                                                        metadata=dict(metadata)):
-            yield None
+            try:
+                yield fields
+            finally:
+                self._apply_span(fields)
+
+    def _apply_span(self, fields: Generation) -> None:
+        """把 span 块内填的 level / status_message / metadata 写回（失败只记日志）。"""
+        payload: dict[str, Any] = {}
+        if fields.metadata:
+            payload["metadata"] = dict(fields.metadata)
+        if fields.level:
+            payload["level"] = fields.level
+        if fields.status_message:
+            payload["status_message"] = fields.status_message[:1000]
+        if not payload:
+            return
+        try:
+            self._client.update_current_span(**payload)
+        except Exception:   # noqa: BLE001 - 上报失败只记日志，绝不影响业务
+            logger.warning("Langfuse span 上报失败（不影响业务）", exc_info=True)
 
     def finish_turn(self, *, status: str, totals: dict[str, Any], turn_id: str = "",
                     error: str = "") -> None:
@@ -422,7 +450,6 @@ class LangfuseTracer:
         metadata: dict[str, Any] = {
             "status": status,
             "tool_calls": int(totals.get("tool_calls") or 0),
-            "llm_calls": int(totals.get("llm_calls") or 0),
             "prompt_tokens": int(totals.get("prompt_tokens") or 0),
             "completion_tokens": int(totals.get("completion_tokens") or 0),
             "cost_cny": round(float(totals.get("cost_cny") or 0.0), 4),
@@ -430,6 +457,8 @@ class LangfuseTracer:
             # 用量不完整（失败 / usage 缺失）时如实标记，不把估算包装成准确值（约定 §7）
             "usage_complete": bool(totals.get("usage_complete", True)),
         }
+        if "llm_calls" in totals:                # 对话侧拿不到精确调用次数时如实缺省
+            metadata["llm_calls"] = int(totals.get("llm_calls") or 0)
         if turn_id:
             metadata["turn_id"] = turn_id
         payload: dict[str, Any] = {

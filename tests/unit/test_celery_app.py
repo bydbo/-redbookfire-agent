@@ -177,6 +177,37 @@ class TestTraceCarrier:
         assert seen["carrier"] == {"traceparent": self.TRACEPARENT}
 
 
+class TestTurnIdPropagation:
+    """S7.20：`turn_id` 走独立业务头（`x-xhs-turn-id`），单独透传给 worker 绑日志上下文。"""
+
+    def _task(self, headers: dict[str, str]):
+        task = FakeTask(retries=0, max_retries=2)
+        task.request.headers = headers          # type: ignore[attr-defined]
+        return task
+
+    def test_turn_id_is_read_from_task_headers(self):
+        task = self._task({"x-xhs-turn-id": "turn-9",
+                           "traceparent": TestTraceCarrier.TRACEPARENT})
+        assert analysis._turn_id_from_task(task) == "turn-9"
+
+    def test_turn_id_is_empty_without_header(self):
+        assert analysis._turn_id_from_task(FakeTask()) == ""
+
+    def test_execute_forwards_turn_id_and_retries(self, tmp_path, monkeypatch):
+        cfg = make_config(tmp_path)
+        task = self._task({"x-xhs-turn-id": "turn-9"})
+        seen: dict = {}
+
+        async def fake_run_job(job_id, cfg, **kwargs):
+            seen.update(kwargs)
+            return "succeeded"
+
+        monkeypatch.setattr(analysis, "run_job", fake_run_job)
+        assert execute(task, "job-1", cfg) == "succeeded"
+        assert seen["turn_id"] == "turn-9"
+        assert seen["retries"] == 0
+
+
 class TestStaleRunReconcile:
     """S4.1 的对账接线：阈值来自 `[queue].task_time_limit_s × 2`，由 worker_ready 触发一次。"""
 

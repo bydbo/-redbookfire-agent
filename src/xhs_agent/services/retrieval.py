@@ -15,6 +15,7 @@
 
 from __future__ import annotations
 
+import time
 import uuid
 from contextlib import AsyncExitStack
 from dataclasses import dataclass, field, replace
@@ -27,6 +28,8 @@ from sqlalchemy.dialects.postgresql import ARRAY
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..config import AppConfig
+from ..core.progress import error_category as error_category_of
+from ..core.tracing import LEVEL_ERROR, NullTracer, Tracer
 from ..db.models import EMBEDDING_DIM
 from ..db.models import Material as MaterialRow
 from ..schemas import Coverage, HotspotClue, MatchCandidate
@@ -158,11 +161,33 @@ def _ranks(hits: list[tuple[str, float]]) -> dict[str, int]:
     return {material_id: rank for rank, (material_id, _score) in enumerate(hits, start=1)}
 
 
+async def _embed_query(client: EmbeddingClient, clue: HotspotClue,
+                       *, tracer: Tracer | None) -> Any:
+    """查询向量化（S7.20）：`node.embedding_query` span 记耗时与成功 / 失败状态。
+
+    失败仍**原样上抛**（`retrieve_candidates` 不降级的口径不变）；span 里只写安全错误类别，
+    不写错误正文或查询文本。
+    """
+    active = tracer if tracer is not None else NullTracer()
+    started = time.monotonic()
+    with active.node(name="node.embedding_query",
+                     metadata={"stage": "embedding_query"}) as fields:
+        try:
+            result = await client.embed([retrieval_tool.vector_query_text(clue)])
+        except BaseException as exc:
+            fields.level = LEVEL_ERROR
+            fields.status_message = error_category_of(exc)
+            raise
+        fields.metadata["latency_ms"] = int((time.monotonic() - started) * 1000)
+        return result
+
+
 async def retrieve_candidates(session: AsyncSession, cfg: AppConfig, clue: HotspotClue, *,
                               embedder: EmbeddingClient | None = None,
                               now: float | None = None,
                               topk: int | None = None,
-                              http: httpx.AsyncClient | None = None) -> RetrievalOutcome:
+                              http: httpx.AsyncClient | None = None,
+                              tracer: Tracer | None = None) -> RetrievalOutcome:
     """一次检索：双通道召回 → 映射成内存素材 → 融合排序 → 返回结果。
 
     输入：`session`、`cfg`（读 `[retrieval]` / `[match]` / `[embedding]`）、`clue`；
@@ -170,6 +195,7 @@ async def retrieve_candidates(session: AsyncSession, cfg: AppConfig, clue: Hotsp
     `topk`（可选覆盖：worker 传 `runs.topk`；None = 用 `cfg.match.topk`）。
     `http`（可选 httpx 客户端：`embedder` 未注入时用它造向量客户端，让一次运行复用同一个
     连接池；None = 这里临时起一个）。
+    `tracer`（可选，S7.20）：只给「查询向量化」子步加 span 与耗时，不改变召回 / 排序结果。
     异常：向量召回已启用但查询向量化失败时抛 `EmbeddingError`（不降级）。
     """
     params = retrieval_tool.RetrievalParams.from_config(cfg)
@@ -195,7 +221,7 @@ async def retrieve_candidates(session: AsyncSession, cfg: AppConfig, clue: Hotsp
                 client = build_embedder(cfg, client=shared)
             if client is None:  # pragma: no cover - enabled 为真时 build_embedder 不会返回 None
                 raise RuntimeError("向量召回已启用但没有可用的 embedding 客户端")
-            embedded = await client.embed([retrieval_tool.vector_query_text(clue)])
+            embedded = await _embed_query(client, clue, tracer=tracer)
         query_vector = embedded.vectors[0]
         vector_hits = await vector_recall(session, query_vector, cfg.embedding.model,
                                           limit=params.recall_limit,

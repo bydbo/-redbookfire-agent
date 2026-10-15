@@ -65,13 +65,14 @@ class FakeProvider(llm.BaseProvider):
 
 
 class FakeTracer:
-    """记录 run / hotspot / generation 三类事件的假追踪器（S4.2，离线用）。"""
+    """记录 run / hotspot / node / generation 事件的假追踪器（S4.2 起，S7.19 补 node）。"""
 
     enabled = True
 
     def __init__(self) -> None:
         self.events: list[tuple[str, dict]] = []
         self.finished: dict = {}
+        self.finished_turn: dict = {}
         self.flushes = 0
 
     @contextmanager
@@ -85,6 +86,13 @@ class FakeTracer:
         yield None
 
     @contextmanager
+    def node(self, *, name, metadata):
+        fields = Generation(metadata=dict(metadata))
+        self.events.append(("node", {"name": name, **metadata}))
+        yield fields
+        self.events[-1][1]["level"] = fields.level
+
+    @contextmanager
     def generation(self, *, name, model, metadata):
         fields = Generation(metadata=dict(metadata))
         self.events.append(("generation", {"name": name, "model": model, **metadata}))
@@ -94,9 +102,30 @@ class FakeTracer:
         event["cost"] = dict(fields.cost_details)
         event["level"] = fields.level
 
+    # S7.19 新增门面的空实现（本文件只关心 run / hotspot / node / generation）
+    @contextmanager
+    def turn(self, *, name, metadata, turn_id=""):
+        self.events.append(("turn", {"name": name, "turn_id": turn_id}))
+        yield None
+
+    @contextmanager
+    def tool(self, *, name, metadata):
+        fields = Generation(metadata=dict(metadata))
+        self.events.append(("tool", {"name": name, **metadata}))
+        yield fields
+
     def finish_run(self, *, status, totals, run_id="", prompt_versions=None, error=""):
         self.finished = {"status": status, "totals": dict(totals), "run_id": run_id,
                          "prompt_versions": dict(prompt_versions or {}), "error": error}
+
+    def finish_turn(self, *, status, totals, turn_id="", error=""):
+        self.finished_turn = {"status": status, "totals": dict(totals), "turn_id": turn_id}
+
+    def current_trace_id(self):
+        return "trace-fake"
+
+    def trace_url(self, trace_id):
+        return None
 
     def flush(self):
         self.flushes += 1
@@ -130,7 +159,8 @@ def fake_retrieve(outcome: RetrievalOutcome):
     calls: list[str] = []
     topks: list[int | None] = []
 
-    async def _retrieve(session, cfg, clue, *, embedder=None, now=None, topk=None, http=None):
+    async def _retrieve(session, cfg, clue, *, embedder=None, now=None, topk=None, http=None,
+                        tracer=None):
         calls.append(clue.hotspot_raw)
         topks.append(topk)
         return outcome
@@ -173,7 +203,7 @@ class TestRetryJudgement:
 class TestRunAnalysis:
     @pytest.mark.asyncio
     async def test_reports_trace_spans_and_generations(self, cfg, monkeypatch):
-        """S4.2：一次运行 = 1 个 run + N 个 hotspot + 每个热点 3 个 generation。"""
+        """S4.2 / S7.20：一次运行 = 1 个 run + N 个 hotspot + 每热点 5 个 node + 3 个 generation。"""
         monkeypatch.setattr(workflow, "retrieve_candidates", fake_retrieve(make_outcome()))
         tracer = FakeTracer()
         caller = StructuredCaller(provider=TracingProvider(
@@ -183,12 +213,16 @@ class TestRunAnalysis:
                                     tracer=tracer, trace_metadata={"job_id": "job-1"})
 
         kinds = [kind for kind, _payload in tracer.events]
-        assert kinds == ["run", "hotspot", "generation", "generation", "generation",
-                         "hotspot", "generation", "generation", "generation"]
+        per_hotspot = ["node", "generation", "node", "generation", "node", "node",
+                       "generation", "node"]
+        assert kinds == ["run", "hotspot", *per_hotspot, "hotspot", *per_hotspot]
         run_event = tracer.events[0][1]
         assert run_event["name"] == "analyze" and run_event["hotspots"] == 2
         assert run_event["job_id"] == "job-1"
-        first_generation = tracer.events[2][1]
+        node_names = [payload["name"] for kind, payload in tracer.events if kind == "node"]
+        assert node_names[:5] == ["node.clue", "node.retrieve", "node.gaps",
+                                  "node.draft", "node.report"]
+        first_generation = tracer.events[3][1]
         assert first_generation["name"] == "hotspot_clue"
         assert first_generation["usage"] == {"input": 100, "output": 50, "total": 150}
         assert first_generation["cost"]["total"] == pytest.approx(100 / 1e6 * 2.16
@@ -357,3 +391,54 @@ class TestRunAnalysis:
         steps = store.state["steps"]
         assert [step["name"] for step in steps] == list(NODE_STEPS)
         assert steps[0]["detail"] == "复用已有线索"
+        assert steps[0]["status"] == "skipped"      # S7.20：短路不冒充 succeeded
+
+    @pytest.mark.asyncio
+    async def test_stage_reporter_records_lifecycles_and_skipped(self, cfg, tmp_path):
+        """S7.20：节点阶段上报（running → 终态）与短路 skipped 都可见。"""
+        store = RunStore(str(tmp_path / "runs"), "阶段")
+        provider = FakeProvider()
+        fake = fake_retrieve(make_outcome())
+        reported: list[dict] = []
+
+        async def on_stage(payload):
+            reported.append(dict(payload))
+
+        async def retrieve(clue):
+            return await fake(None, None, clue)
+
+        graph = workflow.build_graph(caller=StructuredCaller(provider=provider),
+                                     retrieve=retrieve, store=store, on_stage=on_stage)
+        await graph.ainvoke({"hotspot_raw": "某明星打羽毛球", "clue": CLUE_PAYLOAD})
+
+        keys = [(item["stage"], item["status"]) for item in reported]
+        assert keys[0] == ("clue", "running")       # 阶段先报 running，再报终态
+        assert ("clue", "skipped") in keys
+        assert ("retrieve", "succeeded") in keys
+        assert ("report", "succeeded") in keys
+        assert keys[-1] == ("report", "succeeded")
+
+    @pytest.mark.asyncio
+    async def test_stage_reporter_marks_failed_node(self, cfg, tmp_path):
+        """节点重试仍失败：阶段上报带安全错误类别（llm_error），不写错误正文。"""
+        store = RunStore(str(tmp_path / "runs"), "失败")
+        reported: list[dict] = []
+
+        async def on_stage(payload):
+            reported.append(dict(payload))
+
+        fake = fake_retrieve(make_outcome())
+
+        async def retrieve(clue):
+            return await fake(None, None, clue)
+
+        graph = workflow.build_graph(
+            caller=StructuredCaller(provider=FakeProvider(fail_times=99)),
+            retrieve=retrieve, store=store, retry_policy=FAST_RETRY, on_stage=on_stage)
+        with pytest.raises(LLMError):
+            await graph.ainvoke({"hotspot_raw": "某明星打羽毛球"})
+
+        failed = [item for item in reported if item["status"] == "failed"]
+        assert failed and failed[0]["stage"] == "clue"
+        assert failed[0]["error_category"] == "llm_error"
+        assert store.state["steps"][0]["status"] == "failed"

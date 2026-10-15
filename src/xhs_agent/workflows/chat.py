@@ -19,8 +19,8 @@
   内部模型调用（含图片解析、分析那次 run）之和，与 `cost_cny` 一起落 `chat_messages`（S7.10）；
 - 模型点名不存在的工具：记一条 `status=failed` 的工具记录并结束这一轮（不猜、不硬套）；
 - 工具失败不炸整轮：把失败原因作为 tool 消息喂回模型，由它向用户解释；
-- 事件只在两个地方发：模型正文增量（`text_delta`）与工具过程（`tool_started` /
-  `tool_progress` / `tool_finished`）——由调用方（S7.4 的运行器）转成 SSE。
+- 事件：阶段生命周期（`stage`，S7.20）、模型正文增量（`text_delta`）与工具过程
+  （`tool_started` / `tool_progress` / `tool_finished`）——由调用方（S7.4 的运行器）转成 SSE。
 """
 
 from __future__ import annotations
@@ -36,9 +36,12 @@ from typing_extensions import TypedDict
 
 from ..agents.supervisor import TASK_ID, initial_messages, supervise
 from ..config import AppConfig
+from ..core import progress as progress_tool
+from ..core.progress import error_category as error_category_of
 from ..services import chat_tools
 from ..services.chat_tools import ToolOutcome
 from ..tools.llm import BaseProvider
+from ..util import now_iso
 
 EventFn = Callable[[str, dict[str, Any]], Awaitable[None]]
 ToolRunner = Callable[..., Awaitable[ToolOutcome]]
@@ -75,6 +78,9 @@ class ChatTurn:
     prompt_versions: dict[str, int] = field(default_factory=dict)
     status: str = "succeeded"
     error: str = ""
+    # S7.19 / S7.20：本轮 trace（运行器在 turn span 内取）与失败类别（只记安全枚举）
+    trace_id: str = ""
+    error_category: str = ""
 
 
 def _build_graph(*, provider: BaseProvider, run_tool: ToolRunner, max_rounds: int,
@@ -87,14 +93,29 @@ def _build_graph(*, provider: BaseProvider, run_tool: ToolRunner, max_rounds: in
 
     async def supervisor_node(state: ChatState) -> dict[str, Any]:
         rounds = int(state.get("tool_rounds") or 0)
+        attempt = rounds + 1                     # 第几轮决策（多轮决策不等于重试）
         remaining = max(0, int(max_rounds) - rounds)
         tools = chat_tools.TOOLS if remaining > 0 else []   # 到上限就不给工具，逼出正文
+
+        # S7.20：决策阶段的生命周期事件——前端据此区分"理解与决策 / 工具 / 排队 / 回复"
+        await emit("stage", {"stage": "supervisor",
+                             "label": progress_tool.label_for("supervisor"),
+                             "status": "running", "attempt": attempt,
+                             "started_at": now_iso(), "updated_at": now_iso()})
 
         async def delta(piece: str) -> None:
             await emit("text_delta", {"text": piece})
 
-        turn = await supervise(provider, state.get("messages") or [], tools=tools,
-                               on_delta=delta if stream else None, stream=stream)
+        try:
+            turn = await supervise(provider, state.get("messages") or [], tools=tools,
+                                   on_delta=delta if stream else None, stream=stream)
+        except BaseException as exc:
+            await emit("stage", {"stage": "supervisor", "status": "failed", "attempt": attempt,
+                                 "error_category": error_category_of(exc),
+                                 "updated_at": now_iso()})
+            raise
+        await emit("stage", {"stage": "supervisor", "status": "succeeded", "attempt": attempt,
+                             "updated_at": now_iso()})
         records = [*(state.get("records") or []), turn.record]
         # 已知 / 未知**按工具清单动态划分**（S7.7a）：这里不写任何具体工具名，
         # 加工具只改 `services/chat_tools.py` 一处。清单读模块属性而不是导入时快照，
@@ -116,6 +137,8 @@ def _build_graph(*, provider: BaseProvider, run_tool: ToolRunner, max_rounds: in
         return {"records": records, "version": version, "reply": reply,
                 "tool_calls": history, "pending": pending}
 
+    tool_attempts: dict[str, int] = {}           # 同一工具在本轮内的第几次执行（S7.20）
+
     async def tools_node(state: ChatState) -> dict[str, Any]:
         messages = list(state.get("messages") or [])
         history = list(state.get("tool_calls") or [])
@@ -124,22 +147,32 @@ def _build_graph(*, provider: BaseProvider, run_tool: ToolRunner, max_rounds: in
         run_id = str(state.get("run_id") or "")
 
         for call in state.get("pending") or []:
-            await emit("tool_started", {"tool": call["name"], "args": call["args"]})
+            name = str(call.get("name") or "")
+            tool_attempts[name] = tool_attempts.get(name, 0) + 1
+            attempt = tool_attempts[name]
+            call_id = call.get("id") or f"{name}-{rounds + 1}"
+            await emit("tool_started", {"tool": name, "args": call["args"], "call_id": call_id,
+                                        "attempt": attempt, "started_at": now_iso()})
             started = time.monotonic()
 
             async def progress(stage: str, done: int = 0, total: int = 0,
-                               _call: dict[str, Any] = call) -> None:
-                await emit("tool_progress", {"tool": _call["name"], "stage": stage,
-                                             "done": done, "total": total})
+                               _call: dict[str, Any] = call, _call_id: str = call_id,
+                               _attempt: int = attempt) -> None:
+                await emit("tool_progress", {
+                    "tool": _call["name"], "stage": stage,
+                    "stage_key": progress_tool.key_for_label(stage), "status": "running",
+                    "done": done, "total": total, "call_id": _call_id, "attempt": _attempt,
+                    "updated_at": now_iso()})
 
             if call.get("args_error"):
                 outcome = ToolOutcome(status="failed", error=str(call["args_error"]))
             else:
                 outcome = await run_tool(call["name"], call["args"], on_progress=progress)
 
-            call_id = call.get("id") or f"{call['name']}-{rounds + 1}"
             entry = {
-                "tool": call["name"],
+                "tool": name,
+                "call_id": call_id,
+                "attempt": attempt,
                 "status": outcome.status,
                 "args": call["args"],
                 "run_id": outcome.payload.get("run_id"),
@@ -158,7 +191,7 @@ def _build_graph(*, provider: BaseProvider, run_tool: ToolRunner, max_rounds: in
                  "function": {"name": call["name"], "arguments": call["arguments"]}}]})
             messages.append({"role": "tool", "tool_call_id": call_id,
                              "content": outcome.as_tool_message()})
-            await emit("tool_finished", dict(entry))
+            await emit("tool_finished", {**entry, "ended_at": now_iso()})
             run_id = str(outcome.payload.get("run_id") or run_id)
 
         return {"messages": messages, "tool_calls": history, "pending": [],
@@ -199,6 +232,7 @@ async def run_turn(cfg: AppConfig, *, provider: BaseProvider, history: list[dict
         })
     except Exception as exc:                     # noqa: BLE001 - 整轮失败要落库，不能炸进程
         return ChatTurn(status="failed", error=f"{type(exc).__name__}: {exc}",
+                        error_category=error_category_of(exc),
                         latency_ms=int((time.monotonic() - started) * 1000),
                         prompt_versions={TASK_ID: rendered.version})
 

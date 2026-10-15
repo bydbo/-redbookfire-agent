@@ -95,6 +95,18 @@ class TestSteps:
             pass
         assert [step["name"] for step in store.state["steps"]] == ["一", "二"]
 
+    def test_skipped_step_is_recorded_as_skipped(self, store):
+        """S7.20：短路步骤（复用线索的拆解节点）标 skipped，不冒充 succeeded。"""
+        with store.step("拆解", "复用已有线索", skipped=True):
+            pass
+        step = store.state["steps"][0]
+        assert step["status"] == "skipped"
+        assert step["ended_at"] and step["latency_ms"] >= 0
+        events = [json.loads(line) for line
+                  in pathlib.Path(store.trace_path).read_text(encoding="utf-8").splitlines()]
+        finished = [event for event in events if event["event"] == "step_finished"]
+        assert finished and finished[0]["payload"]["status"] == "skipped"
+
 
 class TestLLMRecords:
     def test_totals_accumulate(self, store):

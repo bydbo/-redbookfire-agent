@@ -674,3 +674,54 @@ class TestRunIdFallback:
                                      {"request": "改得更口语一点"})
 
         assert outcome.status == "failed" and "还没跑过分析" in outcome.error
+
+
+class FakePollSession:
+    """只满足 `_wait_for_run` 的形状（`expire_all` 不发 SQL）。"""
+
+    def __init__(self) -> None:
+        self.expired = 0
+
+    def expire_all(self) -> None:
+        self.expired += 1
+
+
+class TestWaitForRunStages:
+    """S7.20：轮询阶段——排队等待 / 素材同步 / 拆解逐段上报，同一阶段不重复。"""
+
+    @pytest.mark.asyncio
+    async def test_reports_new_stages_once(self, tmp_path: Path,
+                                           monkeypatch: pytest.MonkeyPatch) -> None:
+        jobs: list[dict[str, Any]] = [
+            {"status": "queued", "progress": 0.0, "stage": None},
+            {"status": "running", "progress": 0.05,
+             "stage": {"stage": "material_sync", "status": "running"}},
+            {"status": "running", "progress": 0.05,
+             "stage": {"stage": "material_sync", "status": "running"}},
+            {"status": "running", "progress": 0.4,
+             "stage": {"stage": "clue", "status": "running"}},
+            {"status": "succeeded", "progress": 1.0,
+             "stage": {"stage": "report", "status": "succeeded"}},
+        ]
+        pending = list(jobs)
+
+        async def fake_load_job(_session: Any, _job_id: str) -> dict[str, Any]:
+            return dict(pending.pop(0)) if pending else dict(jobs[-1])
+
+        async def fake_sleep(_seconds: float) -> None:
+            return None
+
+        monkeypatch.setattr(chat_tools, "load_job", fake_load_job)
+        session = FakePollSession()
+        ctx = ToolContext(cfg=write_config(tmp_path), session=cast(Any, session),
+                          sleep=fake_sleep, poll_interval_s=0.0)
+        labels: list[str] = []
+
+        async def progress(stage: str, done: int = 0, total: int = 0) -> None:
+            labels.append(stage)
+
+        status = await chat_tools._wait_for_run(ctx, "job-1", progress)
+
+        assert status == "succeeded"
+        assert labels == ["排队等待", "素材同步", "分析中", "拆解"]
+        assert session.expired == 5              # 每次轮询都先过期，读到的是库里的新值

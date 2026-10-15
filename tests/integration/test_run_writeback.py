@@ -22,7 +22,13 @@ from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
 from xhs_agent.config import AppConfig, load_config
 from xhs_agent.db import Base
 from xhs_agent.db.models import EMBEDDING_DIM, Hotspot, Run, RunHotspot, RunMatch
-from xhs_agent.services.runs import load_run, planned_hotspots, submit_analysis
+from xhs_agent.services.runs import (
+    load_job,
+    load_run,
+    planned_hotspots,
+    set_run_stage,
+    submit_analysis,
+)
 from xhs_agent.tools import llm
 from xhs_agent.tools.embedding import EmbeddingResult
 from xhs_agent.tools.llm import LLMResult, StructuredCaller
@@ -344,3 +350,56 @@ async def _run_hotspot_count(session: AsyncSession, run_id: str) -> int:
     return int((await session.execute(
         select(func.count()).select_from(RunHotspot)
         .where(RunHotspot.run_id == uuid.UUID(run_id)))).scalar_one())
+
+
+async def _job_id_of(session: AsyncSession, run_id: str) -> str:
+    return str((await session.execute(
+        select(Run.job_id).where(Run.id == uuid.UUID(run_id)))).scalar_one())
+
+
+class TestRunStageSnapshot:
+    """S7.20：`runs.stage` 阶段快照——五节点可见、迟到更新不覆盖、`load_job` 投影正确。"""
+
+    @pytest.mark.asyncio
+    async def test_pipeline_records_node_stages(self, db_session: AsyncSession,
+                                                tmp_path: Path) -> None:
+        """跑完一批后：5 个节点都进了快照，收尾后 `current_step` 为空而节点明细仍在。"""
+        await seed_library(db_session)
+        cfg = write_config(tmp_path)
+        run_id = await start_run(db_session, ["阶段热点"])
+        await run_for(db_session, run_id, cfg, provider=FakeProvider())
+
+        job = await load_job(db_session, await _job_id_of(db_session, run_id))
+        snapshot = job["stage"]
+        assert snapshot["stage"] == "report"
+        assert snapshot["last_finished_stage"] == "report"
+        assert snapshot["status"] == "succeeded"
+        assert {node["stage"] for node in snapshot["nodes"]} >= {"clue", "retrieve",
+                                                                 "gaps", "draft", "report"}
+        assert job["current_step"] is None            # 已收尾：不再显示"正在做什么"
+
+    @pytest.mark.asyncio
+    async def test_late_attempt_does_not_override(self, db_session: AsyncSession) -> None:
+        """旧尝试的迟到更新不覆盖新状态（重试场景）。"""
+        run_id = await start_run(db_session, ["阶段热点二"])
+        await set_run_stage(db_session, run_id, stage="clue", status="running", attempt=2)
+        await set_run_stage(db_session, run_id, stage="clue", status="succeeded", attempt=1)
+
+        job = await load_job(db_session, await _job_id_of(db_session, run_id))
+        assert job["stage"]["status"] == "running"
+        assert job["current_step"] == "拆解"
+
+    @pytest.mark.asyncio
+    async def test_running_stage_projects_current_step(self, db_session: AsyncSession) -> None:
+        run_id = await start_run(db_session, ["阶段热点三"])
+        await set_run_stage(db_session, run_id, stage="material_sync", status="running")
+        await set_run_stage(db_session, run_id, stage="material_sync", status="succeeded",
+                            latency_ms=42)
+        await set_run_stage(db_session, run_id, stage="embedding_backfill", status="running")
+        await set_run_stage(db_session, run_id, stage="embedding_backfill", status="failed",
+                            error_category="embedding_error", latency_ms=8)
+
+        job = await load_job(db_session, await _job_id_of(db_session, run_id))
+        assert job["stage"]["last_finished_stage"] == "material_sync"
+        assert job["stage"]["error_category"] == "embedding_error"
+        assert job["current_step"] is None            # 没有在跑的阶段：如实为空

@@ -115,14 +115,19 @@ class CeleryDispatcher:
             self._app = build_celery_app(self.cfg)
         return self._app
 
-    async def enqueue(self, job_id: str) -> None:
+    async def enqueue(self, job_id: str, *, turn_id: str = "") -> None:
         from kombu.exceptions import KombuError
 
+        from ..core.progress import TURN_ID_HEADER
         from ..core.tracing import current_trace_headers
         from ..tasks.analysis import ANALYZE_TASK_NAME
 
-        # S4.3：把本次请求的 W3C traceparent 放进消息头，worker 接着这条 trace 往下走
+        # S4.3：把本次请求的 W3C traceparent 放进消息头，worker 接着这条 trace 往下走。
+        # S7.20：投递发生在工具 span 内时，traceparent 就取自那个工具 span（父 span 口径）；
+        # turn_id 走独立业务头，worker 侧单独绑定日志上下文——不混进 W3C carrier。
         headers = current_trace_headers()
+        if turn_id:
+            headers[TURN_ID_HEADER] = str(turn_id)
         try:
             await asyncio.to_thread(self.app().send_task, ANALYZE_TASK_NAME, args=[job_id],
                                     headers=headers, ignore_result=True)

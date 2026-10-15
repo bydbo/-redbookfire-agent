@@ -3,13 +3,15 @@
 用途：把「发一条消息」变成一次真正的对话——写好 `running` 的 assistant 行 → 跑对话图（S7.3）
       → 把结果写回消息 → 全程通过 Redis pub/sub 广播事件，SSE 端点订阅后转发给浏览器。
 输入：`AppConfig`、会话与消息、历史、本轮文本与附件、投递器（把分析投给 Celery）。
-输出：事件流（`turn_started` / `tool_started` / `tool_progress` / `tool_finished` /
+输出：事件流（`turn_started` / `stage` / `tool_started` / `tool_progress` / `tool_finished` /
       `text_delta` / `turn_finished` / `error`）与落库后的消息。
 
 口径：
 
 - **turn 跑在 detached asyncio 任务里**：浏览器断开只取消"转发"，不取消这一轮——结果照常落库。
   分析本来就在 Celery worker 跑；对话层的模型调用与图片解析接口同一先例（在 API 进程内等待）。
+- S7.19 / S7.20：整轮一个 `chat.turn` span，`tool.<name>` 是它的子 span；`turn_id` 绑进日志
+  上下文（结束后复位），随 Celery 业务头传给 worker；阶段生命周期走 `stage` 事件。
 - 事件走 Redis pub/sub（复用现有 redis 依赖，channel = `xhs_agent:chat:{turn_id}`）；
   **不做事件重放**：刷新后的中间态靠库里 `status=running` 的行 + 轮询补齐（数据契约 §3.7）。
 - 订阅（`TurnEvents.open()`）必须在起 turn **之前**完成，否则最早的几个事件会被漏掉。
@@ -22,8 +24,10 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import logging
+import time
 import uuid
 from collections.abc import AsyncIterator
 from contextlib import suppress
@@ -34,13 +38,24 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..config import AppConfig
 from ..core.errors import DependencyUnavailableError
-from ..core.tracing import Tracer, TracingProvider, capture_content, get_tracer
+from ..core.logging import bind_turn_id, reset_turn_id
+from ..core.progress import error_category as error_category_of
+from ..core.progress import label_for
+from ..core.tracing import (
+    LEVEL_ERROR,
+    NullTracer,
+    Tracer,
+    TracingProvider,
+    capture_content,
+    get_tracer,
+)
 from ..db.session import create_engine_from_config, create_session_factory
 from ..services import chat_tools
 from ..services.chat import latest_attachments, update_message
 from ..services.chat_tools import ToolContext, ToolOutcome
 from ..tools.http import build_http_client
 from ..tools.llm import BaseProvider, StructuredCaller, build_provider
+from ..util import now_iso
 from ..workflows.chat import ChatTurn, run_turn
 
 logger = logging.getLogger("xhs_agent.chat")
@@ -183,25 +198,67 @@ def build_turn_provider(cfg: AppConfig, client: Any, *,
         price_out_per_m=cfg.llm.price_out_per_m))
 
 
+def _enqueue_with_turn(enqueue: Any, turn_id: str) -> Any:
+    """把 `turn_id` 一并传给支持它的投递器（S7.20）。
+
+    只收 `job_id` 的旧替身（离线测试）原样返回——投递语义不变，只是不带业务标识；
+    真实 `CeleryDispatcher.enqueue` 能收 `turn_id`，worker 侧据此绑定日志上下文。
+    """
+    if enqueue is None or not turn_id:
+        return enqueue
+    try:
+        supports = "turn_id" in inspect.signature(enqueue).parameters
+    except (TypeError, ValueError):              # 内建 / C 实现没有可查签名
+        supports = False
+    if not supports:
+        return enqueue
+
+    async def wrapped(job_id: str) -> None:
+        await enqueue(job_id, turn_id=turn_id)
+
+    return wrapped
+
+
 def build_tool_runner(session: AsyncSession, *, cfg: AppConfig, client: Any,
                       session_id: uuid.UUID, attachments: list[dict[str, Any]],
                       dispatcher: Any, caller: Any = None,
-                      recent_attachments: list[dict[str, Any]] | None = None) -> Any:
+                      recent_attachments: list[dict[str, Any]] | None = None,
+                      turn_id: str = "", tracer: Tracer | None = None) -> Any:
     """工具执行器：按 `chat_tools.HANDLERS` 分派（S7.7a）——这里也不写具体工具名。
 
     `caller` 是给只读工具用的文本模型入口（拆解热点等）；`cache` 让同一轮内的同一件事
     只付一次钱（S7.7）。`recent_attachments` 是本会话最近**一组**图（S7.10 的跨轮图片回落，
     S7.16 改成整组）：这一轮没有附件时，用户说「上面那几张图」的工具调用才有东西可用。
+    S7.20：`turn_id` 随分析投递传给 worker（绑日志上下文）；`tracer` 给每次工具调用开一个
+    `tool.<name>` span——提交分析时的 traceparent 就取自它（worker 的父 span 口径）。
     """
+    active = tracer if tracer is not None else NullTracer()
     context = ToolContext(cfg=cfg, session=session, session_id=session_id,
-                          enqueue=getattr(dispatcher, "enqueue", None), http=client,
-                          caller=caller, recent_attachments=list(recent_attachments or []))
+                          enqueue=_enqueue_with_turn(getattr(dispatcher, "enqueue", None), turn_id),
+                          http=client, caller=caller,
+                          recent_attachments=list(recent_attachments or []))
 
     async def runner(name: str, args: dict[str, Any], *, on_progress: Any = None) -> Any:
         handler = chat_tools.HANDLERS.get(name)
         if handler is None:                      # 图已按清单过滤过；这里只是兜底，不炸整轮
             return ToolOutcome(status="failed", error=f"未知工具：{name}")
-        return await handler(context, args, attachments=attachments, on_progress=on_progress)
+        started = time.monotonic()
+        with active.tool(name=f"tool.{name}",
+                         metadata={"tool": name, "turn_id": turn_id}) as fields:
+            try:
+                outcome = await handler(context, args, attachments=attachments,
+                                        on_progress=on_progress)
+            except BaseException as exc:
+                fields.level = LEVEL_ERROR
+                fields.status_message = error_category_of(exc)
+                raise
+            fields.metadata["status"] = outcome.status
+            fields.metadata["latency_ms"] = int((time.monotonic() - started) * 1000)
+            if outcome.status != "succeeded":
+                # 只记安全类别：错误正文可能含用户原文 / 路径，不进追踪元数据（约定 §9）
+                fields.level = LEVEL_ERROR
+                fields.status_message = "tool_failed"
+            return outcome
 
     return runner
 
@@ -226,17 +283,24 @@ async def run_turn_task(cfg: AppConfig, events: TurnEvents, *, session_id: uuid.
                         message_id: uuid.UUID, history: list[dict[str, Any]], user_text: str,
                         attachment_note: str = "", attachments: list[dict[str, Any]] | None = None,
                         dispatcher: Any = None) -> None:
-    """任务体：自建 engine / httpx，跑完这一轮并把结果写回消息、广播事件。"""
+    """任务体：自建 engine / httpx，跑完这一轮并把结果写回消息、广播事件。
+
+    S7.19 / S7.20：整轮包在 `chat.turn` span 里（detached 任务继承到请求上下文就挂其下，
+    不继承也能自成因）；`turn_id` 绑进日志上下文并在 `finally` 复位；结束时按真实终态
+    收尾 span（成功 / 失败都有终态，不永远挂在 running）。
+    """
     engine = create_engine_from_config(cfg)
+    token = bind_turn_id(events.turn_id)
+    tracer = get_tracer(cfg)
     try:
         factory = create_session_factory(engine)
         try:
             async with factory() as session:
                 await events.publish("turn_started", {
                     "turn_id": events.turn_id, "session_id": str(session_id),
-                    "message_id": str(message_id)})
+                    "message_id": str(message_id), "started_at": now_iso()})
                 async with build_http_client(cfg.llm.timeout_s) as client:
-                    provider = build_turn_provider(cfg, client)
+                    provider = build_turn_provider(cfg, client, tracer=tracer)
                     # 跨轮图片回落（S7.10 / S7.16 按组）：先把本会话最近一组图取出来，工具在
                     # "本轮没带图"时才有得用（用户说「上面那几张图」正是这种情况）
                     recent = await latest_attachments(session, session_id)
@@ -245,24 +309,58 @@ async def run_turn_task(cfg: AppConfig, events: TurnEvents, *, session_id: uuid.
                                                attachments=attachments or [],
                                                dispatcher=dispatcher,
                                                caller=StructuredCaller(provider=provider),
-                                               recent_attachments=recent)
+                                               recent_attachments=recent,
+                                               turn_id=events.turn_id, tracer=tracer)
 
                     async def on_event(event: str, payload: dict[str, Any]) -> None:
-                        await events.publish(event, payload)
+                        body = dict(payload)
+                        if event != "text_delta":    # 每个 token 都补关联字段没有意义
+                            body.setdefault("turn_id", events.turn_id)
+                            body.setdefault("message_id", str(message_id))
+                        await events.publish(event, body)
 
-                    turn = await run_turn(cfg, provider=provider, history=history,
-                                          user_text=user_text, run_tool=runner,
-                                          attachment_note=attachment_note, on_event=on_event)
-                await _finish(session, events, turn, message_id=message_id,
-                              session_id=session_id)
+                    with tracer.turn(name="chat.turn",
+                                     metadata={"session_id": str(session_id),
+                                               "message_id": str(message_id)},
+                                     turn_id=events.turn_id):
+                        turn = await run_turn(cfg, provider=provider, history=history,
+                                              user_text=user_text, run_tool=runner,
+                                              attachment_note=attachment_note,
+                                              on_event=on_event)
+                        # 收尾阶段（S7.20）：正文已流式回吐，这一步只做写库与终态整理
+                        await events.publish("stage", {
+                            "turn_id": events.turn_id, "message_id": str(message_id),
+                            "stage": "final_reply", "label": label_for("final_reply"),
+                            "status": "running", "attempt": 1, "started_at": now_iso(),
+                            "run_id": turn.run_id or None})
+                        status = await _finish(session, events, turn, message_id=message_id,
+                                               session_id=session_id, tracer=tracer)
+                        tracer.finish_turn(status=status, totals=_turn_totals(turn),
+                                           turn_id=events.turn_id,
+                                           error=turn.error if status != "succeeded" else "")
         except Exception as exc:                 # noqa: BLE001 - 整轮失败要落库 + 广播，不炸进程
             logger.exception("对话轮次异常：%s", events.turn_id)
             error = f"{type(exc).__name__}: {exc}"[:200]
+            category = error_category_of(exc)
             await _mark_failed(factory, message_id=message_id, error=error)
-            await _fail(events, message_id=message_id, error=error)
+            with tracer.turn(name="chat.turn", metadata={"failed": True},
+                             turn_id=events.turn_id):
+                await _fail(events, message_id=message_id, error=error,
+                            error_category=category, tracer=tracer)
+                tracer.finish_turn(status="failed", totals={}, turn_id=events.turn_id,
+                                   error=error)
     finally:
+        reset_turn_id(token)
         await events.close_publisher()
         await engine.dispose()
+
+
+def _turn_totals(turn: ChatTurn) -> dict[str, Any]:
+    """轮次汇总（只给 trace 收尾展示用；父层不参与核账，不跨层相加，约定 §7）。"""
+    return {"tool_calls": len(turn.tool_calls),
+            "prompt_tokens": turn.prompt_tokens, "completion_tokens": turn.completion_tokens,
+            "cost_cny": turn.cost_cny, "latency_ms": turn.latency_ms,
+            "usage_complete": True}
 
 
 async def _mark_failed(factory: Any, *, message_id: uuid.UUID, error: str) -> None:
@@ -273,27 +371,49 @@ async def _mark_failed(factory: Any, *, message_id: uuid.UUID, error: str) -> No
 
 
 async def _finish(session: AsyncSession, events: TurnEvents, turn: ChatTurn, *,
-                  message_id: uuid.UUID, session_id: uuid.UUID) -> None:
+                  message_id: uuid.UUID, session_id: uuid.UUID,
+                  tracer: Tracer | None = None) -> str:
+    """写回消息并发终态事件（S7.20 起带 `turn_id` / `trace_id` / 阶段）；返回本轮终态。"""
+    active = tracer if tracer is not None else NullTracer()
+    trace_id = active.current_trace_id()
     if turn.status != "succeeded":
         await update_message(session, message_id, status="failed",
                              error=turn.error or "这一轮失败了",
                              latency_ms=turn.latency_ms,
                              prompt_versions=turn.prompt_versions)
-        await _fail(events, message_id=message_id, error=turn.error or "这一轮失败了")
-        return
+        await events.publish("stage", {
+            "turn_id": events.turn_id, "message_id": str(message_id),
+            "stage": "final_reply", "label": label_for("final_reply"), "status": "failed",
+            "attempt": 1, "updated_at": now_iso(),
+            "error_category": turn.error_category or "internal"})
+        await _fail(events, message_id=message_id, error=turn.error or "这一轮失败了",
+                    error_category=turn.error_category or "internal", tracer=active)
+        return "failed"
     await update_message(session, message_id, content=turn.reply, status="succeeded",
                          tool_calls=turn.tool_calls, prompt_versions=turn.prompt_versions,
                          run_id=turn.run_id or None, cost_cny=turn.cost_cny,
                          latency_ms=turn.latency_ms,
                          prompt_tokens=turn.prompt_tokens,
                          completion_tokens=turn.completion_tokens)
+    await events.publish("stage", {
+        "turn_id": events.turn_id, "message_id": str(message_id),
+        "stage": "final_reply", "label": label_for("final_reply"), "status": "succeeded",
+        "attempt": 1, "updated_at": now_iso(), "last_finished_stage": "final_reply",
+        "run_id": turn.run_id or None})
     await events.publish("turn_finished", {
         "turn_id": events.turn_id, "session_id": str(session_id),
         "message_id": str(message_id), "status": "succeeded",
-        "run_id": turn.run_id, "cost_cny": turn.cost_cny, "latency_ms": turn.latency_ms})
+        "run_id": turn.run_id, "cost_cny": turn.cost_cny, "latency_ms": turn.latency_ms,
+        "trace_id": trace_id, "last_finished_stage": "final_reply"})
+    return "succeeded"
 
 
-async def _fail(events: TurnEvents, *, message_id: uuid.UUID, error: str) -> None:
+async def _fail(events: TurnEvents, *, message_id: uuid.UUID, error: str,
+                error_category: str = "internal", tracer: Tracer | None = None) -> None:
+    """失败终端事件：带轮次关联信息（失败阶段 / 安全类别 / trace），方便回看与排查。"""
+    active = tracer if tracer is not None else NullTracer()
     await events.publish("error", {"turn_id": events.turn_id,
                                    "message_id": str(message_id),
-                                   "code": "internal_error", "message": error})
+                                   "code": "internal_error", "message": error,
+                                   "stage": "", "error_category": error_category,
+                                   "trace_id": active.current_trace_id()})

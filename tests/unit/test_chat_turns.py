@@ -303,7 +303,7 @@ async def test_start_turn_persists_terminal_message(cfg: AppConfig, fake_redis: 
     monkeypatch.setattr(chat_turns, "create_engine_from_config", lambda _cfg: engine)
     monkeypatch.setattr(chat_turns, "create_session_factory", lambda _engine: dummy_factory)
     monkeypatch.setattr(chat_turns, "build_turn_provider",
-                        lambda _cfg, _client: ScriptedProvider("跑好了", ["跑", "好了"]))
+                        lambda _cfg, _client, tracer=None: ScriptedProvider("跑好了", ["跑", "好了"]))
 
     events = TurnEvents(cfg, turn_id="t-4")
     await events.open()
@@ -351,7 +351,7 @@ async def test_start_turn_marks_message_failed_on_crash(
     monkeypatch.setattr(chat_turns, "create_engine_from_config", lambda _cfg: engine)
     monkeypatch.setattr(chat_turns, "create_session_factory", lambda _engine: dummy_factory)
     monkeypatch.setattr(chat_turns, "build_turn_provider",
-                        lambda _cfg, _client: ScriptedProvider())
+                        lambda _cfg, _client, tracer=None: ScriptedProvider())
     monkeypatch.setattr(chat_turns, "run_turn", boom)
 
     events = TurnEvents(cfg, turn_id="t-5")
@@ -392,3 +392,37 @@ def test_build_turn_provider_wraps_with_tracer(
     assert isinstance(provider, TracingProvider)
     assert provider.tracer is tracer
     assert provider.name == "scripted"
+
+
+# ---------- 6. S7.20：turn_id 随投递传给 worker ----------
+
+
+@pytest.mark.asyncio
+async def test_enqueue_with_turn_passes_turn_id_to_aware_dispatcher() -> None:
+    seen: list[tuple[str, str]] = []
+
+    async def enqueue(job_id: str, *, turn_id: str = "") -> None:
+        seen.append((job_id, turn_id))
+
+    wrapped = chat_turns._enqueue_with_turn(enqueue, "turn-9")
+    assert wrapped is not None
+    await wrapped("job-1")
+    assert seen == [("job-1", "turn-9")]
+
+
+@pytest.mark.asyncio
+async def test_enqueue_with_turn_leaves_legacy_dispatcher_untouched() -> None:
+    """只收 job_id 的替身原样返回：投递语义不变，不为兼容测试引入静默降级。"""
+    seen: list[str] = []
+
+    async def enqueue(job_id: str) -> None:
+        seen.append(job_id)
+
+    wrapped = chat_turns._enqueue_with_turn(enqueue, "turn-9")
+    assert wrapped is enqueue
+    await wrapped("job-1")
+    assert seen == ["job-1"]
+
+
+def test_enqueue_with_turn_without_dispatcher_stays_none() -> None:
+    assert chat_turns._enqueue_with_turn(None, "turn-9") is None

@@ -15,24 +15,37 @@
   用**独立会话**写 `runs.status='failed'`（原会话可能已回滚，不能复用）。
 - **重试**：只有基础设施类错误（DB / 网络 / 超时）走 Celery 重试；分析类失败不重试
   （模型调用已在客户端内重试过，再整批重跑只是重复烧钱）。
+- **阶段快照与轮次关联（S7.20）**：索引新鲜度两步与分析五节点写 `runs.stage`（`/api/jobs/{id}`
+  与对话轮询据此显示"正在哪个环节"）；`turn_id` 经独立业务头（`x-xhs-turn-id`）绑定日志上下文，
+  与 W3C traceparent 各走各的。
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from contextvars import Token
 from typing import Any
 
 from celery.exceptions import SoftTimeLimitExceeded
 from sqlalchemy.exc import InterfaceError, OperationalError
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..config import AppConfig
-from ..core.logging import bind_run_id, reset_run_id
-from ..core.tracing import CARRIER_KEYS, use_trace_carrier
+from ..core.logging import bind_run_id, bind_turn_id, reset_run_id, reset_turn_id
+from ..core.progress import TURN_ID_HEADER
+from ..core.progress import error_category as error_category_of
+from ..core.tracing import (
+    CARRIER_KEYS,
+    LEVEL_ERROR,
+    Tracer,
+    get_tracer,
+    use_trace_carrier,
+)
 from ..db.session import create_engine_from_config, create_session_factory
 from ..services.materials import backfill_embeddings, sync_materials
-from ..services.runs import load_job, mark_run_failed, planned_hotspots
+from ..services.runs import load_job, mark_run_failed, planned_hotspots, set_run_stage
 from ..workflows import run_analysis
 
 ANALYZE_TASK_NAME = "xhs_agent.analyze_run"
@@ -55,7 +68,8 @@ logger = logging.getLogger("xhs_agent.tasks")
 
 async def run_job(job_id: str, cfg: AppConfig, *, caller: Any = None, embedder: Any = None,
                   vision: Any = None, sync_index: bool = True,
-                  carrier: dict[str, str] | None = None) -> str:
+                  carrier: dict[str, str] | None = None,
+                  turn_id: str = "", retries: int = 0) -> str:
     """任务体（异步）：查状态 → 索引新鲜度 → 分析，返回终态字符串。
 
     `sync_index=False` 只给离线测试用（跳过素材同步与向量回填）。
@@ -66,17 +80,65 @@ async def run_job(job_id: str, cfg: AppConfig, *, caller: Any = None, embedder: 
     `docs/开发规范.md`）。
     S4.3：`carrier` 是投递方传下来的 W3C 上下文（含 `traceparent`）；接上以后本次运行的
     `analyze` 及其子 span 会挂在 API 请求那一条 trace 下。
+    S7.20：`turn_id` 走**独立业务头**（`x-xhs-turn-id`）单独传播并绑进日志上下文；
+    `retries` 是本次投递的第几次重试（写进阶段快照，便于区分"重试中"与"卡住"）。
     """
     with use_trace_carrier(carrier):
+        if not carrier:
+            logger.info("投递未带 traceparent：本次运行自开一条 trace（不伪装已串链）")
         return await _run_job(job_id, cfg, caller=caller, embedder=embedder, vision=vision,
-                              sync_index=sync_index)
+                              sync_index=sync_index, turn_id=turn_id, retries=retries)
+
+
+async def _sync_index_with_stages(session: AsyncSession, cfg: AppConfig, *, run_id: str,
+                                  vision: Any, embedder: Any, tracer: Tracer,
+                                  retries: int) -> None:
+    """索引新鲜度（素材增量同步 → 向量回填）：两步各记阶段快照与 node span（S7.20）。
+
+    逐素材视觉打标不在本批展开；两个阶段作为整体记录状态与耗时。失败原样上抛
+    （不带缺向量的库进分析），阶段快照与 span 里只记安全错误类别。
+    """
+
+    async def sync_work() -> Any:
+        return await sync_materials(session, cfg, vision=vision)
+
+    async def embed_work() -> Any:
+        return await backfill_embeddings(session, cfg, embedder=embedder)
+
+    steps = (
+        ("material_sync", "worker.material_sync", "索引新鲜度", sync_work),
+        ("embedding_backfill", "worker.embedding_backfill", "向量回填", embed_work),
+    )
+    for stage_key, node_name, log_label, work in steps:
+        started = time.monotonic()
+        await set_run_stage(session, run_id, stage=stage_key, status="running", retries=retries)
+        with tracer.node(name=node_name,
+                         metadata={"stage": stage_key, "retries": retries}) as fields:
+            try:
+                report = await work()
+            except BaseException as exc:
+                category = error_category_of(exc)
+                fields.level = LEVEL_ERROR
+                fields.status_message = category
+                await set_run_stage(
+                    session, run_id, stage=stage_key, status="failed", retries=retries,
+                    latency_ms=int((time.monotonic() - started) * 1000),
+                    error_category=category)
+                raise
+            fields.metadata["latency_ms"] = int((time.monotonic() - started) * 1000)
+        await set_run_stage(session, run_id, stage=stage_key, status="succeeded",
+                            retries=retries,
+                            latency_ms=int((time.monotonic() - started) * 1000))
+        logger.info("%s：%s", log_label, report.summary())
 
 
 async def _run_job(job_id: str, cfg: AppConfig, *, caller: Any = None, embedder: Any = None,
-                   vision: Any = None, sync_index: bool = True) -> str:
+                   vision: Any = None, sync_index: bool = True,
+                   turn_id: str = "", retries: int = 0) -> str:
     """`run_job` 的实现体（拆出来只是为了让 trace 上下文包住整段）。"""
     engine = create_engine_from_config(cfg)
     token: Token[str] | None = None
+    turn_token: Token[str] | None = None
     try:
         factory = create_session_factory(engine)
         async with factory() as session:
@@ -92,13 +154,14 @@ async def _run_job(job_id: str, cfg: AppConfig, *, caller: Any = None, embedder:
                 return str(job["status"])
 
             token = bind_run_id(job["run_id"])
+            if turn_id:
+                turn_token = bind_turn_id(turn_id)
             if sync_index:
                 # 索引新鲜度：素材目录有变化就先增量入库，再把新/变更行的向量补齐——
                 # 否则向量通道会静默缺数据（宁可整任务失败，也不带病的库去分析）
-                sync_report = await sync_materials(session, cfg, vision=vision)
-                embed_report = await backfill_embeddings(session, cfg, embedder=embedder)
-                logger.info("索引新鲜度：%s", sync_report.summary())
-                logger.info("向量回填：%s", embed_report.summary())
+                await _sync_index_with_stages(session, cfg, run_id=job["run_id"],
+                                              vision=vision, embedder=embedder,
+                                              tracer=get_tracer(cfg), retries=retries)
 
             raws = [raw for _position, raw in await planned_hotspots(session, job["run_id"])]
             result = await run_analysis(raws, cfg=cfg, session=session,
@@ -107,6 +170,8 @@ async def _run_job(job_id: str, cfg: AppConfig, *, caller: Any = None, embedder:
                                         trace_metadata={"job_id": job_id})
             return result.status
     finally:
+        if turn_token is not None:
+            reset_turn_id(turn_token)
         if token is not None:
             reset_run_id(token)
         await engine.dispose()
@@ -153,13 +218,26 @@ def _carrier_from_task(task: Any) -> dict[str, str]:
             if key in CARRIER_KEYS and value}
 
 
+def _turn_id_from_task(task: Any) -> str:
+    """从 Celery 请求头里取出业务标识 `turn_id`（S7.20）；没带就是空串。
+
+    `turn_id` 走独立业务头（`x-xhs-turn-id`），不混进 W3C carrier——它是要绑进日志上下文
+    与阶段快照的业务标识，和 traceparent 的职责不同。
+    """
+    headers = getattr(getattr(task, "request", None), "headers", None) or {}
+    return str(headers.get(TURN_ID_HEADER) or "")
+
+
 def execute(task: Any, job_id: str, cfg: AppConfig, *, caller: Any = None,
             embedder: Any = None, vision: Any = None) -> str:
     """Celery 任务的同步外壳：`asyncio.run` + 重试/失败语义（`task` 是绑定的 Task）。"""
     carrier = _carrier_from_task(task)
+    turn_id = _turn_id_from_task(task)
+    retries = int(getattr(getattr(task, "request", None), "retries", 0) or 0)
     try:
         return asyncio.run(run_job(job_id, cfg, caller=caller, embedder=embedder,
-                                   vision=vision, carrier=carrier))
+                                   vision=vision, carrier=carrier, turn_id=turn_id,
+                                   retries=retries))
     except SoftTimeLimitExceeded as exc:
         detail = f"软超时（{cfg.queue.task_soft_time_limit_s}s 上限）：{exc}"
         logger.error("job %s %s，标记 failed（不重试）", job_id, detail)

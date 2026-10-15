@@ -144,7 +144,7 @@ def cfg(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, postgres_dsn: str,
 def provider(monkeypatch: pytest.MonkeyPatch) -> ScriptedProvider:
     scripted = ScriptedProvider([{"text": "把热点文字发我，或者丢张图。"}])
     monkeypatch.setattr(chat_turns, "build_turn_provider",
-                        lambda _cfg, _client: scripted)
+                        lambda _cfg, _client, tracer=None: scripted)
     return scripted
 
 
@@ -204,17 +204,29 @@ class TestChatApi:
         assert response.headers["content-type"].startswith("text/event-stream")
         events = parse_sse(response.text)
 
-        assert [name for name, _data in events] == [
+        assert [name for name, _data in events if name != "stage"] == [
             "turn_started", "tool_started", "tool_progress", "tool_progress",
             "tool_finished", "text_delta", "text_delta", "turn_finished"]
+        assert events[0][0] == "turn_started" and events[-1][0] == "turn_finished"
+        # S7.20：阶段事件补足"决策 / 排队 / 回复"的可见性，且全部事件都带 turn_id
+        stage_payloads = [data for name, data in events if name == "stage"]
+        assert [item["stage"] for item in stage_payloads].count("supervisor") == 4
+        assert [item["status"] for item in stage_payloads
+                if item["stage"] == "final_reply"] == ["running", "succeeded"]
+        assert all(data.get("turn_id") for name, data in events if name != "text_delta")
         assert tools.calls == [(TOOL_RUN_ANALYSIS, {"hotspot": "夜跑", "topk": 5})]
-        assert events[1][1]["args"] == {"hotspot": "夜跑", "topk": 5}
-        assert events[3][1] == {"tool": TOOL_RUN_ANALYSIS, "stage": "分析中",
-                                "done": 50, "total": 100}
+        started = next(data for name, data in events if name == "tool_started")
+        assert started["args"] == {"hotspot": "夜跑", "topk": 5}
+        assert started["call_id"] == "call-1" and started["attempt"] == 1
+        progresses = [data for name, data in events if name == "tool_progress"]
+        assert progresses[0]["stage_key"] == "image_parse"
+        assert progresses[1]["stage"] == "分析中" and progresses[1]["done"] == 50
+        assert progresses[1]["stage_key"] == "queue_wait"
         assert [data["text"] for name, data in events if name == "text_delta"] == \
             ["跑了", "完整分析，命中 5 条。"]
         finished = events[-1][1]
         assert finished["status"] == "succeeded" and finished["run_id"] == RUN_ID
+        assert finished["turn_id"] and "trace_id" in finished
 
         # 消息落库：正文 / 工具过程 / run_id / 成本（两次 supervisor + 一次分析）
         detail = client.get(f"/api/chat/sessions/{session_id}").json()
@@ -263,9 +275,10 @@ class TestChatApi:
                                data={"text": "帮我蹭一下这个热点"})
         events = parse_sse(response.text)
 
-        assert [name for name, _data in events] == [
+        assert [name for name, _data in events if name != "stage"] == [
             "turn_started", "tool_started", "tool_progress", "tool_progress",
             "tool_finished", "turn_finished"]
+        assert events[-1][0] == "turn_finished"
         detail = client.get(f"/api/chat/sessions/{session_id}").json()
         assistant = detail["messages"][-1]
         assert assistant["status"] == "succeeded"           # 工具失败不炸整轮

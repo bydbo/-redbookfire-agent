@@ -48,6 +48,17 @@ STAGE_STATUSES: tuple[str, ...] = ("running", "succeeded", "failed", "skipped", 
 TERMINAL_STAGE_STATUSES: tuple[str, ...] = ("succeeded", "failed", "skipped", "interrupted")
 MAX_NODES = 30
 
+#: 工具内部的中文进度标签 → 阶段键（S7.20）；未登记的标签返回空串（前端退回显示原标签）
+PROGRESS_LABEL_KEYS: dict[str, str] = {
+    "解析图片": "image_parse",
+    "提交分析": "submit_analysis",
+    "分析中": "queue_wait",
+    "拆解要素": "clue",
+    "检索素材": "retrieve",
+    "素材同步": "material_sync",
+    "向量回填": "embedding_backfill",
+}
+
 ERROR_CATEGORIES: tuple[str, ...] = (
     "llm_error", "embedding_error", "schema_error", "config_error", "timeout",
     "cancelled", "dependency_unavailable", "internal",
@@ -79,6 +90,15 @@ def label_for(stage: str) -> str:
     """阶段键 → 中文标签；未登记的键原样返回（便于新阶段灰度）。"""
     key = str(stage or "").strip()
     return STAGE_LABELS.get(key, key)
+
+
+def key_for_label(label: str) -> str:
+    """工具进度里的中文标签 → 阶段键；未登记返回空串（不臆造阶段）。"""
+    value = str(label or "").strip()
+    for key, text in STAGE_LABELS.items():
+        if text == value:
+            return key
+    return PROGRESS_LABEL_KEYS.get(value, "")
 
 
 def error_category(exc: BaseException) -> str:

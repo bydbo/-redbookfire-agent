@@ -36,6 +36,8 @@ COLUMN_SPECS: dict[str, dict[str, str]] = {
         "started_at": "timestamptz", "finished_at": "timestamptz", "llm_calls": "int4",
         "prompt_tokens": "int4", "completion_tokens": "int4", "cost_cny": "numeric",
         "latency_ms": "int4", "prompt_versions": "jsonb", "error": "text",
+        # S7.20：阶段快照（素材同步 / 向量回填 / 五节点），只记阶段切换
+        "stage": "jsonb",
     },
     "run_hotspots": {
         "id": "uuid", "run_id": "uuid", "hotspot_id": "uuid", "position": "int4",
