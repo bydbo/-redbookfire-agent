@@ -370,3 +370,49 @@ class TestDispatchIsDataDriven:
 
         assert runner.calls == [] and len(provider.calls) == 1
         assert turn.tool_calls[0]["error"] == "模型要调一个不存在的工具"
+
+
+class TestStructuredWorkerProgress:
+    """R3（OBS-05）：worker 的结构化阶段投影原样穿透工具通道，且分层表达身份。"""
+
+    @pytest.mark.asyncio
+    async def test_worker_update_passes_through_with_layered_attempts(self, tmp_path: Path):
+        cfg = write_config(tmp_path)
+        events = Events()
+
+        class WorkerTools(FakeTools):
+            async def __call__(self, name: str, args: dict[str, Any], *,
+                               on_progress=None) -> ToolOutcome:
+                assert on_progress is not None
+                # worker 侧结构化投影：真实状态 / 源尝试号 / 重试 / 身份
+                await on_progress("拆解", 0, 0, update={
+                    "stage_key": "clue", "label": "拆解", "status": "failed",
+                    "attempt": 1, "retries": 2, "error_category": "llm_error",
+                    "run_id": "run-9", "job_id": "job-9"})
+                await on_progress("分析中", 30, 100, update={
+                    "stage_key": "clue", "label": "拆解", "status": "running",
+                    "attempt": 2, "retries": 2, "error_category": "",
+                    "run_id": "run-9", "job_id": "job-9"})
+                # 工具内部的旧式标签进度（不带 update）：attempt 退回工具第几次调用
+                await on_progress("解析图片", 0, 0)
+                return self.outcome
+
+        tools = WorkerTools()
+        await run(cfg, events=events, tools=tools,
+                  steps=[{"text": "", "tool_calls": [tool_call()]},
+                         {"text": "好了"}])
+
+        progress_events = [payload for name, payload in events.items
+                           if name == "tool_progress"]
+        failed = progress_events[0]
+        assert (failed["stage_key"], failed["status"], failed["attempt"],
+                failed["retries"], failed["error_category"]) == ("clue", "failed", 1, 2,
+                                                                 "llm_error")
+        assert failed["tool_attempt"] == 1                # 工具第几次调用（分层，不代用）
+        assert failed["run_id"] == "run-9" and failed["job_id"] == "job-9"
+        retried = progress_events[1]
+        assert retried["status"] == "running" and retried["attempt"] == 2
+        plain = progress_events[2]
+        assert plain["stage_key"] == "image_parse"        # 旧式标签进度仍映射阶段键
+        assert plain["attempt"] == 1 and plain["status"] == "running"
+        assert plain["run_id"] is None                    # 无 worker 身份就不虚构

@@ -51,11 +51,15 @@ class TestSnapshotLifecycle:
         assert snapshot["status"] == "skipped"
         assert snapshot["last_finished_stage"] == "clue"
 
-    def test_running_after_terminal_restarts_the_stage(self):
+    def test_running_after_terminal_needs_a_higher_attempt(self):
+        """R3（OBS-12）：同一执行终结后不因重复 begin 重开；更高的 attempt 才启动新执行。"""
         snapshot = progress.apply(None, stage="clue", status="failed", error_category="llm_error")
         assert snapshot["error_category"] == "llm_error"
-        retried = progress.apply(snapshot, stage="clue", status="running")
+        same = progress.apply(snapshot, stage="clue", status="running")
+        assert same["status"] == "failed" and same["error_category"] == "llm_error"
+        retried = progress.apply(snapshot, stage="clue", status="running", attempt=2)
         assert retried["status"] == "running" and retried["error_category"] == ""
+        assert retried["attempt"] == 2
 
     def test_nodes_dedupe_and_cap(self):
         snapshot = progress.empty()
@@ -130,3 +134,60 @@ class TestErrorCategory:
                  OSError("x"), Exception("x"), KeyboardInterrupt()]
         for exc in cases:
             assert progress.error_category(exc) in progress.ERROR_CATEGORIES
+
+
+class TestMonotonicMerge:
+    """R3（OBS-12）：迟到的 begin 不回退、终态不重开、更高尝试才能启动新执行。"""
+
+    def test_late_begin_does_not_regress_attempt(self):
+        snapshot = progress.begin(None, stage="draft", attempt=2)
+        late = progress.begin(snapshot, stage="draft", attempt=1)
+        assert late["attempt"] == 2 and late["status"] == "running"
+
+    def test_terminal_execution_is_not_reopened(self):
+        snapshot = progress.end(progress.begin(None, stage="draft", attempt=2), stage="draft",
+                                status="succeeded", attempt=2)
+        again = progress.begin(snapshot, stage="draft", attempt=2)
+        assert again["status"] == "succeeded"          # 已终结的执行：重复 begin 不重开
+
+    def test_higher_attempt_starts_a_new_execution(self):
+        snapshot = progress.end(progress.begin(None, stage="draft", attempt=1), stage="draft",
+                                status="failed", attempt=1, error_category="llm_error")
+        retry = progress.begin(snapshot, stage="draft", attempt=2)
+        assert retry["status"] == "running" and retry["attempt"] == 2
+        assert retry["error_category"] == ""           # 新执行不带旧失败类别
+
+    def test_completed_execution_blocks_late_begin_across_stages(self):
+        snapshot = progress.begin(None, stage="supervisor")
+        snapshot = progress.end(snapshot, stage="supervisor", status="succeeded")
+        snapshot = progress.begin(snapshot, stage="clue")            # 已经走到下一个阶段
+        late = progress.begin(snapshot, stage="supervisor", attempt=1)
+        assert late["stage"] == "clue"                 # 迟到事件不改当前阶段
+
+    def test_run_identity_keeps_two_analyses_separate(self):
+        snapshot = progress.begin(None, stage="clue", attempt=1, run_id="run-a")
+        snapshot = progress.end(snapshot, stage="clue", status="succeeded", attempt=1,
+                                run_id="run-a")
+        second = progress.begin(snapshot, stage="clue", attempt=1, run_id="run-b")
+        assert second["status"] == "running" and second["run_id"] == "run-b"
+        second = progress.end(second, stage="clue", status="failed", attempt=1,
+                              error_category="llm_error", run_id="run-b")
+        nodes = {(item["stage"], item["attempt"], item.get("run_id") or ""): item["status"]
+                 for item in second["nodes"]}
+        assert nodes[("clue", 1, "run-a")] == "succeeded"   # 第一轮记录不被覆盖
+        assert nodes[("clue", 1, "run-b")] == "failed"
+
+    def test_retries_flow_into_snapshot_through_apply(self):
+        snapshot = progress.apply(None, stage="material_sync", status="running", retries=2)
+        assert snapshot["retries"] == 2
+        snapshot = progress.apply(snapshot, stage="material_sync", status="succeeded", retries=2)
+        assert snapshot["retries"] == 2
+
+    def test_old_snapshot_without_run_id_still_merges(self):
+        """兼容旧快照：没有 run_id 的节点与新事件按旧口径合并（不因缺身份拒绝更新）。"""
+        legacy = {"stage": "clue", "status": "running", "attempt": 1,
+                  "nodes": [{"stage": "clue", "status": "running", "attempt": 1}]}
+        merged = progress.end(legacy, stage="clue", status="succeeded", attempt=1,
+                              run_id="run-new")
+        assert merged["status"] == "succeeded"
+        assert len(merged["nodes"]) == 1               # 合并进同一个节点，不新增

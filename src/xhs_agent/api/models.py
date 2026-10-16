@@ -62,6 +62,7 @@ class StageNode(_Response):
     ended_at: DateTimeStr | None = None
     latency_ms: int = Field(default=0, ge=0)
     error_category: str = ""
+    run_id: str | None = None
 
 
 class StageInfo(_Response):

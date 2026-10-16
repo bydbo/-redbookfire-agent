@@ -306,3 +306,45 @@ describe('useChatStore', () => {
     expect(store.stageElapsedMs).toBe(0)
   })
 })
+
+describe('useChatStore 阶段单调合并（R3 / OBS-12）', () => {
+  beforeEach(() => {
+    setActivePinia(createPinia())
+    vi.clearAllMocks()
+  })
+  afterEach(() => vi.useRealTimers())
+
+  it('迟到的阶段事件不回退尝试号；同一次执行的终态不因重复事件重开', async () => {
+    vi.mocked(createChatSession).mockResolvedValue({
+      session_id: 's-9', title: '', created_at: '', updated_at: '',
+    })
+    vi.mocked(listChatSessions).mockResolvedValue(listing())
+    vi.mocked(getChatSession).mockResolvedValue(detail([]))
+    const observed: Record<string, string | number | undefined> = {}
+    vi.mocked(streamMessage).mockImplementation(async (_id, _input, onEvent) => {
+      onEvent({ event: 'stage', data: { stage: 'draft', label: '撰稿', status: 'running',
+                attempt: 2, started_at: '2026-10-15T08:00:00+00:00' } })
+      onEvent({ event: 'stage', data: { stage: 'draft', label: '撰稿', status: 'running',
+                attempt: 1 } })
+      const store = useChatStore()
+      observed.attempt = store.progress?.attempt           // 仍是 2：旧尝试不回退
+      onEvent({ event: 'stage', data: { stage: 'draft', label: '撰稿', status: 'succeeded',
+                attempt: 2, updated_at: '2026-10-15T08:00:05+00:00' } })
+      observed.status = store.progress?.status             // succeeded
+      onEvent({ event: 'stage', data: { stage: 'draft', label: '撰稿', status: 'running',
+                attempt: 2 } })
+      observed.reopened = store.progress?.status           // 仍 succeeded：终态不重开
+      onEvent({ event: 'stage', data: { stage: 'draft', label: '撰稿', status: 'running',
+                attempt: 3 } })
+      observed.retried = store.progress?.status            // running：更高尝试开启新执行
+    })
+    const store = useChatStore()
+
+    await store.send({ text: '帮我蹭一下这个热点' })
+
+    expect(observed.attempt).toBe(2)
+    expect(observed.status).toBe('succeeded')
+    expect(observed.reopened).toBe('succeeded')
+    expect(observed.retried).toBe('running')
+  })
+})

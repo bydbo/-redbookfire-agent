@@ -845,3 +845,71 @@ async def test_finalize_write_failure_is_logged_not_claimed(
 
     assert any("轮次收尾写库失败" in item.getMessage() for item in caplog.records)
     assert received[-1]["event"] == "error"
+
+
+@pytest.mark.asyncio
+async def test_worker_stage_updates_persist_real_status_retries_and_identity(
+        cfg: AppConfig, fake_redis: FakeRedis, monkeypatch: pytest.MonkeyPatch) -> None:
+    """R3（OBS-05）：worker 的 failed / 重试 / skipped / run 身份都进快照，不再一律 running。
+
+    失败尝试仍可追查（`nodes` 保留 clue/attempt=1/failed），重试成功不抹掉失败记录。
+    """
+    saved: list[tuple[uuid.UUID, dict[str, Any]]] = []
+
+    async def fake_update(_session: Any, message_id: uuid.UUID,
+                          **fields: Any) -> dict[str, Any]:
+        saved.append((message_id, fields))
+        return {}
+
+    async def structured_run(*_args: Any, **kwargs: Any) -> Any:
+        on_event = kwargs["on_event"]
+        await on_event("stage", {"stage": "submit_analysis", "status": "running", "attempt": 1})
+        await on_event("tool_progress", {"tool": "run_hotspot_analysis", "stage": "拆解",
+                                         "stage_key": "clue", "status": "failed",
+                                         "attempt": 1, "retries": 2,
+                                         "error_category": "llm_error",
+                                         "run_id": "run-9", "job_id": "job-9"})
+        await on_event("tool_progress", {"tool": "run_hotspot_analysis", "stage": "拆解",
+                                         "stage_key": "clue", "status": "running",
+                                         "attempt": 2, "retries": 2, "error_category": "",
+                                         "run_id": "run-9", "job_id": "job-9"})
+        await on_event("tool_progress", {"tool": "run_hotspot_analysis", "stage": "报告",
+                                         "stage_key": "report", "status": "succeeded",
+                                         "attempt": 1, "retries": 0, "error_category": "",
+                                         "run_id": "run-9", "job_id": "job-9",
+                                         "latency_ms": 7})
+        return ChatTurn(status="succeeded", reply="好了", run_id="run-9", cost_cny=0.05)
+
+    engine = DummyEngine()
+    _patch_turn_harness(monkeypatch, engine, fake_update, NullTracer())
+    monkeypatch.setattr(chat_turns, "run_turn", structured_run)
+
+    events = TurnEvents(cfg, turn_id="t-worker")
+    await events.open()
+    received: list[dict[str, Any]] = []
+    pump = asyncio.create_task(_collect(events, received))
+    message_id = uuid.uuid4()
+    task = start_turn(cfg, events, session_id=uuid.uuid4(), message_id=message_id,
+                      history=[], user_text="跑一下")
+    try:
+        await asyncio.wait_for(task, timeout=5)
+    finally:
+        pump.cancel()
+        await events.aclose()
+
+    final = saved[-1][1]
+    assert final["status"] == "succeeded" and final["run_id"] == "run-9"
+    snapshot = final["progress"]
+    assert snapshot["stage"] == "final_reply" and snapshot["status"] == "succeeded"
+    assert snapshot["last_finished_stage"] == "final_reply"
+    assert snapshot["retries"] == 0                     # 当前阶段（报告）的投递重试数
+    nodes = {(item["stage"], item["attempt"], item.get("run_id") or ""): item
+             for item in snapshot["nodes"]}
+    assert nodes[("clue", 1, "run-9")]["status"] == "failed"           # 失败尝试可追查
+    assert nodes[("clue", 1, "run-9")]["error_category"] == "llm_error"
+    assert nodes[("clue", 2, "run-9")]["status"] == "succeeded"        # 重试成功不抹掉失败
+    assert nodes[("report", 1, "run-9")]["latency_ms"] == 7
+    skipped_like = [item for item in snapshot["nodes"] if item["stage"] == "submit_analysis"]
+    assert skipped_like and skipped_like[0]["status"] == "succeeded"   # 自有阶段照常收尾
+
+

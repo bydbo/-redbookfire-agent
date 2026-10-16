@@ -10,10 +10,12 @@
 
 口径（改动需同步 `docs/可观测.md` 与《数据契约》）：
 
-- 只记阶段切换，不逐 token、不逐轮询；`nodes` 按 `(stage, attempt)` 去重，最多保留
-  `MAX_NODES` 条（超出丢最早的）。
-- **旧尝试的迟到更新不覆盖新状态**：同一阶段 `attempt` 更小的终态更新被忽略；同一阶段的
-  重复 `running` 不重置 `started_at`。
+- 只记阶段切换，不逐 token、不逐轮询；`nodes` 按 `(stage, attempt, run_id?)` 去重，最多保留
+  `MAX_NODES` 条（超出丢最早的）。`run_id` 是可选身份（R3）：对话轮次里同轮多次分析用它隔离，
+  任一侧缺身份时按旧口径合并（兼容旧快照）。
+- **单调合并（R3）**：同一阶段 `attempt` 更小的更新被忽略（开始与结束都查）；同一阶段重复
+  `running` 不重置 `started_at`；同一执行的终态**不因重复 `begin` 重开**；只有更高的 `attempt`
+  （重试）或新阶段才能启动新的运行。
 - 错误只记**类别**（`ERROR_CATEGORIES` 白名单），不记错误正文、提示词、用户原文或素材路径。
 - 按类名匹配异常（不在 `core/` 里 import `tools/*`，维持单向依赖）；未识别一律 `internal`。
 """
@@ -147,9 +149,30 @@ def normalize(prev: Any) -> dict[str, Any]:
 
 def begin(prev: Any, *, stage: str, attempt: int = 1, retries: int = 0,
           run_id: str = "", job_id: str = "") -> dict[str, Any]:
-    """进入一个阶段（`running`）；同一阶段重复进入只刷新 `updated_at`，不重置计时。"""
+    """进入一个阶段（`running`）；同一阶段重复进入只刷新 `updated_at`，不重置计时。
+
+    R3（OBS-12）单调合并——迟到的 `begin` 不回退、不重开：
+    - 同一阶段、`attempt` 更小：旧尝试的迟到开始事件，忽略；
+    - 同一阶段、同一 `attempt` 且当前已是终态：该执行已经结束，重复开始不重开；
+    - `nodes` 里同 `(stage, attempt, run_id)` 的执行已终结：迟到开始事件同样忽略——
+    - 只有**更高的 `attempt`**（重试）或新阶段才能启动新的运行。
+    """
     snapshot = normalize(prev)
     attempt = max(1, int(attempt or 1))
+    run_id = str(run_id or "")
+    current_stage = str(snapshot.get("stage") or "")
+    current_attempt = int(snapshot.get("attempt") or 1)
+    current_run = str(snapshot.get("run_id") or "")
+    # 身份不一致（新的 run 进来）说明这是**另一次执行**，即使 stage/attempt 相同也不受"已终结"限制
+    same_execution = (not run_id or not current_run or run_id == current_run)
+    if current_stage == stage and same_execution:
+        if attempt < current_attempt:
+            return snapshot
+        if attempt == current_attempt and snapshot.get("status") in TERMINAL_STAGE_STATUSES:
+            return snapshot
+    done = _find_node(snapshot, stage=stage, attempt=attempt, run_id=run_id)
+    if done is not None and str(done.get("status") or "") in TERMINAL_STAGE_STATUSES:
+        return snapshot
     same = (snapshot.get("stage") == stage
             and int(snapshot.get("attempt") or 1) == attempt
             and snapshot.get("status") == "running")
@@ -163,36 +186,43 @@ def begin(prev: Any, *, stage: str, attempt: int = 1, retries: int = 0,
         "error_category": "",
     })
     if run_id:
-        snapshot["run_id"] = str(run_id)
+        snapshot["run_id"] = run_id
     if job_id:
         snapshot["job_id"] = str(job_id)
     return snapshot
 
 
 def end(prev: Any, *, stage: str, status: str, attempt: int = 1,
-        error_category: str = "", latency_ms: int = 0) -> dict[str, Any]:
-    """结束一个阶段并把它写进 `nodes`；迟到（`attempt` 更小）的更新被忽略。"""
+        error_category: str = "", latency_ms: int = 0, retries: int = 0,
+        run_id: str = "") -> dict[str, Any]:
+    """结束一个阶段并把它写进 `nodes`；迟到（`attempt` 更小）的更新被忽略。
+
+    R3：`nodes` 的节点可带 `run_id` 身份（对话轮次里同轮多次分析用不同 run 隔离）；
+    可选地带上 worker 的投递重试次数（`retries`）。
+    """
     if status not in TERMINAL_STAGE_STATUSES:
         raise ValueError(f"阶段终态只能是 {TERMINAL_STAGE_STATUSES}，收到：{status!r}")
     snapshot = normalize(prev)
     attempt = max(1, int(attempt or 1))
+    run_id = str(run_id or "")
     current_stage = str(snapshot.get("stage") or "")
     current_attempt = int(snapshot.get("attempt") or 1)
     if current_stage == stage and attempt < current_attempt:
         return snapshot                          # 旧尝试的迟到更新：不覆盖、不追加
-    if current_stage in ("", stage):             # 结束的就是当前阶段（或还没有当前阶段）
-        if current_stage == "":
-            snapshot["stage"] = str(stage)
-            snapshot["label"] = label_for(stage)
-        snapshot["status"] = status
-        snapshot["attempt"] = (max(attempt, current_attempt) if current_stage == stage
-                               else attempt)
-        snapshot["updated_at"] = now_iso()
-        if error_category:
-            snapshot["error_category"] = _sanitize_error(error_category)
-    else:
-        snapshot["updated_at"] = now_iso()       # 结束的不是当前阶段：只补 node
-    node = {
+    # 终态更新代表"最新已知事实"：无论结束的是不是当前阶段，顶层都推进到它
+    # （同阶段旧尝试的迟到更新已在上方被拦截）
+    if current_stage == "":
+        snapshot["label"] = label_for(stage)
+    snapshot["stage"] = str(stage)
+    snapshot["status"] = status
+    snapshot["attempt"] = (max(attempt, current_attempt) if current_stage == stage
+                           else attempt)
+    snapshot["updated_at"] = now_iso()
+    # 无条件写：`retries` 表示"当前阶段的投递重试次数"，随阶段切换更新（R3）
+    snapshot["retries"] = max(0, int(retries or 0))
+    if error_category:
+        snapshot["error_category"] = _sanitize_error(error_category)
+    node: dict[str, Any] = {
         "stage": str(stage),
         "label": label_for(stage),
         "status": status,
@@ -204,6 +234,8 @@ def end(prev: Any, *, stage: str, status: str, attempt: int = 1,
         "error_category": ("" if status in ("succeeded", "skipped")
                            else _sanitize_error(error_category)),
     }
+    if run_id:                                   # 身份可选：不传时保持旧快照形状（兼容）
+        node["run_id"] = run_id
     _upsert_node(snapshot, node)
     if status in ("succeeded", "skipped"):
         snapshot["last_finished_stage"] = str(stage)
@@ -217,8 +249,8 @@ def apply(prev: Any, *, stage: str, status: str, attempt: int = 1, retries: int 
     if status == "running":
         return begin(prev, stage=stage, attempt=attempt, retries=retries,
                      run_id=run_id, job_id=job_id)
-    return end(prev, stage=stage, status=status, attempt=attempt,
-               error_category=error_category, latency_ms=latency_ms)
+    return end(prev, stage=stage, status=status, attempt=attempt, retries=retries,
+               error_category=error_category, latency_ms=latency_ms, run_id=run_id)
 
 
 def interrupt(prev: Any, *, error_category: str = "timeout") -> dict[str, Any]:
@@ -239,12 +271,37 @@ def current_step(snapshot: Any) -> str | None:
     return None
 
 
+def _node_matches(item: dict[str, Any], *, stage: str, attempt: int, run_id: str) -> bool:
+    """节点是否属于同一个执行：`(stage, attempt)` 相同，且身份不冲突。
+
+    `run_id` 是 R3 新增的**可选**身份（对话轮次里同轮多次分析）：任一侧缺身份时按旧口径
+    合并——旧快照（没有 `run_id` 的节点）因此保持可读、可继续更新。
+    """
+    if str(item.get("stage") or "") != stage:
+        return False
+    if int(item.get("attempt") or 1) != attempt:
+        return False
+    left, right = str(item.get("run_id") or ""), run_id
+    return not left or not right or left == right
+
+
+def _find_node(snapshot: dict[str, Any], *, stage: str, attempt: int,
+               run_id: str = "") -> dict[str, Any] | None:
+    """按 `(stage, attempt, run_id)` 找已有节点（R3 的单调合并与身份隔离都用它）。"""
+    for item in snapshot.get("nodes") or []:
+        if isinstance(item, dict) and _node_matches(item, stage=stage, attempt=attempt,
+                                                    run_id=run_id):
+            return item
+    return None
+
+
 def _upsert_node(snapshot: dict[str, Any], node: dict[str, Any]) -> None:
-    """按 `(stage, attempt)` 去重写入节点记录；同一节点重复上报以最后一次为准。"""
+    """按 `(stage, attempt, run_id)` 去重写入节点记录；同一节点重复上报以最后一次为准。"""
     nodes = list(snapshot.get("nodes") or [])
     for index, item in enumerate(nodes):
-        if (item.get("stage") == node["stage"]
-                and int(item.get("attempt") or 1) == node["attempt"]):
+        if isinstance(item, dict) and _node_matches(
+                item, stage=node["stage"], attempt=node["attempt"],
+                run_id=str(node.get("run_id") or "")):
             merged = dict(item)
             merged.update(node)
             merged["error_category"] = node["error_category"] or item.get("error_category", "")

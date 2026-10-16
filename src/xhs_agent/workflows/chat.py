@@ -157,18 +157,35 @@ def _build_graph(*, provider: BaseProvider, run_tool: ToolRunner, max_rounds: in
             # 工具最后一次上报的阶段键（S7.21）：`tool_finished` 用它把快照里的阶段收成终态
             stage_holder: dict[str, str] = {"key": ""}
 
-            async def progress(stage: str, done: int = 0, total: int = 0,
+            async def progress(stage: str, done: int = 0, total: int = 0, *,
+                               update: dict[str, Any] | None = None,
                                _call: dict[str, Any] = call, _call_id: str = call_id,
                                _attempt: int = attempt,
                                _holder: dict[str, str] = stage_holder) -> None:
-                key = progress_tool.key_for_label(stage)
+                """工具进度 → `tool_progress` 事件（S7.20 / R3）。
+
+                `update` 是 worker `runs.stage` 快照的结构化投影：阶段键 / **真实状态** /
+                **源尝试号** / 重试次数 / 错误类别 / run_id / job_id。工具第几次调用
+                （`tool_attempt`）与 worker 第几次尝试（`attempt`）**分层表达**，不互相代用；
+                没有 `update` 时退回工具内部的标签进度（如「解析图片」）。
+                """
+                data = dict(update or {})
+                key = str(data.get("stage_key") or progress_tool.key_for_label(stage))
                 if key:
                     _holder["key"] = key
-                await emit("tool_progress", {
-                    "tool": _call["name"], "stage": stage, "stage_key": key,
-                    "status": "running",
-                    "done": done, "total": total, "call_id": _call_id, "attempt": _attempt,
-                    "updated_at": now_iso()})
+                body: dict[str, Any] = {
+                    "tool": _call["name"], "stage": str(data.get("label") or stage),
+                    "stage_key": key,
+                    "status": str(data.get("status") or "running"),
+                    "done": done, "total": total, "call_id": _call_id,
+                    "attempt": int(data.get("attempt") or _attempt),
+                    "tool_attempt": _attempt,
+                    "retries": int(data.get("retries") or 0),
+                    "error_category": str(data.get("error_category") or ""),
+                    "run_id": data.get("run_id") or None,
+                    "job_id": data.get("job_id") or None,
+                    "updated_at": now_iso()}
+                await emit("tool_progress", body)
 
             if call.get("args_error"):
                 outcome = ToolOutcome(status="failed", error=str(call["args_error"]))

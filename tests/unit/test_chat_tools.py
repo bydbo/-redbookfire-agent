@@ -716,12 +716,119 @@ class TestWaitForRunStages:
         ctx = ToolContext(cfg=write_config(tmp_path), session=cast(Any, session),
                           sleep=fake_sleep, poll_interval_s=0.0)
         labels: list[str] = []
+        updates: list[dict[str, Any]] = []
 
-        async def progress(stage: str, done: int = 0, total: int = 0) -> None:
+        async def progress(stage: str, done: int = 0, total: int = 0, *,
+                           update: dict[str, Any] | None = None) -> None:
             labels.append(stage)
+            if update is not None:
+                updates.append(dict(update))
 
         status = await chat_tools._wait_for_run(ctx, "job-1", progress)
 
         assert status == "succeeded"
-        assert labels == ["排队等待", "素材同步", "分析中", "拆解"]
+        # R3：终态 job 的最后一份快照在返回前补发（报告阶段不再被丢掉）
+        assert labels == ["排队等待", "素材同步", "分析中", "拆解", "报告"]
         assert session.expired == 5              # 每次轮询都先过期，读到的是库里的新值
+        # 结构化更新只在内容变化时上报；同一阶段重复轮询不重复上报
+        assert [item["stage_key"] for item in updates] == [
+            "queue_wait", "material_sync", "clue", "report"]
+        assert updates[-1]["status"] == "succeeded"
+        assert updates[0]["job_id"] == "job-1"
+
+
+class TestWaitForRunStructuredUpdates:
+    """R3（OBS-05）：结构化阶段更新——真实状态 / 源尝试号 / 重试 / 身份都不再丢失。"""
+
+    def _ctx(self, tmp_path: Path, sleep: Any = None) -> Any:
+        async def fake_sleep(_seconds: float) -> None:
+            return None
+
+        return ToolContext(cfg=write_config(tmp_path), session=cast(Any, FakePollSession()),
+                           sleep=sleep or fake_sleep, poll_interval_s=0.0)
+
+    @pytest.mark.asyncio
+    async def test_forwards_real_status_retries_and_identity(
+            self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        jobs: list[dict[str, Any]] = [
+            {"status": "running", "progress": 0.2, "run_id": "run-9", "job_id": "job-9",
+             "stage": {"stage": "clue", "status": "failed", "attempt": 1, "retries": 2,
+                       "error_category": "llm_error"}},
+            {"status": "running", "progress": 0.3, "run_id": "run-9", "job_id": "job-9",
+             "stage": {"stage": "clue", "status": "running", "attempt": 2, "retries": 2}},
+            {"status": "succeeded", "progress": 1.0, "run_id": "run-9", "job_id": "job-9",
+             "stage": {"stage": "report", "status": "succeeded", "attempt": 1,
+                       "nodes": [{"stage": "report", "status": "succeeded", "attempt": 1,
+                                  "latency_ms": 7}]}},
+        ]
+        pending = list(jobs)
+
+        async def fake_load_job(_session: Any, _job_id: str) -> dict[str, Any]:
+            return dict(pending.pop(0)) if pending else dict(jobs[-1])
+
+        monkeypatch.setattr(chat_tools, "load_job", fake_load_job)
+        updates: list[dict[str, Any]] = []
+
+        async def progress(stage: str, done: int = 0, total: int = 0, *,
+                           update: dict[str, Any] | None = None) -> None:
+            if update is not None:
+                updates.append(dict(update))
+
+        status = await chat_tools._wait_for_run(self._ctx(tmp_path), "job-9", progress)
+
+        assert status == "succeeded"
+        failed = updates[0]
+        assert (failed["stage_key"], failed["status"], failed["attempt"], failed["retries"],
+                failed["error_category"]) == ("clue", "failed", 1, 2, "llm_error")
+        assert failed["run_id"] == "run-9" and failed["job_id"] == "job-9"
+        retry = updates[1]
+        assert retry["stage_key"] == "clue" and retry["status"] == "running"
+        assert retry["attempt"] == 2                     # 重试：更高的源尝试号
+        final = updates[2]
+        assert final["status"] == "succeeded" and final["latency_ms"] == 7
+
+    @pytest.mark.asyncio
+    async def test_skipped_stage_is_forwarded_as_skipped(
+            self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        job = {"status": "succeeded", "progress": 1.0, "run_id": "run-1",
+               "stage": {"stage": "clue", "status": "skipped", "attempt": 1}}
+
+        async def fake_load_job(_session: Any, _job_id: str) -> dict[str, Any]:
+            return dict(job)
+
+        monkeypatch.setattr(chat_tools, "load_job", fake_load_job)
+        updates: list[dict[str, Any]] = []
+
+        async def progress(stage: str, done: int = 0, total: int = 0, *,
+                           update: dict[str, Any] | None = None) -> None:
+            if update is not None:
+                updates.append(dict(update))
+
+        status = await chat_tools._wait_for_run(self._ctx(tmp_path), "job-1", progress)
+
+        assert status == "succeeded"
+        assert [item["status"] for item in updates] == ["skipped"]
+
+    @pytest.mark.asyncio
+    async def test_queued_maps_to_queue_wait_without_fabricating_stage(
+            self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        pending = [{"status": "queued", "progress": 0.0, "stage": {}},
+                   {"status": "succeeded", "progress": 1.0, "stage": {}}]
+
+        async def fake_load_job(_session: Any, _job_id: str) -> dict[str, Any]:
+            return dict(pending.pop(0)) if pending else {"status": "succeeded", "stage": {}}
+
+        monkeypatch.setattr(chat_tools, "load_job", fake_load_job)
+        updates: list[dict[str, Any]] = []
+
+        async def progress(stage: str, done: int = 0, total: int = 0, *,
+                           update: dict[str, Any] | None = None) -> None:
+            if update is not None:
+                updates.append(dict(update))
+
+        status = await chat_tools._wait_for_run(self._ctx(tmp_path), "job-1", progress)
+
+        assert status == "succeeded"
+        assert updates == [{"stage_key": "queue_wait", "label": "排队等待", "status": "running",
+                            "attempt": 1, "retries": 0, "error_category": "", "latency_ms": 0,
+                            "run_id": "", "job_id": "job-1"}]

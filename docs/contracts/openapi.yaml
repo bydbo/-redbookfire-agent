@@ -1946,12 +1946,19 @@ components:
         error_category:
           type: string
           description: 安全错误类别（llm_error / embedding_error / schema_error / config_error / timeout / cancelled / dependency_unavailable / internal），不含错误正文
+        run_id:
+          oneOf:
+            - type: string
+            - type: 'null'
+          description: 产生该节点的分析运行 id（可选，R3）；对话轮次里同轮多次分析用它区分节点归属，缺省时按旧口径合并
 
     StageInfo:
       type: object
       description: |
         当前阶段快照（S7.20 / S7.21）：应用内事件与可刷新状态是运行状态的事实源，
-        只记阶段切换，不逐 token；`nodes` 按 `(stage, attempt)` 去重，旧尝试的迟到更新不覆盖新状态。
+        只记阶段切换，不逐 token；`nodes` 按 `(stage, attempt, run_id?)` 去重（R3），
+        单调合并——旧尝试的迟到更新不覆盖新状态，同一执行的终态不因重复 begin 重开，
+        只有更高的 attempt（重试）或新阶段才能启动新的运行。
       required:
         - stage
         - status

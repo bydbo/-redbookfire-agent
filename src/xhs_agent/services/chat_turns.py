@@ -322,23 +322,30 @@ async def run_turn_task(cfg: AppConfig, events: TurnEvents, *, session_id: uuid.
 
                     async def persist(*, stage: str, status: str, attempt: int = 1,
                                       latency_ms: int = 0, error_category: str = "",
-                                      run_id: str = "") -> None:
+                                      run_id: str = "", retries: int = 0,
+                                      job_id: str = "") -> None:
                         """合并一条阶段更新；只有快照确实变化才写库（S7.21 的写库节流点）。
 
                         切到新阶段时把上一个还在跑的阶段收成 `succeeded`——否则快照的 `nodes`
-                        里会留下永远 running 的旧阶段（阶段是顺序推进的：能走到下一步说明上一步成功）。
+                        里会留下永远 running 的旧阶段（阶段是顺序推进的：能走到下一步说明上一步成功；
+                        **只在来源确实推进到下一阶段时才这样推断**，R3）。
                         """
                         nonlocal snapshot, written
                         previous_stage = str(snapshot.get("stage") or "")
-                        if (status == "running" and previous_stage and previous_stage != stage
+                        if (previous_stage and previous_stage != stage
                                 and snapshot.get("status") == "running"):
+                            # 来源推进到下一阶段 ⇒ 上一阶段已完成（顺序流水线的可靠推断，R3）
+                            # ——对 running 与终态更新都成立；推断只在这一条件下使用；
+                            # 收尾带上当前执行的 run_id 身份，节点不会丢身份
                             snapshot = progress_tool.end(
                                 snapshot, stage=previous_stage, status="succeeded",
-                                attempt=int(snapshot.get("attempt") or 1))
+                                attempt=int(snapshot.get("attempt") or 1),
+                                run_id=str(snapshot.get("run_id") or ""))
                         snapshot = progress_tool.apply(snapshot, stage=stage, status=status,
-                                                       attempt=attempt, latency_ms=latency_ms,
+                                                       attempt=attempt, retries=retries,
+                                                       latency_ms=latency_ms,
                                                        error_category=error_category,
-                                                       run_id=run_id)
+                                                       run_id=run_id, job_id=job_id)
                         marker = json.dumps(snapshot, ensure_ascii=False, sort_keys=True)
                         if marker == written:
                             return
@@ -370,16 +377,25 @@ async def run_turn_task(cfg: AppConfig, events: TurnEvents, *, session_id: uuid.
                                               error_category=str(body.get("error_category") or ""),
                                               run_id=str(body.get("run_id") or ""))
                             elif event == "tool_progress" and body.get("stage_key"):
-                                # 排队等待 / 素材同步 / 向量回填 / 五节点：worker 阶段随轮询可见
-                                await persist(stage=str(body["stage_key"]), status="running",
-                                              attempt=int(body.get("attempt") or 1))
+                                # R3：worker 阶段的**结构化**更新（真实状态 / 源尝试号 / 重试 /
+                                # 错误类别 / run 身份）——不再一律写 running，也便于区分
+                                # failed / skipped / 重试；同一执行重复上报由 progress 单调合并
+                                await persist(stage=str(body["stage_key"]),
+                                              status=str(body.get("status") or "running"),
+                                              attempt=int(body.get("attempt") or 1),
+                                              retries=int(body.get("retries") or 0),
+                                              error_category=str(body.get("error_category") or ""),
+                                              latency_ms=int(body.get("latency_ms") or 0),
+                                              run_id=str(body.get("run_id") or ""),
+                                              job_id=str(body.get("job_id") or ""))
                             elif event == "tool_finished" and body.get("stage_key"):
                                 await persist(stage=str(body["stage_key"]),
                                               status=("succeeded"
                                                       if body.get("status") == "succeeded"
                                                       else "failed"),
                                               attempt=int(body.get("attempt") or 1),
-                                              latency_ms=int(body.get("latency_ms") or 0))
+                                              latency_ms=int(body.get("latency_ms") or 0),
+                                              run_id=str(body.get("run_id") or ""))
                             await events.publish(event, body)
 
                         # R2（OBS-03）：先按轮次结果分流——失败不做 `final_reply`
@@ -450,7 +466,8 @@ def _terminal_snapshot(snapshot: dict[str, Any], *, status: str,
     if data.get("status") == "running":
         return progress_tool.end(data, stage=stage, status=status,
                                  attempt=int(data.get("attempt") or 1),
-                                 error_category=error_category)
+                                 error_category=error_category,
+                                 run_id=str(data.get("run_id") or ""))
     if error_category and not data.get("error_category"):
         data["error_category"] = error_category
     return data

@@ -49,7 +49,7 @@ import uuid
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol
 
 import httpx
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -252,7 +252,16 @@ TOOLS: list[dict[str, Any]] = [
     },
 ]
 
-ProgressFn = Callable[[str, int, int], Awaitable[None]]
+class ProgressFn(Protocol):
+    """工具进度回调：`(中文标签, done, total)`；R3 起可带结构化 `update`。
+
+    `update` 是 `runs.stage` 快照的投影（阶段键 / 真实状态 / 源尝试号 / 重试次数 / 错误类别 /
+    `run_id` / `job_id`）——对话侧据此合并出忠实区分 running / failed / skipped / 重试的快照。
+    只收三个位置参数的旧实现仍然可用（不传 `update` 时行为与以前一致）。
+    """
+
+    async def __call__(self, stage: str, done: int = 0, total: int = 0, *,
+                       update: dict[str, Any] | None = None) -> None: ...
 EnqueueFn = Callable[[str], Awaitable[None]]
 ToolHandler = Callable[..., Awaitable["ToolOutcome"]]
 
@@ -809,40 +818,84 @@ async def _read_image(ctx: ToolContext, attachment: dict[str, Any]) -> tuple[byt
     return data, mime
 
 
+def _stage_update(job: dict[str, Any], job_id: str, snapshot: dict[str, Any],
+                  stage_key: str) -> dict[str, Any]:
+    """把 `runs.stage` 快照投影成对话侧的结构化阶段更新（R3 / OBS-05）。
+
+    保留**来源身份与真实状态**：`stage_key` / 状态 / 源尝试号 / 投递重试次数 / 安全错误类别 /
+    耗时（终态节点上的 `latency_ms`）/ `run_id` / `job_id`；没有阶段键时返回空 dict
+    （调用方退回"分析中"心跳）。
+    """
+    if not stage_key:
+        return {}
+    key = str(stage_key)
+    attempt = int(snapshot.get("attempt") or 1)
+    latency_ms = 0
+    for node in snapshot.get("nodes") or []:
+        if (isinstance(node, dict) and str(node.get("stage") or "") == key
+                and int(node.get("attempt") or 1) == attempt
+                and str(node.get("status") or "") == str(snapshot.get("status") or "")):
+            latency_ms = int(node.get("latency_ms") or 0)
+            break
+    return {
+        "stage_key": key,
+        "label": progress_tool.label_for(key),
+        "status": str(snapshot.get("status") or "running"),
+        "attempt": attempt,
+        "retries": int(snapshot.get("retries") or 0),
+        "error_category": str(snapshot.get("error_category") or ""),
+        "latency_ms": latency_ms,
+        "run_id": str(job.get("run_id") or ""),
+        "job_id": str(job.get("job_id") or job_id),
+    }
+
+
+def _update_marker(update: dict[str, Any]) -> tuple[Any, ...]:
+    """结构化更新的去重键：内容没变就不重复上报（不重复追加节点 / 不逐轮询写库）。"""
+    return (update.get("stage_key"), update.get("status"), int(update.get("attempt") or 1),
+            int(update.get("retries") or 0), str(update.get("error_category") or ""))
+
+
 async def _wait_for_run(ctx: ToolContext, job_id: str,
-                        progress: Callable[[str, int, int], Awaitable[None]]) -> str:
+                        progress: Callable[..., Awaitable[None]]) -> str:
     """轮询 `runs` 到终态；返回 `succeeded` / `failed` / `timeout`。
 
-    S7.20：每次读到**新的阶段**（`runs.stage` 快照 / `queued` 推导的排队等待）就顺着既有的
-    `progress` 通道报一次中文标签——对话侧据此发 `tool_progress` 事件，因此
-    「提交 → 排队等待 → 素材同步 → 向量回填 → 拆解 / 检索 / 缺口 / 撰稿 / 报告」逐段可见。
-    阶段状态与尝试序号仍以 `GET /api/jobs/{job_id}` 的 `stage` 字段为准。
+    S7.20 / R3：除中文标签进度外，把 `runs.stage` 快照**结构化转发**（阶段 / 真实状态 / 源尝试号 /
+    重试次数 / 错误类别 / run_id / job_id）——对话侧据此合并出忠实区分 running / failed /
+    skipped / 重试的快照；终态 job 的最后一份快照在返回前补发一次，结构化内容没变化时不重复上报。
+    快速阶段被轮询略过时**不补造**记录（观测缺失就如实缺席）。
     """
     limit = ctx.max_wait_s if ctx.max_wait_s is not None else float(
         ctx.cfg.queue.task_time_limit_s)
     deadline = time.monotonic() + limit
-    last_stage = ""
+    last_marker: tuple[Any, ...] = ()
     while True:
         # 同一个 session 里必须显式过期：否则 ORM 会把内存里的旧对象原样返回（poll 永远不变）。
         # `expire_all()` 是同步方法（只清身份映射，不发 SQL）。
         ctx.session.expire_all()
         job = await load_job(ctx.session, job_id)
-        status = str((job or {}).get("status") or "")
-        if status in RUN_TERMINAL:
-            return status
-        if time.monotonic() >= deadline:
-            return "timeout"
-        percent = int(round(float((job or {}).get("progress") or 0) * 100))
-        snapshot = (job or {}).get("stage") or {}
+        job = job or {}
+        status = str(job.get("status") or "")
+        snapshot = job.get("stage") or {}
         stage_key = str(snapshot.get("stage") or "")
         if not stage_key and status == "queued":
             stage_key = "queue_wait"            # 排队等待由状态推导，不落单独阶段
-        if stage_key and stage_key != last_stage:
-            last_stage = stage_key
+        percent = int(round(float(job.get("progress") or 0) * 100))
+        update = _stage_update(job, job_id, snapshot, stage_key)
+        if update and _update_marker(update) != last_marker:
+            last_marker = _update_marker(update)
             # 阶段切换的那一次用阶段标签代替"分析中"：每条轮询仍只发一个进度事件
-            await progress(progress_tool.label_for(stage_key), percent, 100)
+            await progress(str(update["label"]), percent, 100, update=update)
         else:
             await progress("分析中", percent, 100)
+        if status in RUN_TERMINAL:
+            # 终态 job：最后一份快照（含 failed / skipped 节点）在返回前补发一次
+            final = _stage_update(job, job_id, snapshot, stage_key)
+            if final and _update_marker(final) != last_marker:
+                await progress(str(final["label"]), 100, 100, update=final)
+            return status
+        if time.monotonic() >= deadline:
+            return "timeout"
         await ctx.sleep(ctx.poll_interval_s)
 
 

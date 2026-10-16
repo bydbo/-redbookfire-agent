@@ -82,6 +82,9 @@ export interface StageView {
 /** 跑起来超过这个时长就提示「耗时较长」——只是提示，不据此断定失败。 */
 export const LONG_STAGE_MS = 60_000
 
+/** 阶段终态（R3 单调合并用）：同一次执行的终态不因重复事件重开。 */
+export const TERMINAL_STAGE_STATUSES = ['succeeded', 'failed', 'skipped', 'interrupted']
+
 // 对话首页的状态：会话列表 / 当前会话的消息 / 本轮流式增量与工具步骤 / 命中过的结果卡片。
 export const useChatStore = defineStore('chat', () => {
   const sessions = ref<ChatSessionSummary[]>([])
@@ -148,19 +151,29 @@ export const useChatStore = defineStore('chat', () => {
     return items.some((item) => item.status === 'running')
   }
 
-  /** 把一份「类快照」对象合进当前阶段（SSE 事件或 `message.progress` 都走这里）。 */
+  /** 把一份「类快照」对象合进当前阶段（SSE 事件或 `message.progress` 都走这里）。
+
+   *  R3（OBS-12）单调合并，与后端 `core/progress.py::begin` 同一口径：
+   *  - 同一阶段、`attempt` 更小：旧尝试的迟到事件，忽略（不回退）；
+   *  - 同一阶段、同一 `attempt` 且已是终态：不重开（重复事件不改写已结束的执行）。
+   */
   function applyProgressLike(raw: Record<string, unknown> | null | undefined): void {
     if (raw === null || raw === undefined) return
     const stage = String(raw.stage ?? '')
     if (stage === '') return
     const attempt = Number(raw.attempt ?? 1)
+    const status = String(raw.status ?? 'running')
     const previous = progress.value
+    if (previous !== null && previous.stage === stage) {
+      if (attempt < previous.attempt) return
+      if (attempt === previous.attempt && TERMINAL_STAGE_STATUSES.includes(previous.status)) return
+    }
     const sameStage = previous !== null && previous.stage === stage && previous.attempt === attempt
     const startedAt = String(raw.started_at ?? '') || (sameStage ? previous.startedAt : '')
     progress.value = {
       stage,
       label: String(raw.label ?? '') || stageLabel(stage),
-      status: String(raw.status ?? 'running'),
+      status,
       attempt,
       // 事件里可能只有 updated_at（如 tool_progress）：同阶段沿用旧起点，新阶段从此刻起算
       startedAt: startedAt !== '' ? startedAt : new Date().toISOString(),
