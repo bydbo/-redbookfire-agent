@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 import sys
 from pathlib import Path
 from typing import Any
@@ -453,7 +454,7 @@ class TestHelpers:
                 "b",
                 parent="s1",
                 type_="GENERATION",
-                usageDetails={"input": 1},
+                usageDetails={"input": 1, "output": 2},
                 metadata={"usage_status": "estimated"},
             ),
         ]
@@ -484,12 +485,158 @@ class TestHelpers:
         assert chain.trace_wall_ms(good_trace()["observations"]) == 4000
         assert chain.trace_wall_ms([]) is None
 
-    def test_generation_tokens_and_cost(self, chain) -> None:
+    def test_probe_usage_and_cost(self, chain) -> None:
         item = generation("g", "x", parent="p")
-        assert chain.generation_tokens(item) == (100, 50)
-        assert abs(chain.generation_cost(item) - 0.0006) < 1e-9
-        assert chain.generation_tokens({}) == (0, 0)
-        assert chain.generation_cost({}) == 0.0
+        assert chain.probe_usage(item) == ("valid", (100, 50))
+        state, value = chain.probe_cost(item)
+        assert state == "valid" and abs(float(value) - 0.0006) < 1e-9
+        assert chain.probe_usage({}) == ("missing", None)
+        assert chain.probe_cost({}) == ("missing", None)
+        # R5（E7OBS2-05）：非法形状 / 值一律 invalid，不按零核账
+        assert chain.probe_cost({"costDetails": {"total": "bad"}}) == ("invalid", None)
+        assert chain.probe_cost({"costDetails": {"total": True}}) == ("invalid", None)
+        assert chain.probe_cost({"costDetails": {"total": -1}}) == ("invalid", None)
+        assert chain.probe_cost({"costDetails": {"total": float("nan")}}) == (
+            "invalid",
+            None,
+        )
+        assert chain.probe_cost({"costDetails": {"total": float("inf")}}) == (
+            "invalid",
+            None,
+        )
+        assert chain.probe_cost({"costDetails": {"weird": 1}}) == ("invalid", None)
+        # 显式零合法；分项求和合法
+        assert chain.probe_cost({"costDetails": {"total": 0.0}}) == ("valid", 0.0)
+        state, value = chain.probe_cost({"costDetails": {"input": 0.1, "output": 0.2}})
+        assert state == "valid" and abs(float(value) - 0.3) < 1e-9
+        assert (
+            chain.probe_usage({"usageDetails": {"input": -1, "output": 5}})[0]
+            == "invalid"
+        )
+        assert (
+            chain.probe_usage({"usageDetails": {"input": "100", "output": 5}})[0]
+            == "invalid"
+        )
+        assert (
+            chain.probe_usage({"usageDetails": {"total": 10}})[0] == "invalid"
+        )  # 不支持形状
+
+
+class TestCostAndUsageParsing:
+    """R5（E7OBS2-05）：非法成本不能通过核对；叶子与账本同一解析结果。"""
+
+    def test_invalid_cost_string_fails_leaf_and_ledger(self, chain) -> None:
+        trace = good_trace()
+        trace["observations"].append(
+            generation("g3", "bad_leaf", parent="s4", cost="bad")
+        )
+        checks = verify(chain, trace, ledger=GOOD_LEDGER)
+        assert checks["叶子用量"].ok is False
+        assert "非法" in checks["叶子用量"].detail
+        assert checks["账本核对"].ok is False  # 不能因"转换失败按 0"而通过
+        assert "无法核对" in checks["账本核对"].detail
+
+    def test_invalid_cost_not_hidden_by_unknown_declaration(self, chain) -> None:
+        trace = good_trace()
+        trace["observations"].append(
+            generation(
+                "g3",
+                "sneaky",
+                parent="s4",
+                cost=-1,
+                metadata={"usage_status": "unknown"},
+            )
+        )
+        checks = verify(chain, trace)
+        assert checks["叶子用量"].ok is False  # 无效数字不因 unknown 被隐藏
+
+    def test_cost_without_usage_and_usage_without_cost_both_fail(self, chain) -> None:
+        trace = good_trace()
+        trace["observations"].append(
+            observation(
+                "g3",
+                "no_usage",
+                parent="s4",
+                type_="GENERATION",
+                costDetails={"total": 0.01},
+            )
+        )
+        trace["observations"].append(
+            observation(
+                "g4",
+                "no_cost",
+                parent="s4",
+                type_="GENERATION",
+                usageDetails={"input": 5, "output": 5},
+            )
+        )
+        checks = verify(chain, trace)
+        assert checks["叶子用量"].ok is False
+        assert "no_usage" in checks["叶子用量"].detail
+        assert "no_cost" in checks["叶子用量"].detail
+
+    def test_explicit_zero_value_still_valid(self, chain) -> None:
+        trace = good_trace()
+        trace["observations"].append(
+            generation("g3", "free_call", parent="s4", prompt=0, completion=0, cost=0)
+        )
+        checks = verify(chain, trace)
+        assert checks["叶子用量"].ok is True
+
+    def test_latency_prefers_same_basis_window(self, chain) -> None:
+        """有轮次时间窗时按**同边界**比对（入口 span 只作参考）；不一致照样判失败。"""
+        trace = good_trace()
+        trace["observations"][0]["metadata"].update(
+            {
+                "run_started_at": "2026-10-15T08:00:00.000Z",
+                "run_finished_at": "2026-10-15T08:00:03.000Z",
+            }
+        )  # 窗 3000ms，入口 span 4000ms
+        checks = verify(chain, trace, expected_latency_ms=3000)
+        assert checks["耗时口径"].ok is True
+        assert "同边界" in checks["耗时口径"].detail
+
+        checks = verify(chain, trace, expected_latency_ms=4000, tolerance_ms=500)
+        assert checks["耗时口径"].ok is False  # 3000 vs 4000：按同边界就不一致
+
+    def test_json_cli_stdout_is_pure_json(
+        self, chain, capsys, monkeypatch, tmp_path
+    ) -> None:
+        class Cfg:
+            langfuse_keys = ("pk", "sk", "http://host")
+
+        monkeypatch.setattr(chain, "load_config", lambda: Cfg())
+        monkeypatch.setattr(
+            chain, "load_trace", lambda cfg, tid, retries=2: good_trace()
+        )
+        save = tmp_path / "trace.json"
+        code = chain.main(["--trace-id", "t1", "--json", "--save", str(save)])
+
+        out, err = capsys.readouterr()
+        payload = json.loads(out)  # stdout 可直接解析
+        assert payload["trace_id"] == "t1"
+        assert payload["checks"]
+        assert "[已存证]" in err  # 说明挪到 stderr
+        assert out.count("{") >= 1 and "[已存证]" not in out
+        assert code == 0
+
+    def test_json_cli_failure_exit_code_still_reported(
+        self, chain, capsys, monkeypatch
+    ) -> None:
+        class Cfg:
+            langfuse_keys = ("pk", "sk", "http://host")
+
+        monkeypatch.setattr(chain, "load_config", lambda: Cfg())
+        broken = good_trace()
+        broken["observations"][0]["metadata"]["usage_unknown_calls"] = 1
+        monkeypatch.setattr(chain, "load_trace", lambda cfg, tid, retries=2: broken)
+        code = chain.main(["--trace-id", "t2", "--json", "--expect", "vision"])
+
+        out, _err = capsys.readouterr()
+        payload = json.loads(out)
+        assert code == 1
+        assert payload["passed"] is False
+        assert any(item["name"] == "视觉调用" for item in payload["failures"])
 
 
 class TestCli:

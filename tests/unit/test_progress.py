@@ -191,3 +191,78 @@ class TestMonotonicMerge:
                               run_id="run-new")
         assert merged["status"] == "succeeded"
         assert len(merged["nodes"]) == 1               # 合并进同一个节点，不新增
+
+
+class TestIdentityIsolation:
+    """R5（E7OBS2-02）：迟到终态不回退、不串身份；冲突终态保留首个；身份随当前阶段一致。"""
+
+    def test_late_terminal_from_another_run_only_fills_nodes(self):
+        """report/running/run-new 收到 draft/succeeded/run-old：顶层不回退，历史照补。"""
+        snapshot = progress.begin(None, stage="report", attempt=1, run_id="run-new",
+                                  job_id="job-new")
+        late = progress.end(snapshot, stage="draft", status="succeeded", attempt=2,
+                            run_id="run-old")
+        assert late["stage"] == "report" and late["status"] == "running"
+        assert late["run_id"] == "run-new" and late["job_id"] == "job-new"
+        nodes = {(item["stage"], item.get("run_id") or ""): item["status"]
+                 for item in late["nodes"]}
+        assert nodes[("draft", "run-old")] == "succeeded"      # 历史事实照补，不回退顶层
+
+    def test_same_stage_terminal_from_another_run_does_not_take_over(self):
+        """同 stage 新 run 收旧 run 结束：当前状态与身份都不被改写。"""
+        snapshot = progress.begin(None, stage="clue", attempt=1, run_id="run-new")
+        late = progress.end(snapshot, stage="clue", status="failed", attempt=5,
+                            run_id="run-old", error_category="llm_error")
+        assert late["status"] == "running" and late["attempt"] == 1
+        assert late["run_id"] == "run-new" and late["error_category"] == ""
+        assert late["nodes"][0]["run_id"] == "run-old"         # 旧执行自己的节点
+
+    def test_new_run_with_lower_attempt_starts_its_own_execution(self):
+        """新 run 尝试号更低：不被旧 run 的高尝试 / 终态拦截（身份优先于序号）。"""
+        old = progress.begin(None, stage="clue", attempt=3, run_id="run-old")
+        old = progress.end(old, stage="clue", status="failed", attempt=3, run_id="run-old",
+                           error_category="llm_error")
+        fresh = progress.begin(old, stage="clue", attempt=1, run_id="run-new")
+        assert fresh["status"] == "running" and fresh["attempt"] == 1
+        assert fresh["run_id"] == "run-new" and fresh["error_category"] == ""
+
+    def test_duplicate_terminal_same_status_refreshes_latency(self):
+        """同状态重复终态：允许耗时修订（终态耗时来源后补的场景）。"""
+        snapshot = progress.end(progress.begin(None, stage="report", attempt=1,
+                                               run_id="run-a"),
+                                stage="report", status="succeeded", attempt=1,
+                                run_id="run-a", latency_ms=5)
+        refreshed = progress.end(snapshot, stage="report", status="succeeded", attempt=1,
+                                 run_id="run-a", latency_ms=99)
+        assert refreshed["nodes"][0]["latency_ms"] == 99
+        assert refreshed["status"] == "succeeded"
+
+    def test_conflicting_terminal_keeps_first_status(self):
+        """冲突终态（同执行同尝试）：保留首个，不翻转、不混状态。"""
+        snapshot = progress.end(progress.begin(None, stage="clue", attempt=1, run_id="run-a"),
+                                stage="clue", status="failed", attempt=1, run_id="run-a",
+                                error_category="llm_error")
+        second = progress.end(snapshot, stage="clue", status="succeeded", attempt=1,
+                              run_id="run-a")
+        assert second["status"] == "failed"
+        assert second["error_category"] == "llm_error"
+        assert second["nodes"][0]["status"] == "failed"
+
+    def test_identity_follows_current_stage(self):
+        """顶层 run/job 身份与当前阶段一致：同阶段缺身份保留，跨阶段缺身份清空。"""
+        started = progress.begin(None, stage="clue", attempt=1, run_id="run-a", job_id="job-a")
+        closed = progress.end(started, stage="clue", status="succeeded")
+        assert closed["run_id"] == "run-a" and closed["job_id"] == "job-a"
+        moved = progress.end(closed, stage="report", status="succeeded", run_id="run-a")
+        assert moved["stage"] == "report" and moved["run_id"] == "run-a"
+        left = progress.end(moved, stage="final_reply", status="succeeded")
+        assert left["run_id"] is None and left["job_id"] is None   # 跨阶段缺身份：清空
+
+    def test_cross_stage_advance_resets_error_category(self):
+        """跨阶段推进不残留上一阶段的错误类别。"""
+        failed = progress.end(progress.begin(None, stage="clue", attempt=1, run_id="run-a"),
+                              stage="clue", status="failed", attempt=1, run_id="run-a",
+                              error_category="llm_error")
+        moved = progress.end(progress.begin(failed, stage="report", attempt=1, run_id="run-a"),
+                             stage="report", status="succeeded", run_id="run-a")
+        assert moved["stage"] == "report" and moved["error_category"] == ""

@@ -40,7 +40,7 @@ from xhs_agent.services.chat_tools import (
 from xhs_agent.services.image_clue import ImageClueParse
 from xhs_agent.services.retrieval import RetrievalOutcome
 from xhs_agent.tools import llm
-from xhs_agent.tools.llm import LLMResult, StructuredCaller
+from xhs_agent.tools.llm import LLMError, LLMResult, StructuredCaller
 
 CLUE_PAYLOAD: dict[str, Any] = {
     "hotspot_raw": "",
@@ -94,6 +94,7 @@ class CountingProvider(llm.BaseProvider):
             prompt_tokens=10,
             completion_tokens=5,
             cost_cny=0.003,
+            usage_status="actual",  # R5：假 provider 按真实契约标来源
         )
 
 
@@ -285,6 +286,8 @@ class TestClueCache:
         )  # S7.10：用量只在第一次记
         assert first.version == 1 and second.version == 1
         assert third.cost_cny > 0
+        assert first.usage_status == "actual"  # R5：真实调用带口径
+        assert second.usage_status == "cached"  # 缓存命中：本轮无新增消费
 
 
 class TestImageUsageAndFallback:
@@ -300,6 +303,7 @@ class TestImageUsageAndFallback:
             prompt_tokens=1000,
             completion_tokens=500,
             cost_cny=0.0075,
+            usage_status="actual",  # R5：视觉结果自带来源口径
         )
 
     @pytest.mark.asyncio
@@ -335,6 +339,8 @@ class TestImageUsageAndFallback:
             0,
             0.0,
         )
+        assert first.usage_status == "actual"
+        assert second.usage_status == "cached"  # R5：命中缓存与免费真实请求区分
 
     @pytest.mark.asyncio
     async def test_multi_image_group_goes_through_the_merge_path_once(
@@ -349,6 +355,7 @@ class TestImageUsageAndFallback:
             prompt_tokens=3000,
             completion_tokens=600,
             cost_cny=0.02,
+            usage_status="estimated",
         )
         single_calls: list[str] = []
         multi_calls: list[list[str]] = []
@@ -387,6 +394,8 @@ class TestImageUsageAndFallback:
         assert first.prompt_versions == {"image_hotspot_clue_multi": 1}
         assert first.cost_cny == pytest.approx(0.02)
         assert second.cost_cny == 0.0 and second.prompt_tokens == 0  # 缓存命中不计费
+        assert first.usage_status == "estimated"
+        assert second.usage_status == "cached"  # R5：缓存命中口径随结果上卷
 
     @pytest.mark.asyncio
     async def test_analysis_passes_the_whole_group_to_the_parser(
@@ -1120,6 +1129,108 @@ class TestWaitForRunStructuredUpdates:
             }
         ]
 
+    def test_update_marker_includes_source_identity_and_terminal_latency(self) -> None:
+        """R5（E7OBS2-03）：去重键带来源身份——不同来源不许静默去重；终态耗时修订要能到达。"""
+        base = {
+            "stage_key": "clue",
+            "status": "succeeded",
+            "attempt": 1,
+            "retries": 0,
+            "error_category": "",
+            "run_id": "run-a",
+            "job_id": "job-1",
+            "latency_ms": 5,
+        }
+        marker = chat_tools._update_marker(base)
+        assert chat_tools._update_marker(dict(base)) == marker  # 同内容去重
+        assert (
+            chat_tools._update_marker({**base, "run_id": "run-b"}) != marker
+        )  # 换 run：不是同一事实
+        assert chat_tools._update_marker({**base, "job_id": "job-2"}) != marker
+        assert (
+            chat_tools._update_marker({**base, "latency_ms": 9}) != marker
+        )  # 终态耗时修订
+        running = {**base, "status": "running", "latency_ms": 0}
+        assert chat_tools._update_marker(running) == chat_tools._update_marker(
+            {**running, "latency_ms": 7}
+        )  # 运行中不带耗时：不逐轮询上报
+
+    @pytest.mark.asyncio
+    async def test_terminal_latency_revision_reaches_the_caller(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """终态节点的耗时随后修正（0 → 9）：修正那次也要上报，不能被去重吞掉。"""
+        jobs = [
+            {
+                "status": "running",
+                "progress": 0.5,
+                "run_id": "run-1",
+                "job_id": "job-1",
+                "stage": {
+                    "stage": "clue",
+                    "status": "succeeded",
+                    "attempt": 1,
+                    "nodes": [
+                        {
+                            "stage": "clue",
+                            "status": "succeeded",
+                            "attempt": 1,
+                            "latency_ms": 0,
+                        }
+                    ],
+                },
+            },
+            {
+                "status": "running",
+                "progress": 0.5,
+                "run_id": "run-1",
+                "job_id": "job-1",
+                "stage": {
+                    "stage": "clue",
+                    "status": "succeeded",
+                    "attempt": 1,
+                    "nodes": [
+                        {
+                            "stage": "clue",
+                            "status": "succeeded",
+                            "attempt": 1,
+                            "latency_ms": 9,
+                        }
+                    ],
+                },
+            },
+            {
+                "status": "succeeded",
+                "progress": 1.0,
+                "run_id": "run-1",
+                "job_id": "job-1",
+                "stage": {"stage": "report", "status": "succeeded", "attempt": 1},
+            },
+        ]
+        pending = list(jobs)
+
+        async def fake_load_job(_session: Any, _job_id: str) -> dict[str, Any]:
+            return dict(pending.pop(0)) if pending else dict(jobs[-1])
+
+        monkeypatch.setattr(chat_tools, "load_job", fake_load_job)
+        updates: list[dict[str, Any]] = []
+
+        async def progress(
+            stage: str,
+            done: int = 0,
+            total: int = 0,
+            *,
+            update: dict[str, Any] | None = None,
+        ) -> None:
+            if update is not None:
+                updates.append(dict(update))
+
+        status = await chat_tools._wait_for_run(self._ctx(tmp_path), "job-1", progress)
+
+        assert status == "succeeded"
+        clue_updates = [item for item in updates if item["stage_key"] == "clue"]
+        assert [item["latency_ms"] for item in clue_updates] == [0, 9]  # 修订到达
+
 
 class TestToolClosureForwardsStructuredUpdate:
     """R6 冒烟回归（OBS-12）：run_hotspot_analysis 的 progress 闭包必须把结构化
@@ -1202,3 +1313,87 @@ class TestToolClosureForwardsStructuredUpdate:
             "report",
         ]
         assert updates[-1]["status"] == "succeeded"
+
+
+class TestPartialConsumptionOnFailure:
+    """R5（E7OBS2-01）：工具内部部分成功后失败，已知消费与运行引用不丢、未知单列。"""
+
+    def _parsed_image(self) -> ImageClueParse:
+        clue = HotspotClue.from_dict({**CLUE_PAYLOAD, "hotspot_raw": "夜跑球鞋开箱"})
+        return ImageClueParse(
+            raw_text="夜跑球鞋开箱",
+            clue=clue,
+            prompt_versions={"image_hotspot_clue": 1},
+            prompt_tokens=500,
+            completion_tokens=20,
+            cost_cny=0.003,
+        )
+
+    @pytest.mark.asyncio
+    async def test_image_cost_survives_analysis_timeout(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """图片解析已成功、分析超时：视觉已知账目与 run 引用保留，未知单独标注。"""
+
+        async def fake_image(_ctx: Any, _group: Any) -> ImageClueParse:
+            return self._parsed_image()
+
+        async def fake_submit(*_args: Any, **_kwargs: Any) -> Any:
+            return SimpleNamespace(job_id="job-1", run_id=RUN_UUID)
+
+        async def fake_load_job(_session: Any, _job_id: str) -> dict[str, Any]:
+            return {"status": "running", "progress": 0.1, "stage": {}}
+
+        monkeypatch.setattr(chat_tools, "_image_clue_for", fake_image)
+        monkeypatch.setattr(chat_tools, "submit_analysis", fake_submit)
+        monkeypatch.setattr(chat_tools, "load_job", fake_load_job)
+
+        ctx = ToolContext(
+            cfg=write_config(tmp_path),
+            session=cast(Any, FakePollSession()),
+            poll_interval_s=0.0,
+            max_wait_s=0.0,
+        )
+        outcome = await chat_tools.run_hotspot_analysis(
+            ctx, {"hotspot": ""}, attachments=[{"path": "a.png"}]
+        )
+
+        assert outcome.status == "failed" and "超过等待上限" in outcome.error
+        assert outcome.payload["usage_status"] == "unknown"  # 分析那段未知
+        assert outcome.payload["cost_cny"] == 0.003  # 图片那段已知，不丢
+        assert outcome.payload["prompt_tokens"] == 500
+        assert outcome.payload["completion_tokens"] == 20
+        assert outcome.payload["run_id"] == RUN_UUID  # 运行引用保留
+        assert outcome.prompt_versions == {"image_hotspot_clue": 1}
+
+    @pytest.mark.asyncio
+    async def test_clue_cost_survives_retrieval_failure(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """拆解已成功、检索失败：拆解的已知消费与版本保留，检索那段未知单列。"""
+        record = chat_tools.ClueRecord(
+            clue=HotspotClue.from_dict({**CLUE_PAYLOAD, "hotspot_raw": "夜跑球鞋开箱"}),
+            version=2,
+            cost_cny=0.004,
+            prompt_tokens=300,
+            completion_tokens=100,
+        )
+
+        async def fake_clue(_ctx: Any, _text: str) -> Any:
+            return record
+
+        async def boom(*_args: Any, **_kwargs: Any) -> Any:
+            raise LLMError("检索挂了")
+
+        monkeypatch.setattr(chat_tools, "_clue_for", fake_clue)
+        monkeypatch.setattr(chat_tools, "retrieve_candidates", boom)
+
+        outcome = await chat_tools.search_materials(
+            context(tmp_path), {"hotspot": "夜跑球鞋开箱"}
+        )
+
+        assert outcome.status == "failed" and "检索素材失败" in outcome.error
+        assert outcome.payload["usage_status"] == "unknown"
+        assert outcome.payload["cost_cny"] == 0.004
+        assert outcome.payload["prompt_tokens"] == 300
+        assert outcome.prompt_versions == {chat_tools.CLUE_TASK: 2}

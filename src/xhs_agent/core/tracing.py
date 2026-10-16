@@ -77,18 +77,30 @@ R = TypeVar("R")
 def availability(cfg: AppConfig) -> tuple[bool, str]:
     """追踪是否可用：三件套齐全才算启用；否则返回一句可照做的原因。"""
     public, secret, host = cfg.langfuse_keys
-    missing = [name for name, value in (("LANGFUSE_PUBLIC_KEY", public),
-                                        ("LANGFUSE_SECRET_KEY", secret),
-                                        ("LANGFUSE_HOST", host)) if not value]
+    missing = [
+        name
+        for name, value in (
+            ("LANGFUSE_PUBLIC_KEY", public),
+            ("LANGFUSE_SECRET_KEY", secret),
+            ("LANGFUSE_HOST", host),
+        )
+        if not value
+    ]
     if missing:
-        return False, ("缺少 " + " / ".join(missing)
-                       + "（三个都写进 config/.env 才启用；追踪是旁路组件，关闭不影响分析）")
+        return False, (
+            "缺少 "
+            + " / ".join(missing)
+            + "（三个都写进 config/.env 才启用；追踪是旁路组件，关闭不影响分析）"
+        )
     return True, ""
 
 
 def capture_content(cfg: AppConfig) -> bool:
     """是否上报提示词与产出正文（默认 false，符合 ADR 0005）。"""
-    return str(cfg.env_view.get("LANGFUSE_CAPTURE_CONTENT") or "").strip().lower() in TRUTHY
+    return (
+        str(cfg.env_view.get("LANGFUSE_CAPTURE_CONTENT") or "").strip().lower()
+        in TRUTHY
+    )
 
 
 # ---------- S4.3：OpenTelemetry span、埋点与跨进程传播 ----------
@@ -118,8 +130,9 @@ def install_fastapi_instrumentation(app: Any) -> bool:
         return False
     from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
 
-    FastAPIInstrumentor.instrument_app(app, excluded_urls=EXCLUDED_URLS,
-                                       exclude_spans=["receive", "send"])
+    FastAPIInstrumentor.instrument_app(
+        app, excluded_urls=EXCLUDED_URLS, exclude_spans=["receive", "send"]
+    )
     app.state.otel_instrumented = True
     return True
 
@@ -136,8 +149,9 @@ def db_span(name: str, *, operation: str, tables: Sequence[str]) -> Iterator[Non
     而 DB span 是会导出到云的；错误诊断走本地日志与调用方的安全类别。
     """
     tracer = otel_trace.get_tracer(DB_TRACER_NAME)
-    with tracer.start_as_current_span(name, record_exception=False,
-                                      set_status_on_exception=False) as span:
+    with tracer.start_as_current_span(
+        name, record_exception=False, set_status_on_exception=False
+    ) as span:
         if span.is_recording():
             _annotate_db_span(span, operation=operation, tables=tables)
         yield None
@@ -147,17 +161,22 @@ def _annotate_db_span(span: Any, *, operation: str, tables: Sequence[str]) -> No
     """DB span 的属性：semconv 的标准键 + Langfuse 读得懂的原样元数据键。"""
     span.set_attribute("db.system", "postgresql")
     span.set_attribute("db.operation", operation)
-    metadata: dict[str, Any] = {"db.system": "postgresql", "db.operation": operation,
-                                "db.tables": list(tables)}
+    metadata: dict[str, Any] = {
+        "db.system": "postgresql",
+        "db.operation": operation,
+        "db.tables": list(tables),
+    }
     for key, value in metadata.items():
-        span.set_attribute(f"{_LANGFUSE_METADATA_PREFIX}{key}",
-                           json.dumps(value, ensure_ascii=False))
+        span.set_attribute(
+            f"{_LANGFUSE_METADATA_PREFIX}{key}", json.dumps(value, ensure_ascii=False)
+        )
 
 
-def traced_db(name: str, *, operation: str,
-              tables: Sequence[str]) -> Callable[[Callable[P, Awaitable[R]]],
-                                                 Callable[P, Awaitable[R]]]:
+def traced_db(
+    name: str, *, operation: str, tables: Sequence[str]
+) -> Callable[[Callable[P, Awaitable[R]]], Callable[P, Awaitable[R]]]:
     """给异步函数套一层 DB span 的装饰器（免去在每个调用点手写 `with`）。"""
+
     def decorator(func: Callable[P, Awaitable[R]]) -> Callable[P, Awaitable[R]]:
         @functools.wraps(func)
         async def wrapper(*args: P.args, **kwargs: P.kwargs) -> R:
@@ -177,7 +196,7 @@ def current_trace_headers() -> dict[str, str]:
     carrier: dict[str, str] = {}
     try:
         propagate.inject(carrier)
-    except Exception as exc:   # noqa: BLE001 - 传播失败不影响业务
+    except Exception as exc:  # noqa: BLE001 - 传播失败不影响业务
         logger.warning("W3C traceparent 注入失败（不影响分析）：%s", type(exc).__name__)
         return {}
     return {key: str(value) for key, value in carrier.items() if value}
@@ -186,8 +205,11 @@ def current_trace_headers() -> dict[str, str]:
 @contextmanager
 def use_trace_carrier(carrier: Mapping[str, Any] | None) -> Iterator[None]:
     """把上游的 trace 上下文接进当前进程（S4.3：worker 接住 API 传下来的 traceparent）。"""
-    headers = {key: str(value) for key, value in (carrier or {}).items()
-               if key in CARRIER_KEYS and value}
+    headers = {
+        key: str(value)
+        for key, value in (carrier or {}).items()
+        if key in CARRIER_KEYS and value
+    }
     if not headers:
         yield None
         return
@@ -216,29 +238,44 @@ class Tracer(Protocol):
 
     enabled: bool
 
-    def run(self, *, name: str, metadata: dict[str, Any]) -> AbstractContextManager[None]: ...
+    def run(
+        self, *, name: str, metadata: dict[str, Any]
+    ) -> AbstractContextManager[None]: ...
 
-    def hotspot(self, *, index: int, metadata: dict[str, Any],
-                content: str = "") -> AbstractContextManager[None]: ...
+    def hotspot(
+        self, *, index: int, metadata: dict[str, Any], content: str = ""
+    ) -> AbstractContextManager[None]: ...
 
-    def generation(self, *, name: str, model: str,
-                   metadata: dict[str, Any]) -> AbstractContextManager[Generation]: ...
+    def generation(
+        self, *, name: str, model: str, metadata: dict[str, Any]
+    ) -> AbstractContextManager[Generation]: ...
 
     # ---- S7.19：对话轮次 / 工具 / 节点三层（span 父子关系见 `docs/可观测.md`）----
-    def turn(self, *, name: str, metadata: dict[str, Any],
-             turn_id: str = "") -> AbstractContextManager[None]: ...
+    def turn(
+        self, *, name: str, metadata: dict[str, Any], turn_id: str = ""
+    ) -> AbstractContextManager[None]: ...
 
-    def tool(self, *, name: str,
-             metadata: dict[str, Any]) -> AbstractContextManager[Generation]: ...
+    def tool(
+        self, *, name: str, metadata: dict[str, Any]
+    ) -> AbstractContextManager[Generation]: ...
 
-    def node(self, *, name: str,
-             metadata: dict[str, Any]) -> AbstractContextManager[Generation]: ...
+    def node(
+        self, *, name: str, metadata: dict[str, Any]
+    ) -> AbstractContextManager[Generation]: ...
 
-    def finish_run(self, *, status: str, totals: dict[str, Any], run_id: str = "",
-                   prompt_versions: dict[str, int] | None = None, error: str = "") -> None: ...
+    def finish_run(
+        self,
+        *,
+        status: str,
+        totals: dict[str, Any],
+        run_id: str = "",
+        prompt_versions: dict[str, int] | None = None,
+        error: str = "",
+    ) -> None: ...
 
-    def finish_turn(self, *, status: str, totals: dict[str, Any], turn_id: str = "",
-                    error: str = "") -> None: ...
+    def finish_turn(
+        self, *, status: str, totals: dict[str, Any], turn_id: str = "", error: str = ""
+    ) -> None: ...
 
     def current_trace_id(self) -> str: ...
 
@@ -252,35 +289,50 @@ class NullTracer:
 
     enabled = False
 
-    def run(self, *, name: str, metadata: dict[str, Any]) -> AbstractContextManager[None]:
+    def run(
+        self, *, name: str, metadata: dict[str, Any]
+    ) -> AbstractContextManager[None]:
         return nullcontext(None)
 
-    def hotspot(self, *, index: int, metadata: dict[str, Any],
-                content: str = "") -> AbstractContextManager[None]:
+    def hotspot(
+        self, *, index: int, metadata: dict[str, Any], content: str = ""
+    ) -> AbstractContextManager[None]:
         return nullcontext(None)
 
-    def generation(self, *, name: str, model: str,
-                   metadata: dict[str, Any]) -> AbstractContextManager[Generation]:
+    def generation(
+        self, *, name: str, model: str, metadata: dict[str, Any]
+    ) -> AbstractContextManager[Generation]:
         return nullcontext(Generation(metadata=dict(metadata)))
 
-    def turn(self, *, name: str, metadata: dict[str, Any],
-             turn_id: str = "") -> AbstractContextManager[None]:
+    def turn(
+        self, *, name: str, metadata: dict[str, Any], turn_id: str = ""
+    ) -> AbstractContextManager[None]:
         return nullcontext(None)
 
-    def tool(self, *, name: str,
-             metadata: dict[str, Any]) -> AbstractContextManager[Generation]:
+    def tool(
+        self, *, name: str, metadata: dict[str, Any]
+    ) -> AbstractContextManager[Generation]:
         return nullcontext(Generation(metadata=dict(metadata)))
 
-    def node(self, *, name: str,
-             metadata: dict[str, Any]) -> AbstractContextManager[Generation]:
+    def node(
+        self, *, name: str, metadata: dict[str, Any]
+    ) -> AbstractContextManager[Generation]:
         return nullcontext(Generation(metadata=dict(metadata)))
 
-    def finish_run(self, *, status: str, totals: dict[str, Any], run_id: str = "",
-                   prompt_versions: dict[str, int] | None = None, error: str = "") -> None:
+    def finish_run(
+        self,
+        *,
+        status: str,
+        totals: dict[str, Any],
+        run_id: str = "",
+        prompt_versions: dict[str, int] | None = None,
+        error: str = "",
+    ) -> None:
         return None
 
-    def finish_turn(self, *, status: str, totals: dict[str, Any], turn_id: str = "",
-                    error: str = "") -> None:
+    def finish_turn(
+        self, *, status: str, totals: dict[str, Any], turn_id: str = "", error: str = ""
+    ) -> None:
         return None
 
     def current_trace_id(self) -> str:
@@ -299,8 +351,12 @@ def build_client(cfg: AppConfig) -> Any:
 
     public, secret, host = cfg.langfuse_keys
     # S4.3：放宽导出过滤器，否则 ASGI 服务端 span 与我们自建的 DB span 会被静默丢弃
-    return Langfuse(public_key=public, secret_key=secret, host=host,
-                    should_export_span=should_export_span)
+    return Langfuse(
+        public_key=public,
+        secret_key=secret,
+        host=host,
+        should_export_span=should_export_span,
+    )
 
 
 # ---------- R1（OBS-01 / OBS-02）：安全错误投影 ----------
@@ -347,9 +403,15 @@ class LangfuseTracer:
     _OMIT = object()
 
     @contextmanager
-    def _safe_observation(self, *, name: str, as_type: str,
-                          metadata: dict[str, Any] | None = None, model: str = "",
-                          input_value: Any = _OMIT) -> Iterator[bool]:
+    def _safe_observation(
+        self,
+        *,
+        name: str,
+        as_type: str,
+        metadata: dict[str, Any] | None = None,
+        model: str = "",
+        input_value: Any = _OMIT,
+    ) -> Iterator[bool]:
         """创建 / 进入 / 退出任一失败都不影响业务的观测上下文（见类 docstring 的口径）。
 
         产出值为"观测是否真正建立"：建立失败时调用方**跳过字段写回**（避免把更新误挂到
@@ -358,8 +420,11 @@ class LangfuseTracer:
         instance: Any = None
         entered = False
         try:
-            kwargs: dict[str, Any] = {"name": name, "as_type": as_type,
-                                      "metadata": dict(metadata or {})}
+            kwargs: dict[str, Any] = {
+                "name": name,
+                "as_type": as_type,
+                "metadata": dict(metadata or {}),
+            }
             if model:
                 kwargs["model"] = model
             if input_value is not self._OMIT:
@@ -367,7 +432,7 @@ class LangfuseTracer:
             instance = self._client.start_as_current_observation(**kwargs)
             instance.__enter__()
             entered = True
-        except Exception as exc:                 # noqa: BLE001 - 建观测失败：空观测继续业务
+        except Exception as exc:  # noqa: BLE001 - 建观测失败：空观测继续业务
             self._warn_safe("观测创建失败", exc)
             instance = None
         try:
@@ -389,7 +454,7 @@ class LangfuseTracer:
         """
         try:
             instance.__exit__(None, None, None)
-        except BaseException as exc:             # noqa: BLE001
+        except BaseException as exc:  # noqa: BLE001
             self._warn_safe("观测收尾失败", exc)
 
     @staticmethod
@@ -405,24 +470,31 @@ class LangfuseTracer:
             yield None
 
     @contextmanager
-    def hotspot(self, *, index: int, metadata: dict[str, Any],
-                content: str = "") -> Iterator[None]:
+    def hotspot(
+        self, *, index: int, metadata: dict[str, Any], content: str = ""
+    ) -> Iterator[None]:
         """一个热点的 span；只有 `capture_content` 打开时才带原文。"""
-        with self._safe_observation(name=f"hotspot-{index}", as_type="span", metadata=metadata,
-                                    input_value=content if (self.capture and content) else None):
+        with self._safe_observation(
+            name=f"hotspot-{index}",
+            as_type="span",
+            metadata=metadata,
+            input_value=content if (self.capture and content) else None,
+        ):
             yield None
 
     @contextmanager
-    def generation(self, *, name: str, model: str,
-                   metadata: dict[str, Any]) -> Iterator[Generation]:
+    def generation(
+        self, *, name: str, model: str, metadata: dict[str, Any]
+    ) -> Iterator[Generation]:
         """一次模型调用的 generation：块内填 `Generation`，退出时写回 SDK。"""
         fields = Generation(metadata=dict(metadata))
-        with self._safe_observation(name=name, as_type="generation", model=model,
-                                    metadata=metadata) as available:
+        with self._safe_observation(
+            name=name, as_type="generation", model=model, metadata=metadata
+        ) as available:
             try:
                 yield fields
             finally:
-                if available:                    # 观测没建起来就不写回（免得挂到外层 span）
+                if available:  # 观测没建起来就不写回（免得挂到外层 span）
                     self._apply_generation(fields)
 
     def _apply_generation(self, fields: Generation) -> None:
@@ -447,11 +519,18 @@ class LangfuseTracer:
             return
         try:
             self._client.update_current_generation(**payload)
-        except Exception as exc:   # noqa: BLE001 - 上报失败只记日志，绝不影响分析结果
+        except Exception as exc:  # noqa: BLE001 - 上报失败只记日志，绝不影响分析结果
             self._warn_safe("generation 上报失败", exc)
 
-    def finish_run(self, *, status: str, totals: dict[str, Any], run_id: str = "",
-                   prompt_versions: dict[str, int] | None = None, error: str = "") -> None:
+    def finish_run(
+        self,
+        *,
+        status: str,
+        totals: dict[str, Any],
+        run_id: str = "",
+        prompt_versions: dict[str, int] | None = None,
+        error: str = "",
+    ) -> None:
         """收尾：把状态、统计与 prompt 版本写到 trace 上，并打一条带 trace 链接的日志。"""
         metadata: dict[str, Any] = {
             "status": status,
@@ -464,17 +543,20 @@ class LangfuseTracer:
         if run_id:
             metadata["run_id"] = run_id
         if prompt_versions:
-            metadata["prompt_versions"] = {str(key): int(value)
-                                           for key, value in prompt_versions.items()}
+            metadata["prompt_versions"] = {
+                str(key): int(value) for key, value in prompt_versions.items()
+            }
         payload: dict[str, Any] = {
             "metadata": metadata,
             "level": LEVEL_ERROR if status != "succeeded" else LEVEL_DEFAULT,
         }
         if error:
-            payload["status_message"] = safe_error_text(error)[:1000]   # OBS-02：只发安全类别
+            payload["status_message"] = safe_error_text(error)[
+                :1000
+            ]  # OBS-02：只发安全类别
         try:
             self._client.update_current_span(**payload)
-        except Exception as exc:   # noqa: BLE001
+        except Exception as exc:  # noqa: BLE001
             self._warn_safe("trace 收尾失败", exc)
         self._log_trace(run_id)
 
@@ -483,16 +565,21 @@ class LangfuseTracer:
         try:
             trace_id = self._client.get_current_trace_id()
             url = self._client.get_trace_url(trace_id=trace_id) if trace_id else None
-        except Exception:   # noqa: BLE001 - 取链接失败不影响上报
+        except Exception:  # noqa: BLE001 - 取链接失败不影响上报
             return
         if trace_id:
-            logger.info("调用追踪：run %s 的 trace %s%s", run_id or "-", trace_id,
-                        f"（{url}）" if url else "")
+            logger.info(
+                "调用追踪：run %s 的 trace %s%s",
+                run_id or "-",
+                trace_id,
+                f"（{url}）" if url else "",
+            )
 
     # ---------- S7.19：对话轮次 / 工具 / 节点 ----------
     @contextmanager
-    def turn(self, *, name: str, metadata: dict[str, Any],
-             turn_id: str = "") -> Iterator[None]:
+    def turn(
+        self, *, name: str, metadata: dict[str, Any], turn_id: str = ""
+    ) -> Iterator[None]:
         """一条对话轮次的 span：detached 任务继承到请求上下文时挂其下，不继承也能自成因。"""
         payload = dict(metadata)
         if turn_id:
@@ -504,8 +591,9 @@ class LangfuseTracer:
     def tool(self, *, name: str, metadata: dict[str, Any]) -> Iterator[Generation]:
         """一次工具调用的 span（提交分析时的 traceparent 就取自它，S7.20）。"""
         fields = Generation(metadata=dict(metadata))
-        with self._safe_observation(name=name, as_type="span",
-                                    metadata=metadata) as available:
+        with self._safe_observation(
+            name=name, as_type="span", metadata=metadata
+        ) as available:
             try:
                 yield fields
             finally:
@@ -516,8 +604,9 @@ class LangfuseTracer:
     def node(self, *, name: str, metadata: dict[str, Any]) -> Iterator[Generation]:
         """一个执行节点的 span：分析五节点、worker 前后置、检索子步（S7.19 / S7.20）。"""
         fields = Generation(metadata=dict(metadata))
-        with self._safe_observation(name=name, as_type="span",
-                                    metadata=metadata) as available:
+        with self._safe_observation(
+            name=name, as_type="span", metadata=metadata
+        ) as available:
             try:
                 yield fields
             finally:
@@ -537,11 +626,12 @@ class LangfuseTracer:
             return
         try:
             self._client.update_current_span(**payload)
-        except Exception as exc:   # noqa: BLE001 - 上报失败只记日志，绝不影响业务
+        except Exception as exc:  # noqa: BLE001 - 上报失败只记日志，绝不影响业务
             self._warn_safe("span 上报失败", exc)
 
-    def finish_turn(self, *, status: str, totals: dict[str, Any], turn_id: str = "",
-                    error: str = "") -> None:
+    def finish_turn(
+        self, *, status: str, totals: dict[str, Any], turn_id: str = "", error: str = ""
+    ) -> None:
         """轮次收尾：把状态与汇总写到 `chat.turn` 上，并打一条带 trace 链接的日志。"""
         metadata: dict[str, Any] = {
             "status": status,
@@ -555,8 +645,14 @@ class LangfuseTracer:
             # 未知调用量单独可查（R6 / OBS-08：回放脚本据此判"待验证"而非"失败"）
             "usage_unknown_calls": int(totals.get("usage_unknown_calls") or 0),
         }
-        if "llm_calls" in totals:                # 对话侧拿不到精确调用次数时如实缺省
+        if "llm_calls" in totals:  # 对话侧拿不到精确调用次数时如实缺省
             metadata["llm_calls"] = int(totals.get("llm_calls") or 0)
+        # R5（E7OBS2-05）：轮次时间窗（进入 run_turn 到返回）——落库 `latency_ms` 的**同边界**
+        # 时间戳；回放脚本据此同口径比对，入口 span（含准备 / 收尾）只作参考
+        if totals.get("run_started_at"):
+            metadata["run_started_at"] = str(totals["run_started_at"])
+        if totals.get("run_finished_at"):
+            metadata["run_finished_at"] = str(totals["run_finished_at"])
         if turn_id:
             metadata["turn_id"] = turn_id
         payload: dict[str, Any] = {
@@ -564,10 +660,12 @@ class LangfuseTracer:
             "level": LEVEL_ERROR if status != "succeeded" else LEVEL_DEFAULT,
         }
         if error:
-            payload["status_message"] = safe_error_text(error)[:1000]   # OBS-02：只发安全类别
+            payload["status_message"] = safe_error_text(error)[
+                :1000
+            ]  # OBS-02：只发安全类别
         try:
             self._client.update_current_span(**payload)
-        except Exception as exc:   # noqa: BLE001 - 上报失败只记日志，绝不影响这一轮
+        except Exception as exc:  # noqa: BLE001 - 上报失败只记日志，绝不影响这一轮
             self._warn_safe("turn 收尾失败", exc)
         self._log_turn_trace(turn_id)
 
@@ -575,7 +673,7 @@ class LangfuseTracer:
         """当前 span 所属 trace 的 id（S7.21 落 `chat_messages.trace_id`）；失败返回空串。"""
         try:
             return str(self._client.get_current_trace_id() or "")
-        except Exception:   # noqa: BLE001 - 取不到 id 不影响业务
+        except Exception:  # noqa: BLE001 - 取不到 id 不影响业务
             return ""
 
     def trace_url(self, trace_id: str) -> str | None:
@@ -584,7 +682,7 @@ class LangfuseTracer:
             return None
         try:
             url = self._client.get_trace_url(trace_id=trace_id)
-        except Exception:   # noqa: BLE001
+        except Exception:  # noqa: BLE001
             return None
         return str(url) if url else None
 
@@ -593,17 +691,23 @@ class LangfuseTracer:
         try:
             trace_id = self._client.get_current_trace_id()
             url = self._client.get_trace_url(trace_id=trace_id) if trace_id else None
-        except Exception:   # noqa: BLE001 - 取链接失败不影响上报
+        except Exception:  # noqa: BLE001 - 取链接失败不影响上报
             return
         if trace_id:
-            logger.info("调用追踪：turn %s 的 trace %s%s", turn_id or "-", trace_id,
-                        f"（{url}）" if url else "")
+            logger.info(
+                "调用追踪：turn %s 的 trace %s%s",
+                turn_id or "-",
+                trace_id,
+                f"（{url}）" if url else "",
+            )
 
     def flush(self) -> None:
         try:
             self._client.flush()
-        except Exception as exc:   # noqa: BLE001
-            logger.warning("Langfuse flush 失败（不影响分析结果）：%s", type(exc).__name__)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "Langfuse flush 失败（不影响分析结果）：%s", type(exc).__name__
+            )
 
 
 # 进程级单例（见模块 docstring 的"进程级懒加载单例"）：`_warned` 保证缺键时只警告一次
@@ -626,9 +730,11 @@ def get_tracer(cfg: AppConfig) -> Tracer:
             else:
                 try:
                     _tracer = LangfuseTracer(cfg)
-                except Exception as exc:   # noqa: BLE001 - 初始化失败也只是关闭追踪
-                    logger.warning("Langfuse 客户端初始化失败，本次进程不上报追踪：%s",
-                                   type(exc).__name__)
+                except Exception as exc:  # noqa: BLE001 - 初始化失败也只是关闭追踪
+                    logger.warning(
+                        "Langfuse 客户端初始化失败，本次进程不上报追踪：%s",
+                        type(exc).__name__,
+                    )
                     _tracer = NullTracer()
     return _tracer
 
@@ -670,8 +776,15 @@ class TracingProvider:
     离线测试可直接传假 provider。上报失败绝不影响返回值（`LangfuseTracer` 内部吞掉异常）。
     """
 
-    def __init__(self, inner: Any, tracer: Tracer, *, capture: bool = False,
-                 price_in_per_m: float = 0.0, price_out_per_m: float = 0.0) -> None:
+    def __init__(
+        self,
+        inner: Any,
+        tracer: Tracer,
+        *,
+        capture: bool = False,
+        price_in_per_m: float = 0.0,
+        price_out_per_m: float = 0.0,
+    ) -> None:
         self.inner = inner
         self.tracer = tracer
         self.capture = capture
@@ -691,12 +804,14 @@ class TracingProvider:
         """转发给内层 provider，并把这几次调用的 token / 成本 / 结果状态上报出去。"""
         task = str(getattr(call, "task", "llm"))
         metadata = {"provider": self.name, "task": task}
-        with self.tracer.generation(name=task, model=self.model, metadata=metadata) as fields:
+        with self.tracer.generation(
+            name=task, model=self.model, metadata=metadata
+        ) as fields:
             try:
                 result = await self.inner.complete(call)
             except BaseException as exc:
                 fields.level = LEVEL_ERROR
-                fields.status_message = safe_error_of(exc)   # OBS-02：类别，不带正文
+                fields.status_message = safe_error_of(exc)  # OBS-02：类别，不带正文
                 fields.metadata["error_category"] = safe_error_of(exc)
                 raise
             self._fill_generation(fields, call, result)
@@ -710,17 +825,24 @@ class TracingProvider:
         返回的 `LLMResult` 与未包装时逐字段一致。
         """
         task = str(getattr(call, "task", "llm"))
-        metadata = {"provider": self.name, "task": task,
-                    "stream": bool(getattr(call, "stream", False))}
-        with self.tracer.generation(name=task, model=self.model, metadata=metadata) as fields:
+        metadata = {
+            "provider": self.name,
+            "task": task,
+            "stream": bool(getattr(call, "stream", False)),
+        }
+        with self.tracer.generation(
+            name=task, model=self.model, metadata=metadata
+        ) as fields:
             try:
                 result = await self.inner.complete_with_tools(call, on_delta=on_delta)
             except BaseException as exc:
                 fields.level = LEVEL_ERROR
-                fields.status_message = safe_error_of(exc)   # OBS-02：类别，不带正文
+                fields.status_message = safe_error_of(exc)  # OBS-02：类别，不带正文
                 fields.metadata["error_category"] = safe_error_of(exc)
                 raise
-            fields.metadata["tool_calls"] = len(list(getattr(result, "tool_calls", []) or []))
+            fields.metadata["tool_calls"] = len(
+                list(getattr(result, "tool_calls", []) or [])
+            )
             self._fill_generation(fields, call, result)
             return result
 
@@ -730,10 +852,16 @@ class TracingProvider:
         completion_tokens = int(getattr(result, "completion_tokens", 0) or 0)
         in_cost = prompt_tokens / 1_000_000 * self.price_in_per_m
         out_cost = completion_tokens / 1_000_000 * self.price_out_per_m
-        fields.usage_details = {"input": prompt_tokens, "output": completion_tokens,
-                                "total": prompt_tokens + completion_tokens}
-        fields.cost_details = {"input": in_cost, "output": out_cost,
-                               "total": in_cost + out_cost}
+        fields.usage_details = {
+            "input": prompt_tokens,
+            "output": completion_tokens,
+            "total": prompt_tokens + completion_tokens,
+        }
+        fields.cost_details = {
+            "input": in_cost,
+            "output": out_cost,
+            "total": in_cost + out_cost,
+        }
         fields.metadata["attempts"] = int(getattr(result, "attempts", 1) or 1)
         usage_status = str(getattr(result, "usage_status", "") or "")
         if usage_status:
@@ -748,6 +876,8 @@ class TracingProvider:
             fields.status_message = "llm_error"
             fields.metadata["error_category"] = "llm_error"
         if self.capture:
-            fields.input = {"system": str(getattr(call, "system", "")),
-                            "user": str(getattr(call, "user", ""))}
+            fields.input = {
+                "system": str(getattr(call, "system", "")),
+                "user": str(getattr(call, "user", "")),
+            }
             fields.output = str(getattr(result, "text", "") or "")

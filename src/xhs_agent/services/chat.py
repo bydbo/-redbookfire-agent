@@ -27,8 +27,9 @@ import uuid
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from typing import Any
+from typing import cast as type_cast
 
-from sqlalchemy import DateTime, cast, func, select
+from sqlalchemy import CursorResult, DateTime, cast, func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..config import PROJECT_ROOT, AppConfig
@@ -75,26 +76,30 @@ def _relative(path: str) -> str:
     return rel.replace(os.sep, "/")
 
 
-def attachment_target(cfg: AppConfig, session_id: uuid.UUID | str,
-                      mime: str) -> str:
+def attachment_target(cfg: AppConfig, session_id: uuid.UUID | str, mime: str) -> str:
     """给一张附件挑落点：`<runs>/_chat/<session_id>/<uuid>.<ext>`。"""
     suffix = IMAGE_SUFFIX.get(mime, ".bin")
     return os.path.join(chat_root(cfg), str(session_id), f"{uuid.uuid4().hex}{suffix}")
 
 
-def save_attachment(cfg: AppConfig, session_id: uuid.UUID | str, data: bytes, *,
-                    name: str, mime: str) -> dict[str, Any]:
+def save_attachment(
+    cfg: AppConfig, session_id: uuid.UUID | str, data: bytes, *, name: str, mime: str
+) -> dict[str, Any]:
     """把一张图片附件写盘（同步；调用方用 `asyncio.to_thread`），返回消息里要存的引用。"""
     target = attachment_target(cfg, session_id, mime)
     os.makedirs(os.path.dirname(target), exist_ok=True)
     with open(target, "wb") as handle:
         handle.write(data)
-    return {"kind": "image", "name": os.path.basename(str(name or "image")), "mime": mime,
-            "bytes": len(data), "path": _relative(target)}
+    return {
+        "kind": "image",
+        "name": os.path.basename(str(name or "image")),
+        "mime": mime,
+        "bytes": len(data),
+        "path": _relative(target),
+    }
 
 
-def resolve_attachment(cfg: AppConfig, session_id: uuid.UUID | str,
-                       path: str) -> str:
+def resolve_attachment(cfg: AppConfig, session_id: uuid.UUID | str, path: str) -> str:
     """把消息里的附件路径解析回绝对路径；越出该会话目录一律 404（防穿越）。"""
     root = os.path.realpath(os.path.join(chat_root(cfg), str(session_id)))
     candidate = path if os.path.isabs(path) else os.path.join(PROJECT_ROOT, path)
@@ -115,14 +120,16 @@ def _session_view(row: ChatSession) -> dict[str, Any]:
     }
 
 
-def _attachment_views(session_id: str, message_id: str,
-                      attachments: list[dict[str, Any]] | None) -> list[dict[str, Any]]:
+def _attachment_views(
+    session_id: str, message_id: str, attachments: list[dict[str, Any]] | None
+) -> list[dict[str, Any]]:
     """给附件补 `url`：前端可以直接当 `<img src>`（读接口按 session + message + 下标取）。"""
     out: list[dict[str, Any]] = []
     for index, item in enumerate(attachments or []):
         view = dict(item)
-        view["url"] = (f"{API_PREFIX}/chat/sessions/{session_id}"
-                       f"/attachments/{message_id}/{index}")
+        view["url"] = (
+            f"{API_PREFIX}/chat/sessions/{session_id}/attachments/{message_id}/{index}"
+        )
         out.append(view)
     return out
 
@@ -151,8 +158,9 @@ def message_view(row: ChatMessage) -> dict[str, Any]:
         "status": row.status,
         "attachments": _attachment_views(session_id, message_id, row.attachments),
         "tool_calls": [dict(item) for item in (row.tool_calls or [])],
-        "prompt_versions": {str(key): int(value)
-                            for key, value in (row.prompt_versions or {}).items()},
+        "prompt_versions": {
+            str(key): int(value) for key, value in (row.prompt_versions or {}).items()
+        },
         "run_id": str(row.run_id) if row.run_id else None,
         "turn_id": str(row.turn_id) if row.turn_id else None,
         "trace_id": row.trace_id,
@@ -188,61 +196,105 @@ async def latest_run_id(session: AsyncSession, session_id: uuid.UUID) -> str:
     消息**正文**——所以用户在下一轮说「把刚才那版改得更口语一点」时，模型手上根本没有 id。
     让 `read_run` / `revise_draft` 的 `run_id` 可省（缺省就落到这里），多轮对话才真的可用。
     """
-    row = (await session.execute(
-        select(ChatMessage.run_id)
-        .where(ChatMessage.session_id == session_id, ChatMessage.run_id.is_not(None))
-        .order_by(ChatMessage.created_at.desc(), ChatMessage.id.desc())
-        .limit(1))).scalar_one_or_none()
+    row = (
+        await session.execute(
+            select(ChatMessage.run_id)
+            .where(
+                ChatMessage.session_id == session_id, ChatMessage.run_id.is_not(None)
+            )
+            .order_by(ChatMessage.created_at.desc(), ChatMessage.id.desc())
+            .limit(1)
+        )
+    ).scalar_one_or_none()
     return str(row) if row else ""
 
 
-async def latest_attachments(session: AsyncSession,
-                             session_id: uuid.UUID) -> list[dict[str, Any]]:
+async def latest_attachments(
+    session: AsyncSession, session_id: uuid.UUID
+) -> list[dict[str, Any]]:
     """本会话**最近一条带图消息的整组**图片（跨轮图片回落用，S7.10 起、S7.16 改成整组）。
 
     用户说「上面那几张图」时，这一轮并没有附件、模型也看不到早前的图片字节——由服务端兜底：
     从最近的消息往回找第一条带图的消息（最多看 `LOOKBACK_MESSAGES` 条），把**那一整组**交给
     工具去解析（多图一次调用出一份线索）。没有就返回空列表（工具按"这一轮没有图片"处理）。
     """
-    rows = (await session.execute(
-        select(ChatMessage.attachments)
-        .where(ChatMessage.session_id == session_id,
-               func.jsonb_array_length(ChatMessage.attachments) > 0)
-        .order_by(ChatMessage.created_at.desc(), ChatMessage.id.desc())
-        .limit(LOOKBACK_MESSAGES))).scalars().all()
+    rows = (
+        (
+            await session.execute(
+                select(ChatMessage.attachments)
+                .where(
+                    ChatMessage.session_id == session_id,
+                    func.jsonb_array_length(ChatMessage.attachments) > 0,
+                )
+                .order_by(ChatMessage.created_at.desc(), ChatMessage.id.desc())
+                .limit(LOOKBACK_MESSAGES)
+            )
+        )
+        .scalars()
+        .all()
+    )
     for attachments in rows:
-        group = [dict(item) for item in (attachments or [])
-                 if str(item.get("kind") or "") == "image"]
+        group = [
+            dict(item)
+            for item in (attachments or [])
+            if str(item.get("kind") or "") == "image"
+        ]
         if group:
             return group
     return []
 
 
-async def list_sessions(session: AsyncSession, *, limit: int = 50,
-                        offset: int = 0) -> dict[str, Any]:
+async def list_sessions(
+    session: AsyncSession, *, limit: int = 50, offset: int = 0
+) -> dict[str, Any]:
     """会话列表：`updated_at` 倒序（平局按 id 倒序），页内批量补消息数与末条预览。"""
-    total = int((await session.execute(
-        select(func.count()).select_from(ChatSession))).scalar_one())
-    rows = (await session.execute(
-        select(ChatSession).order_by(ChatSession.updated_at.desc(), ChatSession.id.desc())
-        .limit(limit).offset(offset))).scalars().all()
+    total = int(
+        (
+            await session.execute(select(func.count()).select_from(ChatSession))
+        ).scalar_one()
+    )
+    rows = (
+        (
+            await session.execute(
+                select(ChatSession)
+                .order_by(ChatSession.updated_at.desc(), ChatSession.id.desc())
+                .limit(limit)
+                .offset(offset)
+            )
+        )
+        .scalars()
+        .all()
+    )
     ids = [row.id for row in rows]
 
     counts: dict[uuid.UUID, int] = {}
     previews: dict[uuid.UUID, str] = {}
     if ids:
-        counts = {session_id: int(count) for session_id, count in (await session.execute(
-            select(ChatMessage.session_id, func.count())
-            .where(ChatMessage.session_id.in_(ids))
-            .group_by(ChatMessage.session_id))).all()}
+        counts = {
+            session_id: int(count)
+            for session_id, count in (
+                await session.execute(
+                    select(ChatMessage.session_id, func.count())
+                    .where(ChatMessage.session_id.in_(ids))
+                    .group_by(ChatMessage.session_id)
+                )
+            ).all()
+        }
         # DISTINCT ON：每个会话只取最后一条消息的正文（Postgres 专属，项目只跑 Postgres）
-        latest = (select(ChatMessage.session_id, ChatMessage.content)
-                  .where(ChatMessage.session_id.in_(ids))
-                  .distinct(ChatMessage.session_id)
-                  .order_by(ChatMessage.session_id, ChatMessage.created_at.desc(),
-                            ChatMessage.id.desc()))
-        previews = {session_id: _preview(content)
-                    for session_id, content in (await session.execute(latest)).all()}
+        latest = (
+            select(ChatMessage.session_id, ChatMessage.content)
+            .where(ChatMessage.session_id.in_(ids))
+            .distinct(ChatMessage.session_id)
+            .order_by(
+                ChatMessage.session_id,
+                ChatMessage.created_at.desc(),
+                ChatMessage.id.desc(),
+            )
+        )
+        previews = {
+            session_id: _preview(content)
+            for session_id, content in (await session.execute(latest)).all()
+        }
 
     items = []
     for row in rows:
@@ -253,50 +305,67 @@ async def list_sessions(session: AsyncSession, *, limit: int = 50,
     return {"items": items, "total": total}
 
 
-async def load_session(session: AsyncSession, session_id: uuid.UUID, *,
-                       limit: int | None = None) -> dict[str, Any] | None:
+async def load_session(
+    session: AsyncSession, session_id: uuid.UUID, *, limit: int | None = None
+) -> dict[str, Any] | None:
     """会话详情（含消息）；`limit` 给最近 N 条（内部按时间倒序取再翻回正序）。"""
-    row = (await session.execute(
-        select(ChatSession).where(ChatSession.id == session_id))).scalar_one_or_none()
+    row = (
+        await session.execute(select(ChatSession).where(ChatSession.id == session_id))
+    ).scalar_one_or_none()
     if row is None:
         return None
     statement = select(ChatMessage).where(ChatMessage.session_id == session_id)
     if limit is None:
-        statement = statement.order_by(ChatMessage.created_at.asc(), ChatMessage.id.asc())
+        statement = statement.order_by(
+            ChatMessage.created_at.asc(), ChatMessage.id.asc()
+        )
     else:
-        statement = statement.order_by(ChatMessage.created_at.desc(),
-                                       ChatMessage.id.desc()).limit(limit)
+        statement = statement.order_by(
+            ChatMessage.created_at.desc(), ChatMessage.id.desc()
+        ).limit(limit)
     messages = list((await session.execute(statement)).scalars().all())
     if limit is not None:
         messages.reverse()
     return {**_session_view(row), "messages": [message_view(item) for item in messages]}
 
 
-async def load_message(session: AsyncSession,
-                       message_id: uuid.UUID) -> dict[str, Any] | None:
+async def load_message(
+    session: AsyncSession, message_id: uuid.UUID
+) -> dict[str, Any] | None:
     """单条消息（附件读接口用它找 session_id 与下标）。"""
-    row = (await session.execute(
-        select(ChatMessage).where(ChatMessage.id == message_id))).scalar_one_or_none()
+    row = (
+        await session.execute(select(ChatMessage).where(ChatMessage.id == message_id))
+    ).scalar_one_or_none()
     return None if row is None else message_view(row)
 
 
-async def append_message(session: AsyncSession, session_id: uuid.UUID, *, role: str,
-                         content: str = "", status: str = "succeeded",
-                         attachments: list[dict[str, Any]] | None = None,
-                         tool_calls: list[dict[str, Any]] | None = None,
-                         prompt_versions: dict[str, int] | None = None,
-                         run_id: str | None = None, cost_cny: float = 0.0,
-                         latency_ms: int = 0, prompt_tokens: int = 0,
-                         completion_tokens: int = 0, turn_id: str | None = None,
-                         trace_id: str | None = None,
-                         progress: dict[str, Any] | None = None,
-                         error: str | None = None) -> dict[str, Any] | None:
+async def append_message(
+    session: AsyncSession,
+    session_id: uuid.UUID,
+    *,
+    role: str,
+    content: str = "",
+    status: str = "succeeded",
+    attachments: list[dict[str, Any]] | None = None,
+    tool_calls: list[dict[str, Any]] | None = None,
+    prompt_versions: dict[str, int] | None = None,
+    run_id: str | None = None,
+    cost_cny: float = 0.0,
+    latency_ms: int = 0,
+    prompt_tokens: int = 0,
+    completion_tokens: int = 0,
+    turn_id: str | None = None,
+    trace_id: str | None = None,
+    progress: dict[str, Any] | None = None,
+    error: str | None = None,
+) -> dict[str, Any] | None:
     """追加一条消息并刷新会话的 `updated_at`；会话不存在返回 None（接口层折 404）。
 
     首条**用户**消息同时把会话标题补上（`derive_title`）。
     """
-    chat = (await session.execute(
-        select(ChatSession).where(ChatSession.id == session_id))).scalar_one_or_none()
+    chat = (
+        await session.execute(select(ChatSession).where(ChatSession.id == session_id))
+    ).scalar_one_or_none()
     if chat is None:
         return None
     row = ChatMessage(
@@ -325,20 +394,28 @@ async def append_message(session: AsyncSession, session_id: uuid.UUID, *, role: 
     return message_view(row)
 
 
-async def update_message(session: AsyncSession, message_id: uuid.UUID, *, content: str | None = None,
-                         status: str | None = None,
-                         tool_calls: list[dict[str, Any]] | None = None,
-                         prompt_versions: dict[str, int] | None = None,
-                         run_id: str | None = None, cost_cny: float | None = None,
-                         latency_ms: int | None = None,
-                         prompt_tokens: int | None = None,
-                         completion_tokens: int | None = None,
-                         turn_id: str | None = None, trace_id: str | None = None,
-                         progress: dict[str, Any] | None = None,
-                         error: str | None = None) -> dict[str, Any] | None:
+async def update_message(
+    session: AsyncSession,
+    message_id: uuid.UUID,
+    *,
+    content: str | None = None,
+    status: str | None = None,
+    tool_calls: list[dict[str, Any]] | None = None,
+    prompt_versions: dict[str, int] | None = None,
+    run_id: str | None = None,
+    cost_cny: float | None = None,
+    latency_ms: int | None = None,
+    prompt_tokens: int | None = None,
+    completion_tokens: int | None = None,
+    turn_id: str | None = None,
+    trace_id: str | None = None,
+    progress: dict[str, Any] | None = None,
+    error: str | None = None,
+) -> dict[str, Any] | None:
     """更新一条消息（只改显式给了的字段）；不存在返回 None。"""
-    row = (await session.execute(
-        select(ChatMessage).where(ChatMessage.id == message_id))).scalar_one_or_none()
+    row = (
+        await session.execute(select(ChatMessage).where(ChatMessage.id == message_id))
+    ).scalar_one_or_none()
     if row is None:
         return None
     if content is not None:
@@ -348,8 +425,9 @@ async def update_message(session: AsyncSession, message_id: uuid.UUID, *, conten
     if tool_calls is not None:
         row.tool_calls = list(tool_calls)
     if prompt_versions is not None:
-        row.prompt_versions = {str(key): int(value)
-                               for key, value in prompt_versions.items()}
+        row.prompt_versions = {
+            str(key): int(value) for key, value in prompt_versions.items()
+        }
     if run_id is not None:
         row.run_id = uuid.UUID(str(run_id))
     if turn_id is not None:
@@ -372,8 +450,46 @@ async def update_message(session: AsyncSession, message_id: uuid.UUID, *, conten
     return message_view(row)
 
 
-async def mark_stale_turns(session: AsyncSession, *, stale_seconds: int,
-                           session_id: uuid.UUID | None = None) -> int:
+async def _interrupt_stale_row(
+    session: AsyncSession, *, message_id: uuid.UUID, cutoff: datetime, detail: str
+) -> int:
+    """CAS 收尾一行：WHERE 里**再查一次** status 与最近活跃（R5 / E7OBS2-06）。
+
+    SELECT 判定与真正写回之间，主流程可能刚成功 / 刚续约——按旧 ORM 对象直接覆盖会把
+    新终态改回 interrupted。这里用一条原子 UPDATE：只有该行**此刻仍 running 且仍陈旧**
+    才收敛（受影响 1 行），否则 0 行、不动它；阶段快照用 SQL 局部更新（只在确实 running
+    的顶层上改状态 / 类别 / 时间），不整份覆盖。
+    """
+    statement = text(
+        "UPDATE chat_messages SET status = 'interrupted', error = :detail, "
+        "progress = CASE WHEN progress->>'status' = 'running' THEN "
+        "jsonb_set(jsonb_set(jsonb_set(progress, '{status}', "
+        "to_jsonb(CAST(:interrupted AS text))), '{error_category}', "
+        "to_jsonb(CAST(:category AS text))), '{updated_at}', "
+        "to_jsonb(CAST(:ts AS text))) ELSE progress END "
+        "WHERE id = :message_id AND role = 'assistant' AND status = 'running' "
+        "AND COALESCE(NULLIF(progress->>'updated_at', '')::timestamptz, created_at) < :cutoff"
+    )
+    result = type_cast(
+        CursorResult[Any],
+        await session.execute(
+            statement,
+            {
+                "message_id": message_id,
+                "detail": detail,
+                "interrupted": "interrupted",
+                "category": "timeout",
+                "ts": datetime.now(UTC).isoformat(),
+                "cutoff": cutoff,
+            },
+        ),
+    )
+    return int(result.rowcount or 0)
+
+
+async def mark_stale_turns(
+    session: AsyncSession, *, stale_seconds: int, session_id: uuid.UUID | None = None
+) -> int:
     """把"失联太久还挂在 running"的 assistant 行标成 `interrupted`，返回改了几行。
 
     API 进程重启会带走进程内的 turn（S7.4 的 detached 任务），库里就留下永远 `running` 的行。
@@ -381,29 +497,30 @@ async def mark_stale_turns(session: AsyncSession, *, stale_seconds: int,
     `interrupted`——刷新后看到的是"停在哪一阶段"。
 
     R3（OBS-11）：陈旧判定不再单看 `created_at`——**最近活跃时间** = 快照的 `updated_at`
-    （后台任务的心跳租约，见 `chat_turns`），缺省回落 `created_at`（兼容旧快照）。活跃的
-    长轮次（心跳在跳）不会被误判；心跳停止（执行者消失 / 进程重启）才收敛。
-    对账条件只命中 `running` 行——刚完成的终态不会被覆盖。
+    （后台任务的心跳租约，见 `chat_turns`），缺省回落 `created_at`（兼容旧快照）。
+    R5（E7OBS2-06）：判定只是**候选**，真正写回走 `_interrupt_stale_row` 的 CAS——
+    主流程刚成功 / 刚续约的行不会被旧判定覆盖；返回值 = 实际受影响行数，不用旧对象假装。
     """
     cutoff = datetime.now(UTC) - timedelta(seconds=int(stale_seconds))
     last_active = func.coalesce(
         cast(ChatMessage.progress["updated_at"].as_string(), DateTime(timezone=True)),
-        ChatMessage.created_at)
-    statement = (select(ChatMessage)
-                 .where(ChatMessage.role == "assistant",
-                        ChatMessage.status == "running",
-                        last_active < cutoff))
+        ChatMessage.created_at,
+    )
+    statement = select(ChatMessage.id).where(
+        ChatMessage.role == "assistant",
+        ChatMessage.status == "running",
+        last_active < cutoff,
+    )
     if session_id is not None:
         statement = statement.where(ChatMessage.session_id == session_id)
-    rows = list((await session.execute(statement)).scalars().all())
-    if not rows:
+    candidates = list((await session.execute(statement)).scalars().all())
+    if not candidates:
         return 0
     detail = "这一轮没跑完就断了（进程重启或长时间无响应）"
-    for row in rows:
-        row.status = "interrupted"
-        row.error = detail
-        snapshot = progress_tool.normalize(row.progress)
-        if snapshot.get("status") == "running":
-            row.progress = progress_tool.interrupt(snapshot)
+    changed = 0
+    for message_id in candidates:
+        changed += await _interrupt_stale_row(
+            session, message_id=message_id, cutoff=cutoff, detail=detail
+        )
     await session.commit()
-    return len(rows)
+    return changed

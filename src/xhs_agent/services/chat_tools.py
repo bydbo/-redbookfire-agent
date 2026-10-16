@@ -287,6 +287,8 @@ class ClueRecord:
     cost_cny: float = 0.0
     prompt_tokens: int = 0
     completion_tokens: int = 0
+    # R5（E7OBS2-04）：用量来源口径——actual / estimated / cached（本轮缓存命中）。
+    usage_status: str = ""
 
 
 @dataclass
@@ -372,6 +374,22 @@ def _records_tokens(caller: StructuredCaller, before: int) -> tuple[int, int]:
     )
 
 
+def _records_usage_status(caller: StructuredCaller, before: int) -> str:
+    """取 `StructuredCaller` 这次调用新增记录的**用量来源**（R5 / E7OBS2-04）。
+
+    一段窗口可能包含多次调用：unknown 优先（有一段未知就不能宣称完整），其次 actual，
+    再次 estimated；窗口为空（如调用失败没留下记录）返回空串，由调用方按场景处理。
+    """
+    statuses = {str(item.get("usage_status") or "") for item in caller.records[before:]}
+    if "unknown" in statuses:
+        return "unknown"
+    if "actual" in statuses:
+        return "actual"
+    if "estimated" in statuses:
+        return "estimated"
+    return ""
+
+
 def _element_view(element: Element) -> dict[str, Any]:
     """要素 → 回给模型的精简形状（带中文标签，省得模型自己翻译）。"""
     return {
@@ -438,10 +456,17 @@ def _check_topk(raw: Any, default: int) -> tuple[int, str]:
 
 
 async def _clue_for(ctx: ToolContext, text: str) -> ClueRecord:
-    """拆解热点（同一轮内同一段文本只拆一次）；缓存命中时本次成本记 0。"""
+    """拆解热点（同一轮内同一段文本只拆一次）；缓存命中时本次成本记 0、口径标 `cached`。"""
     cached = ctx.cache.clues.get(text)
     if cached is not None:
-        return replace(cached, cost_cny=0.0, prompt_tokens=0, completion_tokens=0)
+        # R5（E7OBS2-04）：缓存命中 = 本轮无新增模型消费——与"免费真实请求（actual 零值）"区分
+        return replace(
+            cached,
+            cost_cny=0.0,
+            prompt_tokens=0,
+            completion_tokens=0,
+            usage_status="cached",
+        )
     if ctx.caller is None:  # pragma: no cover - 运行器总会注入
         raise LLMError("对话工具缺少文本模型 caller")
     before = len(ctx.caller.records)
@@ -453,6 +478,7 @@ async def _clue_for(ctx: ToolContext, text: str) -> ClueRecord:
         cost_cny=_records_cost(ctx.caller, before),
         prompt_tokens=prompt_tokens,
         completion_tokens=completion_tokens,
+        usage_status=_records_usage_status(ctx.caller, before),
     )
     ctx.cache.clues[text] = record
     return record
@@ -509,8 +535,15 @@ async def _image_clue_for(
     if cached is not None:
         parsed, _version = cached
         # R3（OBS-06）：缓存命中只记"命中 + 数量"，不虚构 generation、不新增费用
+        # R5（E7OBS2-04）：口径标 cached——本轮无新增消费，与免费真实请求区分
         logger.info("图片线索缓存命中：%d 张（不重复计费）", len(group))
-        return replace(parsed, cost_cny=0.0, prompt_tokens=0, completion_tokens=0)
+        return replace(
+            parsed,
+            cost_cny=0.0,
+            prompt_tokens=0,
+            completion_tokens=0,
+            usage_status="cached",
+        )
     images = [await _read_image(ctx, item) for item in group]
     if len(images) == 1:
         data, mime = images[0]
@@ -572,6 +605,7 @@ async def run_hotspot_analysis(
         group = list(ctx.recent_attachments or [])
     image_cost = 0.0
     image_tokens = (0, 0)
+    image_status = ""
     if group:
         await progress("解析图片")
         try:
@@ -587,6 +621,7 @@ async def run_hotspot_analysis(
         versions.update(parsed.prompt_versions)
         image_cost = float(parsed.cost_cny or 0.0)
         image_tokens = (int(parsed.prompt_tokens), int(parsed.completion_tokens))
+        image_status = str(parsed.usage_status or "")
         clue = parsed.clue.to_dict()
         if not text:
             text = parsed.raw_text.strip()
@@ -613,7 +648,14 @@ async def run_hotspot_analysis(
         return ToolOutcome(
             status="failed",
             steps=steps,
-            payload={"run_id": submission.run_id, "usage_status": "unknown"},
+            # R5（E7OBS2-01）：图片解析**已经消费**的部分照记；分析那段未知单列，不丢已知
+            payload={
+                "run_id": submission.run_id,
+                "usage_status": "unknown",
+                "cost_cny": image_cost,
+                "prompt_tokens": image_tokens[0],
+                "completion_tokens": image_tokens[1],
+            },
             error="分析还在跑（超过等待上限），结果稍后可以在运行历史里看到",
             prompt_versions=versions,
         )
@@ -623,7 +665,13 @@ async def run_hotspot_analysis(
         return ToolOutcome(
             status="failed",
             steps=steps,
-            payload={"run_id": submission.run_id, "usage_status": "unknown"},
+            payload={
+                "run_id": submission.run_id,
+                "usage_status": "unknown",
+                "cost_cny": image_cost,
+                "prompt_tokens": image_tokens[0],
+                "completion_tokens": image_tokens[1],
+            },
             error=str(detail),
             prompt_versions=versions,
         )
@@ -637,6 +685,12 @@ async def run_hotspot_analysis(
         int(summary.get("completion_tokens") or 0) + image_tokens[1]
     )
     summary["image_count"] = len(group)
+    # R5（E7OBS2-04）：分析 run 的记账来自 worker 记录（供应商 usage 优先、字符估算兜底），
+    # 对话层无法逐条核验供应商标记——保守标 estimated（既不像素未知、也不冒充 actual）；
+    # 图片段自带口径（actual / estimated / cached），单独可查
+    summary["usage_status"] = "estimated"
+    if group:
+        summary["image_usage_status"] = str(image_status or "estimated")
     return ToolOutcome(
         status="succeeded", steps=steps, payload=summary, prompt_versions=versions
     )
@@ -679,6 +733,8 @@ async def parse_clue_from_image(
         "cost_cny": float(parsed.cost_cny or 0.0),
         "prompt_tokens": int(parsed.prompt_tokens),
         "completion_tokens": int(parsed.completion_tokens),
+        # R5（E7OBS2-04）：视觉调用的来源口径随结果上卷（actual / estimated / cached）
+        "usage_status": str(parsed.usage_status or "estimated"),
     }
     return ToolOutcome(
         status="succeeded",
@@ -725,7 +781,11 @@ async def search_materials(
         record = await _clue_for(ctx, text)
     except (ApiError, LLMError) as exc:
         return ToolOutcome(
-            status="failed", steps=steps, error=f"热点拆解失败：{_reason(exc)}"
+            status="failed",
+            steps=steps,
+            # R5（E7OBS2-01）：拆解请求可能已发出——用量未知如实单列
+            payload={"usage_status": "unknown"},
+            error=f"热点拆解失败：{_reason(exc)}",
         )
 
     await progress("检索素材")
@@ -735,7 +795,17 @@ async def search_materials(
         )
     except (ApiError, EmbeddingError, LLMError) as exc:
         return ToolOutcome(
-            status="failed", steps=steps, error=f"检索素材失败：{_reason(exc)}"
+            status="failed",
+            steps=steps,
+            # R5（E7OBS2-01）：拆解已经消费的部分照记；检索那段未知单列
+            payload={
+                "usage_status": "unknown",
+                "cost_cny": record.cost_cny,
+                "prompt_tokens": record.prompt_tokens,
+                "completion_tokens": record.completion_tokens,
+            },
+            error=f"检索素材失败：{_reason(exc)}",
+            prompt_versions={CLUE_TASK: record.version},
         )
 
     candidates = list(outcome.candidates)
@@ -750,6 +820,8 @@ async def search_materials(
         "cost_cny": record.cost_cny,
         "prompt_tokens": record.prompt_tokens,
         "completion_tokens": record.completion_tokens,
+        # R5（E7OBS2-04）：拆解调用的来源口径（缓存命中为 cached，与真实调用区分）
+        "usage_status": str(record.usage_status or "estimated"),
     }
     await progress("完成", 100, 100)
     return ToolOutcome(
@@ -824,7 +896,11 @@ async def preview_element_coverage(
         record = await _clue_for(ctx, text)
     except (ApiError, LLMError) as exc:
         return ToolOutcome(
-            status="failed", steps=steps, error=f"热点拆解失败：{_reason(exc)}"
+            status="failed",
+            steps=steps,
+            # R5（E7OBS2-01）：拆解请求可能已发出——用量未知如实单列
+            payload={"usage_status": "unknown"},
+            error=f"热点拆解失败：{_reason(exc)}",
         )
 
     await progress("估算覆盖")
@@ -832,7 +908,17 @@ async def preview_element_coverage(
         outcome = await literal_only_candidates(ctx.session, ctx.cfg, record.clue)
     except (ApiError, EmbeddingError, LLMError) as exc:
         return ToolOutcome(
-            status="failed", steps=steps, error=f"覆盖估算失败：{_reason(exc)}"
+            status="failed",
+            steps=steps,
+            # R5（E7OBS2-01）：拆解已经消费的部分照记
+            payload={
+                "usage_status": "unknown",
+                "cost_cny": record.cost_cny,
+                "prompt_tokens": record.prompt_tokens,
+                "completion_tokens": record.completion_tokens,
+            },
+            error=f"覆盖估算失败：{_reason(exc)}",
+            prompt_versions={CLUE_TASK: record.version},
         )
 
     coverage = outcome.coverage
@@ -851,6 +937,8 @@ async def preview_element_coverage(
         "cost_cny": record.cost_cny,
         "prompt_tokens": record.prompt_tokens,
         "completion_tokens": record.completion_tokens,
+        # R5（E7OBS2-04）：拆解调用的来源口径（缓存命中为 cached）
+        "usage_status": str(record.usage_status or "estimated"),
     }
     await progress("完成", 100, 100)
     return ToolOutcome(
@@ -974,7 +1062,11 @@ async def revise_draft(
         )
     except (ApiError, LLMError, SchemaError) as exc:
         return ToolOutcome(
-            status="failed", steps=steps, error=f"改写失败：{_reason(exc)}"
+            status="failed",
+            steps=steps,
+            # R5（E7OBS2-01）：改写请求可能已发出、用量未知——如实单列，不按"没调用"漏账
+            payload={"usage_status": "unknown"},
+            error=f"改写失败：{_reason(exc)}",
         )
 
     cost = _records_cost(ctx.caller, before)
@@ -995,6 +1087,8 @@ async def revise_draft(
                 "cost_cny": cost,
                 "prompt_tokens": prompt_tokens,
                 "completion_tokens": completion_tokens,
+                "usage_status": _records_usage_status(ctx.caller, before)
+                or "estimated",
             },
             prompt_versions=versions,
         )
@@ -1010,6 +1104,8 @@ async def revise_draft(
             "cost_cny": cost,
             "prompt_tokens": prompt_tokens,
             "completion_tokens": completion_tokens,
+            # R5（E7OBS2-04）：改写调用的来源口径随结果上卷
+            "usage_status": _records_usage_status(ctx.caller, before) or "estimated",
         },
         prompt_versions=versions,
     )
@@ -1068,13 +1164,21 @@ def _stage_update(
 
 
 def _update_marker(update: dict[str, Any]) -> tuple[Any, ...]:
-    """结构化更新的去重键：内容没变就不重复上报（不重复追加节点 / 不逐轮询写库）。"""
+    """结构化更新的去重键：内容没变就不重复上报（不重复追加节点 / 不逐轮询写库）。
+
+    R5（E7OBS2-03）：键里带**来源身份**（`run_id` / `job_id`）——不同来源的同名阶段不是
+    同一条事实，不能静默去重；终态带耗时（`latency_ms`），后补的耗时修订才能到达对话侧。
+    运行中不带耗时（避免把逐轮询的进度采样当变化）。
+    """
     return (
         update.get("stage_key"),
         update.get("status"),
         int(update.get("attempt") or 1),
         int(update.get("retries") or 0),
         str(update.get("error_category") or ""),
+        str(update.get("run_id") or ""),
+        str(update.get("job_id") or ""),
+        int(update.get("latency_ms") or 0) if update.get("status") != "running" else 0,
     )
 
 
@@ -1095,12 +1199,25 @@ async def _wait_for_run(
     )
     deadline = time.monotonic() + limit
     last_marker: tuple[Any, ...] = ()
+    last_source: tuple[str, str] = ("", "")
     while True:
         # 同一个 session 里必须显式过期：否则 ORM 会把内存里的旧对象原样返回（poll 永远不变）。
         # `expire_all()` 是同步方法（只清身份映射，不发 SQL）。
         ctx.session.expire_all()
         job = await load_job(ctx.session, job_id)
         job = job or {}
+        # R5（E7OBS2-03）：单个 job_id 的来源（run / job）本应固定；变化不是静默去重，
+        # 而是**如实报告**（乱序 / 串线迹象）并继续按新来源上报
+        source = (str(job.get("run_id") or ""), str(job.get("job_id") or job_id))
+        if last_source != ("", "") and source != last_source:
+            logger.warning(
+                "分析 job 来源发生变化：run=%s job=%s → run=%s job=%s（按新来源上报）",
+                last_source[0],
+                last_source[1],
+                source[0],
+                source[1],
+            )
+        last_source = source
         status = str(job.get("status") or "")
         snapshot = job.get("stage") or {}
         stage_key = str(snapshot.get("stage") or "")

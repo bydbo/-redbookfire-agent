@@ -348,3 +348,55 @@ describe('useChatStore 阶段单调合并（R3 / OBS-12）', () => {
     expect(observed.retried).toBe('running')
   })
 })
+
+describe('useChatStore 阶段身份隔离（R5 / E7OBS2-02）', () => {
+  beforeEach(() => {
+    setActivePinia(createPinia())
+    vi.clearAllMocks()
+  })
+  afterEach(() => vi.useRealTimers())
+
+  it('另一条执行的迟到终态不回退；同 stage 新 run 收旧 run 结束也不改写', async () => {
+    vi.mocked(createChatSession).mockResolvedValue({
+      session_id: 's-9', title: '', created_at: '', updated_at: '',
+    })
+    vi.mocked(listChatSessions).mockResolvedValue(listing())
+    vi.mocked(getChatSession).mockResolvedValue(detail([]))
+    const observed: Record<string, string | undefined> = {}
+    vi.mocked(streamMessage).mockImplementation(async (_id, _input, onEvent) => {
+      onEvent({ event: 'tool_progress', data: { stage_key: 'report', stage: '报告',
+                status: 'running', attempt: 1, run_id: 'run-new',
+                started_at: '2026-10-15T08:00:00+00:00' } })
+      // 旧 run 的迟到终态（跨 stage）：不许回退，也不许串身份
+      onEvent({ event: 'tool_progress', data: { stage_key: 'draft', stage: '撰稿',
+                status: 'succeeded', attempt: 1, run_id: 'run-old' } })
+      const store = useChatStore()
+      observed.stage = store.progress?.stage
+      observed.runId = store.progress?.runId
+      // 同 stage、新 run 收旧 run 结束：同样不改写当前状态
+      onEvent({ event: 'tool_progress', data: { stage_key: 'report', stage: '报告',
+                status: 'failed', attempt: 9, run_id: 'run-old',
+                error_category: 'llm_error' } })
+      observed.status = store.progress?.status
+      observed.reportRun = store.progress?.runId
+      // 同一 run 的合法推进照常：report 成功
+      onEvent({ event: 'tool_progress', data: { stage_key: 'report', stage: '报告',
+                status: 'succeeded', attempt: 1, run_id: 'run-new' } })
+      observed.finalStatus = store.progress?.status
+      // 新阶段不带身份（对话侧收尾）：run 身份清空，不残留
+      onEvent({ event: 'stage', data: { stage: 'final_reply', label: '整理回复',
+                status: 'succeeded', attempt: 1 } })
+      observed.finalRun = store.progress?.runId
+    })
+    const store = useChatStore()
+
+    await store.send({ text: '帮我蹭一下这个热点' })
+
+    expect(observed.stage).toBe('report')            // 旧 draft 终态不回退
+    expect(observed.runId).toBe('run-new')           // 身份不串
+    expect(observed.status).toBe('running')          // 旧 run 同 stage 终态不改写
+    expect(observed.reportRun).toBe('run-new')
+    expect(observed.finalStatus).toBe('succeeded')   // 同 run 推进照常
+    expect(observed.finalRun).toBe('')               // 跨阶段缺身份：清空
+  })
+})

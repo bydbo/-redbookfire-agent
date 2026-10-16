@@ -77,6 +77,8 @@ export interface StageView {
   attempt: number
   startedAt: string
   errorCategory: string
+  /** 当前阶段所属执行（worker run_id）；对话侧阶段为空串。R5：身份隔离用。 */
+  runId: string
 }
 
 /** 跑起来超过这个时长就提示「耗时较长」——只是提示，不据此断定失败。 */
@@ -153,9 +155,13 @@ export const useChatStore = defineStore('chat', () => {
 
   /** 把一份「类快照」对象合进当前阶段（SSE 事件或 `message.progress` 都走这里）。
 
-   *  R3（OBS-12）单调合并，与后端 `core/progress.py::begin` 同一口径：
+   *  R3（OBS-12）单调合并，与后端 `core/progress.py` 同一口径：
    *  - 同一阶段、`attempt` 更小：旧尝试的迟到事件，忽略（不回退）；
    *  - 同一阶段、同一 `attempt` 且已是终态：不重开（重复事件不改写已结束的执行）。
+   *  R5（E7OBS2-02）身份隔离，同样对齐后端：
+   *  - 两侧都有明确 `run_id` 且不一致 = 另一条执行：**终态一律不接管当前状态**
+   *    （迟到补历史在后端快照里做，这里不许回退）；`running` 视为新执行开始（接替显示）；
+   *  - 顶层 `runId` 随当前阶段一致：事件带身份用它，同阶段缺身份保留、跨阶段缺身份清空。
    */
   function applyProgressLike(raw: Record<string, unknown> | null | undefined): void {
     if (raw === null || raw === undefined) return
@@ -163,12 +169,17 @@ export const useChatStore = defineStore('chat', () => {
     if (stage === '') return
     const attempt = Number(raw.attempt ?? 1)
     const status = String(raw.status ?? 'running')
+    const incomingRun = String(raw.run_id ?? '')
     const previous = progress.value
-    if (previous !== null && previous.stage === stage) {
+    const conflict = previous !== null && incomingRun !== ''
+      && previous.runId !== '' && incomingRun !== previous.runId
+    if (previous !== null && conflict && TERMINAL_STAGE_STATUSES.includes(status)) return
+    if (previous !== null && !conflict && previous.stage === stage) {
       if (attempt < previous.attempt) return
       if (attempt === previous.attempt && TERMINAL_STAGE_STATUSES.includes(previous.status)) return
     }
-    const sameStage = previous !== null && previous.stage === stage && previous.attempt === attempt
+    const sameStage = previous !== null && !conflict
+      && previous.stage === stage && previous.attempt === attempt
     const startedAt = String(raw.started_at ?? '') || (sameStage ? previous.startedAt : '')
     progress.value = {
       stage,
@@ -178,6 +189,9 @@ export const useChatStore = defineStore('chat', () => {
       // 事件里可能只有 updated_at（如 tool_progress）：同阶段沿用旧起点，新阶段从此刻起算
       startedAt: startedAt !== '' ? startedAt : new Date().toISOString(),
       errorCategory: String(raw.error_category ?? ''),
+      // 身份与当前阶段一致：带就用；同阶段缺身份保留已知身份；跨阶段缺身份清空（不串）
+      runId: incomingRun !== '' ? incomingRun
+        : (previous !== null && previous.stage === stage && !conflict ? previous.runId : ''),
     }
     if (progress.value.status === 'running') startClock()
     else stopClock()
@@ -319,12 +333,17 @@ export const useChatStore = defineStore('chat', () => {
           total: Number(data.total ?? 0),
         })
         if (String(data.stage_key ?? '') !== '') {
-          // 排队等待 / 素材同步 / 向量回填 / 五节点：以阶段键更新当前阶段
+          // 排队等待 / 素材同步 / 向量回填 / 五节点：以阶段键更新当前阶段。
+          // R5（E7OBS2-02/03）：结构化字段**原样转发**——真实状态（failed / skipped）、
+          // 源尝试号、错误类别与 run 身份不能被压成"running"，否则实时显示与刷新后的
+          // 快照（后端按同一份快照持久化）会漂移，身份隔离也失效。
           applyProgressLike({
             stage: String(data.stage_key),
-            label: stageLabel(String(data.stage_key)),
-            status: 'running',
+            label: String(data.stage ?? '') || stageLabel(String(data.stage_key)),
+            status: String(data.status ?? 'running'),
             attempt: data.attempt,
+            error_category: String(data.error_category ?? ''),
+            run_id: String(data.run_id ?? ''),
             updated_at: data.updated_at,
           })
         }

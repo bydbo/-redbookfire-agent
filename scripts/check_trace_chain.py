@@ -1,4 +1,4 @@
-"""按轮次 / trace 读回调用链并核对口径（运维/验收脚本，S7.22；R6 / OBS-08 全面加固）。
+"""按轮次 / trace 读回调用链并核对口径（运维/验收脚本，S7.22；R6 / R5 两轮加固）。
 
 用途：给定一轮对话（`--turn-id`）或一条 trace（`--trace-id`），从库里取出 `trace_id`，
       经 Langfuse 公开 API（`/api/public/v2/observations`，游标分页 + 显式字段组）
@@ -11,16 +11,20 @@
          （`--expect workers` 时"没有"也算失败）；
       5. 视觉调用：`--expect vision` 要求出现 `image_hotspot_clue(_multi)` generation，
          `--expect no-vision` 要求不出现（一次多图调用只有一个逻辑 generation）；
-      6. 叶子 generation 有**有效**用量与成本，或 metadata 如实标 `usage_status=unknown`
-         （标未知的算"待验证"，不算失败；ERROR 级别**不再**自动等于未知）；
-      7. 账本核对：generation 用量 / 成本求和必须与落库
-         `prompt_tokens` / `completion_tokens` / `cost_cny` 一致（token 精确、成本 ±0.01）；
-         失败 / 取消轮次或入口 metadata 标了未知调用时为"待验证"；
-      8. 耗时口径：**入口 span 的耗时**（不是 trace 墙钟——并行 worker 会拉宽墙钟）
-         与消息 `latency_ms` 同口径（默认容差 2000ms）。
+      6. 叶子 generation 有**有效**用量与成本（R5：数值统一解析——字符串、bool、负数、
+         NaN、Infinity、不支持形状一律判无效，不"转换失败按 0"；显式 0 合法），
+         或 metadata 如实标 `usage_status=unknown`（标未知的算"待验证"；ERROR 级别不自动
+         等于未知；**非法数字不因 unknown 声明被隐藏**）；
+      7. 账本核对：generation 用量 / 成本求和（与叶子**同一解析结果**）必须与落库
+         `prompt_tokens` / `completion_tokens` / `cost_cny` 一致（token 精确、成本 ±0.01，
+         人民币、按配置单价折算）；失败 / 取消轮次或入口 metadata 标了未知调用时为"待验证"；
+      8. 耗时口径：优先用 trace 上落的**轮次时间窗**（`run_started_at` → `run_finished_at`，
+         与落库 `latency_ms` 同边界）；没有时间窗才退回**入口 span**（含轮次准备与收尾，
+         边界不同、如实写明），默认容差 2000ms；trace 墙钟只作展示（并行 worker 会拉宽）。
 输入：`--turn-id <uuid>` 或 `--trace-id <id>`（二选一）；`--expect tool,vision,...` 声明
       本轮应有的环节；`--tolerance-ms` 调容差；`--retries` 云端 404/429 重试次数；
-      `--save <path>` 把云端原始 JSON 落盘（验收证据）；`--json` 输出机器可读结果。
+      `--save <path>` 把云端原始 JSON 落盘（验收证据）；`--json` 输出机器可读结果
+      （stdout 是可直接 `json.loads` 的**纯 JSON**；存证提示等人类说明走 stderr）。
 输出：逐条核对结果 + span 树；退出码 0 = 全部通过（无失败、无待验证），
       1 = 有失败，2 = 用法或配置错误，3 = 仅待验证（有 unknown 用量 / 缺账本一边，
       不能视为完整通过，需人工确认后重跑）。
@@ -29,7 +33,7 @@
 - **只读**：库里查询 + Langfuse GET，不写任何状态。
 - 云导出有延迟：404 / 429 按 `--retries` 有界重试（退避 5s × 次数），仍取不到提示稍后再试，
   不把"还没收到"当成"没上报"。
-- 耗时按边界：整轮看入口 span；父子不相加；与落库 `latency_ms` 用明确容差比对。
+- 耗时按边界：同边界优先（轮次时间窗），父子不相加；与落库 `latency_ms` 用明确容差比对。
 - 追踪关闭 / 轮次太早没有 `trace_id`：给出明确说明并以 1 退出（这不是失败，是"没有证据"）。
 """
 
@@ -39,6 +43,7 @@ import argparse
 import asyncio
 import datetime as dt
 import json
+import math
 import sys
 import time
 from dataclasses import dataclass
@@ -158,48 +163,84 @@ def ancestor_names(item: dict[str, Any], by_id: dict[str, dict[str, Any]]) -> li
     return list(reversed(chain))
 
 
-def has_usage(item: dict[str, Any]) -> bool:
-    for key in ("usageDetails", "usage"):
-        value = item.get(key)
-        if isinstance(value, dict) and value:
-            return True
-    return False
+def _valid_number(value: Any) -> bool:
+    """合法数值：有限、非负的 int / float（bool 不算数；NaN / Infinity 拒绝）。"""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return False
+    return math.isfinite(float(value)) and float(value) >= 0
 
 
-def usage_values_valid(item: dict[str, Any]) -> bool:
-    """用量字典存在且每个值都是**非负数值**（bool 不算数值；0 是合法值）。
+def probe_usage(item: dict[str, Any]) -> tuple[str, tuple[int, int] | None]:
+    """用量解析（R5 / E7OBS2-05）：`("valid", (prompt, completion))` / `("missing", None)`
+    / `("invalid", None)`，叶子与账本核对**共用同一结果**，不允许两处各算一遍。
 
-    防"填零冒充"的反面：0 用量 + 0 成本对免费 / 缓存场景是合法的，但 -1、
-    `"100"`（字符串）这类脏值说明上报口径有问题，必须暴露。
+    - 支持 `usageDetails` / `usage`；方向字段 `input`/`output`（或 `prompt`/`completion`）
+      必须同时在场；出现的每个值都必须是合法数值（字符串、bool、负数、NaN、Infinity 拒绝）；
+    - 非空但**不支持的形状**（如只有 `total`）→ invalid：判无效，不擅自按零核账；
+    - 完全没有用量字段 → missing（缺证据 ≠ 无效；unknown 声明只能解释 missing）。
     """
     for key in ("usageDetails", "usage"):
         value = item.get(key)
-        if isinstance(value, dict) and value:
-            for number in value.values():
-                if (
-                    isinstance(number, bool)
-                    or not isinstance(number, (int, float))
-                    or number < 0
-                ):
-                    return False
-            return True
-    return False
+        if not isinstance(value, dict) or not value:
+            continue
+        for number in value.values():
+            if not _valid_number(number):
+                return ("invalid", None)
+        prompt = value.get("input", value.get("prompt"))
+        completion = value.get("output", value.get("completion"))
+        if prompt is None or completion is None:
+            return ("invalid", None)
+        return ("valid", (int(prompt), int(completion)))
+    return ("missing", None)
 
 
-def has_cost(item: dict[str, Any]) -> bool:
-    """有成本记录：字典非空，或数值（**显式 0 也算**——免费调用如实记 0，不算缺）。"""
-    for key in ("costDetails", "calculatedTotalCost", "totalCost"):
-        value = item.get(key)
-        if isinstance(value, dict):
-            if value:
-                return True
-        elif (
-            isinstance(value, (int, float))
-            and not isinstance(value, bool)
-            and value >= 0
-        ):
-            return True
-    return False
+def probe_cost(item: dict[str, Any]) -> tuple[str, float | None]:
+    """成本解析（R5 / E7OBS2-05）：`("valid", 元)` / `("missing", None)` / `("invalid", None)`。
+
+    - `costDetails`：优先 `total`；没有 total 时要求 `input` + `output` 同时合法（求和）；
+      非空但不支持的形状 / 值非法（字符串、bool、负数、NaN、Infinity）→ invalid；
+    - `calculatedTotalCost` / `totalCost` 数值字段：合法才算有效；
+    - 显式 **0 合法**（免费调用如实记 0）；没有任何成本字段 → missing。
+    """
+    details = item.get("costDetails")
+    if isinstance(details, dict) and details:
+        if "total" in details:
+            total = details.get("total")
+            return (
+                ("valid", float(total)) if _valid_number(total) else ("invalid", None)
+            )
+        if "input" in details and "output" in details:
+            first, second = details.get("input"), details.get("output")
+            if _valid_number(first) and _valid_number(second):
+                return ("valid", float(first) + float(second))
+            return ("invalid", None)
+        return ("invalid", None)
+    for key in ("calculatedTotalCost", "totalCost"):
+        if key in item:
+            value = item.get(key)
+            return (
+                ("valid", float(value)) if _valid_number(value) else ("invalid", None)
+            )
+    return ("missing", None)
+
+
+def has_usage(item: dict[str, Any]) -> bool:
+    """有**任何**用量字段（含非法 / 不支持形状）——给展示层打标用，核对一律走 `probe_usage`。"""
+    state, _value = probe_usage(item)
+    return state != "missing"
+
+
+def window_ms(metadata: dict[str, Any]) -> int | None:
+    """trace 上落的**轮次时间窗**（run_started_at → run_finished_at，毫秒）。
+
+    R5（E7OBS2-05）：这是与落库 `latency_ms` **同边界**的口径（都在 run_turn 内测量），
+    优先用它比对；入口 span 含轮次准备与收尾，只在没有时间窗时退回参考。
+    """
+    start = parse_time(metadata.get("run_started_at"))
+    end = parse_time(metadata.get("run_finished_at"))
+    if start is None or end is None or end < start:
+        return None
+    return int((end - start).total_seconds() * 1000)
 
 
 def usage_status_of(item: dict[str, Any]) -> str:
@@ -215,38 +256,6 @@ def usage_status_of(item: dict[str, Any]) -> str:
 
 def is_vision_generation(item: dict[str, Any]) -> bool:
     return observation_name(item) in VISION_GENERATIONS
-
-
-def generation_tokens(item: dict[str, Any]) -> tuple[int, int]:
-    """generation 的 (prompt, completion) token 数；缺了按 0 计（叶子用量口径另行把关）。"""
-    for key in ("usageDetails", "usage"):
-        value = item.get(key)
-        if isinstance(value, dict) and value:
-            prompt = value.get("input", value.get("prompt", 0))
-            completion = value.get("output", value.get("completion", 0))
-            try:
-                return int(prompt or 0), int(completion or 0)
-            except (TypeError, ValueError):
-                return 0, 0
-    return 0, 0
-
-
-def generation_cost(item: dict[str, Any]) -> float:
-    """generation 的成本（元）：costDetails.total 优先，退回 calculatedTotalCost / totalCost。"""
-    for key in ("costDetails",):
-        value = item.get(key)
-        if isinstance(value, dict):
-            for sub in ("total", "totalCost"):
-                if sub in value:
-                    try:
-                        return float(value[sub])
-                    except (TypeError, ValueError):
-                        return 0.0
-    for key in ("calculatedTotalCost", "totalCost"):
-        value = item.get(key)
-        if isinstance(value, (int, float)) and not isinstance(value, bool):
-            return float(value)
-    return 0.0
 
 
 def tree_lines(observations: list[dict[str, Any]]) -> list[str]:
@@ -268,12 +277,14 @@ def tree_lines(observations: list[dict[str, Any]]) -> list[str]:
         marks = []
         if observation_type(item) == "GENERATION":
             status = usage_status_of(item)
-            if status == "unknown":
-                marks.append("用量未知")
-            elif has_usage(item):
-                marks.append("有用量" if status != "estimated" else "估算用量")
+            usage_state, _usage_value = probe_usage(item)
+            cost_state, _cost_value = probe_cost(item)
+            if usage_state == "invalid" or cost_state == "invalid":
+                marks.append("用量/成本非法")
+            elif usage_state == "missing" and cost_state == "missing":
+                marks.append("用量未知" if status == "unknown" else "缺用量")
             else:
-                marks.append("缺用量")
+                marks.append("估算用量" if status == "estimated" else "有用量")
         if str(item.get("level") or "").upper() == "ERROR":
             marks.append("错误")
         suffix = f"（{latency} ms）" if latency is not None else ""
@@ -323,13 +334,48 @@ def _ledger_check(
 
     ledger_prompt = int(ledger.get("prompt_tokens") or 0)
     ledger_completion = int(ledger.get("completion_tokens") or 0)
-    try:
-        ledger_cost = float(ledger.get("cost_cny") or 0.0)
-    except (TypeError, ValueError):
-        ledger_cost = 0.0
-    prompt_sum = sum(generation_tokens(item)[0] for item in generations)
-    completion_sum = sum(generation_tokens(item)[1] for item in generations)
-    cost_sum = sum(generation_cost(item) for item in generations)
+    ledger_cost_value = ledger.get("cost_cny")
+    ledger_cost = float(ledger_cost_value) if _valid_number(ledger_cost_value) else 0.0
+    # R5（E7OBS2-05）：求和与叶子检查**同一解析结果**（probe_usage / probe_cost）——
+    # 非法数字在哪一层都是失败，不因为"能转成 0 就按 0 核账"。
+    invalid: list[str] = []
+    pending_missing: list[str] = []
+    prompt_sum = completion_sum = 0
+    cost_sum = 0.0
+    for item in generations:
+        name = observation_name(item)
+        usage_state, usage_value = probe_usage(item)
+        cost_state, cost_value = probe_cost(item)
+        if usage_state == "invalid" or cost_state == "invalid":
+            invalid.append(f"{name}（用量/成本含非法值）")
+            continue
+        if usage_state == "missing":
+            if usage_status_of(item) == "unknown":
+                pending_missing.append(name)
+            else:
+                invalid.append(f"{name}（缺用量）")
+            continue
+        if cost_state == "missing":
+            invalid.append(f"{name}（有用量但缺成本）")
+            continue
+        assert usage_value is not None and cost_value is not None
+        prompt_sum += usage_value[0]
+        completion_sum += usage_value[1]
+        cost_sum += cost_value
+    if invalid:
+        return Check(
+            "账本核对",
+            False,
+            f"无法核对（{len(invalid)} 个叶子有非法 / 缺失值）：{'、'.join(invalid)}",
+        )
+    if pending_missing:
+        return Check(
+            "账本核对",
+            None,
+            f"有 {len(pending_missing)} 个叶子如实标未知（{'、'.join(pending_missing)}）："
+            "总和可能不完整，待人工确认",
+            pending=True,
+        )
     prompt_diff = prompt_sum - ledger_prompt
     completion_diff = completion_sum - ledger_completion
     cost_diff = cost_sum - ledger_cost
@@ -342,7 +388,8 @@ def _ledger_check(
         f"云端 tokens {prompt_sum}+{completion_sum} / 成本 {cost_sum:.4f} 元 vs "
         f"落库 {ledger_prompt}+{ledger_completion} / {ledger_cost:.4f} 元"
         f"（token 差 {prompt_diff:+d}/{completion_diff:+d}，"
-        f"成本差 {cost_diff:+.4f}，容差 ±{LEDGER_COST_TOLERANCE_CNY}）"
+        f"成本差 {cost_diff:+.4f}，容差 ±{LEDGER_COST_TOLERANCE_CNY}；"
+        "成本为人民币、由各调用方按配置单价折算）"
     )
     return Check("账本核对", ok, detail)
 
@@ -546,25 +593,34 @@ def verify_trace(
             )
         )
 
-    # 5. 叶子 generation 的用量 / 成本：unknown 只认 metadata.usage_status（R6 修正）
+    # 5. 叶子 generation 的用量 / 成本（R5 / E7OBS2-05）：统一解析、无效不隐藏
     if not generations:
         checks.append(Check("叶子用量", None, "trace 里没有 generation"))
     else:
-        bad_usage = [
-            observation_name(item)
-            for item in generations
-            if usage_status_of(item) != "unknown"
-            and (not usage_values_valid(item) or not has_cost(item))
-        ]
-        unknown = [
-            observation_name(item)
-            for item in generations
-            if usage_status_of(item) == "unknown"
-        ]
+        bad_usage: list[str] = []
+        unknown: list[str] = []
+        for item in generations:
+            name = observation_name(item)
+            usage_state, usage_value = probe_usage(item)
+            cost_state, cost_value = probe_cost(item)
+            if usage_state == "invalid" or cost_state == "invalid":
+                # 非法数字不因 unknown 声明被隐藏：先于"未知"判定
+                bad_usage.append(f"{name}（用量/成本含非法值）")
+            elif usage_state == "missing" and cost_state == "missing":
+                if usage_status_of(item) == "unknown":
+                    unknown.append(name)
+                else:
+                    bad_usage.append(f"{name}（缺用量与成本）")
+            elif usage_state == "missing":
+                bad_usage.append(f"{name}（缺用量）")
+            elif cost_state == "missing":
+                bad_usage.append(f"{name}（有用量但缺成本）")
+            else:
+                assert usage_value is not None and cost_value is not None
         detail = (
             f"{len(generations)} 个 generation；"
-            f"{sum(1 for item in generations if usage_values_valid(item))} 个用量有效"
-            + (f"；缺有效用量或成本：{'、'.join(bad_usage)}" if bad_usage else "")
+            f"{sum(1 for item in generations if probe_usage(item)[0] == 'valid' and probe_cost(item)[0] == 'valid')} 个用量/成本有效"
+            + (f"；无效或缺失：{'、'.join(bad_usage)}" if bad_usage else "")
             + (
                 f"；{len(unknown)} 个如实标未知：{'、'.join(unknown)}"
                 if unknown
@@ -585,8 +641,10 @@ def verify_trace(
         )
     )
 
-    # 7. 耗时口径：入口 span 耗时（不是 trace 墙钟——并行 worker 会拉宽墙钟）
+    # 7. 耗时口径（R5 / E7OBS2-05）：优先**同边界**的轮次时间窗；没有才退回入口 span
+    #    （入口 span 含轮次准备与收尾，和 run_turn 内测的 latency_ms 边界不同，如实写明）
     entry_latency = observation_latency_ms(entry) if entry is not None else None
+    window_latency = window_ms(entry_metadata)
     if expected_latency_ms is None:
         checks.append(
             Check(
@@ -595,10 +653,29 @@ def verify_trace(
                 "未提供落库 latency_ms（--trace-id 直连或该轮次没落耗时）",
             )
         )
+    elif window_latency is not None:
+        diff = abs(window_latency - expected_latency_ms)
+        extra = (
+            f"；入口 span {entry_latency} ms 仅供参考"
+            if entry_latency is not None
+            else ""
+        )
+        checks.append(
+            Check(
+                "耗时口径",
+                diff <= tolerance_ms,
+                f"轮次时间窗（与落库同边界）{window_latency} ms vs 落库 {expected_latency_ms} ms"
+                f"（差 {diff} ms，容差 {tolerance_ms} ms{extra}；"
+                f"trace 墙钟 {trace_wall_ms(observations)} ms 仅供参考）",
+            )
+        )
     elif entry_latency is None:
         checks.append(
             Check(
-                "耗时口径", None, "入口 span 没有可算耗时（缺起止时间）", pending=True
+                "耗时口径",
+                None,
+                "既没有轮次时间窗，入口 span 也没有可算耗时",
+                pending=True,
             )
         )
     else:
@@ -607,8 +684,9 @@ def verify_trace(
             Check(
                 "耗时口径",
                 diff <= tolerance_ms,
-                f"入口 span {entry_latency} ms vs 落库 {expected_latency_ms} ms（差 {diff} ms，"
-                f"容差 {tolerance_ms} ms；trace 墙钟 {trace_wall_ms(observations)} ms 仅供参考）",
+                f"入口 span {entry_latency} ms（**含轮次准备与收尾，与落库 latency_ms 边界不同**）"
+                f" vs 落库 {expected_latency_ms} ms（差 {diff} ms，容差 {tolerance_ms} ms；"
+                f"无轮次时间窗时按此校验；trace 墙钟 {trace_wall_ms(observations)} ms 仅供参考）",
             )
         )
     return checks
@@ -725,17 +803,23 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
+
+    def note(message: str) -> None:
+        """人类可读的说明（存证提示 / 结论摘要）——R5（E7OBS2-05）：`--json` 时走 stderr，
+        stdout 只留一份可直接 `json.loads` 的纯 JSON，退出码语义不变。"""
+        print(message, file=sys.stderr if args.as_json else sys.stdout)
+
     expects = [
         part.strip() for part in str(args.expect or "").split(",") if part.strip()
     ]
     bad = [item for item in expects if item not in EXPECT_CHOICES]
     if bad:
-        print(f"[用法错误] --expect 里的 {'、'.join(bad)} 不在 {EXPECT_CHOICES} 中")
+        note(f"[用法错误] --expect 里的 {'、'.join(bad)} 不在 {EXPECT_CHOICES} 中")
         return 2
     try:
         cfg = load_config()
     except ConfigError as exc:
-        print(f"[配置错误] {exc}")
+        note(f"[配置错误] {exc}")
         return 2
 
     ledger: dict[str, Any] | None = None
@@ -744,7 +828,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.turn_id:
         row = asyncio.run(_lookup_turn(cfg, args.turn_id))
         if row is None:
-            print(f"[未找到] 没有 turn_id = {args.turn_id} 的消息")
+            note(f"[未找到] 没有 turn_id = {args.turn_id} 的消息")
             return 2
         trace_id = str(row.get("trace_id") or "")
         expected_latency_ms = int(row["latency_ms"]) if row.get("latency_ms") else None
@@ -754,7 +838,7 @@ def main(argv: list[str] | None = None) -> int:
             "completion_tokens": row.get("completion_tokens"),
         }
         if not trace_id:
-            print(
+            note(
                 f"[没有证据] 该轮次 status = {row.get('status')}，但没关联 trace_id"
                 "（追踪关闭或轮次早于 S7.21，属预期情况）"
             )
@@ -762,16 +846,16 @@ def main(argv: list[str] | None = None) -> int:
 
     public, secret, host = cfg.langfuse_keys
     if not (public and secret and host):
-        print("[配置错误] LANGFUSE 三件套不齐，没法读回云端 trace")
+        note("[配置错误] LANGFUSE 三件套不齐，没法读回云端 trace")
         return 2
 
     try:
         trace = load_trace(cfg, trace_id, retries=max(0, int(args.retries)))
     except RuntimeError as exc:  # 429 等云端限流：给出可照做的提示
-        print(f"[稍后重试] {exc}")
+        note(f"[稍后重试] {exc}")
         return 1
     if trace is None:
-        print(f"[还没收到] 云端没有 trace {trace_id}——导出有延迟，稍后重试")
+        note(f"[还没收到] 云端没有 trace {trace_id}——导出有延迟，稍后重试")
         return 1
 
     if args.save:
@@ -779,7 +863,7 @@ def main(argv: list[str] | None = None) -> int:
         Path(args.save).write_text(
             json.dumps(trace, ensure_ascii=False, indent=2), encoding="utf-8"
         )
-        print(f"[已存证] {args.save}")
+        note(f"[已存证] {args.save}")
 
     checks = verify_trace(
         trace,
@@ -832,15 +916,15 @@ def main(argv: list[str] | None = None) -> int:
             print(f"  {line}")
 
     if failures:
-        print(f"\n有 {len(failures)} 项没通过；逐条看上面对应的 detail。")
+        note(f"\n有 {len(failures)} 项没通过；逐条看上面对应的 detail。")
         return 1
     if pending:
-        print(
+        note(
             f"\n有 {len(pending)} 项待验证（unknown 用量 / 缺一边证据）："
             "不算失败，但也不能视为完整通过，请人工确认后重跑。"
         )
         return 3
-    print("\n核对完成：硬口径全部通过（跳过项 = 本轮没有对应环节）。")
+    note("\n核对完成：硬口径全部通过（跳过项 = 本轮没有对应环节）。")
     return 0
 
 

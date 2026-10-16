@@ -118,8 +118,7 @@ class FakeRedis:
 def write_config(tmp_path: Path, body: str = "") -> AppConfig:
     path = tmp_path / "config.toml"
     path.write_text(
-        "[paths]\n"
-        f'runs_dir = "{(tmp_path / "runs").as_posix()}"\n' + body,
+        f'[paths]\nruns_dir = "{(tmp_path / "runs").as_posix()}"\n' + body,
         encoding="utf-8",
     )
     return load_config(str(path))
@@ -176,17 +175,25 @@ class ScriptedProvider(llm.BaseProvider):
         self.deltas = list(deltas or [])
         self.calls: list[llm.LLMCall] = []
 
-    async def complete(self, call: llm.LLMCall) -> LLMResult:      # pragma: no cover
+    async def complete(self, call: llm.LLMCall) -> LLMResult:  # pragma: no cover
         raise AssertionError("对话用例不该走 complete()")
 
-    async def complete_with_tools(self, call: llm.LLMCall,
-                                  on_delta: Any = None) -> LLMResult:
+    async def complete_with_tools(
+        self, call: llm.LLMCall, on_delta: Any = None
+    ) -> LLMResult:
         self.calls.append(call)
         if on_delta is not None:
             for piece in self.deltas:
                 await on_delta(piece)
-        return LLMResult(text=self.text, provider=self.name, model=self.model,
-                         prompt_tokens=10, completion_tokens=5, cost_cny=0.002)
+        return LLMResult(
+            text=self.text,
+            provider=self.name,
+            model=self.model,
+            prompt_tokens=10,
+            completion_tokens=5,
+            cost_cny=0.002,
+            usage_status="actual",
+        )  # R5：假 provider 也按真实契约标来源
 
 
 async def _collect(events: TurnEvents, sink: list[dict[str, Any]]) -> None:
@@ -212,12 +219,13 @@ def test_sse_frame_keeps_data_on_a_single_line() -> None:
     assert frame.startswith("event: turn_started\ndata: ")
     assert frame.endswith("\n\n")
     body = frame.split("data: ", 1)[1].strip()
-    assert "\n" not in body                    # 换行必须被 JSON 转义掉，否则 SSE 帧会被拆断
+    assert "\n" not in body  # 换行必须被 JSON 转义掉，否则 SSE 帧会被拆断
     assert json.loads(body) == {"session_id": "s-1", "text": "你好\n世界"}
 
 
-def test_redis_url_requires_a_redis_dsn(tmp_path: Path,
-                                        monkeypatch: pytest.MonkeyPatch) -> None:
+def test_redis_url_requires_a_redis_dsn(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     monkeypatch.delenv("REDIS_URL", raising=False)
     cfg = write_config(tmp_path)
     with pytest.raises(DependencyUnavailableError):
@@ -231,7 +239,9 @@ def test_redis_url_requires_a_redis_dsn(tmp_path: Path,
 
 
 @pytest.mark.asyncio
-async def test_publish_reaches_subscriber(cfg: AppConfig, fake_redis: FakeRedis) -> None:
+async def test_publish_reaches_subscriber(
+    cfg: AppConfig, fake_redis: FakeRedis
+) -> None:
     events = TurnEvents(cfg, turn_id="t-1")
     await events.open()
     received: list[dict[str, Any]] = []
@@ -272,8 +282,8 @@ async def test_broken_json_is_dropped(cfg: AppConfig, fake_redis: FakeRedis) -> 
 
 @pytest.mark.asyncio
 async def test_sse_stream_heartbeats_then_closes_on_terminal_event(
-        cfg: AppConfig, fake_redis: FakeRedis,
-        monkeypatch: pytest.MonkeyPatch) -> None:
+    cfg: AppConfig, fake_redis: FakeRedis, monkeypatch: pytest.MonkeyPatch
+) -> None:
     monkeypatch.setattr(chat_router, "HEARTBEAT_S", 0.05)
     events = TurnEvents(cfg, turn_id="t-3")
     await events.open()
@@ -284,7 +294,7 @@ async def test_sse_stream_heartbeats_then_closes_on_terminal_event(
             frames.append(frame)
 
     task = asyncio.create_task(consume())
-    await asyncio.sleep(0.12)                  # 静默够久 → 至少一条心跳
+    await asyncio.sleep(0.12)  # 静默够久 → 至少一条心跳
     await events.publish("turn_started", {"message_id": "m-3"})
     await _wait_until(lambda: any("turn_started" in item for item in frames))
     await events.publish("turn_finished", {"status": "succeeded"})
@@ -292,19 +302,21 @@ async def test_sse_stream_heartbeats_then_closes_on_terminal_event(
 
     assert frames and frames[0] == ": ping\n\n"
     assert any(item.startswith("event: turn_started") for item in frames)
-    assert frames[-1].startswith("event: turn_finished")   # 终端事件后生成器收尾
+    assert frames[-1].startswith("event: turn_finished")  # 终端事件后生成器收尾
 
 
 # ---------- 4. detached 运行器 ----------
 
 
 @pytest.mark.asyncio
-async def test_start_turn_persists_terminal_message(cfg: AppConfig, fake_redis: FakeRedis,
-                                                   monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_start_turn_persists_terminal_message(
+    cfg: AppConfig, fake_redis: FakeRedis, monkeypatch: pytest.MonkeyPatch
+) -> None:
     saved: list[tuple[uuid.UUID, dict[str, Any]]] = []
 
-    async def fake_update(_session: Any, message_id: uuid.UUID,
-                          **fields: Any) -> dict[str, Any]:
+    async def fake_update(
+        _session: Any, message_id: uuid.UUID, **fields: Any
+    ) -> dict[str, Any]:
         saved.append((message_id, fields))
         return {}
 
@@ -312,21 +324,34 @@ async def test_start_turn_persists_terminal_message(cfg: AppConfig, fake_redis: 
     monkeypatch.setattr(chat_turns, "update_message", fake_update)
     monkeypatch.setattr(chat_turns, "latest_attachments", no_recent_attachments)
     monkeypatch.setattr(chat_turns, "create_engine_from_config", lambda _cfg: engine)
-    monkeypatch.setattr(chat_turns, "create_session_factory", lambda _engine: dummy_factory)
-    monkeypatch.setattr(chat_turns, "build_turn_provider",
-                        lambda _cfg, _client, tracer=None: ScriptedProvider("跑好了", ["跑", "好了"]))
+    monkeypatch.setattr(
+        chat_turns, "create_session_factory", lambda _engine: dummy_factory
+    )
+    monkeypatch.setattr(
+        chat_turns,
+        "build_turn_provider",
+        lambda _cfg, _client, tracer=None: ScriptedProvider("跑好了", ["跑", "好了"]),
+    )
 
     events = TurnEvents(cfg, turn_id="t-4")
     await events.open()
     received: list[dict[str, Any]] = []
     pump = asyncio.create_task(_collect(events, received))
     message_id = uuid.uuid4()
-    task = start_turn(cfg, events, session_id=uuid.uuid4(), message_id=message_id,
-                      history=[], user_text="帮我蹭一下这个热点")
-    assert isinstance(task, asyncio.Task)      # detached：调用方拿到任务就走
+    task = start_turn(
+        cfg,
+        events,
+        session_id=uuid.uuid4(),
+        message_id=message_id,
+        history=[],
+        user_text="帮我蹭一下这个热点",
+    )
+    assert isinstance(task, asyncio.Task)  # detached：调用方拿到任务就走
     try:
         await asyncio.wait_for(task, timeout=5)
-        await _wait_until(lambda: any(item["event"] == "turn_finished" for item in received))
+        await _wait_until(
+            lambda: any(item["event"] == "turn_finished" for item in received)
+        )
     finally:
         pump.cancel()
         await events.aclose()
@@ -335,21 +360,25 @@ async def test_start_turn_persists_terminal_message(cfg: AppConfig, fake_redis: 
     assert names[0] == "turn_started"
     assert "text_delta" in names
     assert names[-1] == "turn_finished"
-    deltas = [item["data"]["text"] for item in received if item["event"] == "text_delta"]
+    deltas = [
+        item["data"]["text"] for item in received if item["event"] == "text_delta"
+    ]
     assert deltas == ["跑", "好了"]
     assert saved[-1][0] == message_id
     assert saved[-1][1]["status"] == "succeeded"
     assert saved[-1][1]["content"] == "跑好了"
-    assert engine.disposed == 1                # 自建 engine 用完就放
+    assert engine.disposed == 1  # 自建 engine 用完就放
 
 
 @pytest.mark.asyncio
 async def test_start_turn_marks_message_failed_on_crash(
-        cfg: AppConfig, fake_redis: FakeRedis, monkeypatch: pytest.MonkeyPatch) -> None:
+    cfg: AppConfig, fake_redis: FakeRedis, monkeypatch: pytest.MonkeyPatch
+) -> None:
     saved: list[tuple[uuid.UUID, dict[str, Any]]] = []
 
-    async def fake_update(_session: Any, message_id: uuid.UUID,
-                          **fields: Any) -> dict[str, Any]:
+    async def fake_update(
+        _session: Any, message_id: uuid.UUID, **fields: Any
+    ) -> dict[str, Any]:
         saved.append((message_id, fields))
         return {}
 
@@ -360,9 +389,14 @@ async def test_start_turn_marks_message_failed_on_crash(
     monkeypatch.setattr(chat_turns, "update_message", fake_update)
     monkeypatch.setattr(chat_turns, "latest_attachments", no_recent_attachments)
     monkeypatch.setattr(chat_turns, "create_engine_from_config", lambda _cfg: engine)
-    monkeypatch.setattr(chat_turns, "create_session_factory", lambda _engine: dummy_factory)
-    monkeypatch.setattr(chat_turns, "build_turn_provider",
-                        lambda _cfg, _client, tracer=None: ScriptedProvider())
+    monkeypatch.setattr(
+        chat_turns, "create_session_factory", lambda _engine: dummy_factory
+    )
+    monkeypatch.setattr(
+        chat_turns,
+        "build_turn_provider",
+        lambda _cfg, _client, tracer=None: ScriptedProvider(),
+    )
     monkeypatch.setattr(chat_turns, "run_turn", boom)
 
     events = TurnEvents(cfg, turn_id="t-5")
@@ -370,8 +404,14 @@ async def test_start_turn_marks_message_failed_on_crash(
     received: list[dict[str, Any]] = []
     pump = asyncio.create_task(_collect(events, received))
     message_id = uuid.uuid4()
-    task = start_turn(cfg, events, session_id=uuid.uuid4(), message_id=message_id,
-                      history=[], user_text="跑一下")
+    task = start_turn(
+        cfg,
+        events,
+        session_id=uuid.uuid4(),
+        message_id=message_id,
+        history=[],
+        user_text="跑一下",
+    )
     try:
         await asyncio.wait_for(task, timeout=5)
         await _wait_until(lambda: any(item["event"] == "error" for item in received))
@@ -411,12 +451,14 @@ class _BrokenSdkClient:
 
 @pytest.mark.asyncio
 async def test_crash_path_survives_whole_sdk_failure(
-        cfg: AppConfig, fake_redis: FakeRedis, monkeypatch: pytest.MonkeyPatch) -> None:
+    cfg: AppConfig, fake_redis: FakeRedis, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """R1（OBS-01）：追踪 SDK 整体故障时，失败兜底照常落库 + 广播，不再崩一次。"""
     saved: list[tuple[uuid.UUID, dict[str, Any]]] = []
 
-    async def fake_update(_session: Any, message_id: uuid.UUID,
-                          **fields: Any) -> dict[str, Any]:
+    async def fake_update(
+        _session: Any, message_id: uuid.UUID, **fields: Any
+    ) -> dict[str, Any]:
         saved.append((message_id, fields))
         return {}
 
@@ -427,20 +469,34 @@ async def test_crash_path_survives_whole_sdk_failure(
     monkeypatch.setattr(chat_turns, "update_message", fake_update)
     monkeypatch.setattr(chat_turns, "latest_attachments", no_recent_attachments)
     monkeypatch.setattr(chat_turns, "create_engine_from_config", lambda _cfg: engine)
-    monkeypatch.setattr(chat_turns, "create_session_factory", lambda _engine: dummy_factory)
-    monkeypatch.setattr(chat_turns, "build_turn_provider",
-                        lambda _cfg, _client, tracer=None: ScriptedProvider())
+    monkeypatch.setattr(
+        chat_turns, "create_session_factory", lambda _engine: dummy_factory
+    )
+    monkeypatch.setattr(
+        chat_turns,
+        "build_turn_provider",
+        lambda _cfg, _client, tracer=None: ScriptedProvider(),
+    )
     monkeypatch.setattr(chat_turns, "run_turn", boom)
-    monkeypatch.setattr(chat_turns, "get_tracer",
-                        lambda _cfg: LangfuseTracer(cfg, client=_BrokenSdkClient()))
+    monkeypatch.setattr(
+        chat_turns,
+        "get_tracer",
+        lambda _cfg: LangfuseTracer(cfg, client=_BrokenSdkClient()),
+    )
 
     events = TurnEvents(cfg, turn_id="t-sdk")
     await events.open()
     received: list[dict[str, Any]] = []
     pump = asyncio.create_task(_collect(events, received))
     message_id = uuid.uuid4()
-    task = start_turn(cfg, events, session_id=uuid.uuid4(), message_id=message_id,
-                      history=[], user_text="跑一下")
+    task = start_turn(
+        cfg,
+        events,
+        session_id=uuid.uuid4(),
+        message_id=message_id,
+        history=[],
+        user_text="跑一下",
+    )
     try:
         await asyncio.wait_for(task, timeout=5)
         await _wait_until(lambda: any(item["event"] == "error" for item in received))
@@ -454,15 +510,13 @@ async def test_crash_path_survives_whole_sdk_failure(
     assert engine.disposed == 1
 
 
-
-
-
 # ---------- S7.22：取消 / 超时按业务状态契约收尾 ----------
 
 
 @pytest.mark.asyncio
 async def test_start_turn_maps_timeout_to_failed_terminal_state(
-        cfg: AppConfig, fake_redis: FakeRedis, monkeypatch: pytest.MonkeyPatch) -> None:
+    cfg: AppConfig, fake_redis: FakeRedis, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """超时（`TimeoutError`）收尾（R2 / OBS-03）：消息标 `failed`，真实失败阶段终结为 failed。
 
     设计约定 §5：取消与超时按既有业务状态契约映射，不能永远停在 running——超时是失败
@@ -471,23 +525,31 @@ async def test_start_turn_maps_timeout_to_failed_terminal_state(
     """
     saved: list[tuple[uuid.UUID, dict[str, Any]]] = []
 
-    async def fake_update(_session: Any, message_id: uuid.UUID,
-                          **fields: Any) -> dict[str, Any]:
+    async def fake_update(
+        _session: Any, message_id: uuid.UUID, **fields: Any
+    ) -> dict[str, Any]:
         saved.append((message_id, fields))
         return {}
 
     async def slow_then_boom(*_args: Any, **kwargs: Any) -> Any:
         on_event = kwargs["on_event"]
-        await on_event("stage", {"stage": "retrieve", "status": "running", "attempt": 1})
+        await on_event(
+            "stage", {"stage": "retrieve", "status": "running", "attempt": 1}
+        )
         raise TimeoutError("模型超时")
 
     engine = DummyEngine()
     monkeypatch.setattr(chat_turns, "update_message", fake_update)
     monkeypatch.setattr(chat_turns, "latest_attachments", no_recent_attachments)
     monkeypatch.setattr(chat_turns, "create_engine_from_config", lambda _cfg: engine)
-    monkeypatch.setattr(chat_turns, "create_session_factory", lambda _engine: dummy_factory)
-    monkeypatch.setattr(chat_turns, "build_turn_provider",
-                        lambda _cfg, _client, tracer=None: ScriptedProvider())
+    monkeypatch.setattr(
+        chat_turns, "create_session_factory", lambda _engine: dummy_factory
+    )
+    monkeypatch.setattr(
+        chat_turns,
+        "build_turn_provider",
+        lambda _cfg, _client, tracer=None: ScriptedProvider(),
+    )
     monkeypatch.setattr(chat_turns, "run_turn", slow_then_boom)
 
     events = TurnEvents(cfg, turn_id="t-6")
@@ -495,8 +557,14 @@ async def test_start_turn_maps_timeout_to_failed_terminal_state(
     received: list[dict[str, Any]] = []
     pump = asyncio.create_task(_collect(events, received))
     message_id = uuid.uuid4()
-    task = start_turn(cfg, events, session_id=uuid.uuid4(), message_id=message_id,
-                      history=[], user_text="跑一下")
+    task = start_turn(
+        cfg,
+        events,
+        session_id=uuid.uuid4(),
+        message_id=message_id,
+        history=[],
+        user_text="跑一下",
+    )
     try:
         await asyncio.wait_for(task, timeout=5)
         await _wait_until(lambda: any(item["event"] == "error" for item in received))
@@ -505,19 +573,22 @@ async def test_start_turn_maps_timeout_to_failed_terminal_state(
         await events.aclose()
 
     # 阶段先落 running（可见"在检索"），随后随失败一起收成 interrupted
-    running_writes = [fields for _mid, fields in saved
-                      if (fields.get("progress") or {}).get("status") == "running"]
+    running_writes = [
+        fields
+        for _mid, fields in saved
+        if (fields.get("progress") or {}).get("status") == "running"
+    ]
     assert running_writes and running_writes[0]["progress"]["stage"] == "retrieve"
     final = saved[-1][1]
     assert final["status"] == "failed" and "模型超时" in final["error"]
-    assert final["progress"]["status"] == "failed"          # 失败阶段终结为 failed
-    assert final["progress"]["stage"] == "retrieve"         # 真实失败阶段，不臆造 final_reply
+    assert final["progress"]["status"] == "failed"  # 失败阶段终结为 failed
+    assert final["progress"]["stage"] == "retrieve"  # 真实失败阶段，不臆造 final_reply
     assert final["progress"]["error_category"] == "timeout"
     assert final["progress"]["nodes"][0]["status"] == "failed"
     error_event = received[-1]
     assert error_event["event"] == "error"
     assert error_event["data"]["error_category"] == "timeout"
-    assert error_event["data"]["stage"] == "retrieve"       # OBS-03：真实失败位置
+    assert error_event["data"]["stage"] == "retrieve"  # OBS-03：真实失败位置
     assert error_event["data"]["turn_id"] == "t-6"
     assert engine.disposed == 1
 
@@ -526,14 +597,16 @@ async def test_start_turn_maps_timeout_to_failed_terminal_state(
 
 
 def test_build_turn_provider_wraps_with_tracer(
-        cfg: AppConfig, monkeypatch: pytest.MonkeyPatch) -> None:
+    cfg: AppConfig, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """对话层 provider 默认套 `TracingProvider`（S7.19）：追松开时 supervisor 调用有 generation。
 
     追踪关闭（`NullTracer`）时包装器仍在、行为等价——这样生产路径只有一条。
     """
     tracer = NullTracer()
-    monkeypatch.setattr(chat_turns, "build_provider",
-                        lambda _cfg, client=None: ScriptedProvider())
+    monkeypatch.setattr(
+        chat_turns, "build_provider", lambda _cfg, client=None: ScriptedProvider()
+    )
     provider = chat_turns.build_turn_provider(cfg, client=object(), tracer=tracer)
     assert isinstance(provider, TracingProvider)
     assert provider.tracer is tracer
@@ -579,7 +652,8 @@ def test_enqueue_with_turn_without_dispatcher_stays_none() -> None:
 
 @pytest.mark.asyncio
 async def test_tool_runner_opens_tool_span_and_enqueue_uses_it(
-        cfg: AppConfig, otel_exporter: Any, monkeypatch: pytest.MonkeyPatch) -> None:
+    cfg: AppConfig, otel_exporter: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """工具调用跑在 `tool.<name>` span 内——投递的 traceparent 就取自它（S7.20 验收口径）。"""
     from xhs_agent.api.deps import CeleryDispatcher
 
@@ -597,23 +671,36 @@ async def test_tool_runner_opens_tool_span_and_enqueue_uses_it(
 
         @contextmanager
         def tool(self, *, name: str, metadata: dict[str, Any]) -> Any:
-            with otel_trace.get_tracer("xhs_agent.test").start_as_current_span(name) as span:
+            with otel_trace.get_tracer("xhs_agent.test").start_as_current_span(
+                name
+            ) as span:
                 holder["span_id"] = span.get_span_context().span_id
                 yield Generation(metadata=dict(metadata))
 
-    async def fake_handler(ctx: Any, _args: dict[str, Any], *,
-                           attachments: Any = None, on_progress: Any = None) -> ToolOutcome:
-        await ctx.enqueue("job-1")             # 投递发生在工具 span 内
+    async def fake_handler(
+        ctx: Any,
+        _args: dict[str, Any],
+        *,
+        attachments: Any = None,
+        on_progress: Any = None,
+    ) -> ToolOutcome:
+        await ctx.enqueue("job-1")  # 投递发生在工具 span 内
         return ToolOutcome(status="succeeded")
 
     monkeypatch.setitem(chat_tools.HANDLERS, chat_tools.TOOL_RUN_ANALYSIS, fake_handler)
     dispatcher = CeleryDispatcher(cfg)
-    dispatcher._app = RecordingApp()           # type: ignore[assignment]
+    dispatcher._app = RecordingApp()  # type: ignore[assignment]
 
     runner = chat_turns.build_tool_runner(
-        cast(Any, None), cfg=cfg, client=object(), session_id=uuid.uuid4(),
-        attachments=[], dispatcher=dispatcher, turn_id="turn-9",
-        tracer=OtelToolTracer())
+        cast(Any, None),
+        cfg=cfg,
+        client=object(),
+        session_id=uuid.uuid4(),
+        attachments=[],
+        dispatcher=dispatcher,
+        turn_id="turn-9",
+        tracer=OtelToolTracer(),
+    )
     outcome = await runner(chat_tools.TOOL_RUN_ANALYSIS, {})
 
     assert outcome.status == "succeeded"
@@ -630,7 +717,7 @@ class _CountingTracer(NullTracer):
     def __init__(self) -> None:
         self.turns = 0
 
-    def turn(self, *, name: str, metadata: Any, turn_id: str = ""):   # type: ignore[override]
+    def turn(self, *, name: str, metadata: Any, turn_id: str = ""):  # type: ignore[override]
         self.turns += 1
 
         @contextmanager
@@ -657,25 +744,33 @@ class _FlakyFactory:
         return self._inner()
 
 
-def _patch_turn_harness(monkeypatch: pytest.MonkeyPatch, engine: DummyEngine,
-                        update: Any, tracer: Any) -> None:
+def _patch_turn_harness(
+    monkeypatch: pytest.MonkeyPatch, engine: DummyEngine, update: Any, tracer: Any
+) -> None:
     monkeypatch.setattr(chat_turns, "update_message", update)
     monkeypatch.setattr(chat_turns, "latest_attachments", no_recent_attachments)
     monkeypatch.setattr(chat_turns, "create_engine_from_config", lambda _cfg: engine)
-    monkeypatch.setattr(chat_turns, "create_session_factory", lambda _engine: dummy_factory)
-    monkeypatch.setattr(chat_turns, "build_turn_provider",
-                        lambda _cfg, _client, tracer=None: ScriptedProvider())
+    monkeypatch.setattr(
+        chat_turns, "create_session_factory", lambda _engine: dummy_factory
+    )
+    monkeypatch.setattr(
+        chat_turns,
+        "build_turn_provider",
+        lambda _cfg, _client, tracer=None: ScriptedProvider(),
+    )
     monkeypatch.setattr(chat_turns, "get_tracer", lambda _cfg: tracer)
 
 
 @pytest.mark.asyncio
 async def test_cancelled_turn_finalizes_interrupted_and_propagates(
-        cfg: AppConfig, fake_redis: FakeRedis, monkeypatch: pytest.MonkeyPatch) -> None:
+    cfg: AppConfig, fake_redis: FakeRedis, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """OBS-09：真实 `Task.cancel()` → 消息 `interrupted`（类别 cancelled）→ 取消继续传播。"""
     saved: list[tuple[uuid.UUID, dict[str, Any]]] = []
 
-    async def fake_update(_session: Any, message_id: uuid.UUID,
-                          **fields: Any) -> dict[str, Any]:
+    async def fake_update(
+        _session: Any, message_id: uuid.UUID, **fields: Any
+    ) -> dict[str, Any]:
         saved.append((message_id, fields))
         return {}
 
@@ -683,7 +778,9 @@ async def test_cancelled_turn_finalizes_interrupted_and_propagates(
 
     async def hanging(*_args: Any, **kwargs: Any) -> Any:
         on_event = kwargs["on_event"]
-        await on_event("stage", {"stage": "supervisor", "status": "running", "attempt": 1})
+        await on_event(
+            "stage", {"stage": "supervisor", "status": "running", "attempt": 1}
+        )
         started.set()
         await asyncio.sleep(3600)
 
@@ -696,13 +793,19 @@ async def test_cancelled_turn_finalizes_interrupted_and_propagates(
     received: list[dict[str, Any]] = []
     pump = asyncio.create_task(_collect(events, received))
     message_id = uuid.uuid4()
-    task = start_turn(cfg, events, session_id=uuid.uuid4(), message_id=message_id,
-                      history=[], user_text="跑一下")
+    task = start_turn(
+        cfg,
+        events,
+        session_id=uuid.uuid4(),
+        message_id=message_id,
+        history=[],
+        user_text="跑一下",
+    )
     try:
         await asyncio.wait_for(started.wait(), timeout=5)
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
-            await asyncio.wait_for(task, timeout=5)          # 有界：收尾后立即传播取消
+            await asyncio.wait_for(task, timeout=5)  # 有界：收尾后立即传播取消
         await _wait_until(lambda: any(item["event"] == "error" for item in received))
     finally:
         pump.cancel()
@@ -719,17 +822,190 @@ async def test_cancelled_turn_finalizes_interrupted_and_propagates(
     assert error_event["data"]["stage"] == "supervisor"
     assert error_event["data"]["turn_id"] == "t-cancel"
     assert engine.disposed == 1
-    assert current_turn_id() == ""                           # 日志上下文复位
+    assert current_turn_id() == ""  # 日志上下文复位
+
+
+@pytest.mark.asyncio
+async def test_cancelled_turn_keeps_completed_ledger_entries(
+    cfg: AppConfig, fake_redis: FakeRedis, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """R5（E7OBS2-01）：取消时稳定边界账本里**已完成**的工具 / 账目 / 引用尽力写回。
+
+    in-flight 的调用拿不到、如实缺席——不承诺"都已保存"，但已完成的不能丢。
+    """
+    saved: list[tuple[uuid.UUID, dict[str, Any]]] = []
+
+    async def fake_update(
+        _session: Any, message_id: uuid.UUID, **fields: dict[str, Any]
+    ) -> dict[str, Any]:
+        saved.append((message_id, fields))
+        return {}
+
+    run_uuid = "77777777-7777-4777-8777-777777777777"
+    started = asyncio.Event()
+
+    async def partial_then_hang(*_args: Any, **kwargs: Any) -> Any:
+        on_event = kwargs["on_event"]
+        ledger = kwargs.get("ledger")
+        assert ledger is not None  # 运行器注入同一份账本
+        ledger["records"].append(
+            {
+                "task": "chat_supervisor",
+                "cost_cny": 0.001,
+                "prompt_tokens": 10,
+                "completion_tokens": 5,
+                "usage_status": "actual",
+            }
+        )
+        ledger["tool_calls"].append(
+            {
+                "tool": "run_hotspot_analysis",
+                "status": "succeeded",
+                "call_id": "c1",
+                "attempt": 1,
+                "run_id": run_uuid,
+                "cost_cny": 0.05,
+                "prompt_tokens": 700,
+                "completion_tokens": 300,
+                "latency_ms": 1200,
+                "error": "",
+                "steps": [],
+                "usage_status": "actual",
+            }
+        )
+        ledger["run_id"] = run_uuid
+        ledger["versions"]["run_hotspot_analysis"] = 1
+        await on_event(
+            "stage", {"stage": "supervisor", "status": "running", "attempt": 2}
+        )
+        started.set()
+        await asyncio.sleep(3600)
+
+    engine = DummyEngine()
+    _patch_turn_harness(monkeypatch, engine, fake_update, NullTracer())
+    monkeypatch.setattr(chat_turns, "run_turn", partial_then_hang)
+
+    events = TurnEvents(cfg, turn_id="t-cancel-ledger")
+    await events.open()
+    received: list[dict[str, Any]] = []
+    pump = asyncio.create_task(_collect(events, received))
+    task = start_turn(
+        cfg,
+        events,
+        session_id=uuid.uuid4(),
+        message_id=uuid.uuid4(),
+        history=[],
+        user_text="跑一下",
+    )
+    try:
+        await asyncio.wait_for(started.wait(), timeout=5)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(task, timeout=5)
+    finally:
+        pump.cancel()
+        await events.aclose()
+
+    final = saved[-1][1]
+    assert final["status"] == "interrupted"
+    assert final["run_id"] == run_uuid  # 运行引用保留
+    assert [item["tool"] for item in final["tool_calls"]] == ["run_hotspot_analysis"]
+    assert final["cost_cny"] == pytest.approx(0.051)  # 已知消费保留
+    assert final["prompt_tokens"] == 710 and final["completion_tokens"] == 305
+    assert final["prompt_versions"] == {"run_hotspot_analysis": 1}
+
+
+def test_terminal_snapshot_keeps_historical_failure_and_interrupts_current() -> None:
+    """R5（E7OBS2-07）：取消只把**当前执行**投影成 interrupted/cancelled；
+    之前失败的尝试保留在 nodes 里，不被统一收尾改写。"""
+    from xhs_agent.core import progress as progress_tool
+
+    snapshot = progress_tool.begin(None, stage="supervisor", attempt=1)
+    snapshot = progress_tool.end(
+        snapshot,
+        stage="supervisor",
+        status="failed",
+        attempt=1,
+        error_category="llm_error",
+    )
+    snapshot = progress_tool.begin(snapshot, stage="supervisor", attempt=2)
+
+    final = chat_turns._terminal_snapshot(
+        snapshot, status="interrupted", error_category="cancelled"
+    )
+
+    assert final["stage"] == "supervisor" and final["status"] == "interrupted"
+    assert final["attempt"] == 2 and final["error_category"] == "cancelled"
+    nodes = {
+        (node["stage"], node["attempt"]): node["status"] for node in final["nodes"]
+    }
+    assert nodes[("supervisor", 1)] == "failed"  # 历史失败保留
+    assert nodes[("supervisor", 2)] == "interrupted"
+
+
+@pytest.mark.asyncio
+async def test_second_cancel_during_finalize_still_propagates(
+    cfg: AppConfig, fake_redis: FakeRedis, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """R5（E7OBS2-07）：收尾写库被卡住时再取消——取消继续传播，绝不吞掉控制流；
+    尽力边界如实（那一笔写不进去由陈旧对账兜底）。"""
+    write_started = asyncio.Event()
+
+    async def slow_update(
+        _session: Any, _message_id: uuid.UUID, **fields: dict[str, Any]
+    ) -> dict[str, Any]:
+        # 只卡住**收尾**写库（带 status 的终态写回）；阶段快照写库照常放行
+        if fields.get("status") == "interrupted":
+            write_started.set()
+            await asyncio.sleep(3600)  # 卡住收尾写库
+        return {}
+
+    started = asyncio.Event()
+
+    async def hanging(*_args: Any, **kwargs: Any) -> Any:
+        on_event = kwargs["on_event"]
+        await on_event(
+            "stage", {"stage": "supervisor", "status": "running", "attempt": 1}
+        )
+        started.set()
+        await asyncio.sleep(3600)
+
+    engine = DummyEngine()
+    _patch_turn_harness(monkeypatch, engine, slow_update, NullTracer())
+    monkeypatch.setattr(chat_turns, "run_turn", hanging)
+
+    events = TurnEvents(cfg, turn_id="t-cancel-twice")
+    await events.open()
+    task = start_turn(
+        cfg,
+        events,
+        session_id=uuid.uuid4(),
+        message_id=uuid.uuid4(),
+        history=[],
+        user_text="跑一下",
+    )
+    try:
+        await asyncio.wait_for(started.wait(), timeout=5)
+        task.cancel()
+        await asyncio.wait_for(write_started.wait(), timeout=5)
+        task.cancel()  # 第二次取消：收尾还在写
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(task, timeout=5)
+    finally:
+        await events.aclose()
+    assert engine.disposed == 1  # 资源照常释放
 
 
 @pytest.mark.asyncio
 async def test_single_turn_entry_and_trace_id_persisted_on_crash(
-        cfg: AppConfig, fake_redis: FakeRedis, monkeypatch: pytest.MonkeyPatch) -> None:
+    cfg: AppConfig, fake_redis: FakeRedis, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """OBS-04：异常路径只有一个业务入口；trace_id 进入 turn 后尽早捕获并落库。"""
     saved: list[tuple[uuid.UUID, dict[str, Any]]] = []
 
-    async def fake_update(_session: Any, message_id: uuid.UUID,
-                          **fields: Any) -> dict[str, Any]:
+    async def fake_update(
+        _session: Any, message_id: uuid.UUID, **fields: Any
+    ) -> dict[str, Any]:
         saved.append((message_id, fields))
         return {}
 
@@ -746,8 +1022,14 @@ async def test_single_turn_entry_and_trace_id_persisted_on_crash(
     received: list[dict[str, Any]] = []
     pump = asyncio.create_task(_collect(events, received))
     message_id = uuid.uuid4()
-    task = start_turn(cfg, events, session_id=uuid.uuid4(), message_id=message_id,
-                      history=[], user_text="跑一下")
+    task = start_turn(
+        cfg,
+        events,
+        session_id=uuid.uuid4(),
+        message_id=message_id,
+        history=[],
+        user_text="跑一下",
+    )
     try:
         await asyncio.wait_for(task, timeout=5)
         await _wait_until(lambda: any(item["event"] == "error" for item in received))
@@ -755,31 +1037,46 @@ async def test_single_turn_entry_and_trace_id_persisted_on_crash(
         pump.cancel()
         await events.aclose()
 
-    assert tracer.turns == 1                                 # 不重建第二个 chat.turn
+    assert tracer.turns == 1  # 不重建第二个 chat.turn
     assert [item["event"] for item in received] == ["turn_started", "error"]
-    assert saved[0][1]["trace_id"] == "trace-fixed-1"        # 尽早落库
+    assert saved[0][1]["trace_id"] == "trace-fixed-1"  # 尽早落库
     assert saved[-1][1]["trace_id"] == "trace-fixed-1"
     assert received[-1]["data"]["trace_id"] == "trace-fixed-1"
 
 
 @pytest.mark.asyncio
 async def test_failed_turn_keeps_real_stage_and_never_fakes_final_reply(
-        cfg: AppConfig, fake_redis: FakeRedis, monkeypatch: pytest.MonkeyPatch) -> None:
+    cfg: AppConfig, fake_redis: FakeRedis, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """OBS-03：返回失败不做 final_reply；终态快照与事件停在真实失败阶段。"""
     saved: list[tuple[uuid.UUID, dict[str, Any]]] = []
 
-    async def fake_update(_session: Any, message_id: uuid.UUID,
-                          **fields: Any) -> dict[str, Any]:
+    async def fake_update(
+        _session: Any, message_id: uuid.UUID, **fields: Any
+    ) -> dict[str, Any]:
         saved.append((message_id, fields))
         return {}
 
     async def failing(*_args: Any, **kwargs: Any) -> Any:
         on_event = kwargs["on_event"]
-        await on_event("stage", {"stage": "supervisor", "status": "running", "attempt": 1})
-        await on_event("stage", {"stage": "supervisor", "status": "failed", "attempt": 1,
-                                 "error_category": "llm_error"})
-        return ChatTurn(status="failed", error="模型拒绝了", error_category="llm_error",
-                        latency_ms=12)
+        await on_event(
+            "stage", {"stage": "supervisor", "status": "running", "attempt": 1}
+        )
+        await on_event(
+            "stage",
+            {
+                "stage": "supervisor",
+                "status": "failed",
+                "attempt": 1,
+                "error_category": "llm_error",
+            },
+        )
+        return ChatTurn(
+            status="failed",
+            error="模型拒绝了",
+            error_category="llm_error",
+            latency_ms=12,
+        )
 
     engine = DummyEngine()
     _patch_turn_harness(monkeypatch, engine, fake_update, NullTracer())
@@ -790,8 +1087,14 @@ async def test_failed_turn_keeps_real_stage_and_never_fakes_final_reply(
     received: list[dict[str, Any]] = []
     pump = asyncio.create_task(_collect(events, received))
     message_id = uuid.uuid4()
-    task = start_turn(cfg, events, session_id=uuid.uuid4(), message_id=message_id,
-                      history=[], user_text="跑一下")
+    task = start_turn(
+        cfg,
+        events,
+        session_id=uuid.uuid4(),
+        message_id=message_id,
+        history=[],
+        user_text="跑一下",
+    )
     try:
         await asyncio.wait_for(task, timeout=5)
         await _wait_until(lambda: any(item["event"] == "error" for item in received))
@@ -800,7 +1103,9 @@ async def test_failed_turn_keeps_real_stage_and_never_fakes_final_reply(
         await events.aclose()
 
     stage_events = [item["data"] for item in received if item["event"] == "stage"]
-    assert all(item["stage"] != "final_reply" for item in stage_events)   # 不臆造收尾阶段
+    assert all(
+        item["stage"] != "final_reply" for item in stage_events
+    )  # 不臆造收尾阶段
     final = saved[-1][1]
     assert final["status"] == "failed" and final["latency_ms"] == 12
     assert final["progress"]["stage"] == "supervisor"
@@ -813,11 +1118,16 @@ async def test_failed_turn_keeps_real_stage_and_never_fakes_final_reply(
 
 @pytest.mark.asyncio
 async def test_finalize_write_failure_is_logged_not_claimed(
-        cfg: AppConfig, fake_redis: FakeRedis, monkeypatch: pytest.MonkeyPatch,
-        caplog: pytest.LogCaptureFixture) -> None:
+    cfg: AppConfig,
+    fake_redis: FakeRedis,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
     """OBS-04 点 4：收尾写库失败 → 明确记录"未保存"，事件照常广播，不谎称已落库。"""
-    async def fake_update(_session: Any, message_id: uuid.UUID,
-                          **fields: Any) -> dict[str, Any]:
+
+    async def fake_update(
+        _session: Any, message_id: uuid.UUID, **fields: Any
+    ) -> dict[str, Any]:
         return {}
 
     async def boom(*_args: Any, **_kwargs: Any) -> Any:
@@ -833,12 +1143,20 @@ async def test_finalize_write_failure_is_logged_not_claimed(
     await events.open()
     received: list[dict[str, Any]] = []
     pump = asyncio.create_task(_collect(events, received))
-    task = start_turn(cfg, events, session_id=uuid.uuid4(), message_id=uuid.uuid4(),
-                      history=[], user_text="跑一下")
+    task = start_turn(
+        cfg,
+        events,
+        session_id=uuid.uuid4(),
+        message_id=uuid.uuid4(),
+        history=[],
+        user_text="跑一下",
+    )
     try:
         with caplog.at_level(logging.WARNING, logger="xhs_agent.chat"):
             await asyncio.wait_for(task, timeout=5)
-            await _wait_until(lambda: any(item["event"] == "error" for item in received))
+            await _wait_until(
+                lambda: any(item["event"] == "error" for item in received)
+            )
     finally:
         pump.cancel()
         await events.aclose()
@@ -849,35 +1167,68 @@ async def test_finalize_write_failure_is_logged_not_claimed(
 
 @pytest.mark.asyncio
 async def test_worker_stage_updates_persist_real_status_retries_and_identity(
-        cfg: AppConfig, fake_redis: FakeRedis, monkeypatch: pytest.MonkeyPatch) -> None:
+    cfg: AppConfig, fake_redis: FakeRedis, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """R3（OBS-05）：worker 的 failed / 重试 / skipped / run 身份都进快照，不再一律 running。
 
     失败尝试仍可追查（`nodes` 保留 clue/attempt=1/failed），重试成功不抹掉失败记录。
     """
     saved: list[tuple[uuid.UUID, dict[str, Any]]] = []
 
-    async def fake_update(_session: Any, message_id: uuid.UUID,
-                          **fields: Any) -> dict[str, Any]:
+    async def fake_update(
+        _session: Any, message_id: uuid.UUID, **fields: Any
+    ) -> dict[str, Any]:
         saved.append((message_id, fields))
         return {}
 
     async def structured_run(*_args: Any, **kwargs: Any) -> Any:
         on_event = kwargs["on_event"]
-        await on_event("stage", {"stage": "submit_analysis", "status": "running", "attempt": 1})
-        await on_event("tool_progress", {"tool": "run_hotspot_analysis", "stage": "拆解",
-                                         "stage_key": "clue", "status": "failed",
-                                         "attempt": 1, "retries": 2,
-                                         "error_category": "llm_error",
-                                         "run_id": "run-9", "job_id": "job-9"})
-        await on_event("tool_progress", {"tool": "run_hotspot_analysis", "stage": "拆解",
-                                         "stage_key": "clue", "status": "running",
-                                         "attempt": 2, "retries": 2, "error_category": "",
-                                         "run_id": "run-9", "job_id": "job-9"})
-        await on_event("tool_progress", {"tool": "run_hotspot_analysis", "stage": "报告",
-                                         "stage_key": "report", "status": "succeeded",
-                                         "attempt": 1, "retries": 0, "error_category": "",
-                                         "run_id": "run-9", "job_id": "job-9",
-                                         "latency_ms": 7})
+        await on_event(
+            "stage", {"stage": "submit_analysis", "status": "running", "attempt": 1}
+        )
+        await on_event(
+            "tool_progress",
+            {
+                "tool": "run_hotspot_analysis",
+                "stage": "拆解",
+                "stage_key": "clue",
+                "status": "failed",
+                "attempt": 1,
+                "retries": 2,
+                "error_category": "llm_error",
+                "run_id": "run-9",
+                "job_id": "job-9",
+            },
+        )
+        await on_event(
+            "tool_progress",
+            {
+                "tool": "run_hotspot_analysis",
+                "stage": "拆解",
+                "stage_key": "clue",
+                "status": "running",
+                "attempt": 2,
+                "retries": 2,
+                "error_category": "",
+                "run_id": "run-9",
+                "job_id": "job-9",
+            },
+        )
+        await on_event(
+            "tool_progress",
+            {
+                "tool": "run_hotspot_analysis",
+                "stage": "报告",
+                "stage_key": "report",
+                "status": "succeeded",
+                "attempt": 1,
+                "retries": 0,
+                "error_category": "",
+                "run_id": "run-9",
+                "job_id": "job-9",
+                "latency_ms": 7,
+            },
+        )
         return ChatTurn(status="succeeded", reply="好了", run_id="run-9", cost_cny=0.05)
 
     engine = DummyEngine()
@@ -889,8 +1240,14 @@ async def test_worker_stage_updates_persist_real_status_retries_and_identity(
     received: list[dict[str, Any]] = []
     pump = asyncio.create_task(_collect(events, received))
     message_id = uuid.uuid4()
-    task = start_turn(cfg, events, session_id=uuid.uuid4(), message_id=message_id,
-                      history=[], user_text="跑一下")
+    task = start_turn(
+        cfg,
+        events,
+        session_id=uuid.uuid4(),
+        message_id=message_id,
+        history=[],
+        user_text="跑一下",
+    )
     try:
         await asyncio.wait_for(task, timeout=5)
     finally:
@@ -902,14 +1259,277 @@ async def test_worker_stage_updates_persist_real_status_retries_and_identity(
     snapshot = final["progress"]
     assert snapshot["stage"] == "final_reply" and snapshot["status"] == "succeeded"
     assert snapshot["last_finished_stage"] == "final_reply"
-    assert snapshot["retries"] == 0                     # 当前阶段（报告）的投递重试数
-    nodes = {(item["stage"], item["attempt"], item.get("run_id") or ""): item
-             for item in snapshot["nodes"]}
-    assert nodes[("clue", 1, "run-9")]["status"] == "failed"           # 失败尝试可追查
+    assert snapshot["retries"] == 0  # 当前阶段（报告）的投递重试数
+    nodes = {
+        (item["stage"], item["attempt"], item.get("run_id") or ""): item
+        for item in snapshot["nodes"]
+    }
+    assert nodes[("clue", 1, "run-9")]["status"] == "failed"  # 失败尝试可追查
     assert nodes[("clue", 1, "run-9")]["error_category"] == "llm_error"
-    assert nodes[("clue", 2, "run-9")]["status"] == "succeeded"        # 重试成功不抹掉失败
+    assert nodes[("clue", 2, "run-9")]["status"] == "succeeded"  # 重试成功不抹掉失败
     assert nodes[("report", 1, "run-9")]["latency_ms"] == 7
-    skipped_like = [item for item in snapshot["nodes"] if item["stage"] == "submit_analysis"]
-    assert skipped_like and skipped_like[0]["status"] == "succeeded"   # 自有阶段照常收尾
+    skipped_like = [
+        item for item in snapshot["nodes"] if item["stage"] == "submit_analysis"
+    ]
+    assert skipped_like and skipped_like[0]["status"] == "succeeded"  # 自有阶段照常收尾
 
 
+@pytest.mark.asyncio
+async def test_late_cross_run_terminal_never_regresses_persisted_snapshot(
+    cfg: AppConfig, fake_redis: FakeRedis, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """R5（E7OBS2-02）：迟到旧 run 终态只补 nodes——顶层快照不回退、不串身份，
+    也不触发"切阶段即成功"的自动收尾。"""
+    saved: list[tuple[uuid.UUID, dict[str, Any]]] = []
+
+    async def fake_update(
+        _session: Any, message_id: uuid.UUID, **fields: dict[str, Any]
+    ) -> dict[str, Any]:
+        saved.append((message_id, fields))
+        return {}
+
+    run_new = "11111111-1111-4111-8111-111111111111"
+    run_old = "22222222-2222-4222-8222-222222222222"
+
+    async def late_run(*_args: Any, **kwargs: Any) -> Any:
+        on_event = kwargs["on_event"]
+        await on_event(
+            "tool_progress",
+            {
+                "tool": "run_hotspot_analysis",
+                "stage": "报告",
+                "stage_key": "report",
+                "status": "running",
+                "attempt": 1,
+                "run_id": run_new,
+                "job_id": "job-1",
+            },
+        )
+        # 旧 run 的迟到终态（跨 stage，且尝试号更高）：不许回退、不许串身份
+        await on_event(
+            "tool_progress",
+            {
+                "tool": "run_hotspot_analysis",
+                "stage": "撰稿",
+                "stage_key": "draft",
+                "status": "succeeded",
+                "attempt": 3,
+                "run_id": run_old,
+                "job_id": "job-old",
+            },
+        )
+        # 同 stage、旧 run 的"冲突终态"：同样不改写当前状态
+        await on_event(
+            "tool_progress",
+            {
+                "tool": "run_hotspot_analysis",
+                "stage": "报告",
+                "stage_key": "report",
+                "status": "failed",
+                "attempt": 9,
+                "error_category": "llm_error",
+                "run_id": run_old,
+                "job_id": "job-old",
+            },
+        )
+        return ChatTurn(status="succeeded", reply="好了", run_id=run_new, cost_cny=0.05)
+
+    engine = DummyEngine()
+    _patch_turn_harness(monkeypatch, engine, fake_update, NullTracer())
+    monkeypatch.setattr(chat_turns, "run_turn", late_run)
+
+    events = TurnEvents(cfg, turn_id="t-late")
+    await events.open()
+    received: list[dict[str, Any]] = []
+    pump = asyncio.create_task(_collect(events, received))
+    task = start_turn(
+        cfg,
+        events,
+        session_id=uuid.uuid4(),
+        message_id=uuid.uuid4(),
+        history=[],
+        user_text="跑一下",
+    )
+    try:
+        await asyncio.wait_for(task, timeout=5)
+    finally:
+        pump.cancel()
+        await events.aclose()
+
+    # 所有被持久化的快照里，顶层从未回到 draft；迟到终态期间身份保持 run-new
+    snapshots = [fields["progress"] for _mid, fields in saved if "progress" in fields]
+    assert snapshots and all(item["stage"] != "draft" for item in snapshots)
+    late_snapshot = next(
+        item
+        for item in snapshots
+        if any(node.get("run_id") == run_old for node in item["nodes"])
+    )
+    assert late_snapshot["stage"] == "report" and late_snapshot["status"] == "running"
+    assert late_snapshot["run_id"] == run_new
+    # 旧 run 的历史事实补进了 nodes；report 没有被迟到事件提前收尾
+    late_nodes = {
+        (node["stage"], node.get("run_id") or ""): node["status"]
+        for node in late_snapshot["nodes"]
+    }
+    assert late_nodes[("draft", run_old)] == "succeeded"
+    assert ("report", run_new) not in late_nodes
+
+
+@pytest.mark.asyncio
+async def test_tool_finished_never_overrides_worker_attempt_or_status(
+    cfg: AppConfig, fake_redis: FakeRedis, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """R5（E7OBS2-03）：worker 阶段的结构化终态由 tool_progress 负责；tool_finished
+    的"工具第几次调用"不得覆盖阶段重试号，也不得在 worker 仍 running 时凭空收尾。"""
+    saved: list[tuple[uuid.UUID, dict[str, Any]]] = []
+
+    async def fake_update(
+        _session: Any, message_id: uuid.UUID, **fields: dict[str, Any]
+    ) -> dict[str, Any]:
+        saved.append((message_id, fields))
+        return {}
+
+    run_new = "33333333-3333-4333-8333-333333333333"
+
+    async def structured_run(*_args: Any, **kwargs: Any) -> Any:
+        on_event = kwargs["on_event"]
+        await on_event(
+            "tool_progress",
+            {
+                "tool": "run_hotspot_analysis",
+                "stage": "报告",
+                "stage_key": "report",
+                "status": "running",
+                "attempt": 1,
+                "retries": 2,
+                "run_id": run_new,
+                "job_id": "job-1",
+            },
+        )
+        # 工具成功、worker 最后一份快照仍 running（如超时返回）：不许收尾、不许改重试号
+        await on_event(
+            "tool_finished",
+            {
+                "tool": "run_hotspot_analysis",
+                "stage": "报告",
+                "stage_key": "report",
+                "status": "succeeded",
+                "attempt": 1,
+                "structured": True,
+                "worker_status": "running",
+                "worker_attempt": 1,
+                "worker_retries": 2,
+                "run_id": run_new,
+            },
+        )
+        return ChatTurn(status="succeeded", reply="好了", run_id=run_new, cost_cny=0.05)
+
+    engine = DummyEngine()
+    _patch_turn_harness(monkeypatch, engine, fake_update, NullTracer())
+    monkeypatch.setattr(chat_turns, "run_turn", structured_run)
+
+    events = TurnEvents(cfg, turn_id="t-tf")
+    await events.open()
+    received: list[dict[str, Any]] = []
+    pump = asyncio.create_task(_collect(events, received))
+    task = start_turn(
+        cfg,
+        events,
+        session_id=uuid.uuid4(),
+        message_id=uuid.uuid4(),
+        history=[],
+        user_text="跑一下",
+    )
+    try:
+        await asyncio.wait_for(task, timeout=5)
+    finally:
+        pump.cancel()
+        await events.aclose()
+
+    snapshots = [fields["progress"] for _mid, fields in saved if "progress" in fields]
+    report_snapshots = [item for item in snapshots if item["stage"] == "report"]
+    assert report_snapshots  # 确实停在 report 上
+    assert all(item["status"] == "running" for item in report_snapshots)
+    assert all(item["retries"] == 2 for item in report_snapshots)  # 未被工具次数清零
+    assert all(
+        not any(node["stage"] == "report" for node in item["nodes"])
+        for item in report_snapshots
+    )  # 未凭空收尾
+
+
+@pytest.mark.asyncio
+async def test_tool_finished_uses_worker_status_for_structured_stages(
+    cfg: AppConfig, fake_redis: FakeRedis, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """结构化阶段的收尾用 worker 真实状态（skipped 不冒充 succeeded）、worker 重试号。"""
+    saved: list[tuple[uuid.UUID, dict[str, Any]]] = []
+
+    async def fake_update(
+        _session: Any, message_id: uuid.UUID, **fields: dict[str, Any]
+    ) -> dict[str, Any]:
+        saved.append((message_id, fields))
+        return {}
+
+    run_new = "44444444-4444-4444-8444-444444444444"
+
+    async def skipped_run(*_args: Any, **kwargs: Any) -> Any:
+        on_event = kwargs["on_event"]
+        await on_event(
+            "tool_progress",
+            {
+                "tool": "run_hotspot_analysis",
+                "stage": "拆解",
+                "stage_key": "clue",
+                "status": "running",
+                "attempt": 1,
+                "retries": 0,
+                "run_id": run_new,
+                "job_id": "job-1",
+            },
+        )
+        await on_event(
+            "tool_finished",
+            {
+                "tool": "run_hotspot_analysis",
+                "stage": "拆解",
+                "stage_key": "clue",
+                "status": "succeeded",
+                "attempt": 1,
+                "structured": True,
+                "worker_status": "skipped",
+                "worker_attempt": 1,
+                "worker_retries": 0,
+                "latency_ms": 0,
+                "run_id": run_new,
+            },
+        )
+        return ChatTurn(status="succeeded", reply="好了", run_id=run_new)
+
+    engine = DummyEngine()
+    _patch_turn_harness(monkeypatch, engine, fake_update, NullTracer())
+    monkeypatch.setattr(chat_turns, "run_turn", skipped_run)
+
+    events = TurnEvents(cfg, turn_id="t-tf-skip")
+    await events.open()
+    received: list[dict[str, Any]] = []
+    pump = asyncio.create_task(_collect(events, received))
+    task = start_turn(
+        cfg,
+        events,
+        session_id=uuid.uuid4(),
+        message_id=uuid.uuid4(),
+        history=[],
+        user_text="跑一下",
+    )
+    try:
+        await asyncio.wait_for(task, timeout=5)
+    finally:
+        pump.cancel()
+        await events.aclose()
+
+    final = saved[-1][1]["progress"]
+    nodes = {
+        (node["stage"], node.get("run_id") or ""): node["status"]
+        for node in final["nodes"]
+    }
+    assert nodes[("clue", run_new)] == "skipped"  # skip 不虚构成功

@@ -61,34 +61,50 @@ class ImageClueParse:
     prompt_tokens: int = 0
     completion_tokens: int = 0
     cost_cny: float = 0.0
+    # R5（E7OBS2-04）：用量来源口径——actual（供应商给了 usage）/ estimated（按字符估算）/
+    # cached（本轮缓存命中，无新增消费）。随结果上卷到工具 payload 与轮级汇总。
+    usage_status: str = ""
 
 
 def _cost_cny(cfg: AppConfig, completion: ImageCompletion) -> float:
     """按 `[vision]` 的单价把用量折成人民币元（与 `tools/llm.py` 同一记账口径）。"""
-    return round(completion.prompt_tokens / 1_000_000 * cfg.vision.price_in_per_m
-                 + completion.completion_tokens / 1_000_000 * cfg.vision.price_out_per_m, 4)
+    return round(
+        completion.prompt_tokens / 1_000_000 * cfg.vision.price_in_per_m
+        + completion.completion_tokens / 1_000_000 * cfg.vision.price_out_per_m,
+        4,
+    )
 
 
-def _vision_generation(cfg: AppConfig, *, task_id: str, version: int,
-                       image_count: int) -> Any:
+def _vision_generation(
+    cfg: AppConfig, *, task_id: str, version: int, image_count: int
+) -> Any:
     """视觉调用的**等价 generation**（R3 / OBS-06）。
 
     真实视觉模型 + `[vision]` 单价；**一次多图调用只记一个逻辑 generation**；缓存命中不进
     这里（不虚构模型调用、不新增费用）。隔离与载荷规则复用 R1（OBS-01 / 02，门面内部已兜底）。
     """
     return get_tracer(cfg).generation(
-        name=task_id, model=cfg.vision.model,
-        metadata={"provider": "vision", "images": max(1, int(image_count)),
-                  "prompt_version": int(version)})
+        name=task_id,
+        model=cfg.vision.model,
+        metadata={
+            "provider": "vision",
+            "images": max(1, int(image_count)),
+            "prompt_version": int(version),
+        },
+    )
 
 
-def _fill_vision_usage(fields: Any, cfg: AppConfig,
-                       completion: ImageCompletion) -> None:
+def _fill_vision_usage(
+    fields: Any, cfg: AppConfig, completion: ImageCompletion
+) -> None:
     """把视觉调用的用量 / 成本写进 generation；用量口径随结果上卷（actual / estimated）。"""
     in_tokens = int(completion.prompt_tokens or 0)
     out_tokens = int(completion.completion_tokens or 0)
-    fields.usage_details = {"input": in_tokens, "output": out_tokens,
-                            "total": in_tokens + out_tokens}
+    fields.usage_details = {
+        "input": in_tokens,
+        "output": out_tokens,
+        "total": in_tokens + out_tokens,
+    }
     fields.cost_details = {
         "input": round(in_tokens / 1_000_000 * cfg.vision.price_in_per_m, 6),
         "output": round(out_tokens / 1_000_000 * cfg.vision.price_out_per_m, 6),
@@ -99,8 +115,9 @@ def _fill_vision_usage(fields: Any, cfg: AppConfig,
 
 
 @asynccontextmanager
-async def _client_or_stack(cfg: AppConfig,
-                           http: httpx.AsyncClient | None) -> AsyncIterator[httpx.AsyncClient]:
+async def _client_or_stack(
+    cfg: AppConfig, http: httpx.AsyncClient | None
+) -> AsyncIterator[httpx.AsyncClient]:
     """有注入的客户端就借用；没有就起一个短生命周期的（独立调用路径）。"""
     if http is not None:
         yield http
@@ -109,22 +126,30 @@ async def _client_or_stack(cfg: AppConfig,
         yield client
 
 
-async def parse_image_clue(cfg: AppConfig, data: bytes, mime: str, *,
-                           http: httpx.AsyncClient | None = None) -> ImageClueParse:
+async def parse_image_clue(
+    cfg: AppConfig, data: bytes, mime: str, *, http: httpx.AsyncClient | None = None
+) -> ImageClueParse:
     """把一张图片拆成热点描述与线索；失败按 503 / 502 抛出，不降级。"""
     if not images_ready(cfg):
         raise DependencyUnavailableError(
             "图片热点解析未启用：需要 [vision].enabled = true 与密钥",
-            {"vision_enabled": cfg.vision.enabled, "api_key_env": cfg.vision.api_key_env})
+            {
+                "vision_enabled": cfg.vision.enabled,
+                "api_key_env": cfg.vision.api_key_env,
+            },
+        )
 
     # prompt 资产缺失或格式不合契约时直接抛 PromptError（500），不静默降级
     rendered = prompt_tool.render(TASK_ID)
     async with _client_or_stack(cfg, http) as client:
         api = build_image_client(cfg, client=client)
-        if api is None:   # pragma: no cover - images_ready 已经拦过一遍，这里只是兜底
-            raise DependencyUnavailableError("图片热点解析未启用：缺少可用的多模态客户端")
-        with _vision_generation(cfg, task_id=rendered.task_id, version=rendered.version,
-                                image_count=1) as fields:
+        if api is None:  # pragma: no cover - images_ready 已经拦过一遍，这里只是兜底
+            raise DependencyUnavailableError(
+                "图片热点解析未启用：缺少可用的多模态客户端"
+            )
+        with _vision_generation(
+            cfg, task_id=rendered.task_id, version=rendered.version, image_count=1
+        ) as fields:
             try:
                 completion = await api.complete(rendered, data, mime)
             except VisionError as exc:
@@ -132,8 +157,9 @@ async def parse_image_clue(cfg: AppConfig, data: bytes, mime: str, *,
                 fields.level = LEVEL_ERROR
                 fields.status_message = "llm_error"
                 fields.metadata["usage_status"] = "unknown"
-                raise UpstreamError(f"图片解析失败：{exc}",
-                                    {"detail": str(exc)[:200]}) from exc
+                raise UpstreamError(
+                    f"图片解析失败：{exc}", {"detail": str(exc)[:200]}
+                ) from exc
             _fill_vision_usage(fields, cfg, completion)
 
     text = completion.text
@@ -143,7 +169,8 @@ async def parse_image_clue(cfg: AppConfig, data: bytes, mime: str, *,
         raise UpstreamError("图片解析失败：模型没有给出热点描述（raw_text 为空）")
     if len(raw_text) > MAX_RAW_TEXT_CHARS:
         raise UpstreamError(
-            f"图片解析失败：热点描述超过 {MAX_RAW_TEXT_CHARS} 字上限（{len(raw_text)} 字）")
+            f"图片解析失败：热点描述超过 {MAX_RAW_TEXT_CHARS} 字上限（{len(raw_text)} 字）"
+        )
     clue_payload = payload.get("clue")
     if not isinstance(clue_payload, dict):
         raise UpstreamError("图片解析失败：返回里缺少 clue 对象")
@@ -154,15 +181,23 @@ async def parse_image_clue(cfg: AppConfig, data: bytes, mime: str, *,
     if not clue.elements:
         # 没有要素的"热点"检索不出任何素材，按上游失败处理（不返回半成品）
         raise UpstreamError("图片解析失败：模型没有给出任何爆点要素")
-    return ImageClueParse(raw_text=raw_text, clue=clue,
-                          prompt_versions={rendered.task_id: rendered.version},
-                          prompt_tokens=completion.prompt_tokens,
-                          completion_tokens=completion.completion_tokens,
-                          cost_cny=_cost_cny(cfg, completion))
+    return ImageClueParse(
+        raw_text=raw_text,
+        clue=clue,
+        prompt_versions={rendered.task_id: rendered.version},
+        prompt_tokens=completion.prompt_tokens,
+        completion_tokens=completion.completion_tokens,
+        cost_cny=_cost_cny(cfg, completion),
+        usage_status=str(completion.usage_status or "estimated"),
+    )
 
 
-async def parse_image_clue_multi(cfg: AppConfig, images: Sequence[tuple[bytes, str]], *,
-                                 http: httpx.AsyncClient | None = None) -> ImageClueParse:
+async def parse_image_clue_multi(
+    cfg: AppConfig,
+    images: Sequence[tuple[bytes, str]],
+    *,
+    http: httpx.AsyncClient | None = None,
+) -> ImageClueParse:
     """把**一组**图片（1–9 张，按发送顺序）一次多模态调用拆成一份热点描述与一份线索（S7.15）。
 
     与单图路径同口径：503（未启用 / 缺密钥）、502（上游或契约问题）、`MAX_RAW_TEXT_CHARS`、
@@ -179,23 +214,34 @@ async def parse_image_clue_multi(cfg: AppConfig, images: Sequence[tuple[bytes, s
     if not images_ready(cfg):
         raise DependencyUnavailableError(
             "图片热点解析未启用：需要 [vision].enabled = true 与密钥",
-            {"vision_enabled": cfg.vision.enabled, "api_key_env": cfg.vision.api_key_env})
+            {
+                "vision_enabled": cfg.vision.enabled,
+                "api_key_env": cfg.vision.api_key_env,
+            },
+        )
 
     rendered = prompt_tool.render(MULTI_TASK_ID)
     async with _client_or_stack(cfg, http) as client:
         api = build_image_client(cfg, client=client)
-        if api is None:   # pragma: no cover - images_ready 已经拦过一遍，这里只是兜底
-            raise DependencyUnavailableError("图片热点解析未启用：缺少可用的多模态客户端")
-        with _vision_generation(cfg, task_id=rendered.task_id, version=rendered.version,
-                                image_count=len(images)) as fields:
+        if api is None:  # pragma: no cover - images_ready 已经拦过一遍，这里只是兜底
+            raise DependencyUnavailableError(
+                "图片热点解析未启用：缺少可用的多模态客户端"
+            )
+        with _vision_generation(
+            cfg,
+            task_id=rendered.task_id,
+            version=rendered.version,
+            image_count=len(images),
+        ) as fields:
             try:
                 completion = await api.complete_many(rendered, images)
             except VisionError as exc:
                 fields.level = LEVEL_ERROR
                 fields.status_message = "llm_error"
                 fields.metadata["usage_status"] = "unknown"
-                raise UpstreamError(f"图片解析失败：{exc}",
-                                    {"detail": str(exc)[:200]}) from exc
+                raise UpstreamError(
+                    f"图片解析失败：{exc}", {"detail": str(exc)[:200]}
+                ) from exc
             _fill_vision_usage(fields, cfg, completion)
 
     payload = _parse_payload(completion.text)
@@ -204,7 +250,8 @@ async def parse_image_clue_multi(cfg: AppConfig, images: Sequence[tuple[bytes, s
         raise UpstreamError("图片解析失败：模型没有给出热点描述（raw_text 为空）")
     if len(raw_text) > MAX_RAW_TEXT_CHARS:
         raise UpstreamError(
-            f"图片解析失败：热点描述超过 {MAX_RAW_TEXT_CHARS} 字上限（{len(raw_text)} 字）")
+            f"图片解析失败：热点描述超过 {MAX_RAW_TEXT_CHARS} 字上限（{len(raw_text)} 字）"
+        )
     clue_payload = payload.get("clue")
     if not isinstance(clue_payload, dict):
         raise UpstreamError("图片解析失败：返回里缺少 clue 对象")
@@ -213,11 +260,15 @@ async def parse_image_clue_multi(cfg: AppConfig, images: Sequence[tuple[bytes, s
     except SchemaError as exc:
         raise UpstreamError(f"图片解析失败：线索结构不合契约（{exc}）") from exc
     _check_multi_clue(clue)
-    return ImageClueParse(raw_text=raw_text, clue=clue,
-                          prompt_versions={rendered.task_id: rendered.version},
-                          prompt_tokens=completion.prompt_tokens,
-                          completion_tokens=completion.completion_tokens,
-                          cost_cny=_cost_cny(cfg, completion))
+    return ImageClueParse(
+        raw_text=raw_text,
+        clue=clue,
+        prompt_versions={rendered.task_id: rendered.version},
+        prompt_tokens=completion.prompt_tokens,
+        completion_tokens=completion.completion_tokens,
+        cost_cny=_cost_cny(cfg, completion),
+        usage_status=str(completion.usage_status or "estimated"),
+    )
 
 
 def _check_multi_clue(clue: HotspotClue) -> None:
@@ -226,11 +277,13 @@ def _check_multi_clue(clue: HotspotClue) -> None:
     if not (MULTI_MIN_ELEMENTS <= count <= MULTI_MAX_ELEMENTS):
         raise UpstreamError(
             f"多图解析失败：要素数量必须是 {MULTI_MIN_ELEMENTS}–{MULTI_MAX_ELEMENTS} 个"
-            f"（实际 {count} 个）")
+            f"（实际 {count} 个）"
+        )
     for index, element in enumerate(clue.elements, start=1):
         if not str(element.evidence or "").strip():
             raise UpstreamError(
-                f"多图解析失败：第 {index} 个要素缺少 evidence（必须指明来自哪一张图）")
+                f"多图解析失败：第 {index} 个要素缺少 evidence（必须指明来自哪一张图）"
+            )
 
 
 def _parse_payload(text: str) -> dict[str, Any]:
