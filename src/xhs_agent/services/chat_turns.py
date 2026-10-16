@@ -302,6 +302,24 @@ async def run_turn_task(cfg: AppConfig, events: TurnEvents, *, session_id: uuid.
     snapshot = progress_tool.normalize({})
     written = ""
     factory = create_session_factory(engine)
+    # R3（OBS-11）：心跳租约——周期把当前快照的 `updated_at` touch 一次（多进程可见的
+    # 持久信号），陈旧对账据此区分"活跃长轮次"与"执行者消失"。不逐 token：间隔为
+    # `turn_stale_seconds` 的 1/5（夹在 10–60 秒），内容不变、只有时间戳更新。
+    interval = max(10.0, min(60.0, cfg.chat.turn_stale_seconds / 5.0))
+    holder: dict[str, dict[str, Any]] = {"snapshot": snapshot}
+
+    async def _heartbeat() -> None:
+        while True:
+            await asyncio.sleep(interval)
+            with suppress(Exception):
+                snap = dict(holder.get("snapshot") or {})
+                if not snap.get("stage"):
+                    continue                 # 还没有任何阶段：判定回落 created_at，无需心跳
+                snap["updated_at"] = now_iso()
+                async with create_session_factory(engine)() as session:
+                    await update_message(session, message_id, progress=snap)
+
+    heartbeat_task = asyncio.create_task(_heartbeat())
     status = "failed"
     category = "internal"
     totals: dict[str, Any] = {}
@@ -350,6 +368,7 @@ async def run_turn_task(cfg: AppConfig, events: TurnEvents, *, session_id: uuid.
                         if marker == written:
                             return
                         written = marker
+                        holder["snapshot"] = snapshot   # 心跳读最新快照（OBS-11 租约）
                         await update_message(session, message_id, progress=dict(snapshot))
 
                     async with build_http_client(cfg.llm.timeout_s) as client:
@@ -438,17 +457,25 @@ async def run_turn_task(cfg: AppConfig, events: TurnEvents, *, session_id: uuid.
                 tracer.finish_turn(status=status, totals=totals, turn_id=events.turn_id,
                                    error="" if status == "succeeded" else category)
     finally:
+        heartbeat_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await heartbeat_task
         reset_turn_id(token)
         await events.close_publisher()
         await engine.dispose()
 
 
 def _turn_totals(turn: ChatTurn) -> dict[str, Any]:
-    """轮次汇总（只给 trace 收尾展示用；父层不参与核账，不跨层相加，约定 §7）。"""
+    """轮次汇总（只给 trace 收尾展示用；父层不参与核账，不跨层相加，约定 §7）。
+
+    R3（OBS-07）：完整性按**调用集合**上卷——`unknown` 计入 `usage_unknown_calls`，
+    失败 / 取消轮次如实不完整；不再固定为真。
+    """
     return {"tool_calls": len(turn.tool_calls),
             "prompt_tokens": turn.prompt_tokens, "completion_tokens": turn.completion_tokens,
             "cost_cny": turn.cost_cny, "latency_ms": turn.latency_ms,
-            "usage_complete": True}
+            "usage_complete": bool(turn.usage_complete) and turn.status == "succeeded",
+            "usage_unknown_calls": int(turn.usage_unknown_calls)}
 
 
 def _terminal_snapshot(snapshot: dict[str, Any], *, status: str,
@@ -521,10 +548,15 @@ async def _finish(session: AsyncSession, events: TurnEvents, turn: ChatTurn, *,
         category = turn.error_category or "internal"
         final = _terminal_snapshot(progress_tool.normalize(snapshot), status="failed",
                                    error_category=category)
+        # R3（OBS-10）：失败也保存已知用量与引用（工具状态 / prompt 版本 / run_id），
+        # 未知部分由 finish_turn 的 usage_complete / usage_unknown_calls 单列
         fields: dict[str, Any] = {"status": "failed",
                                   "error": turn.error or "这一轮失败了",
                                   "latency_ms": turn.latency_ms,
                                   "prompt_versions": turn.prompt_versions,
+                                  "cost_cny": turn.cost_cny,
+                                  "prompt_tokens": turn.prompt_tokens,
+                                  "completion_tokens": turn.completion_tokens,
                                   "trace_id": trace_id or None}
         if final.get("status"):                  # 空快照不写，读侧会把它折成 null
             fields["progress"] = dict(final)

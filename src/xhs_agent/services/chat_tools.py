@@ -43,6 +43,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 import time
 import uuid
@@ -82,6 +83,8 @@ TOOL_SEARCH_MATERIALS = "search_materials"
 TOOL_READ_RUN = "read_run"
 TOOL_PREVIEW_COVERAGE = "preview_element_coverage"
 TOOL_REVISE_DRAFT = "revise_draft"
+
+logger = logging.getLogger("xhs_agent.chat_tools")
 
 # 运行终态：出现在这里就是"这一批跑完了"（与 `tasks/analysis.py` 同一口径）
 RUN_TERMINAL = ("succeeded", "failed")
@@ -468,6 +471,8 @@ async def _image_clue_for(ctx: ToolContext,
     cached = ctx.cache.image_clues.get(key) if key else None
     if cached is not None:
         parsed, _version = cached
+        # R3（OBS-06）：缓存命中只记"命中 + 数量"，不虚构 generation、不新增费用
+        logger.info("图片线索缓存命中：%d 张（不重复计费）", len(group))
         return replace(parsed, cost_cny=0.0, prompt_tokens=0, completion_tokens=0)
     images = [await _read_image(ctx, item) for item in group]
     if len(images) == 1:
@@ -516,7 +521,9 @@ async def run_hotspot_analysis(ctx: ToolContext, args: dict[str, Any], *,
         try:
             parsed = await _image_clue_for(ctx, group)
         except (ApiError, LLMError, EmbeddingError) as exc:
+            # R3（OBS-07）：视觉调用可能已发出、用量未知——如实计入未知，不填零
             return ToolOutcome(status="failed", steps=steps,
+                               payload={"usage_status": "unknown"},
                                error=f"图片没能解析出来：{_reason(exc)}")
         versions.update(parsed.prompt_versions)
         image_cost = float(parsed.cost_cny or 0.0)
@@ -541,15 +548,15 @@ async def run_hotspot_analysis(ctx: ToolContext, args: dict[str, Any], *,
     status = await _wait_for_run(ctx, submission.job_id, progress)
     if status == "timeout":
         return ToolOutcome(status="failed", steps=steps,
-                           payload={"run_id": submission.run_id},
+                           payload={"run_id": submission.run_id, "usage_status": "unknown"},
                            error="分析还在跑（超过等待上限），结果稍后可以在运行历史里看到",
                            prompt_versions=versions)
     if status == "failed":
         job = await load_job(ctx.session, submission.job_id)
         detail = ((job or {}).get("error") or {}).get("message") or "分析失败"
         return ToolOutcome(status="failed", steps=steps,
-                           payload={"run_id": submission.run_id}, error=str(detail),
-                           prompt_versions=versions)
+                           payload={"run_id": submission.run_id, "usage_status": "unknown"},
+                           error=str(detail), prompt_versions=versions)
 
     await progress("完成", 100, 100)
     summary = await _summarise(ctx, submission.run_id, text)
@@ -580,6 +587,7 @@ async def parse_clue_from_image(ctx: ToolContext, args: dict[str, Any], *,
         parsed = await _image_clue_for(ctx, group)
     except (ApiError, LLMError, EmbeddingError) as exc:
         return ToolOutcome(status="failed", steps=steps,
+                           payload={"usage_status": "unknown"},
                            error=f"图片没能解析出来：{_reason(exc)}")
     payload = {"raw_text": parsed.raw_text, "elements": _elements_of(parsed.clue),
                "image_count": len(group),

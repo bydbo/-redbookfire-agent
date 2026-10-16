@@ -369,3 +369,53 @@ class TestTurnProgress:
         assert loaded["status"] == "interrupted"
         assert loaded["progress"]["status"] == "interrupted"    # 快照与消息同一生命周期
         assert loaded["progress"]["stage"] == "draft"
+
+
+class TestStalenessByActivity:
+    """R3（OBS-11）：陈旧判定按"最近活跃时间"（快照 updated_at），不再单看创建时间。"""
+
+    @pytest.mark.asyncio
+    async def test_active_heartbeat_prevents_false_interruption(
+            self, db_session: AsyncSession) -> None:
+        """创建很早但心跳在跳（快照 updated_at 新）的活跃长轮次：不误判。"""
+        created = await create_session(db_session)
+        session_id = uuid.UUID(created["session_id"])
+        message = await append_message(
+            db_session, session_id, role="assistant", status="running",
+            progress={"stage": "draft", "label": "撰稿", "status": "running", "attempt": 1,
+                      "started_at": datetime.now(UTC).isoformat(),
+                      "updated_at": datetime.now(UTC).isoformat()})
+        assert message is not None
+        await db_session.execute(text(
+            "UPDATE chat_messages SET created_at = now() - interval '2 hours' WHERE id = :i"),
+            {"i": uuid.UUID(message["message_id"])})
+        await db_session.commit()
+
+        changed = await mark_stale_turns(db_session, stale_seconds=300)
+
+        assert changed == 0                       # 心跳活跃：不收敛
+        loaded = await load_message(db_session, uuid.UUID(message["message_id"]))
+        assert loaded is not None and loaded["status"] == "running"
+
+    @pytest.mark.asyncio
+    async def test_dead_heartbeat_is_marked_interrupted(self, db_session: AsyncSession) -> None:
+        """心跳停止（快照 updated_at 陈旧）：按活跃时间收敛为 interrupted。"""
+        created = await create_session(db_session)
+        session_id = uuid.UUID(created["session_id"])
+        message = await append_message(
+            db_session, session_id, role="assistant", status="running",
+            progress={"stage": "draft", "label": "撰稿", "status": "running", "attempt": 1,
+                      "updated_at": (datetime.now(UTC)
+                                     - timedelta(minutes=10)).isoformat()})
+        assert message is not None
+        await db_session.execute(text(
+            "UPDATE chat_messages SET created_at = now() - interval '2 hours' WHERE id = :i"),
+            {"i": uuid.UUID(message["message_id"])})
+        await db_session.commit()
+
+        changed = await mark_stale_turns(db_session, stale_seconds=300)
+
+        assert changed == 1
+        loaded = await load_message(db_session, uuid.UUID(message["message_id"]))
+        assert loaded is not None and loaded["status"] == "interrupted"
+        assert loaded["progress"]["status"] == "interrupted"

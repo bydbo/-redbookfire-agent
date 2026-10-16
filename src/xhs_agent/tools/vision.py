@@ -152,6 +152,9 @@ class ImageCompletion:
     text: str
     prompt_tokens: int = 0
     completion_tokens: int = 0
+    # R3（OBS-06/07）：用量口径（actual = 上游 usage；estimated = 字符估算下界），
+    # 与 tools/llm.py 同一词表——轮级用量完整性据此上卷
+    usage_status: str = "estimated"
 
 
 class AsyncImageClient:
@@ -232,8 +235,10 @@ class AsyncImageClient:
             prompt_tokens = estimate_tokens(f"{rendered.system}\n{rendered.user}")
         if not completion_tokens:
             completion_tokens = estimate_tokens(str(text))
+        usage_status = "actual" if usage.get("prompt_tokens") is not None else "estimated"
         return ImageCompletion(text=str(text), prompt_tokens=prompt_tokens,
-                               completion_tokens=completion_tokens)
+                               completion_tokens=completion_tokens,
+                               usage_status=usage_status)
 
 
 def build_image_client(cfg: AppConfig, *,

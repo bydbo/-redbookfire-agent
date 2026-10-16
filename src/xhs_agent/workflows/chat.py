@@ -81,10 +81,35 @@ class ChatTurn:
     # S7.19 / S7.20：本轮 trace（运行器在 turn span 内取）与失败类别（只记安全枚举）
     trace_id: str = ""
     error_category: str = ""
+    # R3（OBS-07）：轮级用量完整性——按调用集合计算（actual / estimated 视为已知，
+    # unknown 或"有调用无用量"计入 unknown 数），失败 / 取消轮次如实不完整
+    usage_complete: bool = True
+    usage_unknown_calls: int = 0
+
+
+def _usage_accounting(records: list[dict[str, Any]],
+                      tool_calls: list[dict[str, Any]]) -> tuple[bool, int]:
+    """按调用集合计算轮级用量完整性（R3 / OBS-07）：单列未知调用数，不填零冒充准确。
+
+    计费调用 = 有成本（`cost_cny > 0`）或声明了用量口径（`usage_status`）；其中
+    `usage_status=unknown` 或"有调用无任何 token"的计入未知。查库 / 读运行 / 缓存命中
+    这类非计费调用不参与核算（缓存命中不虚构费用）。
+    """
+    unknown = 0
+    for item in (*records, *tool_calls):
+        cost = float(item.get("cost_cny") or 0)
+        status = str(item.get("usage_status") or "")
+        if not status and cost <= 0:
+            continue                          # 非计费调用：不参与用量核算
+        if status == "unknown" or (int(item.get("prompt_tokens") or 0) == 0
+                                   and int(item.get("completion_tokens") or 0) == 0):
+            unknown += 1
+    return unknown == 0, unknown
 
 
 def _build_graph(*, provider: BaseProvider, run_tool: ToolRunner, max_rounds: int,
-                 on_event: EventFn | None, stream: bool, version: int) -> Any:
+                 on_event: EventFn | None, stream: bool, version: int,
+                 ledger: dict[str, Any]) -> Any:
     """按这一轮的实际依赖构图（provider / 工具执行器都是闭包注入，便于离线测试）。"""
 
     async def emit(event: str, payload: dict[str, Any]) -> None:
@@ -117,6 +142,8 @@ def _build_graph(*, provider: BaseProvider, run_tool: ToolRunner, max_rounds: in
         await emit("stage", {"stage": "supervisor", "status": "succeeded", "attempt": attempt,
                              "updated_at": now_iso()})
         records = [*(state.get("records") or []), turn.record]
+        # R3（OBS-10）：稳定边界账目——图异常时已完成的调用记录仍能带出（状态可能拿不到）
+        ledger["records"].append(turn.record)
         # 已知 / 未知**按工具清单动态划分**（S7.7a）：这里不写任何具体工具名，
         # 加工具只改 `services/chat_tools.py` 一处。清单读模块属性而不是导入时快照，
         # 用例注册一个假工具也能被认出来。
@@ -203,11 +230,16 @@ def _build_graph(*, provider: BaseProvider, run_tool: ToolRunner, max_rounds: in
                 "cost_cny": float(outcome.payload.get("cost_cny") or 0),
                 "prompt_tokens": int(outcome.payload.get("prompt_tokens") or 0),
                 "completion_tokens": int(outcome.payload.get("completion_tokens") or 0),
+                # R3（OBS-07）：用量口径（actual / estimated / unknown）随调用上卷
+                "usage_status": str(outcome.payload.get("usage_status") or ""),
                 "latency_ms": int((time.monotonic() - started) * 1000),
                 "error": outcome.error,
                 "steps": outcome.steps,
             }
             history.append(entry)
+            # R3（OBS-10）：稳定边界账目——工具调用记录带已知用量与身份
+            ledger["tool_calls"].append(dict(entry))
+            ledger["versions"].update(outcome.prompt_versions)
             # 工具内部用掉的 prompt 版本（拆解 / 改写…）一并计入这一轮
             versions.update(outcome.prompt_versions)
             messages.append({"role": "assistant", "content": "", "tool_calls": [
@@ -217,6 +249,8 @@ def _build_graph(*, provider: BaseProvider, run_tool: ToolRunner, max_rounds: in
                              "content": outcome.as_tool_message()})
             await emit("tool_finished", {**entry, "ended_at": now_iso()})
             run_id = str(outcome.payload.get("run_id") or run_id)
+            if run_id:
+                ledger["run_id"] = run_id
 
         return {"messages": messages, "tool_calls": history, "pending": [],
                 "prompt_versions": versions,
@@ -245,8 +279,12 @@ async def run_turn(cfg: AppConfig, *, provider: BaseProvider, history: list[dict
                                           attachment_note=attachment_note,
                                           keep_messages=cfg.chat.history_max_messages,
                                           token_budget=cfg.chat.history_token_budget)
+    # R3（OBS-10）：轮内账目挂在**稳定边界**（闭包持有的 ledger）——图抛异常时，
+    # 已完成的模型 / 工具调用记录仍能带出，失败轮次不丢已知消费与引用
+    ledger: dict[str, Any] = {"records": [], "tool_calls": [], "versions": {}, "run_id": ""}
     graph = _build_graph(provider=provider, run_tool=run_tool, max_rounds=rounds,
-                         on_event=on_event, stream=stream, version=rendered.version)
+                         on_event=on_event, stream=stream, version=rendered.version,
+                         ledger=ledger)
     try:
         final = await graph.ainvoke({
             "messages": messages, "reply": "", "pending": [], "tool_calls": [],
@@ -255,10 +293,25 @@ async def run_turn(cfg: AppConfig, *, provider: BaseProvider, history: list[dict
             "prompt_versions": {TASK_ID: rendered.version},
         })
     except Exception as exc:                     # noqa: BLE001 - 整轮失败要落库，不能炸进程
+        records = list(ledger["records"])
+        tool_calls = list(ledger["tool_calls"])
+        versions = dict(ledger["versions"])
+        versions.setdefault(TASK_ID, rendered.version)
+        # 失败的那次调用本身：请求可能已发出、用量未知——单列，不填零冒充准确
+        usage_complete, unknown = _usage_accounting(records, tool_calls)
         return ChatTurn(status="failed", error=f"{type(exc).__name__}: {exc}",
                         error_category=error_category_of(exc),
                         latency_ms=int((time.monotonic() - started) * 1000),
-                        prompt_versions={TASK_ID: rendered.version})
+                        tool_calls=tool_calls, run_id=str(ledger["run_id"]),
+                        cost_cny=round(sum(float(item.get("cost_cny") or 0)
+                                           for item in (*records, *tool_calls)), 4),
+                        prompt_tokens=sum(int(item.get("prompt_tokens") or 0)
+                                          for item in (*records, *tool_calls)),
+                        completion_tokens=sum(int(item.get("completion_tokens") or 0)
+                                              for item in (*records, *tool_calls)),
+                        prompt_versions=versions,
+                        usage_complete=False,
+                        usage_unknown_calls=unknown + 1)
 
     records = list(final.get("records") or [])
     tool_calls = list(final.get("tool_calls") or [])
@@ -269,10 +322,13 @@ async def run_turn(cfg: AppConfig, *, provider: BaseProvider, history: list[dict
     prompt_tokens = sum(int(item.get("prompt_tokens") or 0) for item in (*records, *tool_calls))
     completion_tokens = sum(int(item.get("completion_tokens") or 0)
                             for item in (*records, *tool_calls))
+    usage_complete, unknown = _usage_accounting(records, tool_calls)
     return ChatTurn(
         reply=str(final.get("reply") or ""),
         tool_calls=tool_calls,
         run_id=str(final.get("run_id") or ""),
+        usage_complete=usage_complete,
+        usage_unknown_calls=unknown,
         cost_cny=round(cost, 4),
         prompt_tokens=prompt_tokens,
         completion_tokens=completion_tokens,

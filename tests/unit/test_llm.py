@@ -119,6 +119,7 @@ class TestLLMResult:
             "latency_ms": 100,
             "cost_cny": 0.0012,
             "attempts": 1,
+            "usage_status": "",                    # R3（OBS-07）：用量口径随记录上卷
             "error": "",
         }
 

@@ -82,6 +82,9 @@ class LLMResult:
             "latency_ms": self.latency_ms,
             "cost_cny": round(self.cost_cny, 4),
             "attempts": self.attempts,
+            # R3（OBS-07）：用量口径随记录上卷（actual / estimated / unknown），
+            # 轮级完整性按调用集合计算，不再默认"完整"
+            "usage_status": self.usage_status,
             "error": self.error,
         }
 

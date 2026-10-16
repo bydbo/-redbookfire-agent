@@ -5,6 +5,7 @@ provider、工具执行器、事件回调全部注入，不联网不连库。
 
 from __future__ import annotations
 
+import asyncio
 import json
 import uuid
 from pathlib import Path
@@ -99,11 +100,14 @@ class Events:
         return [name for name, _payload in self.items]
 
 
-async def run(cfg: AppConfig, *, steps: list[dict[str, Any]], tools: FakeTools | None = None,
+async def run(cfg: AppConfig, *, steps: list[dict[str, Any]] | None = None,
+              tools: FakeTools | None = None,
               events: Events | None = None, user_text: str = "帮我蹭一下这个热点",
               history: list[dict[str, Any]] | None = None,
-              max_rounds: int | None = None) -> tuple[Any, ScriptedProvider, FakeTools]:
-    provider = ScriptedProvider(steps)
+              max_rounds: int | None = None,
+              provider: ScriptedProvider | None = None,
+              ) -> tuple[Any, ScriptedProvider, FakeTools]:
+    provider = provider or ScriptedProvider(steps or [])
     runner = tools or FakeTools()
     turn = await run_turn(cfg, provider=provider, history=history or [], user_text=user_text,
                           run_tool=runner, on_event=events, max_rounds=max_rounds)
@@ -416,3 +420,76 @@ class TestStructuredWorkerProgress:
         assert plain["stage_key"] == "image_parse"        # 旧式标签进度仍映射阶段键
         assert plain["attempt"] == 1 and plain["status"] == "running"
         assert plain["run_id"] is None                    # 无 worker 身份就不虚构
+
+
+class TestFailureLedgerAndUsage:
+    """R3（OBS-10 / OBS-07）：失败保留已知账目与引用；完整性按调用集合上卷。"""
+
+    @pytest.mark.asyncio
+    async def test_partial_failure_keeps_known_usage_and_references(self, tmp_path: Path):
+        """模型成功 → 工具成功 → 第二次模型失败：前两段消费与引用不丢，未知单列。"""
+        cfg = write_config(tmp_path)
+        second = asyncio.Event()
+
+        class Flaky(ScriptedProvider):
+            """第一次调用走剧本，第二次直接炸（模拟后续模型调用失败）。"""
+
+            async def complete_with_tools(self, call, on_delta=None):
+                if second.is_set():
+                    raise RuntimeError("第二次模型调用失败")
+                second.set()
+                return await super().complete_with_tools(call, on_delta)
+
+        tools = FakeTools(ToolOutcome(
+            status="succeeded",
+            payload={"run_id": "r-1", "candidates": 5, "cost_cny": 0.05,
+                     "prompt_tokens": 700, "completion_tokens": 300},
+            steps=[{"stage": "完成", "done": 100, "total": 100, "at": "t"}]))
+        turn, _provider, _runner = await run(
+            cfg, events=Events(), tools=tools,
+            steps=[{"text": "", "tool_calls": [tool_call()]}, {"text": "好了"}],
+            provider=Flaky([{"text": "", "tool_calls": [tool_call()]},
+                            {"text": "不会走到这里"}]))
+
+        assert turn.status == "failed" and "第二次模型调用失败" in turn.error
+        # 已知消费与引用：第一次 supervisor（10/5）+ 那次工具（700/300）都在
+        assert turn.cost_cny == pytest.approx(0.001 + 0.05)
+        assert turn.prompt_tokens == 710 and turn.completion_tokens == 305
+        assert turn.run_id == "r-1"
+        assert [entry["tool"] for entry in turn.tool_calls] == [TOOL_RUN_ANALYSIS]
+        assert turn.prompt_versions.get(TASK_ID) == SUPERVISOR_VERSION
+        # 失败的那次调用用量未知：单列（已知两次 + 失败那次 1 次）
+        assert turn.usage_complete is False
+        assert turn.usage_unknown_calls == 1
+
+    @pytest.mark.asyncio
+    async def test_failed_tool_counts_as_unknown_not_zero(self, tmp_path: Path):
+        """工具失败（调用已发生、无用量）：完整性为假、未知 +1，不填零冒充准确。"""
+        cfg = write_config(tmp_path)
+        tools = FakeTools(outcome=ToolOutcome(
+            status="failed", payload={"run_id": "r-2", "usage_status": "unknown"},
+            error="分析失败"))
+        turn, _provider, _runner = await run(
+            cfg, events=Events(), tools=tools,
+            steps=[{"text": "", "tool_calls": [tool_call()]},
+                   {"text": "分析失败了，我说明一下原因"}])
+
+        assert turn.status == "succeeded"          # 工具失败不炸整轮（S7.4 语义）
+        assert turn.cost_cny == pytest.approx(0.002)   # 只有 supervisor 那次有已知消费
+        assert turn.usage_complete is False
+        assert turn.usage_unknown_calls == 1
+
+    @pytest.mark.asyncio
+    async def test_successful_turn_with_known_usage_is_complete(self, tmp_path: Path):
+        cfg = write_config(tmp_path)
+        tools = FakeTools(ToolOutcome(
+            status="succeeded",
+            payload={"run_id": "r-1", "candidates": 5, "cost_cny": 0.05,
+                     "prompt_tokens": 700, "completion_tokens": 300},
+            steps=[{"stage": "完成", "done": 100, "total": 100, "at": "t"}]))
+        turn, _provider, _runner = await run(
+            cfg, events=Events(), tools=tools,
+            steps=[{"text": "", "tool_calls": [tool_call()]}, {"text": "好了"}])
+
+        assert turn.status == "succeeded"
+        assert turn.usage_complete is True and turn.usage_unknown_calls == 0

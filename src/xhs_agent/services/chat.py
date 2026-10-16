@@ -28,7 +28,7 @@ from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from typing import Any
 
-from sqlalchemy import func, select
+from sqlalchemy import DateTime, cast, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..config import PROJECT_ROOT, AppConfig
@@ -374,18 +374,25 @@ async def update_message(session: AsyncSession, message_id: uuid.UUID, *, conten
 
 async def mark_stale_turns(session: AsyncSession, *, stale_seconds: int,
                            session_id: uuid.UUID | None = None) -> int:
-    """把"跑太久还挂在 running"的 assistant 行标成 `interrupted`，返回改了几行。
+    """把"失联太久还挂在 running"的 assistant 行标成 `interrupted`，返回改了几行。
 
     API 进程重启会带走进程内的 turn（S7.4 的 detached 任务），库里就留下永远 `running` 的行。
-    读会话时顺手兜底：超过 `[chat].turn_stale_seconds` 的一律标中断，前端不再无限等。
-    S7.21：同一行的阶段快照（`progress`）也标成 `interrupted`——刷新后看到的是"停在哪一阶段"，
-    而不是一个永远 `running` 的快照；过期判定复用 `turn_stale_seconds`，不新增配置。
+    读会话时顺手兜底，前端不再无限等。S7.21：同一行的阶段快照（`progress`）也标成
+    `interrupted`——刷新后看到的是"停在哪一阶段"。
+
+    R3（OBS-11）：陈旧判定不再单看 `created_at`——**最近活跃时间** = 快照的 `updated_at`
+    （后台任务的心跳租约，见 `chat_turns`），缺省回落 `created_at`（兼容旧快照）。活跃的
+    长轮次（心跳在跳）不会被误判；心跳停止（执行者消失 / 进程重启）才收敛。
+    对账条件只命中 `running` 行——刚完成的终态不会被覆盖。
     """
     cutoff = datetime.now(UTC) - timedelta(seconds=int(stale_seconds))
+    last_active = func.coalesce(
+        cast(ChatMessage.progress["updated_at"].as_string(), DateTime(timezone=True)),
+        ChatMessage.created_at)
     statement = (select(ChatMessage)
                  .where(ChatMessage.role == "assistant",
                         ChatMessage.status == "running",
-                        ChatMessage.created_at < cutoff))
+                        last_active < cutoff))
     if session_id is not None:
         statement = statement.where(ChatMessage.session_id == session_id)
     rows = list((await session.execute(statement)).scalars().all())

@@ -30,6 +30,7 @@ import httpx
 
 from ..config import AppConfig
 from ..core.errors import DependencyUnavailableError, UpstreamError
+from ..core.tracing import LEVEL_ERROR, get_tracer
 from ..schemas import HotspotClue, SchemaError
 from ..tools import prompt as prompt_tool
 from ..tools.http import build_http_client
@@ -68,6 +69,35 @@ def _cost_cny(cfg: AppConfig, completion: ImageCompletion) -> float:
                  + completion.completion_tokens / 1_000_000 * cfg.vision.price_out_per_m, 4)
 
 
+def _vision_generation(cfg: AppConfig, *, task_id: str, version: int,
+                       image_count: int) -> Any:
+    """视觉调用的**等价 generation**（R3 / OBS-06）。
+
+    真实视觉模型 + `[vision]` 单价；**一次多图调用只记一个逻辑 generation**；缓存命中不进
+    这里（不虚构模型调用、不新增费用）。隔离与载荷规则复用 R1（OBS-01 / 02，门面内部已兜底）。
+    """
+    return get_tracer(cfg).generation(
+        name=task_id, model=cfg.vision.model,
+        metadata={"provider": "vision", "images": max(1, int(image_count)),
+                  "prompt_version": int(version)})
+
+
+def _fill_vision_usage(fields: Any, cfg: AppConfig,
+                       completion: ImageCompletion) -> None:
+    """把视觉调用的用量 / 成本写进 generation；用量口径随结果上卷（actual / estimated）。"""
+    in_tokens = int(completion.prompt_tokens or 0)
+    out_tokens = int(completion.completion_tokens or 0)
+    fields.usage_details = {"input": in_tokens, "output": out_tokens,
+                            "total": in_tokens + out_tokens}
+    fields.cost_details = {
+        "input": round(in_tokens / 1_000_000 * cfg.vision.price_in_per_m, 6),
+        "output": round(out_tokens / 1_000_000 * cfg.vision.price_out_per_m, 6),
+        "total": _cost_cny(cfg, completion),
+    }
+    fields.metadata["attempts"] = 1
+    fields.metadata["usage_status"] = str(completion.usage_status or "estimated")
+
+
 @asynccontextmanager
 async def _client_or_stack(cfg: AppConfig,
                            http: httpx.AsyncClient | None) -> AsyncIterator[httpx.AsyncClient]:
@@ -93,11 +123,18 @@ async def parse_image_clue(cfg: AppConfig, data: bytes, mime: str, *,
         api = build_image_client(cfg, client=client)
         if api is None:   # pragma: no cover - images_ready 已经拦过一遍，这里只是兜底
             raise DependencyUnavailableError("图片热点解析未启用：缺少可用的多模态客户端")
-        try:
-            completion = await api.complete(rendered, data, mime)
-        except VisionError as exc:
-            raise UpstreamError(f"图片解析失败：{exc}",
-                                {"detail": str(exc)[:200]}) from exc
+        with _vision_generation(cfg, task_id=rendered.task_id, version=rendered.version,
+                                image_count=1) as fields:
+            try:
+                completion = await api.complete(rendered, data, mime)
+            except VisionError as exc:
+                # R3（OBS-06 / OBS-02）：调用已发出、用量未知；错误只发安全类别
+                fields.level = LEVEL_ERROR
+                fields.status_message = "llm_error"
+                fields.metadata["usage_status"] = "unknown"
+                raise UpstreamError(f"图片解析失败：{exc}",
+                                    {"detail": str(exc)[:200]}) from exc
+            _fill_vision_usage(fields, cfg, completion)
 
     text = completion.text
     payload = _parse_payload(text)
@@ -149,11 +186,17 @@ async def parse_image_clue_multi(cfg: AppConfig, images: Sequence[tuple[bytes, s
         api = build_image_client(cfg, client=client)
         if api is None:   # pragma: no cover - images_ready 已经拦过一遍，这里只是兜底
             raise DependencyUnavailableError("图片热点解析未启用：缺少可用的多模态客户端")
-        try:
-            completion = await api.complete_many(rendered, images)
-        except VisionError as exc:
-            raise UpstreamError(f"图片解析失败：{exc}",
-                                {"detail": str(exc)[:200]}) from exc
+        with _vision_generation(cfg, task_id=rendered.task_id, version=rendered.version,
+                                image_count=len(images)) as fields:
+            try:
+                completion = await api.complete_many(rendered, images)
+            except VisionError as exc:
+                fields.level = LEVEL_ERROR
+                fields.status_message = "llm_error"
+                fields.metadata["usage_status"] = "unknown"
+                raise UpstreamError(f"图片解析失败：{exc}",
+                                    {"detail": str(exc)[:200]}) from exc
+            _fill_vision_usage(fields, cfg, completion)
 
     payload = _parse_payload(completion.text)
     raw_text = str(payload.get("raw_text") or "").strip()

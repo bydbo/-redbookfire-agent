@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import json
+from contextlib import contextmanager
 from typing import Any
 
 import httpx
@@ -17,9 +18,10 @@ from xhs_agent.api.main import create_app
 from xhs_agent.api.routers import analysis as analysis_router
 from xhs_agent.config import AppConfig, load_config
 from xhs_agent.core.errors import DependencyUnavailableError, UpstreamError
+from xhs_agent.core.tracing import Generation, NullTracer
 from xhs_agent.services import image_clue as image_clue_service
 from xhs_agent.services.image_clue import parse_image_clue, parse_image_clue_multi
-from xhs_agent.tools.vision import ImageCompletion, sniff_image_mime
+from xhs_agent.tools.vision import ImageCompletion, VisionError, sniff_image_mime
 
 # 三种受支持格式的最小字节头（内容本身不需要是真图片：校验只看 magic bytes）
 JPEG = b"\xff\xd8\xff\xe0" + b"\x00" * 64
@@ -265,6 +267,11 @@ class FakeVisionClient:
         return ImageCompletion(text=self.text, prompt_tokens=self.prompt_tokens,
                                completion_tokens=self.completion_tokens)
 
+    async def complete_many(self, rendered, images) -> ImageCompletion:
+        self.calls += 1
+        return ImageCompletion(text=self.text, prompt_tokens=self.prompt_tokens,
+                               completion_tokens=self.completion_tokens)
+
 
 class TestImageClueEndpoint:
     @staticmethod
@@ -334,3 +341,99 @@ class TestImageClueEndpoint:
                                    files={"file": ("hot.jpg", JPEG, "image/jpeg")})
         assert response.status_code == 503
         assert response.json()["code"] == "dependency_unavailable"
+
+
+class _RecordingTracer(NullTracer):
+    """捕获 generation 字段的假 tracer（R3 / OBS-06 验收用）。"""
+
+    def __init__(self) -> None:
+        self.generations: list[dict[str, Any]] = []
+
+    def generation(self, *, name: str, model: str, metadata: dict[str, Any]):
+        fields = Generation(metadata=dict(metadata))
+        holder: dict[str, Any] = {"name": name, "model": model, "fields": fields}
+
+        @contextmanager
+        def _cm():
+            try:
+                yield fields
+            finally:
+                self.generations.append(holder)   # 异常路径也要记录（finally）
+
+        return _cm()
+
+
+class TestVisionGeneration:
+    """R3（OBS-06）：真实视觉调用有等价 generation；一次多图调用只记一个；失败收尾安全。"""
+
+    @pytest.mark.asyncio
+    async def test_single_parse_emits_generation_with_usage_and_cost(
+            self, tmp_path, monkeypatch):
+        cfg = build_config(tmp_path, monkeypatch)
+        tracer = _RecordingTracer()
+        monkeypatch.setattr(image_clue_service, "get_tracer", lambda _cfg: tracer)
+        fake = FakeVisionClient(json.dumps(CLUE_PAYLOAD, ensure_ascii=False),
+                                prompt_tokens=1_000_000, completion_tokens=1_000_000)
+        monkeypatch.setattr(image_clue_service, "build_image_client",
+                            lambda _cfg, *, client: fake)
+
+        await parse_image_clue(cfg, JPEG, "image/jpeg")
+
+        assert len(tracer.generations) == 1
+        gen = tracer.generations[0]
+        assert gen["name"] == "image_hotspot_clue" and gen["model"] == cfg.vision.model
+        assert gen["fields"].metadata["images"] == 1
+        assert gen["fields"].usage_details == {"input": 1_000_000, "output": 1_000_000,
+                                               "total": 2_000_000}
+        assert gen["fields"].cost_details["total"] == pytest.approx(12.0)
+        assert gen["fields"].metadata["usage_status"] == "estimated"  # 假客户端没给 usage
+
+    @pytest.mark.asyncio
+    async def test_multi_parse_counts_one_generation_for_the_group(self, tmp_path, monkeypatch):
+        """一组 3 张图 = **一个**逻辑 generation（一次多图调用一份用量，S7.15 口径）。"""
+        cfg = build_config(tmp_path, monkeypatch)
+        tracer = _RecordingTracer()
+        monkeypatch.setattr(image_clue_service, "get_tracer", lambda _cfg: tracer)
+        fake = FakeVisionClient(json.dumps(CLUE_PAYLOAD, ensure_ascii=False))
+        monkeypatch.setattr(image_clue_service, "build_image_client",
+                            lambda _cfg, *, client: fake)
+
+        # 多图专属校验：要素 3–8 个且都带 evidence —— 构造一份合规载荷
+        multi_payload = dict(CLUE_PAYLOAD)
+        clue = dict(CLUE_PAYLOAD["clue"])
+        element = dict(clue["elements"][0])
+        clue["elements"] = [element,
+                            dict(element, type="visual", value="夜跑的人"),
+                            dict(element, type="emotion", value="自律感")]
+        multi_payload["clue"] = clue
+        fake.text = json.dumps(multi_payload, ensure_ascii=False)
+        await parse_image_clue_multi(cfg, [(JPEG, "image/jpeg"), (PNG, "image/png"),
+                                           (WEBP, "image/webp")])
+
+        assert len(tracer.generations) == 1
+        gen = tracer.generations[0]
+        assert gen["name"] == "image_hotspot_clue_multi"
+        assert gen["fields"].metadata["images"] == 3
+
+    @pytest.mark.asyncio
+    async def test_vision_failure_marks_error_with_unknown_usage(self, tmp_path, monkeypatch):
+        """上游失败：generation 标 ERROR + 安全类别；用量如实 unknown，不填零。"""
+        cfg = build_config(tmp_path, monkeypatch)
+        tracer = _RecordingTracer()
+        monkeypatch.setattr(image_clue_service, "get_tracer", lambda _cfg: tracer)
+
+        class BrokenClient:
+            async def complete(self, rendered, data: bytes, mime: str) -> ImageCompletion:
+                raise VisionError("上游 502")
+
+        monkeypatch.setattr(image_clue_service, "build_image_client",
+                            lambda _cfg, *, client: BrokenClient())
+
+        with pytest.raises(UpstreamError):
+            await parse_image_clue(cfg, JPEG, "image/jpeg")
+
+        gen = tracer.generations[0]
+        assert gen["fields"].level == "ERROR"
+        assert gen["fields"].status_message == "llm_error"      # 不含上游正文（OBS-02）
+        assert gen["fields"].metadata["usage_status"] == "unknown"
+        assert gen["fields"].usage_details == {}                # 没有用量就不写
