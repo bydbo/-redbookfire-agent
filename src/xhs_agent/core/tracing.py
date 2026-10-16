@@ -552,6 +552,8 @@ class LangfuseTracer:
             "latency_ms": int(totals.get("latency_ms") or 0),
             # 用量不完整（失败 / usage 缺失）时如实标记，不把估算包装成准确值（约定 §7）
             "usage_complete": bool(totals.get("usage_complete", True)),
+            # 未知调用量单独可查（R6 / OBS-08：回放脚本据此判"待验证"而非"失败"）
+            "usage_unknown_calls": int(totals.get("usage_unknown_calls") or 0),
         }
         if "llm_calls" in totals:                # 对话侧拿不到精确调用次数时如实缺省
             metadata["llm_calls"] = int(totals.get("llm_calls") or 0)
