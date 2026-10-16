@@ -599,6 +599,18 @@ class TestCostAndUsageParsing:
         checks = verify(chain, trace, expected_latency_ms=4000, tolerance_ms=500)
         assert checks["耗时口径"].ok is False  # 3000 vs 4000：按同边界就不一致
 
+    def test_ledger_accepts_decimal_cost_from_db(self, chain) -> None:
+        """真机回放抓到的漏网：库里的 cost_cny 是 Decimal，不能被"只认 int/float"误判为无效。"""
+        from decimal import Decimal
+
+        ledger = {
+            "prompt_tokens": 400,
+            "completion_tokens": 110,
+            "cost_cny": Decimal("0.0016"),
+        }
+        checks = verify(chain, good_trace(), ledger=ledger)
+        assert checks["账本核对"].ok is True
+
     def test_json_cli_stdout_is_pure_json(
         self, chain, capsys, monkeypatch, tmp_path
     ) -> None:

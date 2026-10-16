@@ -47,6 +47,7 @@ import math
 import sys
 import time
 from dataclasses import dataclass
+from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
@@ -164,8 +165,12 @@ def ancestor_names(item: dict[str, Any], by_id: dict[str, dict[str, Any]]) -> li
 
 
 def _valid_number(value: Any) -> bool:
-    """合法数值：有限、非负的 int / float（bool 不算数；NaN / Infinity 拒绝）。"""
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
+    """合法数值：有限、非负的 int / float / Decimal（bool 不算数；NaN / Infinity 拒绝）。
+
+    Decimal 来自数据库边界（`chat_messages.cost_cny` 是 `numeric`）——真机回放抓到的
+    漏网：只认 int/float 会把落库成本误判无效。
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, float, Decimal)):
         return False
     return math.isfinite(float(value)) and float(value) >= 0
 
@@ -194,6 +199,11 @@ def probe_usage(item: dict[str, Any]) -> tuple[str, tuple[int, int] | None]:
     return ("missing", None)
 
 
+def _as_float(value: Any) -> float:
+    """把**已通过 `_valid_number` 校验**的值转 float（mypy 不跟踪跨函数收窄）。"""
+    return float(value)
+
+
 def probe_cost(item: dict[str, Any]) -> tuple[str, float | None]:
     """成本解析（R5 / E7OBS2-05）：`("valid", 元)` / `("missing", None)` / `("invalid", None)`。
 
@@ -207,19 +217,19 @@ def probe_cost(item: dict[str, Any]) -> tuple[str, float | None]:
         if "total" in details:
             total = details.get("total")
             return (
-                ("valid", float(total)) if _valid_number(total) else ("invalid", None)
+                ("valid", _as_float(total)) if _valid_number(total) else ("invalid", None)
             )
         if "input" in details and "output" in details:
             first, second = details.get("input"), details.get("output")
             if _valid_number(first) and _valid_number(second):
-                return ("valid", float(first) + float(second))
+                return ("valid", _as_float(first) + _as_float(second))
             return ("invalid", None)
         return ("invalid", None)
     for key in ("calculatedTotalCost", "totalCost"):
         if key in item:
             value = item.get(key)
             return (
-                ("valid", float(value)) if _valid_number(value) else ("invalid", None)
+                ("valid", _as_float(value)) if _valid_number(value) else ("invalid", None)
             )
     return ("missing", None)
 
@@ -335,7 +345,7 @@ def _ledger_check(
     ledger_prompt = int(ledger.get("prompt_tokens") or 0)
     ledger_completion = int(ledger.get("completion_tokens") or 0)
     ledger_cost_value = ledger.get("cost_cny")
-    ledger_cost = float(ledger_cost_value) if _valid_number(ledger_cost_value) else 0.0
+    ledger_cost = _as_float(ledger_cost_value) if _valid_number(ledger_cost_value) else 0.0
     # R5（E7OBS2-05）：求和与叶子检查**同一解析结果**（probe_usage / probe_cost）——
     # 非法数字在哪一层都是失败，不因为"能转成 0 就按 0 核账"。
     invalid: list[str] = []
@@ -832,8 +842,10 @@ def main(argv: list[str] | None = None) -> int:
             return 2
         trace_id = str(row.get("trace_id") or "")
         expected_latency_ms = int(row["latency_ms"]) if row.get("latency_ms") else None
+        raw_cost = row.get("cost_cny")
         ledger = {
-            "cost_cny": row.get("cost_cny"),
+            # 库里的 `cost_cny` 是 numeric → Decimal：在边界转 float，核账口径统一
+            "cost_cny": float(raw_cost) if raw_cost is not None else None,
             "prompt_tokens": row.get("prompt_tokens"),
             "completion_tokens": row.get("completion_tokens"),
         }
