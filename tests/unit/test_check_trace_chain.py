@@ -670,3 +670,156 @@ class TestCli:
         monkeypatch.setattr(chain, "_lookup_turn", fake_lookup)
         monkeypatch.setattr(chain, "load_config", lambda: object())
         assert chain.main(["--turn-id", "nope"]) == 2
+
+
+class TestStrictCostParsing:
+    """E7OBS4-06：成本结构、别名冲突与表示精度使用统一校验规则（F1–F9）。"""
+
+    def test_f1_wrong_type_details_not_recovered_by_total(self, chain) -> None:
+        assert chain.probe_cost({"costDetails": "bad", "totalCost": 0}) == ("invalid", None)
+        assert chain.probe_cost({"costDetails": ["0.1"], "totalCost": 0.1}) == (
+            "invalid",
+            None,
+        )
+
+    def test_f2_details_and_scalar_conflict(self, chain) -> None:
+        # 明确冲突：明细说 0，标量说 3 —— 不选一个掩盖
+        assert chain.probe_cost({"costDetails": {"total": 0}, "totalCost": 3}) == (
+            "invalid",
+            None,
+        )
+        state, value = chain.probe_cost({"costDetails": {"total": 0.5}, "totalCost": 0.5})
+        assert state == "valid" and value == 0.5
+
+    def test_f3_illegal_alias_not_hidden_by_legal_one(self, chain) -> None:
+        assert chain.probe_cost({"totalCost": "bad", "calculatedTotalCost": 0.5}) == (
+            "invalid",
+            None,
+        )
+        assert chain.probe_cost(
+            {"calculatedTotalCost": -1, "totalCost": 0.5}
+        ) == ("invalid", None)
+
+    def test_f4_float_representation_error_accepted(self, chain) -> None:
+        # 0.1 + 0.2 的二进制表示误差（1 ULP）应被接受
+        total = 0.1 + 0.2
+        state, value = chain.probe_cost(
+            {"costDetails": {"input": 0.1, "output": 0.2, "total": total}}
+        )
+        assert state == "valid" and value == total
+        # 真实差异必须拒绝：1 + 2 != 0
+        assert chain.probe_cost(
+            {"costDetails": {"input": 1, "output": 2, "total": 0}}
+        ) == ("invalid", None)
+        # 超出 ULP 界的细小但是真实的差异也拒绝（不放大范围相对容差）
+        assert chain.probe_cost(
+            {"costDetails": {"input": 1.0, "output": 2.0, "total": 3.0001}}
+        ) == ("invalid", None)
+
+    def test_f5_decimal_exact_and_beyond_bound(self, chain) -> None:
+        from decimal import Decimal
+
+        state, value = chain.probe_cost(
+            {"costDetails": {"input": Decimal("0.1"), "output": Decimal("0.2")}}
+        )
+        assert state == "valid" and abs(float(value) - 0.3) < 1e-12
+        # 两侧都是精确来源：只认精确相等（0.3 与 0.30000000000000004 是不同的十进制数）
+        assert chain.probe_cost(
+            {
+                "costDetails": {"total": Decimal("0.3")},
+                "totalCost": Decimal("0.30000000000000004"),
+            }
+        ) == ("invalid", None)
+        # 一侧是 float：那一位差可能只是 0.3 的二进制表示误差，按 ULP 政策放行
+        assert chain.probe_cost(
+            {"costDetails": {"total": Decimal("0.3")}, "totalCost": 0.30000000000000004}
+        ) == ("valid", 0.3)
+        # 大额实质差异拒绝
+        assert chain.probe_cost(
+            {"costDetails": {"total": 1000.0}, "totalCost": 1000.5}
+        ) == ("invalid", None)
+
+    def test_f6_bad_components_rejected(self, chain) -> None:
+        for bad in (-1, float("nan"), float("inf"), True):
+            assert chain.probe_cost(
+                {"costDetails": {"input": bad, "output": 1, "total": 1}}
+            ) == ("invalid", None)
+        assert chain.probe_cost({"costDetails": {"input": 1}}) == ("invalid", None)
+
+    def test_f7_token_validator_is_separate(self, chain) -> None:
+        from decimal import Decimal
+
+        # 小数 tokens 拒绝；整数 float / Decimal 接受
+        assert chain.probe_usage({"usageDetails": {"input": 1.5, "output": 2}})[0] == "invalid"
+        assert chain.probe_usage(
+            {"usageDetails": {"input": 2.0, "output": Decimal("3")}}
+        ) == ("valid", (2, 3))
+        # 方向别名冲突拒绝
+        assert chain.probe_usage(
+            {"usageDetails": {"input": 1, "output": 2, "prompt": 2, "completion": 1}}
+        )[0] == "invalid"
+
+    def test_f8_huge_values_and_overflow_safe(self, chain) -> None:
+        from decimal import Decimal
+
+        huge = Decimal("1e400")
+        assert chain.probe_cost({"totalCost": huge})[0] in ("valid", "invalid")
+        assert chain.probe_cost(
+            {"costDetails": {"input": huge, "output": huge}}
+        ) == ("invalid", None)   # float 表示溢出：安全判非法，不返回伪零
+        # unknown 声明不能掩盖非法值
+        trace = good_trace()
+        trace["observations"].append(
+            generation("g9", "huge", parent="s4", cost=float("inf"),
+                       metadata={"usage_status": "unknown"})
+        )
+        checks = verify(chain, trace)
+        assert checks["叶子用量"].ok is False
+
+    def test_f9_cli_exit_codes_match_state(self, chain, capsys, monkeypatch) -> None:
+        class Cfg:
+            langfuse_keys = ("pk", "sk", "http://host")
+
+        monkeypatch.setattr(chain, "load_config", lambda: Cfg())
+
+        # 0 = 完整通过
+        monkeypatch.setattr(chain, "load_trace", lambda cfg, tid, retries=2: good_trace())
+        assert chain.main(["--trace-id", "t1", "--json"]) == 0
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["passed"] is True and payload["failures"] == []
+
+        # 1 = 有失败
+        broken = good_trace()
+        broken["observations"].append(
+            observation(
+                "g9",
+                "bad",
+                parent="s4",
+                type_="GENERATION",
+                usageDetails={"input": 10, "output": 5},
+                costDetails="bad",
+            )
+        )
+        monkeypatch.setattr(chain, "load_trace", lambda cfg, tid, retries=2: broken)
+        assert chain.main(["--trace-id", "t2", "--json"]) == 1
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["passed"] is False
+
+        # 3 = 仅待验证（缺用量证据但如实标了 unknown）
+        unknown = good_trace()
+        unknown["observations"].append(
+            observation(
+                "g9",
+                "mystery",
+                parent="s4",
+                type_="GENERATION",
+                metadata={"usage_status": "unknown"},
+            )
+        )
+        monkeypatch.setattr(chain, "load_trace", lambda cfg, tid, retries=2: unknown)
+        assert chain.main(["--trace-id", "t3", "--json"]) == 3
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["passed"] is False and payload["pending"]
+
+        # 2 = 输入 / 用法错误
+        assert chain.main(["--trace-id", "t4", "--expect", "bogus"]) == 2

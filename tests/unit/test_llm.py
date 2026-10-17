@@ -192,6 +192,33 @@ class TestOpenAICompatibleProvider:
         assert result.error == ""
 
     @pytest.mark.asyncio
+    async def test_explicit_zero_usage_is_actual_and_not_estimated(self, make_api):
+        api = make_api(lambda _payload, _n: httpx.Response(200, json={
+            "choices": [{"message": {"content": "{}"}}],
+            "usage": {"prompt_tokens": 0, "completion_tokens": 0},
+        }))
+        cfg = FakeConfig()
+        cfg.price_in_per_m = 10.0
+        cfg.price_out_per_m = 10.0
+        provider = llm.build_provider(cfg, client=api.client)
+        result = await provider.complete(llm.LLMCall(task="t", system="s", user="u"))
+        assert (result.prompt_tokens, result.completion_tokens) == (0, 0)
+        assert result.cost_cny == 0
+        assert result.usage_status == "actual"
+
+    @pytest.mark.asyncio
+    async def test_missing_usage_direction_is_estimated_not_actual(self, make_api):
+        api = make_api(lambda _payload, _n: httpx.Response(200, json={
+            "choices": [{"message": {"content": "{}"}}],
+            "usage": {"prompt_tokens": 0},
+        }))
+        provider = llm.build_provider(FakeConfig(), client=api.client)
+        result = await provider.complete(llm.LLMCall(task="t", system="s", user="u"))
+        assert result.prompt_tokens == 0
+        assert result.completion_tokens > 0
+        assert result.usage_status == "estimated"
+
+    @pytest.mark.asyncio
     async def test_json_mode_off_omits_response_format(self, make_api):
         api = make_api(lambda _payload, _n: chat_response())
         provider = llm.build_provider(FakeConfig(), client=api.client)
@@ -475,3 +502,80 @@ class TestToolCalling:
         assert result.error != ""
         assert result.attempts == 1
         assert len(api.calls) == 1
+
+
+class TestResolveUsage:
+    """E7OBS4-05（E1–E4）：方向字段、合法总量与附加明细分开解析。"""
+
+    def _resolve(self, usage: dict[str, Any] | None, **kwargs: Any) -> tuple[int, int, str]:
+        from xhs_agent.tools.llm import resolve_usage
+
+        return resolve_usage(
+            usage, prompt_text="一二三四五", completion_text="六", **kwargs
+        )
+
+    def test_e1_legal_total_tokens_is_actual(self) -> None:
+        assert self._resolve(
+            {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15}
+        ) == (10, 5, "actual")
+
+    def test_e2_explicit_zero_kept(self) -> None:
+        assert self._resolve(
+            {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+        ) == (0, 0, "actual")
+        assert self._resolve(
+            {"prompt_tokens": 0, "completion_tokens": 7, "total_tokens": 7}
+        ) == (0, 7, "actual")
+
+    def test_e3_missing_side_estimated_and_illegal_side_unknown(self) -> None:
+        prompt, completion, status = self._resolve({"prompt_tokens": 10})
+        assert status == "estimated" and prompt == 10 and completion > 0
+        # 非法方向：整次 unknown，但合法侧的数值仍保留
+        prompt, completion, status = self._resolve(
+            {"prompt_tokens": 10, "completion_tokens": "5"}
+        )
+        assert status == "unknown" and prompt == 10 and completion > 0
+        # 冲突别名
+        assert self._resolve(
+            {"prompt_tokens": 10, "input_tokens": 12, "completion_tokens": 5}
+        )[2] == "unknown"
+
+    def test_e4_extra_details_do_not_downgrade_valid_directions(self) -> None:
+        assert self._resolve(
+            {
+                "prompt_tokens": 10,
+                "completion_tokens": 5,
+                "total_tokens": 15,
+                "cached_tokens": 4,
+                "reasoning_tokens": 2,
+                "prompt_tokens_details": {"cached_tokens": 4},
+            }
+        ) == (10, 5, "actual")
+
+    def test_e4_inconsistent_total_is_unknown(self) -> None:
+        # 总量与方向合计不一致：不冒充 actual，方向数字保留
+        assert self._resolve(
+            {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 99}
+        ) == (10, 5, "unknown")
+        # 只有总量、没有方向：无法拆分，不支持（estimated 也不该冒充）
+        assert self._resolve({"total_tokens": 15})[2] == "unknown"
+        # 非法总量（小数 / 字符串 / bool）
+        for bad in (15.5, "15", True, -1):
+            assert self._resolve(
+                {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": bad}
+            )[2] == "unknown"
+
+    def test_e6_failure_without_response_is_unknown_not_estimate(self) -> None:
+        from xhs_agent.tools.llm import resolve_usage
+
+        # 失败且没有响应正文：状态必须是 unknown —— 数字只是估算占位，口径标明不可信
+        # （与"供应商给了 usage"的 actual 在下游可区分，账本按 unknown 计入未知调用）
+        prompt, completion, status = resolve_usage(
+            None, prompt_text="一二三四五", completion_text="", error="boom"
+        )
+        assert status == "unknown"
+        assert (prompt, completion) == (3, 1)   # 估算占位，不冒充供应商已知
+        # 有正文但供应商没给 usage：这是"估算"，与失败区分
+        assert resolve_usage(
+            None, prompt_text="一二三四五", completion_text="六"
+        )[2] == "estimated"

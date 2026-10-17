@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
 import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
@@ -94,6 +95,110 @@ def estimate_tokens(text: str) -> int:
     return max(1, int(len(str(text or "")) / 1.5))
 
 
+def _usage_direction(usage: dict[str, Any], names: tuple[str, ...]) -> tuple[bool, int | None, bool]:
+    """读取一个用量方向，区分缺失、合法零值和非法供应商值。"""
+    present = [(name, usage[name]) for name in names if name in usage]
+    if not present:
+        return False, None, True
+    values: list[int] = []
+    for _name, raw in present:
+        if raw is None:
+            continue
+        if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+            return True, None, False
+        if isinstance(raw, float) and (not math.isfinite(raw) or not raw.is_integer()):
+            return True, None, False
+        value = int(raw)
+        if value < 0:
+            return True, None, False
+        values.append(value)
+    if not values:
+        # `null` is missing, not a measured zero.
+        return False, None, True
+    if len(set(values)) != 1:
+        return True, None, False
+    return True, values[0], True
+
+
+def _usage_total(usage: dict[str, Any]) -> tuple[bool, int | None]:
+    """读取并校验总量字段（`total_tokens` / `total`）：返回（是否出现, 合法值）。
+
+    总量用于**一致性校验**：非法或与方向合计冲突时整次调用标 unknown，
+    但合法的方向数字仍然保留（不丢已知、不伪装实际）。
+    """
+    present = [(name, usage[name]) for name in ("total_tokens", "total") if name in usage]
+    if not present:
+        return False, None
+    values: list[int] = []
+    for _name, raw in present:
+        if raw is None:
+            continue
+        if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+            return True, None
+        if isinstance(raw, float) and (not math.isfinite(raw) or not raw.is_integer()):
+            return True, None
+        value = int(raw)
+        if value < 0:
+            return True, None
+        values.append(value)
+    if not values:
+        return False, None
+    if len(set(values)) != 1:
+        return True, None
+    return True, values[0]
+
+
+def resolve_usage(
+    usage: dict[str, Any] | None,
+    *,
+    prompt_text: str,
+    completion_text: str,
+    error: str = "",
+) -> tuple[int, int, str]:
+    """归一化供应商用量，保留明确 0，不把混合来源冒充 actual。
+
+    返回 `(prompt_tokens, completion_tokens, usage_status)`。
+
+    E7OBS4-05：
+    - 方向字段（prompt/input、completion/output）**分别**解析：合法零值保留、冲突别名判非法；
+    - `total_tokens` / `total` 若存在，校验整数合法且与方向合计一致；冲突只影响状态（unknown），
+      不覆盖已取得的方向数字；
+    - 合计 / 缓存 / 推理等**附加明细**不影响方向口径——合法方向不会因为多带了字段变成 unknown；
+    - 缺方向：只对缺失侧做字符估算，整次 `estimated`；非法方向走 `unknown`，合法侧保留；
+    - 失败且无可靠响应：`unknown`，不把估算值伪装成供应商已知。
+    """
+    data = usage if isinstance(usage, dict) else {}
+    prompt_present, prompt, prompt_valid = _usage_direction(
+        data, ("prompt_tokens", "input_tokens")
+    )
+    completion_present, completion, completion_valid = _usage_direction(
+        data, ("completion_tokens", "output_tokens")
+    )
+    total_present, total = _usage_total(data)
+    total_conflict = False
+    if total_present:
+        if total is None:
+            total_conflict = True              # 总量非法：整次 unknown
+        elif prompt_valid and completion_valid and prompt is not None and completion is not None:
+            total_conflict = total != prompt + completion
+        elif not prompt_present and not completion_present:
+            total_conflict = True              # 只有总量、没有方向：无法拆分，判不支持
+    prompt = estimate_tokens(prompt_text) if prompt is None else prompt
+    completion = estimate_tokens(completion_text) if completion is None else completion
+    if (
+        (not data and error and not completion_text)
+        or not prompt_valid
+        or not completion_valid
+        or total_conflict
+    ):
+        status = "unknown"
+    elif prompt_present and completion_present:
+        status = "actual"
+    else:
+        status = "estimated"
+    return prompt, completion, status
+
+
 class BaseProvider:
     name = "base"
 
@@ -163,19 +268,14 @@ class OpenAICompatibleProvider(BaseProvider):
                 usage: dict[str, Any] | None, attempt: int, started: float,
                 error: str = "") -> LLMResult:
         """统一记账口径：token 取 `usage`，缺失时按字符估算（与 S7.1 之前一致）。"""
-        prompt_tokens = int((usage or {}).get("prompt_tokens")
-                            or estimate_tokens(_prompt_text(call)))
-        completion_tokens = int((usage or {}).get("completion_tokens")
-                                or estimate_tokens(text))
+        prompt_tokens, completion_tokens, usage_status = resolve_usage(
+            usage,
+            prompt_text=_prompt_text(call),
+            completion_text=text,
+            error=error,
+        )
         cost = (prompt_tokens / 1_000_000 * self.cfg.price_in_per_m
                 + completion_tokens / 1_000_000 * self.cfg.price_out_per_m)
-        if usage and (usage.get("prompt_tokens") is not None
-                      or usage.get("completion_tokens") is not None):
-            usage_status = "actual"
-        elif error and not text:
-            usage_status = "unknown"
-        else:
-            usage_status = "estimated"
         return LLMResult(
             text=text,
             provider=self.name,

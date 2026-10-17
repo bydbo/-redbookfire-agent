@@ -37,7 +37,7 @@ import httpx
 from ..config import AppConfig
 from ..util import extract_json
 from . import prompt as prompt_tools
-from .llm import estimate_tokens
+from .llm import resolve_usage
 
 TASK_ID = "material_tagging"
 IMAGE_TASK_ID = "image_hotspot_clue"
@@ -228,14 +228,11 @@ class AsyncImageClient:
         if not text:
             raise VisionError("返回内容为空")
         usage = body.get("usage") if isinstance(body, dict) else None
-        usage = usage if isinstance(usage, dict) else {}
-        prompt_tokens = int(usage.get("prompt_tokens") or 0)
-        completion_tokens = int(usage.get("completion_tokens") or 0)
-        if not prompt_tokens:
-            prompt_tokens = estimate_tokens(f"{rendered.system}\n{rendered.user}")
-        if not completion_tokens:
-            completion_tokens = estimate_tokens(str(text))
-        usage_status = "actual" if usage.get("prompt_tokens") is not None else "estimated"
+        prompt_tokens, completion_tokens, usage_status = resolve_usage(
+            usage if isinstance(usage, dict) else None,
+            prompt_text=f"{rendered.system}\n{rendered.user}",
+            completion_text=str(text),
+        )
         return ImageCompletion(text=str(text), prompt_tokens=prompt_tokens,
                                completion_tokens=completion_tokens,
                                usage_status=usage_status)

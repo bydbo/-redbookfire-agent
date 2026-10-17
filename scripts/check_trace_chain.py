@@ -172,7 +172,20 @@ def _valid_number(value: Any) -> bool:
     """
     if isinstance(value, bool) or not isinstance(value, (int, float, Decimal)):
         return False
-    return math.isfinite(float(value)) and float(value) >= 0
+    try:
+        number = Decimal(str(value))
+        as_float = float(number)
+    except (ArithmeticError, ValueError, TypeError):
+        return False
+    return number.is_finite() and number >= 0 and math.isfinite(as_float)
+
+
+def _valid_integer(value: Any) -> bool:
+    """用量必须是有限非负整数；不先转 int，避免把小数静默截断。"""
+    if not _valid_number(value):
+        return False
+    number = Decimal(str(value))
+    return number == number.to_integral_value()
 
 
 def probe_usage(item: dict[str, Any]) -> tuple[str, tuple[int, int] | None]:
@@ -184,19 +197,48 @@ def probe_usage(item: dict[str, Any]) -> tuple[str, tuple[int, int] | None]:
     - 非空但**不支持的形状**（如只有 `total`）→ invalid：判无效，不擅自按零核账；
     - 完全没有用量字段 → missing（缺证据 ≠ 无效；unknown 声明只能解释 missing）。
     """
+    parsed: list[tuple[int, int]] = []
+    seen = False
+    aliases = (("input", "output"), ("prompt", "completion"),
+               ("input_tokens", "output_tokens"))
+    allowed = {"total"} | {name for pair in aliases for name in pair}
     for key in ("usageDetails", "usage"):
-        value = item.get(key)
-        if not isinstance(value, dict) or not value:
+        if key not in item or item[key] is None:
             continue
-        for number in value.values():
-            if not _valid_number(number):
-                return ("invalid", None)
-        prompt = value.get("input", value.get("prompt"))
-        completion = value.get("output", value.get("completion"))
-        if prompt is None or completion is None:
+        value = item[key]
+        if value == {}:
+            continue
+        seen = True
+        if not isinstance(value, dict) or not value:
             return ("invalid", None)
-        return ("valid", (int(prompt), int(completion)))
-    return ("missing", None)
+        if set(value) - allowed:
+            return ("invalid", None)
+        if "total" in value and not _valid_integer(value["total"]):
+            return ("invalid", None)
+        candidates: list[tuple[int, int]] = []
+        for prompt_key, completion_key in aliases:
+            present = prompt_key in value or completion_key in value
+            if not present:
+                continue
+            if prompt_key not in value or completion_key not in value:
+                return ("invalid", None)
+            if not _valid_integer(value[prompt_key]) or not _valid_integer(value[completion_key]):
+                return ("invalid", None)
+            candidates.append((int(Decimal(str(value[prompt_key]))),
+                               int(Decimal(str(value[completion_key])))))
+        if not candidates:
+            return ("invalid", None)
+        if len(set(candidates)) != 1:
+            return ("invalid", None)
+        prompt, completion = candidates[0]
+        if "total" in value and prompt + completion != int(Decimal(str(value["total"]))):
+            return ("invalid", None)
+        parsed.append((prompt, completion))
+    if not seen:
+        return ("missing", None)
+    if len(set(parsed)) != 1:
+        return ("invalid", None)
+    return ("valid", parsed[0])
 
 
 def _as_float(value: Any) -> float:
@@ -204,34 +246,147 @@ def _as_float(value: Any) -> float:
     return float(value)
 
 
-def probe_cost(item: dict[str, Any]) -> tuple[str, float | None]:
-    """成本解析（R5 / E7OBS2-05）：`("valid", 元)` / `("missing", None)` / `("invalid", None)`。
+#: 金额与整数 tokens 用不同验证器（E7OBS4-06）：金额允许小数，tokens 必须是数学整数。
+#: 两者都拒绝 bool / 负值 / 非有限值 / 任意字符串；非法结构判 invalid，不按 0 计账。
 
-    - `costDetails`：优先 `total`；没有 total 时要求 `input` + `output` 同时合法（求和）；
-      非空但不支持的形状 / 值非法（字符串、bool、负数、NaN、Infinity）→ invalid；
-    - `calculatedTotalCost` / `totalCost` 数值字段：合法才算有效；
-    - 显式 **0 合法**（免费调用如实记 0）；没有任何成本字段 → missing。
+#: 受支持的金额候选字段（同一人民币口径的别名）。`costDetails` 另有结构校验。
+_COST_SCALARS: tuple[str, ...] = ("calculatedTotalCost", "totalCost")
+_COST_DETAIL_KEYS: frozenset[str] = frozenset({"input", "output", "total"})
+
+#: 浮点表示误差政策（E7OBS4-06）：以原始 float 的 ULP 为单位，最多放宽 8 个 ULP。
+#: 只吸收二进制表示误差（例如 `0.1 + 0.2` 与 `0.3` 相差 1 ULP），不吸收真实金额差异；
+#: 精确来源（int / Decimal）不放宽——那是"来源明确给的数"，必须精确相等。
+_FLOAT_ULP_SLACK = 8
+
+
+def _amount(value: Any) -> Decimal | None:
+    """金额候选：有限、非负、可保留十进制的数值；bool / 字符串 / NaN / 负值返回 None。"""
+    if not _valid_number(value):
+        return None
+    try:
+        return Decimal(str(value))
+    except (ArithmeticError, ValueError, TypeError):  # pragma: no cover - 防御
+        return None
+
+
+def _float_slack(*values: Any) -> Decimal:
+    """本次比较可放宽的误差界（Decimal 秒）；精确来源为 0。
+
+    E7OBS4-06 §8.2：用标准库 `math.ulp` 由**原始 float** 形成可解释的界，
+    不对全部金额无条件 round 到四位（那会吞掉真实差异）。
     """
+    slack = Decimal(0)
+    for value in values:
+        if isinstance(value, float) and math.isfinite(value):
+            try:
+                slack = max(slack, Decimal(str(math.ulp(value))) * _FLOAT_ULP_SLACK)
+            except (ArithmeticError, ValueError):  # pragma: no cover - 防御
+                continue
+    return slack
+
+
+def _amount_equal(left: Decimal, right: Decimal, slack: Decimal) -> bool:
+    """两个金额是否同一事实：精确来源要求精确相等，float 来源允许 ULP 表示误差。"""
+    try:
+        return abs(left - right) <= slack
+    except ArithmeticError:  # pragma: no cover - 防御
+        return False
+
+
+def probe_cost(item: dict[str, Any]) -> tuple[str, float | None]:
+    """成本解析（R5 / E7OBS2-05；E7OBS4-06 加固）：`("valid", 元)` / `("missing", None)`
+    / `("invalid", None)`。
+
+    先按形状解析**所有**受支持候选，再统一做一致性校验——读到第一个合法字段就返回会让
+    "错误字段被备用字段隐藏"（F1/F2/F3）：
+
+    - `costDetails`：协议允许缺失 / null / 空对象（视为缺证据，可继续看标量别名）；
+      非空但不是对象、含不认识的维度、只有一侧分项、值非法 → invalid；
+      `total` 与 `input+output` 同时存在时两者必须一致；
+    - `calculatedTotalCost` / `totalCost`：合法金额才算候选，非法即 invalid；
+    - 多候选之间必须一致（非法或冲突都判 invalid，不选一个掩盖）；
+      币种 / 计价来源不同的维度不当作金额别名（当前只支持人民币折算口径的这三个字段）；
+    - 显式 **0 合法**（免费调用如实记 0）；完全没有成本字段 → missing。
+    """
+    candidates: list[tuple[str, Decimal]] = []
+    raws: list[Any] = []
+    invalid = False
+
     details = item.get("costDetails")
     if isinstance(details, dict) and details:
-        if "total" in details:
-            total = details.get("total")
-            return (
-                ("valid", _as_float(total)) if _valid_number(total) else ("invalid", None)
-            )
-        if "input" in details and "output" in details:
-            first, second = details.get("input"), details.get("output")
-            if _valid_number(first) and _valid_number(second):
-                return ("valid", _as_float(first) + _as_float(second))
-            return ("invalid", None)
+        if set(details) - _COST_DETAIL_KEYS:
+            invalid = True   # 陌生成本维度：不盲目相加，也不默认有效
+        elif any(value is None for value in details.values()):
+            invalid = True   # 协议外形状：显式 null 不等于 0
+        else:
+            has_input = "input" in details
+            has_output = "output" in details
+            components: Decimal | None = None
+            if has_input != has_output:
+                invalid = True   # 只给一个分项：不补零
+            elif has_input:
+                left = _amount(details["input"])
+                right = _amount(details["output"])
+                if left is None or right is None:
+                    invalid = True
+                else:
+                    try:
+                        components = left + right
+                    except ArithmeticError:  # pragma: no cover - 防御
+                        invalid = True
+            total: Decimal | None = None
+            if "total" in details:
+                total = _amount(details["total"])
+                if total is None:
+                    invalid = True
+                elif components is not None and not _amount_equal(
+                    total,
+                    components,
+                    _float_slack(
+                        details.get("total"), details.get("input"), details.get("output")
+                    ),
+                ):
+                    invalid = True   # 分项之和不等于 total：非法分项不能被 total 掩盖
+            if total is not None:
+                candidates.append(("costDetails.total", total))
+                raws.append(details.get("total"))
+            elif components is not None:
+                candidates.append(("costDetails.input+output", components))
+                raws.extend([details.get("input"), details.get("output")])
+            else:
+                invalid = True
+    elif details is not None and not isinstance(details, dict):
+        invalid = True   # 非空错误类型（字符串 / 数组）：不被 totalCost 合法恢复
+
+    for key in _COST_SCALARS:
+        if key not in item:
+            continue
+        raw = item.get(key)
+        if raw is None:
+            continue   # 协议允许的 null：缺证据，继续评估其他候选
+        amount = _amount(raw)
+        if amount is None:
+            invalid = True
+        else:
+            candidates.append((key, amount))
+            raws.append(raw)
+
+    if invalid:
         return ("invalid", None)
-    for key in ("calculatedTotalCost", "totalCost"):
-        if key in item:
-            value = item.get(key)
-            return (
-                ("valid", _as_float(value)) if _valid_number(value) else ("invalid", None)
-            )
-    return ("missing", None)
+    if not candidates:
+        return ("missing", None)
+    slack = _float_slack(*raws)
+    head = candidates[0][1]
+    for _name, value in candidates[1:]:
+        if not _amount_equal(head, value, slack):
+            return ("invalid", None)   # 候选冲突：明确判非法，不选一个掩盖
+    try:
+        result = _as_float(head)
+    except (OverflowError, ValueError):   # pragma: no cover - 防御
+        return ("invalid", None)
+    if not math.isfinite(result):
+        return ("invalid", None)
+    return ("valid", result)
 
 
 def has_usage(item: dict[str, Any]) -> bool:
