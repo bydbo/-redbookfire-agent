@@ -635,11 +635,17 @@ def build_provider(cfg: AppConfig, *, client: httpx.AsyncClient) -> BaseProvider
 
 @dataclass
 class StructuredCaller:
-    """把模型的自由文本压成结构化对象，失败时带错误信息让模型自修一次。"""
+    """把模型的自由文本压成结构化对象，失败时带错误信息让模型自修一次。
+
+    E7CTX-09：`before_request(call)` 在**每次实际请求发出前**执行（含结构修复的第二次
+    请求）——预算检查挂在这里，不能只检查进入循环前的原始 prompt。回调抛出的异常
+    （如 `BudgetError`）原样传播，本次调用不发出。
+    """
 
     provider: BaseProvider
     max_repairs: int = 1
     records: list[dict[str, Any]] = field(default_factory=list)
+    before_request: Callable[[LLMCall], Awaitable[None]] | None = None
 
     async def call(
         self,
@@ -654,10 +660,12 @@ class StructuredCaller:
         prompt = user
         last_error = ""
         for _attempt in range(self.max_repairs + 1):
-            result = await self.provider.complete(
-                LLMCall(task=task, system=system, user=prompt,
-                        context=context or {}, json_mode=json_mode,
-                        max_tokens=max_tokens))
+            call = LLMCall(task=task, system=system, user=prompt,
+                           context=context or {}, json_mode=json_mode,
+                           max_tokens=max_tokens)
+            if self.before_request is not None:
+                await self.before_request(call)
+            result = await self.provider.complete(call)
             self.records.append(result.record(task))
             if result.error:
                 last_error = result.error

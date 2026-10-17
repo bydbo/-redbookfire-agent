@@ -457,7 +457,8 @@ class ChatSessionList(_Response):
 FactKind = Literal["goal", "constraint", "preference", "audience", "format"]
 FactStatus = Literal["active", "pending_confirmation", "superseded", "retracted"]
 FactScope = Literal["session", "topic", "artifact"]
-ContextAction = Literal["confirm", "reject", "retract", "replace", "reset_topic"]
+ContextAction = Literal["confirm", "reject", "retract", "replace", "reset_topic",
+                        "select_object", "recover", "complete_recovery"]
 ArtifactStatus = Literal["pending", "succeeded", "failed", "refused", "interrupted"]
 ArtifactType = Literal["draft", "clue"]
 ContextMode = Literal["off", "shadow", "enforce"]
@@ -476,6 +477,7 @@ class ContextFact(_Response):
     scope_id: str = ""
     source_ref: dict[str, Any] = Field(default_factory=dict)
     replaces: str | None = None
+    replaces_fact_ids: list[str] = Field(default_factory=list)
     updated_at: DateTimeStr = ""
 
 
@@ -492,6 +494,39 @@ class ContextProposal(_Response):
     source_ref: dict[str, Any] = Field(default_factory=dict)
     conflicts_with: list[str] = Field(default_factory=list)
     created_version: int = Field(default=0, ge=0)
+    operation: Literal["add", "replace", "reset_topic", "select_object"] = "add"
+    replaces_fact_ids: list[str] = Field(default_factory=list)
+    target_object_ref: dict[str, Any] = Field(default_factory=dict)
+    source_message_ids: list[str] = Field(default_factory=list)
+
+
+class ObjectRef(_Response):
+    """一个已验证的对象引用（v2 §3.3A；空字段表示尚未选择，不得以空值激活产物级约束）。"""
+
+    object_key: str
+    object_type: ArtifactType
+    topic_id: str = ""
+    run_id: UuidStr | None = None
+    hotspot_position: int | None = None
+    material_id: str | None = None
+    version_id: UuidStr | None = None
+    image_group_digest: str | None = None
+    source_ref: dict[str, Any] = Field(default_factory=dict)
+
+
+class RecoveryProgress(_Response):
+    """旧会话恢复进度（v2 §3.3A / §3.5）。"""
+
+    status: Literal["complete", "pending", "running", "awaiting_confirmation",
+                    "interrupted", "failed"]
+    recovery_id: UuidStr | None = None
+    reason: str = ""
+    snapshot_last_message_id: UuidStr | None = None
+    cursor_message_id: UuidStr | None = None
+    scanned_user_messages: int = Field(default=0, ge=0)
+    total_user_messages: int = Field(default=0, ge=0)
+    pending_proposal_ids: list[str] = Field(default_factory=list)
+    accounting_message_id: UuidStr | None = None
 
 
 class ArtifactHead(_Response):
@@ -515,21 +550,29 @@ class ChatContext(_Response):
     effective_mode: ContextMode
     topic_id: str | None = None
     blocking_proposals: int = Field(default=0, ge=0)
+    effective_mode_reason: str = ""
+    object_refs: list[ObjectRef] = Field(default_factory=list)
+    recovery: RecoveryProgress | None = None
 
 
 class ContextActionRequest(BaseModel):
-    """`POST .../context/actions` 请求体（契约 `ContextActionRequest`）。"""
+    """`POST .../context/actions` 请求体（契约 `ContextActionRequest`，v2 §3.3A）。"""
 
     model_config = ConfigDict(extra="forbid")
 
     action: ContextAction
     expected_state_version: int = Field(ge=0)
+    action_id: UuidStr | None = None
     target_id: str | None = None
     value: str | None = None
+    object_ref: dict[str, Any] | None = None
+    recovery_id: UuidStr | None = None
+    retry_of: UuidStr | None = None
+    acknowledge_partial_history: bool = False
 
 
 class ContextActionResponse(_Response):
-    """动作结果与最新上下文（契约 `ContextActionResponse`）。"""
+    """动作结果与最新上下文（契约 `ContextActionResponse`，v2 §3.3A）。"""
 
     session_id: UuidStr
     state_version: int = Field(ge=0)
@@ -537,6 +580,10 @@ class ContextActionResponse(_Response):
     decision: Literal["applied", "noop", "conflict"]
     context: ChatContext
     reason: str = ""
+    action_id: UuidStr = ""
+    accounting_message_id: UuidStr | None = None
+    replay: bool = False
+    status: Literal["pending", "running", "succeeded", "failed", "interrupted"] = "succeeded"
 
 
 class ArtifactVersion(_Response):
@@ -565,6 +612,28 @@ class ArtifactVersionList(_Response):
 
     items: list[ArtifactVersion]
     total: int = Field(ge=0)
+
+
+class ClueVersionRequest(BaseModel):
+    """`POST .../artifacts/clue-versions` 请求体（v2 §3.3C）。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    action_id: UuidStr
+    expected_state_version: int = Field(ge=0)
+    expected_head_version_id: UuidStr | None = None
+    object_key: str
+    base_version_id: UuidStr
+    content: dict[str, Any]
+
+
+class ClueSelectRequest(BaseModel):
+    """`POST .../artifacts/{version_id}/select` 请求体（v2 §3.3C）。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    action_id: UuidStr
+    expected_state_version: int = Field(ge=0)
 
 
 class ChatSessionDetail(_Response):

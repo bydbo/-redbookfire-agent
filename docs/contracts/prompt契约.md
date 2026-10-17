@@ -6,7 +6,7 @@
 
 ## 一、适用范围与地位
 
-**prompt 文本的唯一来源是 `src/xhs_agent/prompts/<task_id>.md`。禁止在代码里内联 prompt 字符串**，也禁止另起一套模板目录。当前适用九个任务：
+**prompt 文本的唯一来源是 `src/xhs_agent/prompts/<task_id>.md`。禁止在代码里内联 prompt 字符串**，也禁止另起一套模板目录。当前适用十个任务：
 
 | task_id | 用途 | 调用方 |
 | --- | --- | --- |
@@ -19,6 +19,7 @@
 | `chat_supervisor` | 对话层：读用户消息 → 决定直接回答或调工具 → 把结果讲成人话 | `agents/supervisor.py`（S7.3 落地） |
 | `copy_revise` | 已有初稿 + 用户要求 → 改后初稿（要求越界时只回拒绝理由，不给变通写法） | `agents/revise.py`（S7.8 落地） |
 | `context_extract` | 本轮用户原文 + 现有状态 → 有限类型的状态增量（新增 / 撤回 / 显式替换 / 待确认提案） | `services/context_state.py`（S7.24 落地） |
+| `context_recover` | 恢复页完整用户消息 + 已恢复候选 → 恢复候选增量（全部待确认，E7CTX-05） | `services/context_state.py`（v2 §3.5 落地） |
 
 三条硬规则：
 

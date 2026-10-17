@@ -1,0 +1,10 @@
+{
+  "version": "context-repair-v1",
+  "frozen_at": "2026-10-17",
+  "produced_by": "E7CTX 修复（v2 §4.1.1）",
+  "usage": "验收协议冻结；真实模型运行须用户授权；改动必须升版并保留本目录",
+  "files": {
+    "protocol.md": "d28f998ef7778577cef2cd6052a0bea307e781a8f36bf48142ec6864a47b5578"
+  },
+  "paid_runs_authorized": false
+}

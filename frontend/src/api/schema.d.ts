@@ -418,7 +418,12 @@ export interface paths {
         get: operations["getChatSession"];
         put?: never;
         post?: never;
-        delete?: never;
+        /**
+         * 删除会话
+         * @description 删除会话及其级联数据（消息、状态、审计、版本、缓存、观测），并清理**该会话附件根内**
+         *     的文件（v2 §3.3D）。文件清理失败记录原因但不恢复会话；不存在返回 404。
+         */
+        delete: operations["deleteChatSession"];
         options?: never;
         head?: never;
         patch?: never;
@@ -547,6 +552,48 @@ export interface paths {
         get: operations["listChatArtifacts"];
         put?: never;
         post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/chat/sessions/{session_id}/artifacts/clue-versions": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * 保存用户编辑的线索版本
+         * @description 线索编辑是独立不可变业务版本（v2 §3.3C）：保存完整合法线索、基础版本与来源，
+         *     成功后设为选定引用；同 action_id 重放返回原结果。已有选定编辑版不会被旧缓存覆盖。
+         */
+        post: operations["createClueVersion"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/chat/sessions/{session_id}/artifacts/{version_id}/select": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * 选定一个线索版本
+         * @description 只选同会话成功 clue 版本（v2 §3.3C）；推进状态版本并写用户动作审计。
+         *     重解析产生的原始版本不改变已有选定编辑版，只有显式 select 才切换。
+         */
+        post: operations["selectClueVersion"];
         delete?: never;
         options?: never;
         head?: never;
@@ -1037,6 +1084,8 @@ export interface components {
             };
             created_version: number;
             replaces?: string | null;
+            /** @description 多项替代时记录全部被替换的旧事实 id（v2，E7CTX-04） */
+            replaces_fact_ids?: string[];
             /** Format: date-time */
             updated_at?: string;
         };
@@ -1057,6 +1106,46 @@ export interface components {
             };
             conflicts_with?: string[];
             created_version?: number;
+            /**
+             * @description 拟执行操作（v2 §3.3A）；旧提案按 conflicts_with 推导
+             * @enum {string}
+             */
+            operation?: "add" | "replace" | "reset_topic" | "select_object";
+            /** @description 确认 replace 时要替代的旧事实（E7CTX-04） */
+            replaces_fact_ids?: string[];
+            /** @description select_object 提案的目标对象（确认前由服务端验证归属） */
+            target_object_ref?: {
+                [key: string]: unknown;
+            };
+            source_message_ids?: string[];
+        };
+        /** @description 已验证的对象引用（v2 §3.3A）；空字段表示尚未选择，不得以空值激活产物级约束。 */
+        ObjectRef: {
+            object_key: string;
+            /** @enum {string} */
+            object_type: "draft" | "clue";
+            topic_id?: string;
+            run_id?: string | null;
+            hotspot_position?: number | null;
+            material_id?: string | null;
+            version_id?: string | null;
+            image_group_digest?: string | null;
+            source_ref?: {
+                [key: string]: unknown;
+            };
+        };
+        /** @description 旧会话恢复进度（v2 §3.3A / §3.5）。 */
+        RecoveryProgress: {
+            /** @enum {string} */
+            status: "complete" | "pending" | "running" | "awaiting_confirmation" | "interrupted" | "failed";
+            recovery_id?: string | null;
+            reason?: string;
+            snapshot_last_message_id?: string | null;
+            cursor_message_id?: string | null;
+            scanned_user_messages?: number;
+            total_user_messages?: number;
+            pending_proposal_ids?: string[];
+            accounting_message_id?: string | null;
         };
         /** @description 一个产物对象当前指向的成功版本（S7.25）。 */
         ArtifactHead: {
@@ -1080,18 +1169,54 @@ export interface components {
             artifact_heads: components["schemas"]["ArtifactHead"][];
             /** @enum {string} */
             effective_mode: "off" | "shadow" | "enforce";
+            /** @description 实际模式的原因（configured_off / session_not_enabled / window_unverified） */
+            effective_mode_reason?: string;
+            object_refs?: components["schemas"]["ObjectRef"][];
+            recovery?: components["schemas"]["RecoveryProgress"];
             /** @description 阻断当前任务的待确认提案数（>0 时应先确认再继续） */
             blocking_proposals?: number;
         };
-        /** @description 上下文用户动作（S7.24）；`expected_state_version` 是 CAS 条件。 */
+        /** @description 上下文用户动作（v2 §3.3A）；`expected_state_version` 是 CAS 条件。 */
         ContextActionRequest: {
             /** @enum {string} */
-            action: "confirm" | "reject" | "retract" | "replace" | "reset_topic";
+            action: "confirm" | "reject" | "retract" | "replace" | "reset_topic" | "select_object" | "recover" | "complete_recovery";
             expected_state_version: number;
+            /** @description 幂等键；同 ID 同请求体重放返回原结果，不同请求体 409 */
+            action_id?: string | null;
             /** @description 事实 / 提案标识（confirm / reject / retract / replace 必填） */
             target_id?: string;
-            /** @description 替换后的新值（replace 必填） */
+            /** @description 替换后的新值（replace 必填，1–200 字） */
             value?: string;
+            /** @description select_object 必填；确认未解析产物提案时必填完整目标 */
+            object_ref?: {
+                [key: string]: unknown;
+            };
+            /** @description 后续恢复分页及 complete_recovery 必填 */
+            recovery_id?: string | null;
+            /** @description 显式重试已中断 / 失败恢复时传原 action_id */
+            retry_of?: string | null;
+            /** @description complete_recovery 时已知历史缺口的显式确认 */
+            acknowledge_partial_history?: boolean;
+        };
+        /** @description 保存用户编辑的线索版本（v2 §3.3C）。 */
+        ClueVersionRequest: {
+            /** Format: uuid */
+            action_id: string;
+            expected_state_version: number;
+            expected_head_version_id?: string | null;
+            object_key: string;
+            /** Format: uuid */
+            base_version_id: string;
+            /** @description {raw_text, clue, edited_fields}；raw_text ≤ 500 字 */
+            content: {
+                [key: string]: unknown;
+            };
+        };
+        /** @description 选定一个线索版本（v2 §3.3C）。 */
+        ClueSelectRequest: {
+            /** Format: uuid */
+            action_id: string;
+            expected_state_version: number;
         };
         /** @description 动作结果与最新上下文（S7.24）。 */
         ContextActionResponse: {
@@ -1099,11 +1224,17 @@ export interface components {
             session_id: string;
             state_version: number;
             /** @enum {string} */
-            action: "confirm" | "reject" | "retract" | "replace" | "reset_topic";
+            action: "confirm" | "reject" | "retract" | "replace" | "reset_topic" | "select_object" | "recover" | "complete_recovery";
             /** @enum {string} */
             decision: "applied" | "noop" | "conflict";
             reason?: string;
             context: components["schemas"]["ChatContext"];
+            /** Format: uuid */
+            action_id?: string;
+            accounting_message_id?: string | null;
+            replay?: boolean;
+            /** @enum {string} */
+            status?: "pending" | "running" | "succeeded" | "failed" | "interrupted";
         };
         /** @description 一个不可变的文案 / 线索版本（S7.25）。 */
         ArtifactVersion: {
@@ -1935,6 +2066,31 @@ export interface operations {
             503: components["responses"]["DependencyUnavailable"];
         };
     };
+    deleteChatSession: {
+        parameters: {
+            query?: never;
+            header?: {
+                /** @description 客户端生成的请求标识；未提供时由服务端生成。用于贯穿日志、调用追踪与数据库记录。 */
+                "X-Request-ID"?: components["parameters"]["RequestId"];
+            };
+            path: {
+                session_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description 已删除 */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            404: components["responses"]["NotFound"];
+            503: components["responses"]["DependencyUnavailable"];
+        };
+    };
     postChatMessage: {
         parameters: {
             query?: never;
@@ -1954,6 +2110,8 @@ export interface operations {
                     text?: string;
                     /** @description 可选的热点图片（jpg / png / webp），一次 1–9 张，同属一组 */
                     files?: string[];
+                    /** @description 可选的结构化操作绑定 JSON（v2 §3.3B）：{operation, object_key, base_version_id, expected_state_version, force_reparse} */
+                    operation_binding?: string;
                 };
             };
         };
@@ -2099,6 +2257,89 @@ export interface operations {
                 };
             };
             404: components["responses"]["NotFound"];
+            503: components["responses"]["DependencyUnavailable"];
+        };
+    };
+    createClueVersion: {
+        parameters: {
+            query?: never;
+            header?: {
+                /** @description 客户端生成的请求标识；未提供时由服务端生成。用于贯穿日志、调用追踪与数据库记录。 */
+                "X-Request-ID"?: components["parameters"]["RequestId"];
+            };
+            path: {
+                session_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ClueVersionRequest"];
+            };
+        };
+        responses: {
+            /** @description 动作结果与最新上下文（重放或成功） */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ContextActionResponse"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            /** @description 状态版本冲突 */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            503: components["responses"]["DependencyUnavailable"];
+        };
+    };
+    selectClueVersion: {
+        parameters: {
+            query?: never;
+            header?: {
+                /** @description 客户端生成的请求标识；未提供时由服务端生成。用于贯穿日志、调用追踪与数据库记录。 */
+                "X-Request-ID"?: components["parameters"]["RequestId"];
+            };
+            path: {
+                session_id: string;
+                version_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ClueSelectRequest"];
+            };
+        };
+        responses: {
+            /** @description 动作结果与最新上下文 */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ContextActionResponse"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            /** @description 状态版本冲突 */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
             503: components["responses"]["DependencyUnavailable"];
         };
     };

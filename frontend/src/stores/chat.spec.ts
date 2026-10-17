@@ -671,7 +671,13 @@ describe('chat store · 上下文状态（S7.24）', () => {
     const result = await store.actOnContext('confirm', 'p-1')
     expect(result).toBeNull()
     const body = vi.mocked(postChatContextAction).mock.calls[0][1]
-    expect(body).toEqual({ action: 'confirm', expected_state_version: 3, target_id: 'p-1' })
+    // v2 §3.3A：请求带 action_id 幂等键（uuid），目标与 CAS 版本不变
+    expect(body).toMatchObject({
+      action: 'confirm',
+      expected_state_version: 3,
+      target_id: 'p-1',
+    })
+    expect(String(body.action_id)).toMatch(/^[0-9a-f-]{36}$/)
     expect(store.context?.state_version).toBe(4)
     expect(store.context?.proposals).toHaveLength(0)
   })

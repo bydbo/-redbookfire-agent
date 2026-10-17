@@ -62,6 +62,8 @@ COLUMN_SPECS: dict[str, dict[str, str]] = {
         "error": "text", "created_at": "timestamptz",
         # S7.21：轮次关联（turn_id / trace_id）与阶段快照（progress）
         "turn_id": "uuid", "trace_id": "text", "progress": "jsonb",
+        # v2 §3.3B：结构化操作绑定
+        "operation_binding": "jsonb",
     },
     # E7 第六批（S7.24–S7.28）：状态审计 / 产物版本 / 图片缓存 / 观测
     "chat_context_events": {
@@ -73,14 +75,27 @@ COLUMN_SPECS: dict[str, dict[str, str]] = {
         "id": "uuid", "session_id": "uuid", "object_key": "text", "object_type": "text",
         "run_id": "uuid", "hotspot_position": "int4", "request_key": "text",
         "status": "text", "version_no": "int4", "base_version_id": "uuid",
+        # v2 §3.4（E7CTX-07）：认领时固化的并发预期与来源消息
+        "expected_head_version_id": "uuid", "expected_state_version": "int4",
+        "source_message_id": "uuid",
         "content": "jsonb", "source": "jsonb", "prompt_versions": "jsonb",
         "usage": "jsonb", "error": "text", "created_at": "timestamptz",
         "updated_at": "timestamptz",
     },
     "chat_image_parse_cache": {
-        "id": "uuid", "session_id": "uuid", "cache_key": "text", "identity": "jsonb",
+        "id": "uuid", "session_id": "uuid", "cache_key": "text",
+        # v2 §3.4（E7CTX-11）：条目代次
+        "generation_id": "uuid",
+        "identity": "jsonb",
         "payload": "jsonb", "source": "jsonb", "created_at": "timestamptz",
         "expires_at": "timestamptz",
+    },
+    "chat_context_actions": {
+        "id": "uuid", "session_id": "uuid", "action_id": "uuid", "action": "text",
+        "request_digest": "text", "expected_state_version": "int4", "status": "text",
+        "result": "jsonb", "error": "jsonb", "recovery_id": "uuid", "retry_of": "uuid",
+        "accounting_message_id": "uuid", "created_at": "timestamptz",
+        "updated_at": "timestamptz",
     },
     "context_observations": {
         "event_id": "text", "session_id": "uuid", "event_type": "text", "turn_id": "text",
@@ -96,10 +111,14 @@ NULLABLE_COLUMNS: dict[str, set[str]] = {
     "run_hotspots": {"draft", "error"},
     "run_matches": set(),
     "chat_sessions": {"topic_id"},
-    "chat_messages": {"run_id", "error", "turn_id", "trace_id"},
+    "chat_messages": {"run_id", "error", "turn_id", "trace_id", "operation_binding"},
     "chat_context_events": set(),
     "chat_artifact_versions": {"run_id", "hotspot_position", "version_no",
-                               "base_version_id", "content", "error"},
+                               "base_version_id", "content", "error",
+                               "expected_head_version_id", "expected_state_version",
+                               "source_message_id"},
+    "chat_context_actions": {"expected_state_version", "recovery_id", "retry_of",
+                             "accounting_message_id"},
     "chat_image_parse_cache": set(),
     "context_observations": {"turn_id", "call_id", "attempt", "model",
                              "prompt_version", "policy_version"},
@@ -121,6 +140,9 @@ EXPECTED_INDEXES = {
     "ix_chat_artifact_versions_object_version",
     "uq_chat_image_parse_cache_session_key",
     "ix_chat_image_parse_cache_expires_at",
+    "ix_chat_image_parse_cache_generation_id",
+    "uq_chat_context_actions_session_action",
+    "ix_chat_context_actions_session_created_at",
     "ix_context_observations_session_created_at",
     "ix_context_observations_type_created_at",
 }

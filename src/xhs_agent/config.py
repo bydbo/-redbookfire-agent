@@ -107,7 +107,19 @@ class _Section(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
 
-class LLMConfig(_Section):
+class _ModelCapabilitiesMixin(_Section):
+    """供应商能力开关（v2 §3.6）：默认 false，须以来源日期核实后开启，不按模型名猜协议。
+
+    `prefix_usage_supported`：响应带前缀缓存分项；`stream_usage_supported`：流式可请求
+    usage；`thinking_toggle_supported`：可安全关闭推理模式。能力与窗口一样必须有据可查。
+    """
+
+    prefix_usage_supported: bool = False
+    stream_usage_supported: bool = False
+    thinking_toggle_supported: bool = False
+
+
+class LLMConfig(_ModelCapabilitiesMixin, _Section):
     """文本模型。默认值 / 取值范围见《配置契约》§3.1。"""
 
     provider: str = "openai_compatible"
@@ -152,7 +164,7 @@ class LLMConfig(_Section):
         return self.provider
 
 
-class VisionConfig(_Section):
+class VisionConfig(_ModelCapabilitiesMixin, _Section):
     """多模态打标。默认值 / 取值范围见《配置契约》§3.2。"""
 
     enabled: bool = False
@@ -386,7 +398,7 @@ class ContextConfig(_Section):
     model_context_window: int | None = Field(None, ge=1024, le=4_000_000)
     model_window_verified: bool = False
     extract_max_tokens: int = Field(2048, ge=128, le=8192)
-    extract_repair_max: int = Field(1, ge=0, le=2)
+    extract_repair_max: int = Field(1, ge=0, le=1)
     image_cache_ttl_days: int = Field(7, ge=1, le=90)
     image_cache_enabled: bool = True
     observation_retention_days: int = Field(30, ge=1, le=365)
@@ -455,6 +467,18 @@ class ContextConfig(_Section):
         ):
             return "shadow"
         return self.mode
+
+    def mode_reason(self, session_id: str) -> str:
+        """实际模式的原因（E7CTX-15）：前端显示实际状态及原因，不只显示配置值。"""
+        if self.mode == "off":
+            return "configured_off"
+        if self.enabled_sessions and str(session_id).lower() not in self.enabled_sessions:
+            return "session_not_enabled"
+        if self.mode == "enforce" and not (
+            self.model_window_verified and self.model_context_window
+        ):
+            return "window_unverified"
+        return ""
 
     def enforces(self, session_id: str) -> bool:
         return self.effective_mode(session_id) == "enforce"

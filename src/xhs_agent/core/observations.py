@@ -34,8 +34,13 @@ EVENT_TYPES: tuple[str, ...] = (
     "context_state_decision",
     "context_assembled",
     "artifact_version_committed",
+    "cache_request_started",
     "cache_lookup_finished",
+    "cache_entry_created",
+    "cache_entry_invalidated",
+    "cache_entry_consumed",
     "artifact_consumed",
+    "model_attempt_started",
     "model_attempt_finished",
 )
 #: payload 中禁止出现的键（用户原文 / 图片 / 工具参数 / 素材路径）

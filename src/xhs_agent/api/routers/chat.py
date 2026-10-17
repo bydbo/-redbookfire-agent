@@ -33,6 +33,7 @@ from ...services import artifact_versions, context_state
 from ...services.chat import (
     append_message,
     create_session,
+    delete_session,
     list_sessions,
     load_message,
     load_session,
@@ -41,6 +42,7 @@ from ...services.chat import (
     save_attachment,
 )
 from ...services.chat_turns import HEARTBEAT_S, TurnEvents, sse_frame, start_turn
+from ...tools.llm import StructuredCaller, build_provider
 from ...tools.vision import sniff_image_mime
 from ..deps import ConfigDep, DispatcherDep, SessionDep, request_id_header
 from ..models import (
@@ -51,6 +53,8 @@ from ..models import (
     ChatSessionCreate,
     ChatSessionDetail,
     ChatSessionList,
+    ClueSelectRequest,
+    ClueVersionRequest,
     ContextActionRequest,
     ContextActionResponse,
     UuidPath,
@@ -203,6 +207,8 @@ async def get_chat_session(session_id: UuidPath, cfg: ConfigDep, session: Sessio
 async def post_chat_message(
         session_id: UuidPath, cfg: ConfigDep, session: SessionDep, dispatcher: DispatcherDep,
         text: Annotated[str | None, Form()] = None,
+        # v2 §3.3B：可选的结构化操作绑定（JSON 字符串，服务端严格校验后随用户消息持久保存）
+        operation_binding: Annotated[str | None, Form()] = None,
         # 用裸 `File()`：给列表加 `json_schema_extra={"format": "binary"}` 会让 format 落在
         # **数组外层**（FastAPI 的既有行为），与契约里 `items` 的形状对不上；`list[UploadFile]`
         # 本身带 `contentMediaType`，Swagger UI 照常渲染多文件选择器。
@@ -225,6 +231,9 @@ async def post_chat_message(
     if detail is None:
         raise NotFoundError(f"会话不存在：{session_id}", {"session_id": session_id})
 
+    binding = await context_state.validate_operation_binding(
+        session, chat_id, operation_binding
+    )
     attachments = await _save_images(cfg, chat_id, uploads)
     note = _attachment_note(attachments)
 
@@ -235,7 +244,7 @@ async def post_chat_message(
                 "attachments": item.get("attachments") or []}
                for item in detail["messages"]]
     user = await append_message(session, chat_id, role="user", content=body,
-                                attachments=attachments)
+                                attachments=attachments, operation_binding=binding)
     assistant = await append_message(session, chat_id, role="assistant", status="running")
     if assistant is None:                        # pragma: no cover - 会话刚查过，理论上不会
         raise NotFoundError(f"会话不存在：{session_id}", {"session_id": session_id})
@@ -320,27 +329,127 @@ async def get_chat_context(session_id: UuidPath, cfg: ConfigDep,
                         503: error_response("依赖不可用（不做降级，直接返回错误）")})
 async def post_chat_context_action(session_id: UuidPath, payload: ContextActionRequest,
                                    cfg: ConfigDep, session: SessionDep) -> dict[str, Any]:
-    """确认 / 拒绝 / 撤回 / 替换 / 切换话题（S7.24）；版本不一致返回 409。"""
+    """上下文用户动作（v2 §3.3A）：confirm / reject / retract / replace / reset_topic /
+    select_object / recover / complete_recovery。
+
+    - `action_id` 是幂等键：同 ID 同请求体重放返回原结果，不同请求体 409；
+    - `expected_state_version` 是 CAS 条件：不一致返回 409（响应带当前版本，前端刷新后重试）；
+    - `recover` 会调用一次恢复模型（按页扫描历史，候选全部待确认）；无授权配置时 400。
+    """
     chat_id = _uuid(session_id, what="会话")
-    applied, stored = await context_state.perform_action(
-        session,
-        chat_id,
-        action=payload.action,
-        target_id=payload.target_id or "",
-        value=payload.value or "",
-        expected_state_version=payload.expected_state_version,
-    )
-    decision = "applied" if applied.applied else (
-        "conflict" if applied.conflict else "noop"
-    )
+    caller: StructuredCaller | None = None
+    if payload.action == "recover":
+        from ...tools.http import build_http_client
+
+        async with build_http_client(cfg.llm.timeout_s) as client:
+            caller = StructuredCaller(
+                provider=build_provider(cfg, client=client),
+                max_repairs=int(cfg.context.extract_repair_max),
+            )
+            applied = await context_state.perform_action(
+                session, chat_id,
+                action=payload.action,
+                target_id=payload.target_id or "",
+                value=payload.value or "",
+                expected_state_version=payload.expected_state_version,
+                action_id=payload.action_id,
+                object_ref=payload.object_ref,
+                recovery_id=payload.recovery_id,
+                retry_of=payload.retry_of,
+                acknowledge_partial_history=payload.acknowledge_partial_history,
+                cfg=cfg,
+                caller=caller,
+            )
+    else:
+        applied = await context_state.perform_action(
+            session, chat_id,
+            action=payload.action,
+            target_id=payload.target_id or "",
+            value=payload.value or "",
+            expected_state_version=payload.expected_state_version,
+            action_id=payload.action_id,
+            object_ref=payload.object_ref,
+            recovery_id=payload.recovery_id,
+            retry_of=payload.retry_of,
+            acknowledge_partial_history=payload.acknowledge_partial_history,
+        )
+    stored = await context_state.load(session, chat_id)
+    assert stored is not None   # 动作内部已校验会话存在
+    decision = str(applied.get("decision") or "noop")
+    status = str(applied.get("status") or "succeeded")
+    if status == "interrupted" and applied.get("reason") in ("recovery_running",
+                                                             "recovery_retry_required"):
+        # 已有 running 认领 / 失败页需显式重试：202 + 当前上下文，不自动重试付费页
+        return {
+            **applied,
+            "decision": "noop",
+            "context": context_state.context_view(cfg, stored),
+        }
+    _ = decision
     return {
-        "session_id": str(chat_id),
-        "state_version": int(stored.state_version),
-        "action": payload.action,
-        "decision": decision,
-        "reason": applied.reason,
+        **applied,
         "context": context_state.context_view(cfg, stored),
     }
+
+
+@router.delete("/chat/sessions/{session_id}", status_code=204,
+               responses={404: error_response("资源不存在"),
+                          503: error_response("依赖不可用（不做降级，直接返回错误）")})
+async def delete_chat_session(session_id: UuidPath, cfg: ConfigDep,
+                              session: SessionDep) -> None:
+    """删除会话（v2 §3.3D）：级联状态 / 版本 / 缓存 / 观测，并清理该会话附件根内的文件。"""
+    chat_id = _uuid(session_id, what="会话")
+    deleted = await delete_session(session, cfg, chat_id)
+    if not deleted:
+        raise NotFoundError(f"会话不存在：{session_id}", {"session_id": session_id})
+    return None
+
+
+@router.post("/chat/sessions/{session_id}/artifacts/clue-versions",
+             response_model=ContextActionResponse,
+             responses={400: error_response("请求格式或参数不合法"),
+                        404: error_response("资源不存在"),
+                        409: error_response("状态版本冲突"),
+                        503: error_response("依赖不可用（不做降级，直接返回错误）")})
+async def create_clue_version(session_id: UuidPath, payload: ClueVersionRequest,
+                              cfg: ConfigDep, session: SessionDep) -> dict[str, Any]:
+    """保存用户编辑的线索版本（v2 §3.3C）：独立不可变业务版本，成功后设为选定引用。"""
+    chat_id = _uuid(session_id, what="会话")
+    applied = await context_state.edit_clue_version(
+        session, chat_id, cfg,
+        action_id=payload.action_id,
+        expected_state_version=payload.expected_state_version,
+        expected_head_version_id=payload.expected_head_version_id,
+        object_key=payload.object_key,
+        base_version_id=payload.base_version_id,
+        content=payload.content,
+    )
+    stored = await context_state.load(session, chat_id)
+    assert stored is not None
+    return {**applied, "context": context_state.context_view(cfg, stored)}
+
+
+@router.post("/chat/sessions/{session_id}/artifacts/{version_id}/select",
+             response_model=ContextActionResponse,
+             responses={400: error_response("请求格式或参数不合法"),
+                        404: error_response("资源不存在"),
+                        409: error_response("状态版本冲突"),
+                        503: error_response("依赖不可用（不做降级，直接返回错误）")})
+async def select_clue_version(session_id: UuidPath, version_id: UuidPath,
+                              payload: ClueSelectRequest, cfg: ConfigDep,
+                              session: SessionDep) -> dict[str, Any]:
+    """选定一个线索版本（v2 §3.3C）：只选同会话成功 clue 版本；推进状态版本并写审计。"""
+    _ = cfg
+    chat_id = _uuid(session_id, what="会话")
+    applied = await context_state.select_clue_version(
+        session, chat_id,
+        action_id=payload.action_id,
+        expected_state_version=payload.expected_state_version,
+        version_id=_uuid(version_id, what="版本"),
+    )
+    stored = await context_state.load(session, chat_id)
+    assert stored is not None
+    return {**applied, "context": context_state.context_view(cfg, stored)}
 
 
 @router.get("/chat/sessions/{session_id}/artifacts",

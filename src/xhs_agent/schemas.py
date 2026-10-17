@@ -766,7 +766,10 @@ FACT_STATUSES: tuple[str, ...] = (
     "retracted",
 )
 FACT_SCOPES: tuple[str, ...] = ("session", "topic", "artifact")
-CONTEXT_ACTIONS: tuple[str, ...] = ("confirm", "reject", "retract", "replace", "reset_topic")
+CONTEXT_ACTIONS: tuple[str, ...] = (
+    "confirm", "reject", "retract", "replace", "reset_topic",
+    "select_object", "recover", "complete_recovery",
+)
 OBJECT_TYPES: tuple[str, ...] = ("draft", "clue")
 VERSION_STATUSES: tuple[str, ...] = (
     "pending",
@@ -800,7 +803,14 @@ class ContextFact(BaseModel):
     evidence: str = ""
     created_version: int = 0
     replaces: str | None = None
+    # E7CTX-04（v2）：多项替代时记录全部被替换的旧事实 id；单项替代与 `replaces` 一致
+    replaces_fact_ids: list[str] = Field(default_factory=list)
     updated_at: str = Field(default_factory=now_iso)
+
+    @field_validator("replaces_fact_ids", mode="before")
+    @classmethod
+    def _norm_replace_ids(cls, value: Any) -> list[str]:
+        return _as_str_list(value)
 
     @field_validator("fact_id", "value", "scope_id", "evidence", "updated_at", mode="before")
     @classmethod
@@ -857,6 +867,7 @@ class ContextFact(BaseModel):
             "evidence": self.evidence,
             "created_version": self.created_version,
             "replaces": self.replaces,
+            "replaces_fact_ids": list(self.replaces_fact_ids),
             "updated_at": self.updated_at,
         }
 
@@ -888,11 +899,26 @@ class ContextProposal(BaseModel):
     source_ref: dict[str, Any] = Field(default_factory=dict)
     conflicts_with: list[str] = Field(default_factory=list)
     created_version: int = 0
+    # E7CTX-04 / v2（数据契约 §3.8）：提案保存拟执行操作与替代关系——
+    # 确认 replace 时按 `replaces_fact_ids` 原子替换旧项；旧提案兼容读取：
+    # 有 conflicts_with 映射为 replace，否则默认 add。
+    operation: str = "add"
+    replaces_fact_ids: list[str] = Field(default_factory=list)
+    target_object_ref: dict[str, Any] = Field(default_factory=dict)
+    source_message_ids: list[str] = Field(default_factory=list)
 
     @field_validator("proposal_id", "value", "scope_id", "reason", "evidence", mode="before")
     @classmethod
     def _norm_text(cls, value: Any) -> str:
         return _clean_str(value)
+
+    @field_validator("operation", mode="before")
+    @classmethod
+    def _norm_operation(cls, value: Any) -> str:
+        text = _clean_str(value) or "add"
+        if text not in ("add", "replace", "reset_topic", "select_object"):
+            raise ValueError("operation 只能是 add / replace / reset_topic / select_object")
+        return text
 
     @field_validator("source_ref", mode="before")
     @classmethod
@@ -935,14 +961,24 @@ class ContextProposal(BaseModel):
             "source_ref": dict(self.source_ref),
             "conflicts_with": list(self.conflicts_with),
             "created_version": self.created_version,
+            "operation": self.operation,
+            "replaces_fact_ids": list(self.replaces_fact_ids),
+            "target_object_ref": dict(self.target_object_ref),
+            "source_message_ids": list(self.source_message_ids),
         }
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> ContextProposal:
         if not isinstance(data, dict):
             raise SchemaError("提案必须是一个 JSON 对象")
+        payload = dict(data)
+        # 旧提案兼容读取：没有 operation 时按 conflicts_with 推导替代关系（数据契约 §3.8）
+        if "operation" not in payload:
+            conflicts = _as_str_list(payload.get("conflicts_with"))
+            payload["operation"] = "replace" if conflicts else "add"
+            payload.setdefault("replaces_fact_ids", conflicts)
         try:
-            return cls(**data)
+            return cls(**payload)
         except ValidationError as exc:
             raise _invalid("提案", exc) from exc
 

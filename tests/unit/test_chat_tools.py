@@ -411,7 +411,7 @@ class TestImageUsageAndFallback:
         seen: list[list[dict[str, Any]]] = []
 
         async def fake_image(
-            _ctx: ToolContext, attachments: list[dict[str, Any]]
+            _ctx: ToolContext, attachments: list[dict[str, Any]], **kwargs: Any
         ) -> ImageClueParse:
             seen.append(attachments)
             return merged
@@ -450,7 +450,7 @@ class TestImageUsageAndFallback:
         seen: list[list[dict[str, Any]]] = []
 
         async def fake_image(
-            _ctx: ToolContext, attachments: list[dict[str, Any]]
+            _ctx: ToolContext, attachments: list[dict[str, Any]], **kwargs: Any
         ) -> ImageClueParse:
             seen.append(attachments)
             return parsed
@@ -486,7 +486,7 @@ class TestImageUsageAndFallback:
         seen: list[list[dict[str, Any]]] = []
 
         async def fake_image(
-            _ctx: ToolContext, attachments: list[dict[str, Any]]
+            _ctx: ToolContext, attachments: list[dict[str, Any]], **kwargs: Any
         ) -> ImageClueParse:
             seen.append(attachments)
             return parsed
@@ -516,7 +516,7 @@ class TestImageUsageAndFallback:
         seen: list[list[dict[str, Any]]] = []
 
         async def fake_image(
-            _ctx: ToolContext, attachments: list[dict[str, Any]]
+            _ctx: ToolContext, attachments: list[dict[str, Any]], **kwargs: Any
         ) -> ImageClueParse:
             seen.append(attachments)
             return parsed
@@ -1335,7 +1335,7 @@ class TestPartialConsumptionOnFailure:
     ) -> None:
         """图片解析已成功、分析超时：视觉已知账目与 run 引用保留，未知单独标注。"""
 
-        async def fake_image(_ctx: Any, _group: Any) -> ImageClueParse:
+        async def fake_image(_ctx: Any, _group: Any, *, force_reparse: bool = False, **kwargs: Any) -> ImageClueParse:
             return self._parsed_image()
 
         async def fake_submit(*_args: Any, **_kwargs: Any) -> Any:

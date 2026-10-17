@@ -12,6 +12,7 @@ import type {
 } from '@/api/chat'
 import {
   createChatSession,
+  deleteChatSession,
   getChatContext,
   getChatSession,
   listChatSessions,
@@ -135,6 +136,10 @@ export const useChatStore = defineStore('chat', () => {
 
   // 上下文状态（S7.24）：生效 / 待确认事实与版本；刷新和每轮结束后都从服务端取回
   const context = ref<ChatContext | null>(null)
+  // v2 §3.3B：下一次改稿的基础版本绑定（只影响下一次操作，不切 head）
+  const selectedBase = ref<{ objectKey: string; versionId: string; versionNo: number } | null>(
+    null,
+  )
   const contextLoading = ref(false)
   const contextError = ref<string | null>(null)
 
@@ -397,15 +402,17 @@ export const useChatStore = defineStore('chat', () => {
     }
   }
 
-  /** 上下文动作（确认 / 拒绝 / 撤回 / 替换 / 换话题）。
+  /** 上下文动作（v2 §3.3A）：confirm / reject / retract / replace / reset_topic /
+   *  select_object / recover / complete_recovery。
    *
-   *  带 `expected_state_version` 做 CAS：409 时刷新面板并返回「状态已变化」，由用户重试——
-   *  前端不隐藏选项来代替服务端校验，也不在冲突时静默重放。
+   *  带 `expected_state_version` 做 CAS、带 `action_id` 做客户端幂等：409 时刷新面板并
+   *  返回「状态已变化」，由用户重新操作——前端不隐藏选项代替服务端校验，也不静默重放。
    */
   async function actOnContext(
     action: ContextActionRequest['action'],
     targetId?: string,
     value?: string,
+    extra?: Partial<ContextActionRequest>,
   ): Promise<string | null> {
     const sessionId = currentId.value
     const current = context.value
@@ -414,9 +421,11 @@ export const useChatStore = defineStore('chat', () => {
       const body: ContextActionRequest = {
         action,
         expected_state_version: current.state_version,
+        action_id: crypto.randomUUID(),
       }
       if (targetId !== undefined && targetId !== '') body.target_id = targetId
       if (value !== undefined && value !== '') body.value = value
+      if (extra) Object.assign(body, extra)
       const result = await postChatContextAction(sessionId, body)
       if (currentId.value === sessionId) context.value = result.context
       return null
@@ -427,6 +436,32 @@ export const useChatStore = defineStore('chat', () => {
       }
       return describeError(err)
     }
+  }
+
+  /** 开始 / 继续旧会话恢复（每页一次付费模型调用，不自动重试）。 */
+  async function startRecovery(): Promise<string | null> {
+    return actOnContext('recover')
+  }
+
+  /** 完成恢复：候选清零；有历史缺口时必须显式确认已核对。 */
+  async function completeRecovery(acknowledgePartialHistory = false): Promise<string | null> {
+    return actOnContext('complete_recovery', undefined, undefined,
+                        { acknowledge_partial_history: acknowledgePartialHistory })
+
+  }
+
+  /** 删除当前会话并清空本地视图（v2 §3.3D）。 */
+  async function removeSession(): Promise<string | null> {
+    const sessionId = currentId.value
+    if (sessionId === null) return '没有可删除的会话'
+    try {
+      await deleteChatSession(sessionId)
+    } catch (err) {
+      return describeError(err)
+    }
+    reset()
+    await loadSessions()
+    return null
   }
 
   async function loadSessions(): Promise<void> {
@@ -601,9 +636,20 @@ export const useChatStore = defineStore('chat', () => {
     progress.value = null
     progressScope.value = { messageId: '', turnId: '' }
     try {
-      await streamMessage(sessionId, { text, files }, (event) => {
+      // v2 §3.3B：选择了基础版本时携带结构化绑定（服务端校验后随用户消息持久保存）
+      const binding = selectedBase.value && context.value !== null
+        ? JSON.stringify({
+            operation: 'revise_draft',
+            object_key: selectedBase.value.objectKey,
+            base_version_id: selectedBase.value.versionId,
+            expected_state_version: context.value.state_version,
+          })
+        : undefined
+      await streamMessage(sessionId, { text, files, operationBinding: binding },
+                          (event) => {
         onStreamEvent(event.event, event.data)
       })
+      selectedBase.value = null   // 绑定只作用于下一次明确操作
     } catch (err) {
       error.value = describeError(err)
     } finally {
@@ -651,8 +697,9 @@ export const useChatStore = defineStore('chat', () => {
     currentId, currentSession, messages, messagesLoading,
     sending, busy, streamText, toolSteps, error, runs,
     progress, stageElapsedMs, stageLongRunning,
-    context, contextLoading, contextError,
-    loadSessions, loadContext, actOnContext,
+    context, contextLoading, contextError, selectedBase,
+    loadSessions, loadContext, actOnContext, startRecovery, completeRecovery,
+    removeSession,
     init, newSession, openSession, refreshMessages, send, ensureRun, reset,
     stopPolling, toolLabel,
   }

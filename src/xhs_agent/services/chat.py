@@ -22,6 +22,7 @@
 
 from __future__ import annotations
 
+import logging
 import os
 import uuid
 from datetime import UTC, datetime, timedelta
@@ -85,17 +86,27 @@ def attachment_target(cfg: AppConfig, session_id: uuid.UUID | str, mime: str) ->
 def save_attachment(
     cfg: AppConfig, session_id: uuid.UUID | str, data: bytes, *, name: str, mime: str
 ) -> dict[str, Any]:
-    """把一张图片附件写盘（同步；调用方用 `asyncio.to_thread`），返回消息里要存的引用。"""
+    """把一张图片附件写盘（同步；调用方用 `asyncio.to_thread`），返回消息里要存的引用。
+
+    E7CTX-10（v2）：上传时保存内容身份（sha256）与文件元数据（实际 bytes、mtime_ns）——
+    命中前的校验据此判断"外部内容是否被改过"，不能只信旧摘要。
+    """
+    import hashlib
+    from pathlib import Path as _Path
+
     target = attachment_target(cfg, session_id, mime)
     os.makedirs(os.path.dirname(target), exist_ok=True)
     with open(target, "wb") as handle:
         handle.write(data)
+    stat = _Path(target).stat()
     return {
         "kind": "image",
         "name": os.path.basename(str(name or "image")),
         "mime": mime,
         "bytes": len(data),
         "path": _relative(target),
+        "sha256": hashlib.sha256(data).hexdigest(),
+        "mtime_ns": stat.st_mtime_ns,
     }
 
 
@@ -166,6 +177,7 @@ def message_view(row: ChatMessage) -> dict[str, Any]:
         "trace_id": row.trace_id,
         # 旧行 / 还没写快照时是空对象，对外折成 null（契约允许）；有快照才给 `StageInfo`
         "progress": _progress_view(row.progress),
+        "operation_binding": dict(row.operation_binding) if row.operation_binding else None,
         "cost_cny": float(row.cost_cny or 0),
         "latency_ms": int(row.latency_ms or 0),
         "prompt_tokens": int(row.prompt_tokens or 0),
@@ -357,6 +369,7 @@ async def append_message(
     turn_id: str | None = None,
     trace_id: str | None = None,
     progress: dict[str, Any] | None = None,
+    operation_binding: dict[str, Any] | None = None,
     error: str | None = None,
 ) -> dict[str, Any] | None:
     """追加一条消息并刷新会话的 `updated_at`；会话不存在返回 None（接口层折 404）。
@@ -380,6 +393,7 @@ async def append_message(
         turn_id=uuid.UUID(str(turn_id)) if turn_id else None,
         trace_id=str(trace_id) if trace_id else None,
         progress=dict(progress or {}),
+        operation_binding=dict(operation_binding) if operation_binding else None,
         cost_cny=Decimal(f"{float(cost_cny or 0):.4f}"),
         latency_ms=int(latency_ms or 0),
         prompt_tokens=int(prompt_tokens or 0),
@@ -524,3 +538,53 @@ async def mark_stale_turns(
         )
     await session.commit()
     return changed
+
+
+async def delete_session(
+    session: AsyncSession, cfg: AppConfig, session_id: uuid.UUID
+) -> bool:
+    """删除会话及其级联数据，并清理**该会话附件根内**的文件（v2 §3.3D）。
+
+    - 会话不存在返回 False（接口层折 404）；
+    - 状态、版本、缓存与观测随外键级联删除（数据契约 §3.8–3.11）；
+    - 文件清理只处理解析验证过、位于 `<runs>/_chat/<session_id>/` 内的附件；
+      单个文件删除失败记录警告，不恢复已删除会话，也不扩大到其他目录。
+    """
+    row = (
+        await session.execute(select(ChatSession).where(ChatSession.id == session_id))
+    ).scalar_one_or_none()
+    if row is None:
+        return False
+    attachment_rows = list(
+        (
+            await session.execute(
+                select(ChatMessage.attachments).where(
+                    ChatMessage.session_id == session_id
+                )
+            )
+        ).scalars().all()
+    )
+    targets: list[str] = []
+    for attachments in attachment_rows:
+        for item in attachments or []:
+            path = str((item or {}).get("path") or "")
+            if not path:
+                continue
+            try:
+                targets.append(resolve_attachment(cfg, session_id, path))
+            except NotFoundError:
+                continue   # 已缺失的附件不需要清理
+    await session.delete(row)
+    await session.commit()
+    root = os.path.realpath(chat_root(cfg) + os.sep + str(session_id))
+    for target in targets:
+        resolved = os.path.realpath(target)
+        if resolved != root and not resolved.startswith(root + os.sep):
+            continue   # 防御：只清理本会话目录内的文件
+        try:
+            os.remove(resolved)
+        except OSError as exc:
+            logging.getLogger("xhs_agent.chat").warning(
+                "会话附件清理失败（不恢复会话）：%s %s", resolved, exc
+            )
+    return True

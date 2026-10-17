@@ -23,7 +23,6 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from ..schemas import (
-    MAX_FACTS_PER_SCOPE,
     ContextDelta,
     ContextFact,
     ContextOperation,
@@ -92,6 +91,19 @@ def _same_value(left: str, right: str) -> bool:
     return _norm(left) == _norm(right)
 
 
+def _load_ref(value: Any) -> dict[str, Any]:
+    """对象引用的宽松解析：dict 直用；JSON 字符串解析失败返回空 dict（由上层报无操作）。"""
+    import json
+
+    if not value:
+        return {}
+    try:
+        parsed = json.loads(str(value))
+    except (TypeError, ValueError):
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
 def _find_fact(snapshot: ContextSnapshot, fact_id: str) -> ContextFact | None:
     for fact in snapshot.facts:
         if fact.fact_id == fact_id:
@@ -130,6 +142,9 @@ def _append_proposal(
     message_id: str,
     version: int,
     conflicts_with: list[str] | None = None,
+    operation: str = "add",
+    replaces_fact_ids: list[str] | None = None,
+    target_object_ref: dict[str, Any] | None = None,
 ) -> ContextProposal | None:
     for item in proposals:
         if item.kind == kind and _same_value(item.value, value) and item.scope == scope:
@@ -146,6 +161,10 @@ def _append_proposal(
             source_ref={"message_id": message_id},
             conflicts_with=list(conflicts_with or []),
             created_version=version,
+            operation=operation,
+            replaces_fact_ids=list(replaces_fact_ids or []),
+            target_object_ref=dict(target_object_ref or {}),
+            source_message_ids=[message_id] if message_id else [],
         )
     except SchemaError:
         return None
@@ -153,56 +172,40 @@ def _append_proposal(
     return proposal
 
 
-def _cap_facts(snapshot: ContextSnapshot, *, version: int) -> list[str]:
-    """作用域内事实过多时归档最旧的**非 session** 项；返回被归档的 fact_id。
-
-    session 级限制不自动丢——它们只在用户撤回 / 替换时失效（方案 §4.1）。
-    """
-    by_scope: dict[str, list[ContextFact]] = {}
-    for fact in snapshot.facts:
-        if fact.scope != "session":
-            by_scope.setdefault(fact.scope_id or fact.scope, []).append(fact)
-    archived: list[str] = []
-    for _key, items in by_scope.items():
-        active = [item for item in items if item.status == "active"]
-        if len(active) <= MAX_FACTS_PER_SCOPE:
-            continue
-        overflow = len(active) - MAX_FACTS_PER_SCOPE
-        for fact in sorted(active, key=lambda item: (item.created_version, item.fact_id))[:overflow]:
-            index = next(
-                (i for i, item in enumerate(snapshot.facts) if item is fact), -1
-            )
-            if index < 0:  # pragma: no cover - 列表由上面同一批对象构成
-                continue
-            archived_fact = fact.model_copy(update={"status": "superseded"})
-            snapshot.facts[index] = archived_fact
-            snapshot.archived.append(archived_fact)
-            archived.append(fact.fact_id)
-    _ = version
-    return archived
-
-
 @dataclass
 class DeltaResult:
-    """一次增量的应用结果。"""
+    """一次增量的应用结果。
+
+    E7CTX-01：撤回 / 替换都是真实状态变更——`retracted` / `superseded` 参与变更判定，
+    不再把"applied"当唯一依据。E7CTX-03：任何一条操作验证失败（证据 / 目标 / 作用域）
+    时**整批不提交**（`invalid=True`），依赖工具不得启动；等价重复项是无操作，不算失败。
+    """
 
     snapshot: ContextSnapshot
     decisions: list[dict[str, Any]] = field(default_factory=list)
     applied: int = 0
     pending: int = 0
     rejected: int = 0
+    retracted: int = 0
+    superseded: int = 0
+    invalid: bool = False
+    invalid_reason: str = ""
 
     @property
     def changed(self) -> bool:
-        return bool(self.applied or self.pending)
+        return bool(self.applied or self.pending or self.retracted or self.superseded)
 
 
 @dataclass
 class ActionResult:
-    """一次用户动作的应用结果。"""
+    """一次用户动作的应用结果。
+
+    `decision=conflict` 表示确认替换时旧项已变化（E7CTX-04）：服务层把它折成 409，
+    不留下"旧项已撤销、新项未落库"的半状态。
+    """
 
     snapshot: ContextSnapshot
-    decision: str = "applied"       # applied / noop
+    decision: str = "applied"       # applied / noop / conflict
     reason: str = ""
     event_type: str = "confirm"
 
@@ -225,51 +228,99 @@ def apply_delta(
 ) -> DeltaResult:
     """把抽取增量应用到快照副本上（不写库；调用方负责 CAS / 审计）。
 
-    `version` 是**本次变更后的版本号**（调用方按当前版本 +1 分配）；事实与提案的
-    `created_version` 都记它，便于审计回放。
+    两段式（E7CTX-03）：先**整批校验**（证据 / 目标 / 作用域），任何一条硬性验证失败
+    都不提交、依赖工具不启动；等价重复项是正常无操作。`version` 是本次变更后的版本号
+    （调用方按当前版本 +1 分配），事实与提案的 `created_version` 都记它。
     """
     working = snapshot.model_copy(deep=True)
     result = DeltaResult(snapshot=working)
     refs = list(refs or [])
 
+    # ---- 第一段：整批验证（不改动快照）----
+    validation_failures: list[str] = []
+    plan: list[tuple[Any, dict[str, Any]]] = []   # ("op", outcome) 或 ("proposal", outcome)
     for op in delta.operations:
-        decision = _apply_operation(
-            working, op, user_text=user_text, message_id=message_id,
-            version=version, topic_id=topic_id, refs=refs,
-        )
-        result.decisions.append(decision)
-        if decision["decision"] == "applied":
-            result.applied += 1
-        elif decision["decision"] == "pending_confirmation":
-            result.pending += 1
+        outcome = _validate_operation(working, op, user_text=user_text, topic_id=topic_id,
+                                      refs=refs)
+        if outcome["decision"] in ("applied", "retracted", "superseded", "pending_confirmation"):
+            plan.append((op, outcome))
+            result.decisions.append(outcome)
+        elif outcome["decision"] == "noop":
+            result.decisions.append(outcome)   # 等价重复：无操作，不算失败
         else:
-            result.rejected += 1
-
+            validation_failures.append(str(outcome.get("reason") or "invalid"))
+            result.decisions.append(outcome)
     for raw in delta.proposals:
-        mark = _apply_proposal(
-            working, raw, user_text=user_text, message_id=message_id,
-            version=version, topic_id=topic_id, refs=refs,
-        )
-        result.decisions.append(mark)
-        if mark["decision"] == "pending_confirmation":
-            result.pending += 1
+        outcome = _validate_proposal(raw, user_text=user_text, topic_id=topic_id, refs=refs)
+        if outcome["decision"] == "pending_confirmation":
+            plan.append(("proposal", outcome))
+            result.decisions.append(outcome)
+        elif outcome["decision"] == "noop":
+            result.decisions.append(outcome)
         else:
-            result.rejected += 1
+            validation_failures.append(str(outcome.get("reason") or "invalid"))
+            result.decisions.append(outcome)
 
-    _cap_facts(working, version=version)
+    if validation_failures:
+        # 整批不提交：快照保持原样，由调用方停止依赖本次增量的任务
+        result.invalid = True
+        result.invalid_reason = validation_failures[0]
+        result.snapshot = snapshot.model_copy(deep=True)
+        result.applied = result.pending = result.retracted = result.superseded = 0
+        return result
+
+    # ---- 第二段：按计划应用（此时快照才会变化）----
+    for _item, outcome in plan:
+        if _item == "proposal":
+            mark = _commit_proposal(
+                working, outcome, user_text=user_text, message_id=message_id,
+                version=version, topic_id=topic_id, refs=refs,
+            )
+            result.decisions[result.decisions.index(outcome)] = mark
+            if mark["decision"] == "pending_confirmation":
+                result.pending += 1
+            continue
+        decision = outcome["decision"]
+        if decision == "applied":
+            fact = _commit_add(working, outcome, message_id=message_id, version=version,
+                               topic_id=topic_id)
+            result.applied += 1
+            _ = fact
+        elif decision == "retracted":
+            _mark_status(working, _find_fact(working, outcome["fact_id"]) or working.facts[0],
+                         "retracted", version)
+            result.retracted += 1
+        elif decision == "superseded":
+            replaced = _commit_replace(working, outcome, message_id=message_id,
+                                       version=version, topic_id=topic_id)
+            result.superseded += 1
+            _ = replaced
+        elif decision == "pending_confirmation":
+            body = outcome.get("proposal")
+            if body is not None:
+                mark = _commit_proposal(
+                    working, outcome, user_text=user_text, message_id=message_id,
+                    version=version, topic_id=topic_id, refs=refs,
+                )
+                result.decisions[result.decisions.index(outcome)] = mark
+            result.pending += 1
+
     return result
 
 
-def _apply_operation(
+def _validate_operation(
     working: ContextSnapshot,
     op: ContextOperation,
     *,
     user_text: str,
-    message_id: str,
-    version: int,
     topic_id: str,
     refs: list[dict[str, Any]],
 ) -> dict[str, Any]:
+    """单条操作的**验证**（只读）：返回裁决，不改快照。
+
+    `applied` / `retracted` / `superseded` / `pending_confirmation` 表示验证通过、可执行；
+    `noop` 表示等价重复；其余（`rejected` + reason）是硬性验证失败，触发整批拒绝。
+    """
     if not evidence_in(user_text, op.evidence):
         return _decision(op.target_fact_id or "", op.kind, "rejected", "evidence_mismatch")
 
@@ -279,25 +330,25 @@ def _apply_operation(
             return _decision(op.target_fact_id, op.kind or target_kind(target),
                              "rejected", "target_missing")
         if target.status not in ("active", "pending_confirmation"):
-            return _decision(target.fact_id, target.kind, "rejected", "target_inactive")
+            # 重复撤回 / 替换已失效事实 = 无操作（E7CTX-01：不推进版本，也不算批失败）
+            return _decision(target.fact_id, target.kind, "noop", "target_inactive")
         if op.op == "retract":
-            _mark_status(working, target, "retracted", version)
             return _decision(target.fact_id, target.kind, "retracted", "explicit_retract")
-        return _replace_fact(
-            working, target, op, message_id=message_id, version=version, topic_id=topic_id,
-        )
+        return {
+            **_decision(target.fact_id, target.kind, "superseded", "explicit_replace"),
+            "value": op.value, "evidence": op.evidence,
+        }
 
     # ---- add ----
     scope, scope_id, reject = _resolve_scope(
         scope=op.scope, scope_id=op.scope_id, topic_id=topic_id, refs=refs,
     )
     if reject:
-        _append_proposal(
-            working.proposals, kind=op.kind, value=op.value, scope="topic",
-            scope_id=topic_id, reason=reject, evidence=op.evidence,
-            message_id=message_id, version=version,
-        )
-        return _decision("", op.kind, "pending_confirmation", reject)
+        return {
+            **_decision("", op.kind, "pending_confirmation", reject),
+            "proposal": {"kind": op.kind, "value": op.value, "scope": "topic",
+                         "scope_id": topic_id, "reason": reject, "evidence": op.evidence},
+        }
 
     for fact in working.facts:
         if (
@@ -307,7 +358,7 @@ def _apply_operation(
             and (fact.scope_id or "") == (scope_id or "")
             and _same_value(fact.value, op.value)
         ):
-            return _decision(fact.fact_id, fact.kind, "rejected", "duplicate")
+            return _decision(fact.fact_id, fact.kind, "noop", "duplicate")
 
     conflicts = [
         fact.fact_id
@@ -320,29 +371,144 @@ def _apply_operation(
         and numeric_conflict(op.value, fact.value)
     ]
     if conflicts:
-        proposal = _append_proposal(
-            working.proposals, kind=op.kind, value=op.value, scope=scope,
-            scope_id=scope_id, reason="conflict", evidence=op.evidence,
-            message_id=message_id, version=version, conflicts_with=conflicts,
-        )
-        return _decision(
-            proposal.proposal_id if proposal else "", op.kind,
-            "pending_confirmation", "conflict",
-        )
+        return {
+            **_decision("", op.kind, "pending_confirmation", "conflict"),
+            "proposal": {"kind": op.kind, "value": op.value, "scope": scope,
+                         "scope_id": scope_id, "reason": "conflict",
+                         "evidence": op.evidence, "conflicts_with": conflicts,
+                         "operation": "replace", "replaces_fact_ids": conflicts},
+        }
 
+    return {
+        **_decision("", op.kind, "applied", op.reason or "explicit_add"),
+        "scope": scope, "scope_id": scope_id,
+        "value": op.value, "evidence": op.evidence,
+    }
+
+
+def _validate_proposal(
+    raw: dict[str, Any],
+    *,
+    user_text: str,
+    topic_id: str,
+    refs: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """提案内容的验证（只读）：证据缺失允许（提案可以无证据），证据错误拒绝。"""
+    kind = str(raw.get("kind") or "").strip()
+    value = str(raw.get("value") or "").strip()
+    reason = str(raw.get("reason") or "inferred").strip() or "inferred"
+    evidence = str(raw.get("evidence") or "").strip()
+    if evidence and not evidence_in(user_text, evidence):
+        return _decision("", kind, "rejected", "evidence_mismatch")
+    if not value:
+        return _decision("", kind, "rejected", "value_required")
+    scope, scope_id, reject = _resolve_scope(
+        scope=str(raw.get("scope") or "topic"), scope_id=str(raw.get("scope_id") or ""),
+        topic_id=topic_id, refs=refs,
+    )
+    if reject:
+        reason = reject
+    conflicts = [str(item) for item in (raw.get("conflicts_with") or []) if str(item)]
+    operation = str(raw.get("operation") or ("replace" if conflicts else "add"))
+    return {
+        **_decision("", kind, "pending_confirmation", reason),
+        "proposal": {
+            "kind": kind, "value": value, "scope": scope, "scope_id": scope_id,
+            "reason": reason, "evidence": evidence, "conflicts_with": conflicts,
+            "operation": operation,
+            "replaces_fact_ids": [str(x) for x in (raw.get("replaces_fact_ids") or conflicts)],
+            "target_object_ref": dict(raw.get("target_object_ref") or {}),
+        },
+    }
+
+
+def _commit_add(
+    working: ContextSnapshot,
+    outcome: dict[str, Any],
+    *,
+    message_id: str,
+    version: int,
+    topic_id: str,
+) -> ContextFact:
+    op_kind = str(outcome.get("kind") or "goal")
     fact = ContextFact(
         fact_id=new_fact_id(),
-        kind=op.kind,
-        value=op.value,
+        kind=op_kind,
+        value=str(outcome.get("value") or ""),
+        scope=str(outcome.get("scope") or "topic"),
+        scope_id=str(outcome.get("scope_id") or (topic_id if outcome.get("scope") == "topic" else "")),
+        status="active",
+        source_ref={"message_id": message_id},
+        evidence=str(outcome.get("evidence") or ""),
+        created_version=version,
+    )
+    working.facts.append(fact)
+    return fact
+
+
+def _commit_replace(
+    working: ContextSnapshot,
+    outcome: dict[str, Any],
+    *,
+    message_id: str,
+    version: int,
+    topic_id: str,
+) -> ContextFact:
+    target = _find_fact(working, str(outcome.get("fact_id") or ""))
+    assert target is not None  # 验证段已确认存在
+    scope, scope_id, reject = _resolve_scope(
+        scope=target.scope, scope_id=target.scope_id, topic_id=topic_id,
+        refs=working.object_refs,
+    )
+    if reject:  # pragma: no cover - 验证段已解析过作用域
+        scope, scope_id = target.scope, target.scope_id
+    _mark_status(working, target, "superseded", version)
+    replacement = ContextFact(
+        fact_id=new_fact_id(),
+        kind=target.kind,
+        value=str(outcome.get("value") or ""),
         scope=scope,
         scope_id=scope_id,
         status="active",
         source_ref={"message_id": message_id},
-        evidence=op.evidence,
+        evidence=str(outcome.get("evidence") or ""),
         created_version=version,
+        replaces=target.fact_id,
     )
-    working.facts.append(fact)
-    return _decision(fact.fact_id, fact.kind, "applied", op.reason or "explicit_add")
+    working.facts.append(replacement)
+    return replacement
+
+
+def _commit_proposal(
+    working: ContextSnapshot,
+    outcome: dict[str, Any],
+    *,
+    user_text: str,
+    message_id: str,
+    version: int,
+    topic_id: str,
+    refs: list[dict[str, Any]],
+) -> dict[str, Any]:
+    body = dict(outcome.get("proposal") or {})
+    proposal = _append_proposal(
+        working.proposals,
+        kind=str(body.get("kind") or ""),
+        value=str(body.get("value") or ""),
+        scope=str(body.get("scope") or "topic"),
+        scope_id=str(body.get("scope_id") or ""),
+        reason=str(body.get("reason") or "inferred"),
+        evidence=str(body.get("evidence") or ""),
+        message_id=message_id,
+        version=version,
+        conflicts_with=[str(x) for x in (body.get("conflicts_with") or [])],
+        operation=str(body.get("operation") or "add"),
+        replaces_fact_ids=[str(x) for x in (body.get("replaces_fact_ids") or [])],
+        target_object_ref=dict(body.get("target_object_ref") or {}),
+    )
+    if proposal is None:
+        return _decision("", str(body.get("kind") or ""), "noop", "invalid_or_duplicate")
+    return _decision(proposal.proposal_id, proposal.kind, "pending_confirmation",
+                     proposal.reason)
 
 
 def target_kind(fact: ContextFact | None) -> str:
@@ -381,39 +547,6 @@ def _replace_fact(
     )
     working.facts.append(replacement)
     return _decision(replacement.fact_id, replacement.kind, "applied", "explicit_replace")
-
-
-def _apply_proposal(
-    working: ContextSnapshot,
-    raw: dict[str, Any],
-    *,
-    user_text: str,
-    message_id: str,
-    version: int,
-    topic_id: str,
-    refs: list[dict[str, Any]],
-) -> dict[str, Any]:
-    kind = str(raw.get("kind") or "").strip()
-    value = str(raw.get("value") or "").strip()
-    reason = str(raw.get("reason") or "inferred").strip() or "inferred"
-    evidence = str(raw.get("evidence") or "").strip()
-    if evidence and not evidence_in(user_text, evidence):
-        return _decision("", kind, "rejected", "evidence_mismatch")
-    scope, scope_id, reject = _resolve_scope(
-        scope=str(raw.get("scope") or "topic"), scope_id=str(raw.get("scope_id") or ""),
-        topic_id=topic_id, refs=refs,
-    )
-    if reject:
-        reason = reject
-    conflicts = [str(item) for item in (raw.get("conflicts_with") or []) if str(item)]
-    proposal = _append_proposal(
-        working.proposals, kind=kind, value=value, scope=scope, scope_id=scope_id,
-        reason=reason, evidence=evidence, message_id=message_id, version=version,
-        conflicts_with=conflicts,
-    )
-    if proposal is None:
-        return _decision("", kind, "rejected", "invalid_or_duplicate")
-    return _decision(proposal.proposal_id, kind, "pending_confirmation", reason)
 
 
 def _mark_status(
@@ -469,9 +602,40 @@ def apply_action(
         )
         if proposal is None:
             return ActionResult(snapshot=working, decision="noop", reason="proposal_missing")
-        working.proposals = [item for item in working.proposals if item.proposal_id != target]
         if action == "reject":
+            working.proposals = [
+                item for item in working.proposals if item.proposal_id != target
+            ]
             return ActionResult(snapshot=working, event_type="reject")
+
+        # ---- 确认替换（E7CTX-04）：原子校验旧项 → 全部置 superseded → 新事实记录替代集合 ----
+        replace_ids = list(proposal.replaces_fact_ids) or list(proposal.conflicts_with)
+        if proposal.operation == "replace" and replace_ids:
+            targets: list[ContextFact] = []
+            for fact_id in replace_ids:
+                old = _find_fact(working, fact_id)
+                if old is None or old.status != "active":
+                    return ActionResult(
+                        snapshot=snapshot.model_copy(deep=True),   # 原快照原样返回
+                        decision="conflict",
+                        reason="replace_target_changed",
+                        event_type="confirm",
+                    )
+                targets.append(old)
+            for old in targets:
+                _mark_status(working, old, "superseded", version)
+        if proposal.operation == "select_object":
+            # 对象未解析的提案不能只靠确认生效：必须带完整对象引用（服务层再验证归属）
+            ref = dict(proposal.target_object_ref or {})
+            if not str(ref.get("object_key") or ""):
+                return ActionResult(snapshot=working, decision="noop",
+                                    reason="object_ref_required")
+            working.object_refs = [
+                item for item in working.object_refs
+                if str(item.get("object_key") or "") != str(ref.get("object_key") or "")
+            ]
+            working.object_refs.append(ref)
+        replaces = replace_ids if proposal.operation == "replace" else []
         fact = ContextFact(
             fact_id=new_fact_id(),
             kind=proposal.kind,
@@ -489,9 +653,25 @@ def apply_action(
             },
             evidence=proposal.evidence or "用户确认",
             created_version=version,
+            replaces=replaces[0] if len(replaces) == 1 else None,
+            replaces_fact_ids=replaces,
         )
         working.facts.append(fact)
+        working.proposals = [
+            item for item in working.proposals if item.proposal_id != target
+        ]
         return ActionResult(snapshot=working, event_type="confirm")
+
+    if action == "select_object":
+        ref = value if isinstance(value, dict) else _load_ref(value)
+        if not str(ref.get("object_key") or ""):
+            return ActionResult(snapshot=working, decision="noop", reason="object_ref_required")
+        working.object_refs = [
+            item for item in working.object_refs
+            if str(item.get("object_key") or "") != str(ref.get("object_key") or "")
+        ]
+        working.object_refs.append(ref)
+        return ActionResult(snapshot=working, event_type="select_object")
 
     if action == "retract" and target:
         target_fact = _find_fact(working, target)
@@ -532,8 +712,8 @@ def apply_action(
 # ---------------------------------------------------------------------------
 
 
-def render_state(snapshot: ContextSnapshot, *, limit: int = 20) -> str:
-    """现有状态 → 抽取 prompt 的 `state` 占位符（只给生效 / 待确认项，最多 20 条）。"""
+def render_state(snapshot: ContextSnapshot) -> str:
+    """现有状态 → 抽取 prompt 的 `state` 占位符（E7CTX-02：全部生效 / 待确认项，不截断）。"""
     import json
 
     items: list[dict[str, Any]] = []
@@ -548,7 +728,7 @@ def render_state(snapshot: ContextSnapshot, *, limit: int = 20) -> str:
              "scope": proposal.scope, "scope_id": proposal.scope_id,
              "status": "pending_confirmation"}
         )
-    return json.dumps(items[:limit], ensure_ascii=False)
+    return json.dumps(items, ensure_ascii=False)
 
 
 def fact_view(fact: ContextFact) -> dict[str, Any]:

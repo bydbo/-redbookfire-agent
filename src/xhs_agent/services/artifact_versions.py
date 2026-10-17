@@ -40,6 +40,57 @@ INITIAL_REQUEST_PREFIX = "init:"
 TERMINAL_STATUSES = ("succeeded", "failed", "refused", "interrupted")
 
 
+def normalize_draft_content(content: dict[str, Any] | None) -> dict[str, Any]:
+    """把版本内容归一成**完整 Draft**（E7CTX-06）。
+
+    - 顶层已是合法 Draft（`titles` / `body` / `tags`）→ 原样返回（校验后）；
+    - 旧包裹 `{"draft": {...}}` 或 `{"revised": {...}}`（二选一）→ 校验后取内层；
+    - 两个包裹同时存在且内容不同 → 拒绝（`artifact_version_mismatch`），不任选一个；
+    - 无法识别 → 抛 `ConflictError`（`reason=artifact_version_mismatch`）。
+      **没有"读取失败就回落运行初稿"的路径**——那正是 E7CTX-06 的缺陷。
+    """
+    body = dict(content or {})
+    if not body:
+        raise ConflictError(
+            "版本内容缺失，无法读取基础正文",
+            {"reason": "artifact_version_mismatch", "retryable": False},
+        )
+    if _is_draft(body):
+        return _validate_draft(body)
+    has_draft = isinstance(body.get("draft"), dict)
+    has_revised = isinstance(body.get("revised"), dict)
+    if has_draft and has_revised:
+        raise ConflictError(
+            "版本内容同时携带 draft 与 revised 包裹，无法确定正文",
+            {"reason": "artifact_version_mismatch", "retryable": False},
+        )
+    if has_draft:
+        return _validate_draft(dict(body["draft"]))
+    if has_revised:
+        return _validate_draft(dict(body["revised"]))
+    raise ConflictError(
+        "版本内容结构无法识别（既不是 Draft 也不是已知包裹）",
+        {"reason": "artifact_version_mismatch", "retryable": False},
+    )
+
+
+def _is_draft(body: dict[str, Any]) -> bool:
+    return isinstance(body.get("body"), str) and bool(str(body.get("body") or "").strip())
+
+
+def _validate_draft(payload: dict[str, Any]) -> dict[str, Any]:
+    from ..schemas import Draft, SchemaError
+
+    try:
+        draft = Draft.from_dict(dict(payload))
+    except SchemaError as exc:
+        raise ConflictError(
+            f"版本内容不符合 Draft 结构：{exc}",
+            {"reason": "artifact_version_mismatch", "retryable": False},
+        ) from exc
+    return draft.to_dict()
+
+
 def object_key(object_type: str, run_id: str, position: int) -> str:
     """对象键：`draft:<run_id>:<position>` / `clue:<run_id>:<position>`。"""
     return f"{object_type}:{run_id}:{int(position)}"
@@ -89,10 +140,15 @@ async def claim(
     request_key_value: str,
     source: dict[str, Any] | None = None,
     base_version_id: uuid.UUID | None = None,
+    expected_head_version_id: uuid.UUID | None = None,
+    expected_state_version: int | None = None,
+    source_message_id: str | None = None,
 ) -> ClaimResult:
     """认领一次生成请求；重复的 `request_key` 返回既有行（`is_new=False`）。
 
-    先提交认领行，再发付费调用——进程退出时留 `pending`，由读侧显示"状态不明"并提供受控重试。
+    E7CTX-07：认领时**持久保存**实际基础版本、生成前 head、预期状态版本与来源消息；
+    提交时比较当前 head 与生成前 head（不要求基础等于 head）。先提交认领行，再发付费
+    调用——进程退出时留 `pending`，由读侧显示"状态不明"并提供受控重试。
     """
     statement = (
         insert(ChatArtifactVersion)
@@ -105,6 +161,9 @@ async def claim(
             request_key=request_key_value,
             status="pending",
             base_version_id=base_version_id,
+            expected_head_version_id=expected_head_version_id,
+            expected_state_version=expected_state_version,
+            source_message_id=_uuid_or_none(source_message_id),
             source=dict(source or {}),
         )
         .on_conflict_do_nothing(constraint="uq_chat_artifact_versions_session_request")
@@ -139,14 +198,19 @@ async def ensure_initial(
     session_id: uuid.UUID,
     object_key_value: str,
     object_type: str,
-    run_id: str,
-    position: int,
+    run_id: str | None,
+    position: int | None,
     content: dict[str, Any],
     source: dict[str, Any] | None = None,
     prompt_versions: dict[str, int] | None = None,
 ) -> ChatArtifactVersion:
-    """把运行初稿登记为对象首个成功版本（幂等）；不修改 `run_hotspots.draft`。"""
+    """把运行初稿登记为对象首个成功版本（幂等）；不修改 `run_hotspots.draft`。
+
+    E7CTX-07：锁内**重查**一次——两个首次请求竞争时，后到者在锁内读到已登记行直接返回，
+    不再撞唯一约束。
+    """
     key = f"{INITIAL_REQUEST_PREFIX}{object_key_value}"
+    chat = await _lock_session(session, session_id)
     existing = (
         await session.execute(
             select(ChatArtifactVersion).where(
@@ -157,7 +221,6 @@ async def ensure_initial(
     ).scalar_one_or_none()
     if existing is not None:
         return existing
-    chat = await _lock_session(session, session_id)
     head = await _head_row(session, session_id, object_key_value)
     version_no = (int(head.version_no or 0) if head else 0) + 1
     row = ChatArtifactVersion(
@@ -191,54 +254,85 @@ async def commit_success(
     usage: dict[str, Any] | None = None,
     expected_state_version: int | None = None,
 ) -> ChatArtifactVersion:
-    """提交一次成功版本（锁会话行 + 校验 head + 分配版本号 + 切 head，同一事务）。
+    """提交一次成功版本：按**认领时固化**的预期提交，不接受模型给的新预期值（§3.4）。
 
-    冲突时抛 `ConflictError`（带当前 head 与状态版本），**不覆盖**其他请求刚完成的新 head。
+    - 锁会话行并**重新读取**数据库当前状态（不信长期 ORM 缓存）；
+    - 比较**当前 head 与生成前 head**（`expected_head_version_id`）：不一致 → 409，
+      已发生的消费保留；选定基础是旧版也允许（旧版分支），只拦"生成期间出现的新版本"；
+    - 冲突 / 拒绝 / 失败 / 取消不推进成功版本；
+    - 回滚前先取出错误详情需要的标量，不访问过期 ORM 属性（E7CTX-07）。
     """
+    # §3.4：**重新加载认领行**，不信长期 ORM 缓存——回滚 / 其他提交可能已让它过期，
+    # 直接读属性会触发同步 IO（MissingGreenlet）；先在绿色线程内 refresh 一次。
+    try:
+        await session.refresh(claim_row)
+    except Exception:  # noqa: BLE001 - 认领行被删：按冲突处理
+        await session.rollback()
+        raise ConflictError(
+            "认领记录已不存在，无法提交版本",
+            {"reason": "claim_missing", "retryable": False},
+        ) from None
     session_id = claim_row.session_id
     object_key_value = str(claim_row.object_key)
     chat = await _lock_session(session, session_id)
-    # rollback 会让 ORM 对象过期：冲突分支要用的数字先取出来（否则读属性会触发绿色线程外 IO）
+    fresh_claim = (
+        await session.execute(
+            select(ChatArtifactVersion).where(ChatArtifactVersion.id == claim_row.id)
+        )
+    ).scalar_one()
+    # 回滚会让 ORM 对象过期：冲突分支要用的标量先取出来
     current_state_version = int(chat.state_version or 0)
-    if expected_state_version is not None and current_state_version != int(
-        expected_state_version
-    ):
+    claim_expected_head = fresh_claim.expected_head_version_id
+    claim_expected_state = fresh_claim.expected_state_version
+    base_id = fresh_claim.base_version_id
+    head = await _head_row(session, session_id, object_key_value)
+    head_id = head.id if head is not None else None
+    head_version_no = int(head.version_no or 0) if head is not None else 0
+
+    expected_state = (
+        int(claim_expected_state) if claim_expected_state is not None
+        else (int(expected_state_version) if expected_state_version is not None else None)
+    )
+    if expected_state is not None and current_state_version != expected_state:
         await session.rollback()
         raise ConflictError(
             "生成期间会话状态已变化，新版本未提交为最新",
             {
+                "reason": "state_version_conflict",
                 "state_version": current_state_version,
-                "expected_state_version": int(expected_state_version),
+                "expected_state_version": expected_state,
                 "object_key": object_key_value,
                 "retryable": True,
             },
         )
-    head = await _head_row(session, session_id, object_key_value)
-    base_id = claim_row.base_version_id
-    if base_id is not None and (head is None or head.id != base_id):
+    # E7CTX-07：比较的是"生成前 head"，不是"选定基础"——旧版分支可以成功成为新 head
+    if claim_expected_head is not None and head_id != claim_expected_head:
         await session.rollback()
         raise ConflictError(
             "生成期间该对象已产生新版本，请基于最新版本重试",
             {
+                "reason": "head_changed_during_generation",
                 "object_key": object_key_value,
-                "head_version_id": str(head.id) if head else None,
-                "base_version_id": str(base_id),
+                "head_version_id": str(head_id) if head_id else None,
+                "expected_head_version_id": str(claim_expected_head),
+                "base_version_id": str(base_id) if base_id else None,
                 "state_version": current_state_version,
                 "retryable": True,
             },
         )
-    if base_id is None and head is not None:
+    if base_id is None and head_id is not None:
         # 首个版本只能登记一次：已存在 head 时不允许再插一个"无基础"的成功版本
         await session.rollback()
         raise ConflictError(
             "该对象已有版本链，请指定基础版本后再提交",
             {
+                "reason": "initial_version_exists",
                 "object_key": object_key_value,
-                "head_version_id": str(head.id),
+                "head_version_id": str(head_id),
                 "retryable": True,
             },
         )
-    version_no = (int(head.version_no or 0) if head else 0) + 1
+    version_no = head_version_no + 1
     claim_row.status = "succeeded"
     claim_row.version_no = version_no
     claim_row.content = dict(content)
@@ -259,13 +353,15 @@ async def commit_success(
             "version_id": str(claim_row.id),
             "version_no": version_no,
             "base_version_id": str(base_id) if base_id else None,
+            "expected_head_version_id": str(claim_expected_head)
+            if claim_expected_head else None,
             "state_version": current_state_version,
             "prompt_versions": dict(prompt_versions or {}),
             "usage_status": str((usage or {}).get("usage_status") or ""),
         },
         turn_id=str((claim_row.source or {}).get("turn_id") or ""),
         call_id=str((claim_row.source or {}).get("tool_call_id") or ""),
-        policy_version="artifact_v1",
+        policy_version="artifact_v2",
     )
     return claim_row
 

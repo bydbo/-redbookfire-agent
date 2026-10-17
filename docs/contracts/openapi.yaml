@@ -789,6 +789,30 @@ paths:
         '503':
           $ref: '#/components/responses/DependencyUnavailable'
 
+    delete:
+      tags:
+        - 对话
+      summary: 删除会话
+      description: |
+        删除会话及其级联数据（消息、状态、审计、版本、缓存、观测），并清理**该会话附件根内**
+        的文件（v2 §3.3D）。文件清理失败记录原因但不恢复会话；不存在返回 404。
+      operationId: deleteChatSession
+      parameters:
+        - $ref: '#/components/parameters/RequestId'
+        - name: session_id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '204':
+          description: 已删除
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '503':
+          $ref: '#/components/responses/DependencyUnavailable'
+
   /api/chat/sessions/{session_id}/messages:
     post:
       tags:
@@ -840,6 +864,9 @@ paths:
                   items:
                     type: string
                   description: 可选的热点图片（jpg / png / webp），一次 1–9 张，同属一组
+                operation_binding:
+                  type: string
+                  description: 可选的结构化操作绑定 JSON（v2 §3.3B）：{operation, object_key, base_version_id, expected_state_version, force_reparse}
       responses:
         '200':
           description: SSE 事件流
@@ -1015,6 +1042,98 @@ paths:
                 $ref: '#/components/schemas/ArtifactVersionList'
         '404':
           $ref: '#/components/responses/NotFound'
+        '503':
+          $ref: '#/components/responses/DependencyUnavailable'
+
+  /api/chat/sessions/{session_id}/artifacts/clue-versions:
+    post:
+      tags:
+        - 对话
+      summary: 保存用户编辑的线索版本
+      description: |
+        线索编辑是独立不可变业务版本（v2 §3.3C）：保存完整合法线索、基础版本与来源，
+        成功后设为选定引用；同 action_id 重放返回原结果。已有选定编辑版不会被旧缓存覆盖。
+      operationId: createClueVersion
+      parameters:
+        - $ref: '#/components/parameters/RequestId'
+        - name: session_id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ClueVersionRequest'
+      responses:
+        '200':
+          description: 动作结果与最新上下文（重放或成功）
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ContextActionResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          description: 状态版本冲突
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '503':
+          $ref: '#/components/responses/DependencyUnavailable'
+
+  /api/chat/sessions/{session_id}/artifacts/{version_id}/select:
+    post:
+      tags:
+        - 对话
+      summary: 选定一个线索版本
+      description: |
+        只选同会话成功 clue 版本（v2 §3.3C）；推进状态版本并写用户动作审计。
+        重解析产生的原始版本不改变已有选定编辑版，只有显式 select 才切换。
+      operationId: selectClueVersion
+      parameters:
+        - $ref: '#/components/parameters/RequestId'
+        - name: session_id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+        - name: version_id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ClueSelectRequest'
+      responses:
+        '200':
+          description: 动作结果与最新上下文
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ContextActionResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          description: 状态版本冲突
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
         '503':
           $ref: '#/components/responses/DependencyUnavailable'
 
@@ -2291,6 +2410,11 @@ components:
           oneOf:
             - type: string
             - type: 'null'
+        replaces_fact_ids:
+          type: array
+          items:
+            type: string
+          description: 多项替代时记录全部被替换的旧事实 id（v2，E7CTX-04）
         updated_at:
           type: string
           format: date-time
@@ -2340,6 +2464,117 @@ components:
         created_version:
           type: integer
           minimum: 0
+        operation:
+          type: string
+          enum:
+            - add
+            - replace
+            - reset_topic
+            - select_object
+          description: 拟执行操作（v2 §3.3A）；旧提案按 conflicts_with 推导
+        replaces_fact_ids:
+          type: array
+          items:
+            type: string
+          description: 确认 replace 时要替代的旧事实（E7CTX-04）
+        target_object_ref:
+          type: object
+          additionalProperties: true
+          description: select_object 提案的目标对象（确认前由服务端验证归属）
+        source_message_ids:
+          type: array
+          items:
+            type: string
+
+    ObjectRef:
+      type: object
+      description: 已验证的对象引用（v2 §3.3A）；空字段表示尚未选择，不得以空值激活产物级约束。
+      required:
+        - object_key
+        - object_type
+      properties:
+        object_key:
+          type: string
+        object_type:
+          type: string
+          enum:
+            - draft
+            - clue
+        topic_id:
+          type: string
+        run_id:
+          oneOf:
+            - type: string
+              format: uuid
+            - type: 'null'
+        hotspot_position:
+          oneOf:
+            - type: integer
+            - type: 'null'
+        material_id:
+          oneOf:
+            - type: string
+            - type: 'null'
+        version_id:
+          oneOf:
+            - type: string
+              format: uuid
+            - type: 'null'
+        image_group_digest:
+          oneOf:
+            - type: string
+            - type: 'null'
+        source_ref:
+          type: object
+          additionalProperties: true
+
+    RecoveryProgress:
+      type: object
+      description: 旧会话恢复进度（v2 §3.3A / §3.5）。
+      required:
+        - status
+      properties:
+        status:
+          type: string
+          enum:
+            - complete
+            - pending
+            - running
+            - awaiting_confirmation
+            - interrupted
+            - failed
+        recovery_id:
+          oneOf:
+            - type: string
+              format: uuid
+            - type: 'null'
+        reason:
+          type: string
+        snapshot_last_message_id:
+          oneOf:
+            - type: string
+              format: uuid
+            - type: 'null'
+        cursor_message_id:
+          oneOf:
+            - type: string
+              format: uuid
+            - type: 'null'
+        scanned_user_messages:
+          type: integer
+          minimum: 0
+        total_user_messages:
+          type: integer
+          minimum: 0
+        pending_proposal_ids:
+          type: array
+          items:
+            type: string
+        accounting_message_id:
+          oneOf:
+            - type: string
+              format: uuid
+            - type: 'null'
 
     ArtifactHead:
       type: object
@@ -2406,6 +2641,15 @@ components:
             - 'off'
             - shadow
             - enforce
+        effective_mode_reason:
+          type: string
+          description: 实际模式的原因（configured_off / session_not_enabled / window_unverified）
+        object_refs:
+          type: array
+          items:
+            $ref: '#/components/schemas/ObjectRef'
+        recovery:
+          $ref: '#/components/schemas/RecoveryProgress'
         blocking_proposals:
           type: integer
           minimum: 0
@@ -2413,7 +2657,7 @@ components:
 
     ContextActionRequest:
       type: object
-      description: 上下文用户动作（S7.24）；`expected_state_version` 是 CAS 条件。
+      description: 上下文用户动作（v2 §3.3A）；`expected_state_version` 是 CAS 条件。
       additionalProperties: false
       required:
         - action
@@ -2427,15 +2671,90 @@ components:
             - retract
             - replace
             - reset_topic
+            - select_object
+            - recover
+            - complete_recovery
         expected_state_version:
           type: integer
           minimum: 0
+        action_id:
+          oneOf:
+            - type: string
+              format: uuid
+            - type: 'null'
+          description: 幂等键；同 ID 同请求体重放返回原结果，不同请求体 409
         target_id:
           type: string
           description: 事实 / 提案标识（confirm / reject / retract / replace 必填）
         value:
           type: string
-          description: 替换后的新值（replace 必填）
+          description: 替换后的新值（replace 必填，1–200 字）
+        object_ref:
+          type: object
+          additionalProperties: true
+          description: select_object 必填；确认未解析产物提案时必填完整目标
+        recovery_id:
+          oneOf:
+            - type: string
+              format: uuid
+            - type: 'null'
+          description: 后续恢复分页及 complete_recovery 必填
+        retry_of:
+          oneOf:
+            - type: string
+              format: uuid
+            - type: 'null'
+          description: 显式重试已中断 / 失败恢复时传原 action_id
+        acknowledge_partial_history:
+          type: boolean
+          description: complete_recovery 时已知历史缺口的显式确认
+
+    ClueVersionRequest:
+      type: object
+      description: 保存用户编辑的线索版本（v2 §3.3C）。
+      additionalProperties: false
+      required:
+        - action_id
+        - expected_state_version
+        - object_key
+        - base_version_id
+        - content
+      properties:
+        action_id:
+          type: string
+          format: uuid
+        expected_state_version:
+          type: integer
+          minimum: 0
+        expected_head_version_id:
+          oneOf:
+            - type: string
+              format: uuid
+            - type: 'null'
+        object_key:
+          type: string
+        base_version_id:
+          type: string
+          format: uuid
+        content:
+          type: object
+          additionalProperties: true
+          description: '{raw_text, clue, edited_fields}；raw_text ≤ 500 字'
+
+    ClueSelectRequest:
+      type: object
+      description: 选定一个线索版本（v2 §3.3C）。
+      additionalProperties: false
+      required:
+        - action_id
+        - expected_state_version
+      properties:
+        action_id:
+          type: string
+          format: uuid
+        expected_state_version:
+          type: integer
+          minimum: 0
 
     ContextActionResponse:
       type: object
@@ -2461,6 +2780,9 @@ components:
             - retract
             - replace
             - reset_topic
+            - select_object
+            - recover
+            - complete_recovery
         decision:
           type: string
           enum:
@@ -2471,6 +2793,24 @@ components:
           type: string
         context:
           $ref: '#/components/schemas/ChatContext'
+        action_id:
+          type: string
+          format: uuid
+        accounting_message_id:
+          oneOf:
+            - type: string
+              format: uuid
+            - type: 'null'
+        replay:
+          type: boolean
+        status:
+          type: string
+          enum:
+            - pending
+            - running
+            - succeeded
+            - failed
+            - interrupted
 
     ArtifactVersion:
       type: object

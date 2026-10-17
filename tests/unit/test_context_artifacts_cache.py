@@ -14,6 +14,7 @@ import pytest
 from xhs_agent.config import AppConfig, load_config
 from xhs_agent.core import observations
 from xhs_agent.services import artifact_versions, image_cache
+from xhs_agent.services.chat import chat_root
 
 PNG = b"\x89PNG\r\n\x1a\n" + b"0" * 32
 
@@ -116,6 +117,20 @@ class TestImageIdentity:
 
 
 class TestEnsureDigests:
+    @staticmethod
+    def _write_chat_file(
+        tmp_path: Path, cfg: AppConfig, name: str, data: bytes
+    ) -> dict[str, Any]:
+        """写一个真实附件文件（归属校验需要它真实存在于会话目录内）。"""
+        from pathlib import Path
+
+        target = Path(chat_root(cfg)) / "s1" / name
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(data)
+        # 存储路径与生产一致：runs_dir 不在工程根下时保存绝对路径（`_relative` 同口径）
+        return {"path": str(target), "name": name,
+                "bytes": len(data), "mtime_ns": target.stat().st_mtime_ns}
+
     @pytest.mark.asyncio
     async def test_fills_missing_digest_and_keeps_existing(self, tmp_path: Path) -> None:
         cfg = write_config(tmp_path)
@@ -125,30 +140,61 @@ class TestEnsureDigests:
             seen.append(path)
             return PNG
 
-        attachments = [
-            {"path": "a.png", "name": "a"},
-            {"path": "b.png", "name": "b", "sha256": "precomputed"},
-        ]
+        first = self._write_chat_file(tmp_path, cfg, "a.png", PNG)
+        second = self._write_chat_file(tmp_path, cfg, "b.png", PNG)
+        second["sha256"] = "precomputed"
+        attachments = [first, second]
         digests, elapsed_ms, failures = await image_cache.ensure_digests(
             cfg, "s1", attachments, reader=reader
         )
-        assert seen == ["a.png"]
+        # 元数据未变化：有摘要的不重读；没摘要的补读一次（注入的 reader 收到该路径）
+        assert seen == [first["path"]]
         assert digests == [image_cache.digest_bytes(PNG), "precomputed"]
         assert attachments[0]["sha256"] == image_cache.digest_bytes(PNG)
         assert elapsed_ms >= 0 and failures == []
 
     @pytest.mark.asyncio
-    async def test_read_failure_is_reported_not_hidden(self, tmp_path: Path) -> None:
+    async def test_changed_content_recomputes_digest(self, tmp_path: Path) -> None:
         cfg = write_config(tmp_path)
+        seen: list[str] = []
 
         async def reader(path: str) -> bytes:
-            raise FileNotFoundError(path)
+            seen.append(path)
+            return PNG + b"changed"
 
+        item = self._write_chat_file(tmp_path, cfg, "a.png", PNG)
+        item["sha256"] = image_cache.digest_bytes(PNG)
+        # 外部改写文件：mtime 变化 → 必须重读重算（E7CTX-10）
+        target = Path(chat_root(cfg)) / "s1" / "a.png"
+        target.write_bytes(PNG + b"changed")
         digests, _elapsed, failures = await image_cache.ensure_digests(
-            cfg, "s1", [{"path": "missing.png", "name": "missing"}], reader=reader
+            cfg, "s1", [item], reader=reader
+        )
+        assert seen == [item["path"]]
+        assert failures == []
+        assert digests == [image_cache.digest_bytes(PNG + b"changed")]
+
+    @pytest.mark.asyncio
+    async def test_missing_file_is_a_failure(self, tmp_path: Path) -> None:
+        cfg = write_config(tmp_path)
+        digests, _elapsed, failures = await image_cache.ensure_digests(
+            cfg, "s1", [{"path": "runs/_chat/s1/missing.png", "name": "missing",
+                         "sha256": "x"}]
         )
         assert digests == [""]
         assert failures == ["missing"]
+
+    @pytest.mark.asyncio
+    async def test_path_outside_session_is_a_failure(self, tmp_path: Path) -> None:
+        cfg = write_config(tmp_path)
+        evil = tmp_path / "runs" / "_chat" / "s2" / "evil.png"
+        evil.parent.mkdir(parents=True, exist_ok=True)
+        evil.write_bytes(PNG)
+        digests, _elapsed, failures = await image_cache.ensure_digests(
+            cfg, "s1", [{"path": "runs/_chat/s2/evil.png", "name": "evil"}]
+        )
+        assert digests == [""]
+        assert failures == ["evil"]
 
 
 class TestObservations:

@@ -24,7 +24,7 @@ export function apiUrl(path: string): string {
 }
 
 interface ApiFetchOptions {
-  method?: 'GET' | 'POST' | 'PATCH'
+  method?: 'GET' | 'POST' | 'PATCH' | 'DELETE'
   body?: unknown
 }
 

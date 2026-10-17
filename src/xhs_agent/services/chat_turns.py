@@ -40,9 +40,11 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..config import AppConfig
 from ..core import budget as budget_tool
+from ..core import context_rules
 from ..core import ledger as ledger_projection
 from ..core import progress as progress_tool
 from ..core.budget import BudgetDecision, BudgetPolicy
+from ..core.context_policy import TurnContextPolicy
 from ..core.context_rules import BLOCKING_REASONS
 from ..core.errors import DependencyUnavailableError
 from ..core.logging import bind_turn_id, reset_turn_id
@@ -252,6 +254,8 @@ def build_tool_runner(
     turn_id: str = "",
     tracer: Tracer | None = None,
     ledger: dict[str, Any] | None = None,
+    policy: TurnContextPolicy | None = None,
+    source_message_id: str = "",
 ) -> Any:
     """工具执行器：按 `chat_tools.HANDLERS` 分派（S7.7a）——这里也不写具体工具名。
 
@@ -271,6 +275,8 @@ def build_tool_runner(
         caller=caller,
         recent_attachments=list(recent_attachments or []),
         turn_id=turn_id,
+        policy=policy,
+        source_message_id=source_message_id,
     )
     scope_counts: dict[str, int] = {}
 
@@ -443,9 +449,20 @@ async def renew_turn_activity(
 
 @dataclass
 class ContextPrep:
-    """轮次入口准备好的上下文（S7.24 / S7.26）。"""
+    """轮次入口准备好的上下文（S7.24 / S7.26；v2 §3.4 状态化）。
+
+    `status` 是本轮的准入结论：调用方对非 `ready` 的结果**不得启动依赖工具**——
+
+    - `ready`：正常进入对话图；
+    - `confirmation_required`：存在阻断当前任务的待确认项（含恢复未完成），只回答确认提示；
+    - `conflict`：状态 CAS 失败或恢复/冲突未解决，返回可重试提示；
+    - `invalid`：增量整批验证失败或来源无效；
+    - `overflow`：必需内容超出预算；
+    - `off`：模式关闭，保持旧行为。
+    """
 
     mode: str = "off"
+    status: str = "off"
     state_text: str = ""
     grouped: bool = False
     policy: BudgetPolicy | None = None
@@ -453,10 +470,15 @@ class ContextPrep:
     versions: dict[str, int] = field(default_factory=dict)
     error: str = ""
     error_category: str = ""
+    turn_policy: Any = None
 
     @property
     def enabled(self) -> bool:
         return self.mode in ("shadow", "enforce")
+
+    @property
+    def ready(self) -> bool:
+        return self.status == "ready"
 
 
 async def _context_refs(
@@ -490,24 +512,57 @@ async def _prepare_context(
     user_text: str,
     turn_id: str,
     ledger: dict[str, Any],
+    policy: TurnContextPolicy | None = None,
 ) -> ContextPrep:
-    """历史裁剪前的状态抽取与验证（S7.24）；off 模式直接返回空准备。
+    """历史裁剪前的状态抽取与验证（S7.24；v2 §3.4 状态化准入）。
 
-    失败策略（方案 §4.2）：`enforce` 下抽取 / 验证失败 → 本轮**停止**依赖新状态的任务，
-    给出可重试原因；`shadow` 下只记警告，不改变执行。
+    返回的 `status` 决定本轮能不能启动依赖状态的工具（E7CTX-03）：
+
+    - 遗留冲突（上一轮遗留的 conflict / ambiguous / scope 提案）同样阻断；
+    - CAS 失败 → `conflict`：禁止悄悄读取新快照后继续原任务；
+    - 增量整批验证失败 / 来源无效 → `invalid`；
+    - 恢复未完成（pending / running / awaiting_confirmation）→ `confirmation_required`；
+    - off 模式直接返回 `off`，保持旧行为。
     """
-    mode = cfg.context.effective_mode(str(session_id))
-    policy = BudgetPolicy(
-        application_limit=cfg.context.request_token_limit,
-        model_window=cfg.context.model_context_window,
-        mode=mode,
-        output_tokens=int(cfg.llm.max_tokens),
+    if policy is None:
+        policy = TurnContextPolicy.from_config(cfg, str(session_id))
+    budget_policy = BudgetPolicy(
+        application_limit=policy.application_limit,
+        model_window=policy.model_window,
+        mode=policy.mode,
+        output_tokens=policy.output_tokens,
     )
-    prep = ContextPrep(mode=mode, grouped=mode != "off", policy=policy)
+    prep = ContextPrep(
+        mode=policy.mode,
+        status="off" if policy.mode == "off" else "ready",
+        grouped=policy.grouped_history,
+        policy=budget_policy,
+        turn_policy=policy,
+    )
     if not prep.enabled:
         return prep
     stored = await context_state.load(session, session_id)
     if stored is None:
+        return prep
+
+    # ---- 恢复未完成：不进入依赖旧状态的业务（v2 §3.5）----
+    recovery_status = str((stored.recovery or {}).get("status") or "complete")
+    if policy.blocks_on_unresolved and recovery_status in (
+        "pending", "running", "awaiting_confirmation", "failed", "interrupted",
+    ):
+        prep.status = "confirmation_required"
+        prep.blocking_reply = (
+            "这个会话的历史要求还没有恢复完成（当前状态："
+            f"{recovery_status}）。请先在「当前目标与限制」面板里完成恢复或确认要求，"
+            "再继续；查看历史和处理恢复不受影响。"
+        )
+        return prep
+
+    # ---- 遗留冲突：每轮检查全部仍适用的未解决冲突（E7CTX-03，不限于本轮新增）----
+    blocking_all = context_rules.blocking_proposals(stored.snapshot)
+    if policy.blocks_on_unresolved and blocking_all:
+        prep.status = "confirmation_required"
+        prep.blocking_reply = _blocking_reply(stored, None)
         return prep
 
     async def precheck(system: str, user: str, output_reserve: int) -> None:
@@ -518,9 +573,9 @@ async def _prepare_context(
             ],
             tools=None,
             output_reserve=output_reserve,
-            application_limit=cfg.context.request_token_limit,
-            model_window=cfg.context.model_context_window,
-            mode=mode,
+            application_limit=policy.application_limit,
+            model_window=policy.model_window,
+            mode=policy.mode,
             protected=("本轮用户原文", "现有状态"),
         )
         await record_observation(
@@ -528,19 +583,21 @@ async def _prepare_context(
             event_type="context_assembled",
             session_id=session_id,
             key=f"{turn_id}:extract",
-            payload={**decision.as_event(), "effective_mode": mode, "kind": "extract"},
+            payload={**decision.as_event(), "effective_mode": policy.mode,
+                     "kind": "extract"},
             turn_id=turn_id,
             prompt_version="context_extract:v1",
-            policy_version=f"context:{mode}",
+            policy_version=f"context:{policy.mode}",
         )
-        if mode == "enforce" and not decision.allowed:
+        if policy.enforce and not decision.allowed:
             raise budget_tool.BudgetError(
                 "状态抽取的请求超出预算，本轮不发出该请求",
                 reason="required_context_overflow",
             )
 
     caller = StructuredCaller(
-        provider=provider, max_repairs=int(cfg.context.extract_repair_max)
+        provider=provider,
+        max_repairs=int(cfg.context.extract_repair_max),
     )
     refs = await _context_refs(session, session_id)
     try:
@@ -555,12 +612,13 @@ async def _prepare_context(
             message_id=str(user_message_id),
             turn_id=turn_id,
             user_text=user_text,
-            mode=mode,
+            mode=policy.mode,
             refs=refs,
         )
     except (LLMError, SchemaError, PromptError, budget_tool.BudgetError) as exc:
-        logger.warning("上下文抽取失败（mode=%s）：%s", mode, type(exc).__name__)
-        if mode == "enforce":
+        logger.warning("上下文抽取失败（mode=%s）：%s", policy.mode, type(exc).__name__)
+        if policy.enforce:
+            prep.status = "invalid"
             prep.error = (
                 "这一轮没能确认上下文状态（抽取或校验失败），为避免按错误的前提继续，"
                 "请重试；如果反复失败，可以把要求写得更具体一些"
@@ -574,14 +632,32 @@ async def _prepare_context(
             ledger.setdefault("versions", {})[str(record.get("task") or "")] = 1
         prep.versions["context_extract"] = 1
 
+    # ---- 抽取后的准入判定 ----
     latest = await context_state.load(session, session_id)
     if latest is None:
         return prep
     prep.state_text = context_state.state_prompt(latest)
-    blocking = context_state.context_view(cfg, latest)["blocking_proposals"]
-    created_here = applied.blocking if applied.applied else 0
-    if blocking and (created_here or applied.pending):
+    if applied.conflict:
+        # E7CTX-03：CAS 失败 → 停止依赖本次增量的执行，不悄悄读新快照继续
+        prep.status = "conflict"
+        prep.blocking_reply = (
+            "这一轮的状态更新没有落库（状态版本已变化），为避免基于旧前提执行，"
+            "请重试；刷新后可见最新状态。"
+        )
+        return prep
+    if applied.reason in ("invalid_delta", "source_message_invalid"):
+        prep.status = "invalid"
+        prep.blocking_reply = (
+            "这一轮的要求没能通过校验（证据与原文对不上或来源无效），"
+            "我不会按它执行；请把要求再说明清楚一点。"
+        )
+        return prep
+    blocking_all = context_rules.blocking_proposals(latest.snapshot)
+    if policy.blocks_on_unresolved and blocking_all:
+        prep.status = "confirmation_required"
         prep.blocking_reply = _blocking_reply(latest, applied)
+        return prep
+    prep.status = "ready"
     return prep
 
 
@@ -608,63 +684,109 @@ async def _emit_model_attempts(
     session_id: uuid.UUID,
     turn_id: str,
     records: list[dict[str, Any]],
+    cfg: AppConfig | None = None,
 ) -> None:
-    """`model_attempt_finished`：按**每次实际传输**一条，不用轮次汇总重复计数。"""
+    """按**每次实际传输**写 started + finished 两条观测（E7CTX-14）。
+
+    - 尝试身份 = `turn_id:记录序号:attempt`（结构修复形成新 identity 由 caller 序号区分，
+      传输重试共用 identity、按 attempt 序号区分）；
+    - 每次尝试固化价格快照（币种 / 价格版本 / 单价 / 来源），报告不按当前价格重算历史；
+    - 缺结束事件的尝试（进程崩溃等）没有 finished 行，报告按 incomplete 处理——不补零。
+    """
+    price = {
+        "currency": getattr(cfg.llm, "price_currency", "CNY") if cfg else "CNY",
+        "price_version": getattr(cfg.llm, "price_version", "") if cfg else "",
+        "input_per_m": float(cfg.llm.price_in_per_m) if cfg else None,
+        "output_per_m": float(cfg.llm.price_out_per_m) if cfg else None,
+        "cache_hit_per_m": float(cfg.context.price_cache_hit_per_m)
+        if cfg and cfg.context.price_cache_hit_per_m is not None else None,
+        "cache_miss_per_m": float(cfg.context.price_cache_miss_per_m)
+        if cfg and cfg.context.price_cache_miss_per_m is not None else None,
+        "source_status": "config_estimated",
+    }
     for index, record in enumerate(records):
         details = list(record.get("attempts_detail") or [])
         if not details:
-            # 旧记录 / 无明细：如实标 aggregate，不伪装成逐次传输
+            # 旧记录 / 无逐次明细：如实标 aggregate，不伪装成逐次传输
             total = int(record.get("prompt_tokens") or 0) + int(
                 record.get("completion_tokens") or 0
             )
             if not total:
                 continue
+            base = {
+                "detail": "aggregate",
+                "task": str(record.get("task") or ""),
+                "prompt_tokens": int(record.get("prompt_tokens") or 0),
+                "completion_tokens": int(record.get("completion_tokens") or 0),
+                "usage_status": str(record.get("usage_status") or ""),
+                "cache_status": str(record.get("cache_status") or ""),
+                "attempts": int(record.get("attempts") or 1),
+                "latency_ms": int(record.get("latency_ms") or 0),
+                "price": dict(price),
+            }
+            await record_observation(
+                session,
+                event_type="model_attempt_started",
+                session_id=session_id,
+                key=f"{turn_id}:{index}:aggregate",
+                payload={**base, "identity": "aggregate"},
+                turn_id=turn_id,
+                model=str(record.get("model") or ""),
+                policy_version="attempt_v2",
+            )
             await record_observation(
                 session,
                 event_type="model_attempt_finished",
                 session_id=session_id,
                 key=f"{turn_id}:{index}:aggregate",
-                payload={
-                    "detail": "aggregate",
-                    "task": str(record.get("task") or ""),
-                    "prompt_tokens": int(record.get("prompt_tokens") or 0),
-                    "completion_tokens": int(record.get("completion_tokens") or 0),
-                    "usage_status": str(record.get("usage_status") or ""),
-                    "cache_status": str(record.get("cache_status") or ""),
-                    "attempts": int(record.get("attempts") or 1),
-                    "latency_ms": int(record.get("latency_ms") or 0),
-                },
+                payload=base,
                 turn_id=turn_id,
                 model=str(record.get("model") or ""),
-                policy_version="attempt_v1",
+                policy_version="attempt_v2",
             )
             continue
         for item in details:
             attempt = int(item.get("attempt") or 1)
+            identity = f"{turn_id}:{index}"
+            body = {
+                "detail": "per_attempt",
+                "identity": identity,
+                "task": str(record.get("task") or ""),
+                "status": str(item.get("status") or ""),
+                "prompt_tokens": int(item.get("prompt_tokens") or 0),
+                "completion_tokens": int(item.get("completion_tokens") or 0),
+                "usage_status": str(item.get("usage_status") or ""),
+                "cache_hit_tokens": item.get("cache_hit_tokens"),
+                "cache_miss_tokens": item.get("cache_miss_tokens"),
+                "cache_status": str(item.get("cache_status") or ""),
+                "ttft_ms": item.get("ttft_ms"),
+                "latency_ms": int(item.get("latency_ms") or 0),
+                "error": bool(item.get("error")),
+                "price": dict(price),
+            }
+            await record_observation(
+                session,
+                event_type="model_attempt_started",
+                session_id=session_id,
+                key=f"{identity}:{attempt}:started",
+                payload={**body, "phase": "started"},
+                turn_id=turn_id,
+                attempt=attempt,
+                model=str(record.get("model") or ""),
+                policy_version="attempt_v2",
+            )
             await record_observation(
                 session,
                 event_type="model_attempt_finished",
                 session_id=session_id,
-                key=f"{turn_id}:{index}:{attempt}",
-                payload={
-                    "detail": "per_attempt",
-                    "task": str(record.get("task") or ""),
-                    "status": str(item.get("status") or ""),
-                    "prompt_tokens": int(item.get("prompt_tokens") or 0),
-                    "completion_tokens": int(item.get("completion_tokens") or 0),
-                    "usage_status": str(item.get("usage_status") or ""),
-                    "cache_hit_tokens": item.get("cache_hit_tokens"),
-                    "cache_miss_tokens": item.get("cache_miss_tokens"),
-                    "cache_status": str(item.get("cache_status") or ""),
-                    "ttft_ms": item.get("ttft_ms"),
-                    "latency_ms": int(item.get("latency_ms") or 0),
-                    "error": bool(item.get("error")),
-                },
+                key=f"{identity}:{attempt}:finished",
+                payload={**body, "phase": "finished"},
                 turn_id=turn_id,
                 attempt=attempt,
                 model=str(record.get("model") or ""),
-                policy_version="attempt_v1",
+                policy_version="attempt_v2",
             )
+
 
 
 async def run_turn_task(
@@ -825,6 +947,50 @@ async def run_turn_task(
 
                     async with build_http_client(cfg.llm.timeout_s) as client:
                         provider = build_turn_provider(cfg, client, tracer=tracer)
+                        # E7CTX-15：模式在轮次入口**一次**解析，传给状态 / 版本 / 预算 / 缓存 / 工具
+                        turn_policy = TurnContextPolicy.from_config(cfg, str(session_id))
+                        tool_calls_budget = {"n": 0}
+
+                        async def before_tool_request(call: Any) -> None:
+                            """工具内部模型调用的统一预算入口（E7CTX-09）。
+
+                            挂在 `StructuredCaller.before_request` 上：改稿、拆解、覆盖预览
+                            的**每次实际请求**（含结构修复）都先检查；enforce 超限抛
+                            `BudgetError`，请求不发出。
+                            """
+                            tool_calls_budget["n"] += 1
+                            messages = call.messages or [
+                                {"role": "system", "content": call.system},
+                                {"role": "user", "content": call.user},
+                            ]
+                            decision = budget_tool.decide(
+                                messages=messages,
+                                tools=None,
+                                output_reserve=int(call.max_tokens or cfg.llm.max_tokens),
+                                application_limit=turn_policy.application_limit,
+                                model_window=turn_policy.model_window,
+                                mode=turn_policy.mode,
+                                protected=("本轮用户原文", "有效状态", "基础版本"),
+                            )
+                            await record_observation(
+                                session,
+                                event_type="context_assembled",
+                                session_id=session_id,
+                                key=f"{events.turn_id}:tool:{tool_calls_budget['n']}",
+                                payload={**decision.as_event(),
+                                         "effective_mode": turn_policy.mode,
+                                         "kind": "tool_internal",
+                                         "task": str(call.task)},
+                                turn_id=events.turn_id,
+                                prompt_version=f"{call.task}",
+                                policy_version=f"context:{turn_policy.mode}",
+                            )
+                            if turn_policy.enforce and not decision.allowed:
+                                raise budget_tool.BudgetError(
+                                    "工具调用的必需内容超出请求预算，本轮不发出该请求",
+                                    reason="required_context_overflow",
+                                )
+
                         # 跨轮图片回落（S7.10 / S7.16 按组）：先把本会话最近一组图取出来，工具在
                         # "本轮没带图"时才有得用（用户说「上面那几张图」正是这种情况）
                         recent = await latest_attachments(session, session_id)
@@ -835,11 +1001,15 @@ async def run_turn_task(
                             session_id=session_id,
                             attachments=attachments or [],
                             dispatcher=dispatcher,
-                            caller=StructuredCaller(provider=provider),
+                            caller=StructuredCaller(
+                                provider=provider, before_request=before_tool_request
+                            ),
                             recent_attachments=recent,
                             turn_id=events.turn_id,
                             tracer=tracer,
                             ledger=ledger,
+                            policy=turn_policy,
+                            source_message_id=str(user_message_id or ""),
                         )
                         # S7.24：历史裁剪**之前**做一次结构化状态抽取（输入是本轮原文而不是
                         # 被裁过的历史）。mode=off 时不抽取，保持旧行为。
@@ -852,6 +1022,7 @@ async def run_turn_task(
                             user_text=user_text,
                             turn_id=events.turn_id,
                             ledger=ledger,
+                            policy=turn_policy,
                         )
                         budget_calls = {"n": 0}
 
@@ -1002,19 +1173,23 @@ async def run_turn_task(
 
                         # R2（OBS-03）：先按轮次结果分流——失败不做 `final_reply`
                         window["run_started_at"] = now_iso()
-                        if context_prep.blocking_reply:
-                            # 存在阻断当前任务的待确认项：先确认再继续，不能一边询问一边改稿
-                            turn = ChatTurn(
-                                reply=context_prep.blocking_reply,
-                                status="succeeded",
-                                prompt_versions=dict(context_prep.versions),
-                            )
-                        elif context_prep.error:
+                        if context_prep.error and context_prep.status == "invalid" \
+                                and not context_prep.blocking_reply:
                             # 抽取 / 校验失败：本轮停止依赖新状态的任务，不静默继续
                             turn = ChatTurn(
                                 status="failed",
                                 error=context_prep.error,
                                 error_category=context_prep.error_category or "internal",
+                                prompt_versions=dict(context_prep.versions),
+                            )
+                        elif context_prep.status in (
+                            "confirmation_required", "conflict", "invalid",
+                        ) and context_prep.blocking_reply:
+                            # E7CTX-03：待确认 / 冲突 / 校验失败——只回复处理提示，
+                            # 不启动依赖状态的工具（不能一边询问一边改稿）
+                            turn = ChatTurn(
+                                reply=context_prep.blocking_reply,
+                                status="succeeded",
                                 prompt_versions=dict(context_prep.versions),
                             )
                         else:
@@ -1037,6 +1212,7 @@ async def run_turn_task(
                             session_id=session_id,
                             turn_id=events.turn_id,
                             records=list(ledger.get("records") or []),
+                            cfg=cfg,
                         )
                         window["run_finished_at"] = now_iso()
                         if turn.status == "succeeded":

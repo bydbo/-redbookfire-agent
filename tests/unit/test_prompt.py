@@ -50,11 +50,11 @@ def _drop_section(text: str, title: str) -> str:
 
 
 class TestAssets:
-    def test_available_tasks_lists_nine_assets(self):
+    def test_available_tasks_lists_ten_assets(self):
         assert prompt_tools.available_tasks() == (
-            "chat_supervisor", "context_extract", "copy_draft", "copy_revise",
-            "hotspot_clue", "image_hotspot_clue", "image_hotspot_clue_multi",
-            "material_select", "material_tagging")
+            "chat_supervisor", "context_extract", "context_recover", "copy_draft",
+            "copy_revise", "hotspot_clue", "image_hotspot_clue",
+            "image_hotspot_clue_multi", "material_select", "material_tagging")
 
     @pytest.mark.parametrize("task_id", ["image_hotspot_clue", "image_hotspot_clue_multi"])
     def test_image_hotspot_clue_has_no_placeholders(self, task_id: str):

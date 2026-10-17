@@ -79,6 +79,10 @@ function onIntakeError(message: string): void {
   intakeError.value = message || null
 }
 
+async function onRemoveSession(): Promise<void> {
+  contextActionError.value = await store.removeSession()
+}
+
 async function submit(): Promise<void> {
   const text = draft.value
   const file = picked.value
@@ -201,6 +205,45 @@ async function actOnContext(
   }
 }
 
+function isSelected(head: { object_key: string; version_id: string }): boolean {
+  return store.selectedBase?.objectKey === head.object_key
+    && store.selectedBase.versionId === head.version_id
+}
+
+function selectBase(head: { object_key: string; version_id: string; version_no: number }): void {
+  store.selectedBase = {
+    objectKey: head.object_key,
+    versionId: head.version_id,
+    versionNo: head.version_no,
+  }
+}
+
+async function onStartRecovery(): Promise<void> {
+  contextActionError.value = null
+  contextBusy.value = true
+  try {
+    contextActionError.value = await store.startRecovery()
+  } finally {
+    contextBusy.value = false
+  }
+}
+
+async function onCompleteRecovery(): Promise<void> {
+  contextActionError.value = null
+  contextBusy.value = true
+  try {
+    const message = await store.completeRecovery(false)
+    if (message !== null && message.includes('核对')) {
+      // 有历史缺口：用户确认后携带显式确认重试
+      contextActionError.value = await store.completeRecovery(true)
+    } else {
+      contextActionError.value = message
+    }
+  } finally {
+    contextBusy.value = false
+  }
+}
+
 function versionTag(call: { version_no?: number | null; base_version_no?: number | null }): string | null {
   if (call.version_no === null || call.version_no === undefined) return null
   const base = call.base_version_no !== null && call.base_version_no !== undefined
@@ -223,9 +266,19 @@ function versionTag(call: { version_no?: number | null; base_version_no?: number
             丢一张图或一句话过来，我帮你把热点拆开、找素材、写初稿（会自己决定要不要跑完整分析）。
           </p>
         </div>
-        <n-button size="small" :disabled="store.busy" @click="store.newSession()">
-          新对话
-        </n-button>
+        <div class="flex gap-2">
+          <n-button size="small" :disabled="store.busy" @click="store.newSession()">
+            新对话
+          </n-button>
+          <n-button
+            v-if="store.currentId"
+            size="small"
+            :disabled="store.busy"
+            @click="onRemoveSession"
+          >
+            删除会话
+          </n-button>
+        </div>
       </header>
 
       <n-alert v-if="store.error" class="shrink-0" type="error" :title="store.error" />
@@ -322,6 +375,72 @@ function versionTag(call: { version_no?: number | null; base_version_no?: number
               <span v-if="pendingFacts.length > 0" class="text-xs text-ink-muted">
                 另有 {{ pendingFacts.length }} 条生效事实等待补全来源
               </span>
+
+              <!-- 旧会话恢复（v2 §3.5）：显式触发、候选确认、缺口显式确认后完成 -->
+              <div
+                v-if="store.context && store.context.recovery
+                  && store.context.recovery.status !== 'complete'"
+                class="flex flex-col gap-2 border-t border-line pt-2"
+              >
+                <div class="flex flex-wrap items-center gap-2">
+                  <n-tag size="tiny" type="warning" :bordered="false">
+                    历史恢复：{{ store.context.recovery.status }}
+                  </n-tag>
+                  <span class="text-xs text-ink-muted">
+                    已扫描 {{ store.context.recovery.scanned_user_messages }} /
+                    {{ store.context.recovery.total_user_messages }} 条用户消息
+                  </span>
+                  <div class="ml-auto flex gap-2">
+                    <n-button
+                      size="tiny"
+                      type="primary"
+                      :disabled="contextBusy"
+                      @click="onStartRecovery"
+                    >
+                      {{ store.context.recovery.status === 'pending' ? '开始恢复' : '继续恢复下一页' }}
+                    </n-button>
+                    <n-button
+                      size="tiny"
+                      :disabled="contextBusy"
+                      @click="onCompleteRecovery"
+                    >
+                      已核对并完成
+                    </n-button>
+                  </div>
+                </div>
+                <span class="text-xs text-ink-muted">
+                  恢复完成前不会执行分析 / 改稿；候选全部待确认，确认后才生效。
+                </span>
+              </div>
+
+              <!-- 版本选择（v2 §3.3B）：选择只绑定下一次改稿，不改变 head -->
+              <div
+                v-if="store.context && store.context.artifact_heads.length > 0"
+                class="flex flex-col gap-2 border-t border-line pt-2"
+              >
+                <span class="text-xs text-ink-muted">文案版本（选择只影响下一次改稿）</span>
+                <div
+                  v-for="head in store.context.artifact_heads"
+                  :key="head.object_key"
+                  class="flex flex-wrap items-center gap-2"
+                >
+                  <span class="text-xs text-ink-strong">{{ head.object_key }}</span>
+                  <n-tag size="tiny" :bordered="false">第 {{ head.version_no }} 版</n-tag>
+                  <n-button
+                    v-if="head.object_key.startsWith('draft:')"
+                    size="tiny"
+                    :type="isSelected(head) ? 'primary' : 'default'"
+                    :disabled="contextBusy"
+                    @click="selectBase(head)"
+                  >
+                    {{ isSelected(head) ? '已选为下次基础' : '以此为基础改稿' }}
+                  </n-button>
+                </div>
+                <span v-if="store.selectedBase" class="text-xs text-ink-muted">
+                  下一次改稿将以第 {{ store.selectedBase.versionNo }} 版为基础
+                  （发送后自动清除绑定）
+                </span>
+              </div>
             </div>
           </n-collapse-item>
         </n-collapse>

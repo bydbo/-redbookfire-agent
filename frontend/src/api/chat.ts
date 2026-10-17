@@ -19,6 +19,9 @@ export type ContextActionRequest = components['schemas']['ContextActionRequest']
 export type ContextActionResponse = components['schemas']['ContextActionResponse']
 export type ArtifactVersion = components['schemas']['ArtifactVersion']
 export type ArtifactVersionList = components['schemas']['ArtifactVersionList']
+export type ObjectRef = components['schemas']['ObjectRef']
+export type RecoveryProgress = components['schemas']['RecoveryProgress']
+export type ClueVersionRequest = components['schemas']['ClueVersionRequest']
 
 // 建一个空会话（前端「新对话」）；标题等首条用户消息落库时自动补。
 export function createChatSession(): Promise<ChatSession> {
@@ -78,6 +81,36 @@ export function listChatArtifacts(
   )
 }
 
+// 删除会话（v2 §3.3D）：级联状态 / 版本 / 缓存 / 观测，并清理该会话附件。
+export function deleteChatSession(sessionId: string): Promise<void> {
+  return apiFetch<void>(`/chat/sessions/${encodeURIComponent(sessionId)}`,
+                       { method: 'DELETE' })
+}
+
+// 保存用户编辑的线索版本（v2 §3.3C）。
+export function createClueVersion(
+  sessionId: string,
+  body: ClueVersionRequest,
+): Promise<ContextActionResponse> {
+  return apiFetch<ContextActionResponse>(
+    `/chat/sessions/${encodeURIComponent(sessionId)}/artifacts/clue-versions`,
+    { method: 'POST', body },
+  )
+}
+
+// 选定一个线索版本（v2 §3.3C）。
+export function selectClueVersion(
+  sessionId: string,
+  versionId: string,
+  body: { action_id: string; expected_state_version: number },
+): Promise<ContextActionResponse> {
+  return apiFetch<ContextActionResponse>(
+    `/chat/sessions/${encodeURIComponent(sessionId)}/artifacts/`
+    + `${encodeURIComponent(versionId)}/select`,
+    { method: 'POST', body },
+  )
+}
+
 // 读取指定不可变版本（含来源、基础版本与用量）。
 export function getChatArtifact(sessionId: string, versionId: string): Promise<ArtifactVersion> {
   return apiFetch<ArtifactVersion>(
@@ -95,6 +128,8 @@ export interface ChatStreamInput {
   text?: string
   /** 一组图片（1–9 张，S7.14 起字段名是 `files`，同属一组） */
   files?: File[] | null
+  /** 可选的结构化操作绑定 JSON（v2 §3.3B），服务端校验后随用户消息持久保存 */
+  operationBinding?: string
 }
 
 // 把一帧 SSE 文本（event 行 + 若干 data 行）解析成事件；注释行（": ping"）与坏帧返回 null。
@@ -135,6 +170,7 @@ export async function streamMessage(
 ): Promise<void> {
   const form = new FormData()
   if (input.text) form.append('text', input.text)
+  if (input.operationBinding) form.append('operation_binding', input.operationBinding)
   for (const file of input.files ?? []) form.append('files', file)
 
   const response = await fetch(

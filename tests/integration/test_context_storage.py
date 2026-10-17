@@ -62,6 +62,42 @@ async def _new_session(session: AsyncSession, cfg: AppConfig) -> uuid.UUID:
     return uuid.UUID(created["session_id"])
 
 
+async def _seed_user_message(session: AsyncSession, session_id: uuid.UUID,
+                             content: str) -> str:
+    """来源校验（v2 §2.1）要求增量落到真实用户消息上。"""
+    from xhs_agent.db.models import ChatMessage
+    from xhs_agent.services.chat import append_message
+
+    await append_message(session, session_id, role="user", content=content)
+    row = (
+        await session.execute(
+            select(ChatMessage.id)
+            .where(ChatMessage.session_id == session_id)
+            .order_by(ChatMessage.created_at.desc())
+            .limit(1)
+        )
+    ).scalar_one()
+    return str(row)
+
+
+async def _seed_user_message(session: AsyncSession, session_id: uuid.UUID,
+                             content: str) -> str:
+    """来源校验（v2 §2.1）要求增量落到真实用户消息上。"""
+    from xhs_agent.db.models import ChatMessage
+    from xhs_agent.services.chat import append_message
+
+    await append_message(session, session_id, role="user", content=content)
+    row = (
+        await session.execute(
+            select(ChatMessage.id)
+            .where(ChatMessage.session_id == session_id)
+            .order_by(ChatMessage.created_at.desc())
+            .limit(1)
+        )
+    ).scalar_one()
+    return str(row)
+
+
 def _delta(operations: list[dict[str, object]] | None = None,
            proposals: list[dict[str, object]] | None = None) -> ContextDelta:
     return ContextDelta.from_dict({"operations": operations or [],
@@ -76,11 +112,12 @@ class TestContextState:
         stored = await context_state.load(db_session, session_id)
         assert stored is not None and stored.state_version == 0
 
+        message_id = await _seed_user_message(db_session, session_id, "文案 300 字以内")
         applied = await context_state.apply_delta(
             db_session, cfg, stored,
             _delta([{"op": "add", "kind": "constraint", "value": "300 字以内",
                      "evidence": "300 字以内"}]),
-            message_id="m-1", user_text="文案 300 字以内", mode="enforce",
+            message_id=message_id, user_text="文案 300 字以内", mode="enforce",
         )
         assert applied.applied and applied.version == 1
 
@@ -104,17 +141,18 @@ class TestContextState:
         session_id = await _new_session(db_session, cfg)
         stored = await context_state.load(db_session, session_id)
         assert stored is not None
+        message_id = await _seed_user_message(db_session, session_id, "蹭热点")
         await context_state.apply_delta(
             db_session, cfg, stored,
             _delta([{"op": "add", "kind": "goal", "value": "蹭热点", "evidence": "蹭热点"}]),
-            message_id="m-1", user_text="蹭热点", mode="enforce",
+            message_id=message_id, user_text="蹭热点", mode="enforce",
         )
         # 用旧快照（version=0）再应用一次：CAS 失败，不覆盖新状态
         stale = await context_state.apply_delta(
             db_session, cfg, stored,
             _delta([{"op": "add", "kind": "preference", "value": "口语",
                      "evidence": "口语"}]),
-            message_id="m-2", user_text="口语", mode="enforce",
+            message_id=message_id, user_text="口语", mode="enforce",
         )
         assert stale.applied is False and stale.conflict is True
         latest = await context_state.load(db_session, session_id)
@@ -127,10 +165,11 @@ class TestContextState:
         session_id = await _new_session(db_session, cfg)
         stored = await context_state.load(db_session, session_id)
         assert stored is not None
+        message_id = await _seed_user_message(db_session, session_id, "蹭热点")
         result = await context_state.apply_delta(
             db_session, cfg, stored,
             _delta([{"op": "add", "kind": "goal", "value": "蹭热点", "evidence": "蹭热点"}]),
-            message_id="m-1", user_text="蹭热点", mode="shadow",
+            message_id=message_id, user_text="蹭热点", mode="shadow",
         )
         assert result.applied is False and result.reason == "shadow_mode"
         latest = await context_state.load(db_session, session_id)
@@ -154,28 +193,33 @@ class TestContextState:
         session_id = await _new_session(db_session, cfg)
         stored = await context_state.load(db_session, session_id)
         assert stored is not None
+        message_id = await _seed_user_message(db_session, session_id, "随便改改")
         await context_state.apply_delta(
             db_session, cfg, stored,
             _delta(proposals=[{"kind": "preference", "value": "更口语",
                                "reason": "inferred"}]),
-            message_id="m-1", user_text="随便改改", mode="enforce",
+            message_id=message_id, user_text="随便改改", mode="enforce",
         )
         latest = await context_state.load(db_session, session_id)
         assert latest is not None and latest.snapshot.proposals
         proposal_id = latest.snapshot.proposals[0].proposal_id
 
-        applied, after = await context_state.perform_action(
+        confirmed = await context_state.perform_action(
             db_session, session_id, action="confirm", target_id=proposal_id,
             value="", expected_state_version=latest.state_version,
         )
-        assert applied.applied
+        assert confirmed["decision"] == "applied"
+        after = await context_state.load(db_session, session_id)
+        assert after is not None
         assert after.snapshot.proposals == []
         assert after.snapshot.facts[0].value == "更口语"
 
-        _applied, reset = await context_state.perform_action(
+        await context_state.perform_action(
             db_session, session_id, action="reset_topic", target_id="", value="",
             expected_state_version=after.state_version,
         )
+        reset = await context_state.load(db_session, session_id)
+        assert reset is not None
         assert reset.topic_id != latest.topic_id
         assert reset.snapshot.active() == []  # topic 作用域被归档
 
@@ -185,11 +229,12 @@ class TestContextState:
         session_id = await _new_session(db_session, cfg)
         stored = await context_state.load(db_session, session_id)
         assert stored is not None
+        message_id = await _seed_user_message(db_session, session_id, "帮我写一版文案")
         result = await context_state.apply_delta(
             db_session, cfg, stored,
             _delta([{"op": "add", "kind": "goal", "value": "蹭热点",
                      "evidence": "用户想蹭热点"}]),
-            message_id="m-1", user_text="帮我写一版文案", mode="enforce",
+            message_id=message_id, user_text="帮我写一版文案", mode="enforce",
         )
         assert result.applied is False
         assert result.decisions[0]["reason"] == "evidence_mismatch"
@@ -321,13 +366,13 @@ class TestImageCache:
         identity = image_cache.build_identity(cfg, ["a" * 64])
         assert await image_cache.store(
             db_session, cfg, session_id=session_id, identity=identity,
-            payload={"clue": {}, "raw_text": "描述"}, turn_id="t1",
+            payload={"clue": {"raw_text": "描述"}, "raw_text": "描述"}, turn_id="t1",
         )
         hit = await image_cache.lookup(
             db_session, cfg, session_id=session_id, identity=identity, turn_id="t2",
         )
         assert hit.outcome == "hit" and hit.level == "persistent"
-        assert hit.payload == {"clue": {}, "raw_text": "描述"}
+        assert hit.payload == {"clue": {"raw_text": "描述"}, "raw_text": "描述"}
 
         # 同键重复写入只保留一条
         await image_cache.store(
@@ -376,7 +421,7 @@ class TestImageCache:
         second = await _new_session(db_session, cfg)
         identity = image_cache.build_identity(cfg, ["a" * 64])
         await image_cache.store(db_session, cfg, session_id=first, identity=identity,
-                                payload={"clue": {}, "raw_text": "x"})
+                                payload={"clue": {"raw_text": "x"}, "raw_text": "x"})
         other = await image_cache.lookup(
             db_session, cfg, session_id=second, identity=identity, turn_id="t",
         )

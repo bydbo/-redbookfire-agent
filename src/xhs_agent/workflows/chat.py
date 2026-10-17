@@ -587,14 +587,8 @@ async def run_turn(
             "versions": {},
             "run_id": "",
         }
-    else:  # 注入的账本：按本轮起点清空，避免串轮
-        ledger["records"] = []
-        ledger["calls"] = {}
-        ledger["tool_calls"] = []
-        ledger["components"] = {}
-        ledger.pop("active_scope", None)
-        ledger["versions"] = {}
-        ledger["run_id"] = ""
+    # E7CTX-08：注入的账本**只使用不清空**——轮次入口在抽取前初始化账本，
+    # 抽取的消费记录必须带进对话图（清空会让抽取费用漏计）。串轮隔离由调用方负责。
     graph = _build_graph(
         provider=provider,
         run_tool=run_tool,

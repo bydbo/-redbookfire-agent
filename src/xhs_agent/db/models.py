@@ -267,6 +267,8 @@ class ChatMessage(Base):
     trace_id: Mapped[str | None] = mapped_column(Text, nullable=True)
     progress: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False,
                                                      server_default=text("'{}'"))
+    # v2 §3.3B：结构化操作绑定（对象 / 基础版本 / 预期状态版本），随来源用户消息持久保存
+    operation_binding: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
     cost_cny: Mapped[Decimal] = mapped_column(Numeric(10, 4), nullable=False,
                                               server_default=text("0"))
     latency_ms: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
@@ -343,6 +345,12 @@ class ChatArtifactVersion(Base):
     run_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
     hotspot_position: Mapped[int | None] = mapped_column(Integer, nullable=True)
     request_key: Mapped[str] = mapped_column(Text, nullable=False)
+    # E7CTX-07（v2 修复）：认领时固化的并发预期——提交时比较**当前 head 与生成前 head**，
+    # 不要求选定基础必须等于 head（允许主动从旧版分支，同时阻止覆盖生成期间的新版本）。
+    expected_head_version_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), nullable=True)
+    expected_state_version: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    source_message_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
     status: Mapped[str] = mapped_column(Text, nullable=False, server_default=text("'pending'"))
     version_no: Mapped[int | None] = mapped_column(Integer, nullable=True)
     base_version_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
@@ -395,6 +403,9 @@ class ChatImageParseCache(Base):
     session_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), ForeignKey("chat_sessions.id", ondelete="CASCADE"), nullable=False)
     cache_key: Mapped[str] = mapped_column(Text, nullable=False)
+    # E7CTX-11（v2 修复）：条目代次——同一 cache_key 重建后生成新值，事件与消费按它区分历次结果
+    generation_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), nullable=False, server_default=text("gen_random_uuid()"))
     identity: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)
     payload: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)
     source: Mapped[dict[str, Any]] = mapped_column(
@@ -407,6 +418,7 @@ class ChatImageParseCache(Base):
                          name="uq_chat_image_parse_cache_session_key"),
         CheckConstraint("expires_at > created_at", name="expires_after_created"),
         Index("ix_chat_image_parse_cache_expires_at", "expires_at"),
+        Index("ix_chat_image_parse_cache_generation_id", "generation_id"),
     )
 
 
@@ -435,11 +447,51 @@ class ContextObservation(Base):
     __table_args__ = (
         CheckConstraint(
             "event_type IN ('context_state_decision', 'context_assembled', "
-            "'artifact_version_committed', 'cache_lookup_finished', "
-            "'artifact_consumed', 'model_attempt_finished')",
+            "'artifact_version_committed', 'cache_request_started', "
+            "'cache_lookup_finished', 'cache_entry_created', "
+            "'cache_entry_invalidated', 'cache_entry_consumed', "
+            "'artifact_consumed', 'model_attempt_started', 'model_attempt_finished')",
             name="event_type_allowed",
         ),
         CheckConstraint("attempt IS NULL OR attempt >= 1", name="attempt_positive"),
         Index("ix_context_observations_session_created_at", "session_id", "created_at"),
         Index("ix_context_observations_type_created_at", "event_type", "created_at"),
+    )
+
+
+class ChatContextAction(Base):
+    """`chat_context_actions` — 上下文用例动作认领与重放（v2 修复，数据契约 §3.12）。
+
+    `action_id` 是客户端生成的幂等键：同 (session, action_id) 且同请求体重放返回原结果，
+    不同请求体返回 409；无操作也保存成功结果，但不推进状态、不伪造审计。
+    恢复（recover / complete_recovery）、线索编辑与选择都复用本表，不新建通用任务平台。
+    """
+
+    __tablename__ = "chat_context_actions"
+
+    id: Mapped[uuid.UUID] = _pk()
+    session_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("chat_sessions.id", ondelete="CASCADE"), nullable=False)
+    action_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    action: Mapped[str] = mapped_column(Text, nullable=False)
+    request_digest: Mapped[str] = mapped_column(Text, nullable=False, server_default=text("''"))
+    expected_state_version: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    status: Mapped[str] = mapped_column(Text, nullable=False, server_default=text("'pending'"))
+    result: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False,
+                                                   server_default=text("'{}'"))
+    error: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False,
+                                                  server_default=text("'{}'"))
+    recovery_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
+    retry_of: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
+    accounting_message_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), nullable=True)
+    created_at: Mapped[datetime] = _created_at()
+    updated_at: Mapped[datetime] = _created_at()
+
+    __table_args__ = (
+        UniqueConstraint("session_id", "action_id",
+                         name="uq_chat_context_actions_session_action"),
+        CheckConstraint("status IN ('pending', 'running', 'succeeded', 'failed', 'interrupted')",
+                        name="status_allowed"),
+        Index("ix_chat_context_actions_session_created_at", "session_id", "created_at"),
     )
