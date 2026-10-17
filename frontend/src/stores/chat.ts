@@ -69,7 +69,8 @@ export function errorCategoryLabel(key: string): string {
   return ERROR_CATEGORY_LABELS[key] ?? key
 }
 
-/** 当前阶段视图（S7.21）：来自 SSE `stage` 事件或刷新后的 `message.progress` 快照。 */
+/** 当前阶段视图（S7.21 / E7OBS4-04）：来自 SSE 事件里的**权威快照**或刷新后的
+ *  `message.progress`；两者是同一份后端快照，前端只做投影，不自行拼装状态。 */
 export interface StageView {
   stage: string
   label: string
@@ -79,6 +80,17 @@ export interface StageView {
   errorCategory: string
   /** 当前阶段所属执行（worker run_id）；对话侧阶段为空串。R5：身份隔离用。 */
   runId: string
+  sourceId: string
+  stageInstanceId: string
+  sourceSeq: number
+  /** 后端已接受快照的语义版本（E7OBS4-04）：只在同一消息 / 轮次内可比。 */
+  progressRevision: number
+}
+
+/** revision 的比较范围（E7OBS4-04）：不同消息 / 不同轮次的版本号不可比。 */
+interface ProgressScope {
+  messageId: string
+  turnId: string
 }
 
 /** 跑起来超过这个时长就提示「耗时较长」——只是提示，不据此断定失败。 */
@@ -86,6 +98,13 @@ export const LONG_STAGE_MS = 60_000
 
 /** 阶段终态（R3 单调合并用）：同一次执行的终态不因重复事件重开。 */
 export const TERMINAL_STAGE_STATUSES = ['succeeded', 'failed', 'skipped', 'interrupted']
+
+/** 把事件里的 `progress` 字段读成快照对象；不是对象 / 没有阶段键就当没带（旧格式）。 */
+function asSnapshot(value: unknown): Record<string, unknown> | null {
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) return null
+  const raw = value as Record<string, unknown>
+  return String(raw.stage ?? '') === '' ? null : raw
+}
 
 // 对话首页的状态：会话列表 / 当前会话的消息 / 本轮流式增量与工具步骤 / 命中过的结果卡片。
 export const useChatStore = defineStore('chat', () => {
@@ -104,6 +123,8 @@ export const useChatStore = defineStore('chat', () => {
 
   // 当前阶段（S7.21）：SSE 实时更新 + 刷新后从 message.progress 恢复；已耗时每秒刷新
   const progress = ref<StageView | null>(null)
+  // E7OBS4-04：revision 的比较范围——切会话 / 新消息 / 新轮次都重置，不跨范围比较
+  const progressScope = ref<ProgressScope>({ messageId: '', turnId: '' })
   const clock = ref(Date.now())
   let clockTimer: number | undefined
 
@@ -153,24 +174,107 @@ export const useChatStore = defineStore('chat', () => {
     return items.some((item) => item.status === 'running')
   }
 
-  /** 把一份「类快照」对象合进当前阶段（SSE 事件或 `message.progress` 都走这里）。
+  function sameScope(scope: ProgressScope): boolean {
+    return progressScope.value.messageId === scope.messageId
+      && progressScope.value.turnId === scope.turnId
+  }
 
-   *  R3（OBS-12）单调合并，与后端 `core/progress.py` 同一口径：
-   *  - 同一阶段、`attempt` 更小：旧尝试的迟到事件，忽略（不回退）；
-   *  - 同一阶段、同一 `attempt` 且已是终态：不重开（重复事件不改写已结束的执行）。
-   *  R5（E7OBS2-02）身份隔离，同样对齐后端：
-   *  - 两侧都有明确 `run_id` 且不一致 = 另一条执行：**终态一律不接管当前状态**
-   *    （迟到补历史在后端快照里做，这里不许回退）；`running` 视为新执行开始（接替显示）；
-   *  - 顶层 `runId` 随当前阶段一致：事件带身份用它，同阶段缺身份保留、跨阶段缺身份清空。
+  /** 把一份后端快照读成阶段视图（字段名是后端的 snake_case）。
+   *
+   *  起点**只认快照**：同一阶段实例沿用旧起点，换实例 / 换阶段时若快照没带 `started_at`
+   *  才用当前时刻兜底——绝不因为"又收到一条事件"就重置已耗时。
    */
-  function applyProgressLike(raw: Record<string, unknown> | null | undefined): void {
+  function viewOf(
+    raw: Record<string, unknown>,
+    previous: StageView | null,
+  ): StageView {
+    const stage = String(raw.stage ?? '')
+    const instance = String(raw.stage_instance_id ?? '')
+    const runId = String(raw.run_id ?? '')
+    const sourceId = String(raw.source_id ?? '')
+    const startedAt = String(raw.started_at ?? '')
+    const sameInstance = previous !== null
+      && previous.stage === stage
+      && previous.stageInstanceId === instance
+    return {
+      stage,
+      label: String(raw.label ?? '') || stageLabel(stage),
+      status: String(raw.status ?? 'running'),
+      attempt: Number(raw.attempt ?? 1),
+      startedAt: startedAt !== ''
+        ? startedAt
+        : (sameInstance ? previous.startedAt : new Date().toISOString()),
+      errorCategory: String(raw.error_category ?? ''),
+      runId: runId !== '' ? runId : (sameInstance ? previous.runId : ''),
+      sourceId: sourceId !== '' ? sourceId : (sameInstance ? previous.sourceId : ''),
+      stageInstanceId: instance !== ''
+        ? instance
+        : (sameInstance ? previous.stageInstanceId : ''),
+      sourceSeq: Number(raw.source_seq ?? 0),
+      progressRevision: Number(raw.progress_revision ?? 0),
+    }
+  }
+
+  function applyView(next: StageView): void {
+    progress.value = next
+    if (next.status === 'running') startClock()
+    else stopClock()
+  }
+
+  /** 应用一份**后端已裁决**的权威快照（E7OBS4-04）。
+   *
+   *  - 只比较同一 `(message_id, turn_id)` 范围内的 revision；不同消息 / 轮次不可比，
+   *    换范围时直接以新快照为准（旧范围的 revision 再小也不拦截）；
+   *  - 更旧 revision 忽略；相同 revision 且阶段 / 实例 / 状态 / 尝试都一致视为幂等；
+   *  - 较新 revision 是**完整投影**：允许换 run、换实例、较低 attempt——旧的
+   *    「不同 run 终态一律拒绝」「同阶段同 attempt 终态不改」不再挡它（那只属于旧格式合并）。
+   */
+  function applySnapshot(raw: Record<string, unknown>, scope: ProgressScope): void {
+    const previous = progress.value
+    const inScope = previous !== null && sameScope(scope)
+    const revision = Number(raw.progress_revision ?? 0)
+    if (previous !== null && inScope) {
+      const known = previous.progressRevision
+      if (known > 0 && revision > 0 && revision < known) return
+      if (known > 0 && revision > 0 && revision === known
+        && previous.stage === String(raw.stage ?? '')
+        && previous.status === String(raw.status ?? 'running')
+        && previous.stageInstanceId === String(raw.stage_instance_id ?? '')
+        && previous.attempt === Number(raw.attempt ?? 1)) return
+    }
+    progressScope.value = scope
+    applyView(viewOf(raw, inScope ? previous : null))
+  }
+
+  /** 旧格式兼容合并（后端还没带 `progress` 的事件，或旧消息快照）。
+   *
+   *  R3（OBS-12）单调合并，与后端 `core/progress.py` 的旧口径一致：
+   *  - 同一阶段、`attempt` 更小：旧尝试的迟到事件，忽略（不回退）；
+   *  - 同一阶段、同一 `attempt` 且已是终态：不重开。
+   *  R5（E7OBS2-02）身份隔离：两侧都有明确 `run_id` 且不一致 = 另一条执行，
+   *  **终态一律不接管当前状态**；`running` 视为新执行开始（接替显示）。
+   *  E7OBS4-04：一旦当前视图来自新格式权威快照（revision > 0），无 revision 的旧事件
+   *  一律不能覆盖它。
+   */
+  function mergeLegacyStage(
+    raw: Record<string, unknown> | null | undefined,
+    scope?: ProgressScope,
+  ): void {
     if (raw === null || raw === undefined) return
     const stage = String(raw.stage ?? '')
     if (stage === '') return
+    if (progress.value !== null && progress.value.progressRevision > 0) return
     const attempt = Number(raw.attempt ?? 1)
     const status = String(raw.status ?? 'running')
     const incomingRun = String(raw.run_id ?? '')
+    const incomingRevision = Number(raw.progress_revision ?? 0)
     const previous = progress.value
+    if (previous !== null && incomingRevision > 0
+      && previous.progressRevision > 0
+      && incomingRevision < previous.progressRevision) return
+    if (previous !== null && incomingRevision > 0
+      && incomingRevision === previous.progressRevision
+      && stage !== previous.stage) return
     const conflict = previous !== null && incomingRun !== ''
       && previous.runId !== '' && incomingRun !== previous.runId
     if (previous !== null && conflict && TERMINAL_STAGE_STATUSES.includes(status)) return
@@ -181,7 +285,8 @@ export const useChatStore = defineStore('chat', () => {
     const sameStage = previous !== null && !conflict
       && previous.stage === stage && previous.attempt === attempt
     const startedAt = String(raw.started_at ?? '') || (sameStage ? previous.startedAt : '')
-    progress.value = {
+    if (scope !== undefined) progressScope.value = scope
+    applyView({
       stage,
       label: String(raw.label ?? '') || stageLabel(stage),
       status,
@@ -192,9 +297,14 @@ export const useChatStore = defineStore('chat', () => {
       // 身份与当前阶段一致：带就用；同阶段缺身份保留已知身份；跨阶段缺身份清空（不串）
       runId: incomingRun !== '' ? incomingRun
         : (previous !== null && previous.stage === stage && !conflict ? previous.runId : ''),
-    }
-    if (progress.value.status === 'running') startClock()
-    else stopClock()
+      sourceId: String(raw.source_id ?? '') || (sameStage ? previous?.sourceId ?? '' : ''),
+      stageInstanceId: String(raw.stage_instance_id ?? '')
+        || (sameStage ? previous?.stageInstanceId ?? '' : ''),
+      sourceSeq: Number(raw.source_seq ?? 0),
+      progressRevision: incomingRevision > 0
+        ? incomingRevision
+        : (previous?.progressRevision ?? 0),
+    })
   }
 
   /** 刷新 / 轮询后：从最近一条带快照的 assistant 消息恢复阶段；没有就清空。 */
@@ -205,9 +315,14 @@ export const useChatStore = defineStore('chat', () => {
         && String(item.progress.stage ?? '') !== '',
     )
     if (latest?.progress) {
-      applyProgressLike(latest.progress as unknown as Record<string, unknown>)
+      // 刷新走**同一条权威投影**：不再重复执行一次原始阶段合并（E7OBS4-04）
+      applySnapshot(latest.progress as unknown as Record<string, unknown>, {
+        messageId: latest.message_id,
+        turnId: latest.turn_id ?? '',
+      })
     } else if (!hasRunning(items)) {
       progress.value = null
+      progressScope.value = { messageId: '', turnId: '' }
       stopClock()
     }
   }
@@ -228,12 +343,15 @@ export const useChatStore = defineStore('chat', () => {
   }
 
   async function pollOnce(): Promise<void> {
-    if (currentId.value === null) {
+    const sessionId = currentId.value
+    if (sessionId === null) {
       stopPolling()
       return
     }
     try {
-      const detail = await getChatSession(currentId.value)
+      const detail = await getChatSession(sessionId)
+      // E7OBS4-04：旧请求返回前验证范围——切会话后迟到的响应不能覆盖新会话
+      if (currentId.value !== sessionId) return
       messages.value = detail.messages
       syncProgressFromMessages(detail.messages)
       if (!hasRunning(detail.messages)) stopPolling()
@@ -264,6 +382,7 @@ export const useChatStore = defineStore('chat', () => {
       streamText.value = ''
       toolSteps.value = []
       progress.value = null
+      progressScope.value = { messageId: '', turnId: '' }
       error.value = null
       await loadSessions()
       return null
@@ -290,8 +409,10 @@ export const useChatStore = defineStore('chat', () => {
     streamText.value = ''
     toolSteps.value = []
     progress.value = null
+    progressScope.value = { messageId: '', turnId: '' }
     try {
       const detail = await getChatSession(sessionId)
+      if (currentId.value !== sessionId) return   // 期间切了会话：旧响应不覆盖新视图
       messages.value = detail.messages
       syncProgressFromMessages(detail.messages)
       if (hasRunning(detail.messages)) startPolling()
@@ -304,9 +425,11 @@ export const useChatStore = defineStore('chat', () => {
   }
 
   async function refreshMessages(): Promise<void> {
-    if (currentId.value === null) return
+    const sessionId = currentId.value
+    if (sessionId === null) return
     try {
-      const detail = await getChatSession(currentId.value)
+      const detail = await getChatSession(sessionId)
+      if (currentId.value !== sessionId) return   // 旧会话响应不覆盖新会话
       messages.value = detail.messages
       syncProgressFromMessages(detail.messages)
     } catch {
@@ -315,37 +438,50 @@ export const useChatStore = defineStore('chat', () => {
   }
 
   function onStreamEvent(event: string, data: Record<string, unknown>): void {
+    // 事件信封带 message_id / turn_id（E7OBS4-04）：revision 只在这个范围内可比
+    const scope: ProgressScope = {
+      messageId: String(data.message_id ?? ''),
+      turnId: String(data.turn_id ?? ''),
+    }
+    const snapshot = asSnapshot(data.progress)
     switch (event) {
       case 'turn_started':
+        // 新轮次：范围先重置，避免拿上一轮的 revision 拦这一轮
+        if (scope.turnId !== '') progressScope.value = scope
         void refreshMessages()
         break
       case 'stage':
-        // 阶段生命周期（理解与决策 / 整理回复）：刷新后由 message.progress 恢复同一份快照
-        applyProgressLike(data)
+        // 阶段生命周期（理解与决策 / 整理回复）：事件已带**合并后的权威快照**时只投影它；
+        // 旧后端（没有 progress）才退回原始阶段字段合并。
+        if (snapshot !== null) applySnapshot(snapshot, scope)
+        else mergeLegacyStage(data, scope)
         break
       case 'tool_started':
         toolSteps.value.push({ stage: `开始：${toolLabel(String(data.tool ?? ''))}`, done: 0, total: 0 })
         break
       case 'tool_progress':
+        // 工具过程（done/total 与中文阶段）只喂步骤列表，不再独立改写当前阶段
         toolSteps.value.push({
           stage: String(data.stage ?? ''),
           done: Number(data.done ?? 0),
           total: Number(data.total ?? 0),
         })
-        if (String(data.stage_key ?? '') !== '') {
-          // 排队等待 / 素材同步 / 向量回填 / 五节点：以阶段键更新当前阶段。
-          // R5（E7OBS2-02/03）：结构化字段**原样转发**——真实状态（failed / skipped）、
-          // 源尝试号、错误类别与 run 身份不能被压成"running"，否则实时显示与刷新后的
-          // 快照（后端按同一份快照持久化）会漂移，身份隔离也失效。
-          applyProgressLike({
-            stage: String(data.stage_key),
+        if (snapshot !== null && String(data.stage_key ?? '') !== '') {
+          applySnapshot(snapshot, scope)
+        } else if (String(data.stage_key ?? '') !== '') {
+          // 旧后端：结构化字段原样转发，真实状态 / 尝试号 / 来源身份不能被压成 running
+          mergeLegacyStage({
+            stage: String(data.stage_key ?? ''),
             label: String(data.stage ?? '') || stageLabel(String(data.stage_key)),
             status: String(data.status ?? 'running'),
             attempt: data.attempt,
             error_category: String(data.error_category ?? ''),
             run_id: String(data.run_id ?? ''),
+            source_id: String(data.source_id ?? ''),
+            stage_instance_id: String(data.stage_instance_id ?? ''),
+            source_seq: data.source_seq,
             updated_at: data.updated_at,
-          })
+          }, scope)
         }
         break
       case 'tool_finished':
@@ -354,12 +490,19 @@ export const useChatStore = defineStore('chat', () => {
           done: 0,
           total: 0,
         })
+        // 需要更新阶段的收尾事件同样带快照（结构化 worker 阶段 / 旧式标签阶段）
+        if (snapshot !== null) applySnapshot(snapshot, scope)
         break
       case 'text_delta':
         streamText.value += String(data.text ?? '')
         break
+      case 'turn_finished':
+        if (snapshot !== null) applySnapshot(snapshot, scope)
+        break
       case 'error':
         error.value = String(data.message ?? '这一轮失败了')
+        // 失败 / 取消终态也带权威快照：终止计时并显示真实失败阶段
+        if (snapshot !== null) applySnapshot(snapshot, scope)
         break
       default:
         break
@@ -385,6 +528,7 @@ export const useChatStore = defineStore('chat', () => {
     streamText.value = ''
     toolSteps.value = []
     progress.value = null
+    progressScope.value = { messageId: '', turnId: '' }
     try {
       await streamMessage(sessionId, { text, files }, (event) => {
         onStreamEvent(event.event, event.data)
@@ -425,6 +569,7 @@ export const useChatStore = defineStore('chat', () => {
     streamText.value = ''
     toolSteps.value = []
     progress.value = null
+    progressScope.value = { messageId: '', turnId: '' }
     error.value = null
   }
 

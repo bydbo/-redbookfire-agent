@@ -400,3 +400,199 @@ describe('useChatStore 阶段身份隔离（R5 / E7OBS2-02）', () => {
     expect(observed.finalRun).toBe('')               // 跨阶段缺身份：清空
   })
 })
+
+describe('权威快照投影（E7OBS4-04）', () => {
+  function snapshot(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+    return {
+      stage: 'report',
+      label: '报告',
+      status: 'running',
+      attempt: 1,
+      started_at: '2026-10-06T04:00:00+00:00',
+      updated_at: '2026-10-06T04:00:01+00:00',
+      error_category: '',
+      run_id: 'run-a',
+      job_id: null,
+      source_id: 'worker:run-a:g0',
+      stage_instance_id: 'worker:run-a:g0:report:1',
+      source_seq: 3,
+      progress_revision: 5,
+      nodes: [],
+      ...overrides,
+    }
+  }
+
+  const envelope = { message_id: 'm-a', turn_id: 't-1' }
+
+  /** 发一轮事件并在流中途取一份快照（`send()` 之后会回读消息，终态会以库里为准）。 */
+  async function play(
+    events: { event: string; data: Record<string, unknown> }[],
+    observe: () => void,
+  ): Promise<ReturnType<typeof useChatStore>> {
+    vi.mocked(createChatSession).mockResolvedValue({
+      session_id: 's-9', title: '', created_at: '', updated_at: '',
+    })
+    vi.mocked(listChatSessions).mockResolvedValue(listing())
+    vi.mocked(getChatSession).mockResolvedValue(detail([message({ status: 'running' })]))
+    vi.mocked(streamMessage).mockImplementation(async (_id, _input, onEvent) => {
+      for (const item of events) onEvent(item)
+      observe()
+    })
+    const store = useChatStore()
+    await store.send({ text: '帮我蹭一下这个热点' })
+    return store
+  }
+
+  it('D1：原始阶段是旧 draft，嵌套 progress 是当前 report —— 展示 report，不闪回', async () => {
+    let stage = ''
+    let label = ''
+    await play([
+      { event: 'tool_progress', data: { ...envelope, stage_key: 'draft', stage: '撰稿',
+        status: 'running', progress: snapshot() } },
+    ], () => {
+      const store = useChatStore()
+      stage = store.progress?.stage ?? ''
+      label = store.progress?.label ?? ''
+    })
+    expect(stage).toBe('report')
+    expect(label).toBe('报告')
+  })
+
+  it('D2：较新 revision 的同名新实例、attempt=1 合法接受（旧终态守卫不误拦）', async () => {
+    const observed: string[] = []
+    vi.mocked(createChatSession).mockResolvedValue({
+      session_id: 's-9', title: '', created_at: '', updated_at: '',
+    })
+    vi.mocked(listChatSessions).mockResolvedValue(listing())
+    vi.mocked(getChatSession).mockResolvedValue(detail([message({ status: 'running' })]))
+    vi.mocked(streamMessage).mockImplementation(async (_id, _input, onEvent) => {
+      const store = useChatStore()
+      onEvent({ event: 'stage', data: { ...envelope, progress: snapshot({ status: 'succeeded' }) } })
+      observed.push(`${store.progress?.status}/${store.progress?.stageInstanceId}`)
+      onEvent({ event: 'stage', data: { ...envelope, progress: snapshot({
+        status: 'running', attempt: 1, stage_instance_id: 'worker:run-a:g0:report:2',
+        progress_revision: 6, source_seq: 4, started_at: '2026-10-06T04:00:05+00:00',
+      }) } })
+      observed.push(`${store.progress?.status}/${store.progress?.stageInstanceId}`)
+    })
+    await useChatStore().send({ text: '帮我蹭一下这个热点' })
+
+    // 第一个实例已终结，但更高 revision 的第二个同名实例必须能启动（同 stage、attempt 都是 1）
+    expect(observed).toEqual([
+      'succeeded/worker:run-a:g0:report:1',
+      'running/worker:run-a:g0:report:2',
+    ])
+  })
+
+  it('D3：乱序 revision 不回退、重复 revision 不重置起点', async () => {
+    const observed: { rev: number; startedAt: string }[] = []
+    await play([
+      { event: 'stage', data: { ...envelope, progress: snapshot({ progress_revision: 7 }) } },
+      { event: 'stage', data: { ...envelope, progress: snapshot({
+        stage: 'draft', status: 'running', progress_revision: 5,
+        started_at: '2026-10-06T03:00:00+00:00',
+        stage_instance_id: 'worker:run-a:g0:draft:1',
+      }) } },
+      { event: 'stage', data: { ...envelope, progress: snapshot({
+        progress_revision: 7, started_at: '2026-10-06T05:00:00+00:00',
+      }) } },
+    ], () => {
+      const store = useChatStore()
+      observed.push({
+        rev: store.progress?.progressRevision ?? 0,
+        startedAt: store.progress?.startedAt ?? '',
+      })
+    })
+    expect(observed).toHaveLength(1)
+    expect(observed[0].rev).toBe(7)
+    expect(observed[0].startedAt).toBe('2026-10-06T04:00:00+00:00')  // 起点不被事件到达时间改写
+  })
+
+  it('D4：新消息 revision 更低、切会话后旧响应返回 —— 不跨范围比较、不覆盖新会话', async () => {
+    const observed: number[] = []
+    await play([
+      { event: 'stage', data: { ...envelope, progress: snapshot({ progress_revision: 9 }) } },
+      { event: 'stage', data: { message_id: 'm-b', turn_id: 't-2',
+        progress: snapshot({ stage: 'clue', label: '拆解', progress_revision: 1 }) } },
+    ], () => {
+      const store = useChatStore()
+      observed.push(store.progress?.progressRevision ?? 0, store.progress?.stage === 'clue' ? 1 : 0)
+    })
+    expect(observed).toEqual([1, 1])   // 新消息的低 revision 照常接受
+
+    // 切会话后旧请求返回：不覆盖新会话的视图
+    setActivePinia(createPinia())
+    vi.mocked(getChatSession).mockReset()
+    let resolveOld: (value: ChatSessionDetail) => void = () => {}
+    const slow = new Promise<ChatSessionDetail>((resolve) => { resolveOld = resolve })
+    vi.mocked(getChatSession).mockReturnValueOnce(slow)
+    const store = useChatStore()
+    const pending = store.openSession('s-1')
+    vi.mocked(getChatSession).mockResolvedValue(detail([message({ message_id: 'm-new' })]))
+    await store.openSession('s-2')
+    resolveOld(detail([message({ message_id: 'm-old', progress: snapshot() as never })]))
+    await pending
+    expect(store.currentId).toBe('s-2')
+    expect(store.messages.map((item) => item.message_id)).toEqual(['m-new'])
+  })
+
+  it('D5：SSE + 轮询 + 刷新同一份快照交错 —— 字段一致、不重复回退', async () => {
+    let fromSse: Record<string, unknown> = {}
+    let fromRefresh: Record<string, unknown> = {}
+    const shared = snapshot({ progress_revision: 4, status: 'running' })
+    vi.mocked(createChatSession).mockResolvedValue({
+      session_id: 's-9', title: '', created_at: '', updated_at: '',
+    })
+    vi.mocked(listChatSessions).mockResolvedValue(listing())
+    vi.mocked(getChatSession).mockResolvedValue(detail([
+      message({ message_id: 'm-a', turn_id: 't-1', status: 'running',
+        progress: shared as never }),
+    ]))
+    vi.mocked(streamMessage).mockImplementation(async (_id, _input, onEvent) => {
+      onEvent({ event: 'stage', data: { ...envelope, progress: shared } })
+      const store = useChatStore()
+      fromSse = { ...store.progress }
+      await store.refreshMessages()
+      fromRefresh = { ...store.progress }
+    })
+    const store = useChatStore()
+    await store.send({ text: '帮我蹭一下这个热点' })
+
+    expect(fromSse).toEqual(fromRefresh)
+    expect(store.progress?.label).toBe('报告')
+    expect(store.progress?.sourceId).toBe('worker:run-a:g0')
+    expect(store.progress?.progressRevision).toBe(4)
+    expect(store.progress?.startedAt).toBe('2026-10-06T04:00:00+00:00')
+  })
+
+  it('D6：失败 / 取消终态带快照 —— 状态如实、计时停止', async () => {
+    const observed: { status: string; running: boolean }[] = []
+    await play([
+      { event: 'stage', data: { ...envelope, progress: snapshot() } },
+      { event: 'error', data: { ...envelope, message: '这一轮被取消',
+        progress: snapshot({ status: 'interrupted', error_category: 'cancelled',
+          progress_revision: 6 }) } },
+    ], () => {
+      const store = useChatStore()
+      observed.push({
+        status: store.progress?.status ?? '',
+        running: store.stageElapsedMs > 0,
+      })
+    })
+    expect(observed[0].status).toBe('interrupted')
+    expect(observed[0].running).toBe(false)
+  })
+
+  it('D7：旧消息没有新字段 —— 按兼容规则显示，且不覆盖新格式较新事实', async () => {
+    await play([
+      { event: 'stage', data: { ...envelope, progress: snapshot({ progress_revision: 8 }) } },
+      // 旧后端事件：没有 progress，也没有 revision
+      { event: 'tool_progress', data: { ...envelope, stage_key: 'draft', stage: '撰稿',
+        status: 'running', attempt: 1 } },
+    ], () => {
+      const store = useChatStore()
+      expect(store.progress?.stage).toBe('report')
+      expect(store.progress?.progressRevision).toBe(8)
+    })
+  })
+})
