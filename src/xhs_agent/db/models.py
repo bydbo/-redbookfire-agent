@@ -210,7 +210,7 @@ class RunMatch(Base):
 
 
 class ChatSession(Base):
-    """`chat_sessions` — 对话会话（数据契约 §3.6，S7.2）。"""
+    """`chat_sessions` — 对话会话（数据契约 §3.6，S7.2 / S7.24）。"""
 
     __tablename__ = "chat_sessions"
 
@@ -218,10 +218,22 @@ class ChatSession(Base):
     title: Mapped[str] = mapped_column(Text, nullable=False, server_default=text("''"))
     created_at: Mapped[datetime] = _created_at()
     updated_at: Mapped[datetime] = _created_at()
+    # ---- E7 第六批（S7.24）：结构化上下文状态 ----
+    state_version: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
+    topic_id: Mapped[str | None] = mapped_column(Text, nullable=True)
+    context_state: Mapped[dict[str, Any]] = mapped_column(
+        JSONB, nullable=False, server_default=text("'{}'"))
+    artifact_heads: Mapped[dict[str, Any]] = mapped_column(
+        JSONB, nullable=False, server_default=text("'{}'"))
+    recovery_status: Mapped[str] = mapped_column(
+        Text, nullable=False, server_default=text("'complete'"))
 
     __table_args__ = (
         # 普通 B-tree 就够：Postgres 反向扫描它即可满足 `ORDER BY updated_at DESC`
         Index("ix_chat_sessions_updated_at", "updated_at"),
+        CheckConstraint("state_version >= 0", name="state_version_non_negative"),
+        CheckConstraint("recovery_status IN ('complete', 'partial')",
+                        name="recovery_status_allowed"),
     )
 
 
@@ -273,4 +285,161 @@ class ChatMessage(Base):
         CheckConstraint("prompt_tokens >= 0", name="prompt_tokens_non_negative"),
         CheckConstraint("completion_tokens >= 0", name="completion_tokens_non_negative"),
         Index("ix_chat_messages_session_id_created_at", "session_id", "created_at"),
+    )
+
+
+class ChatContextEvent(Base):
+    """`chat_context_events` — 上下文状态审计（数据契约 §3.8，S7.24）。
+
+    每次**被接受**的状态变更写一行，`state_version` 就是变更后的会话版本；同一会话内唯一，
+    重复提交同一版本不会再次推进（服务端先做 CAS，再写审计，最后提交）。
+    """
+
+    __tablename__ = "chat_context_events"
+
+    id: Mapped[uuid.UUID] = _pk()
+    session_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("chat_sessions.id", ondelete="CASCADE"), nullable=False)
+    state_version: Mapped[int] = mapped_column(Integer, nullable=False)
+    event_type: Mapped[str] = mapped_column(Text, nullable=False)
+    actor: Mapped[str] = mapped_column(Text, nullable=False)
+    source_ref: Mapped[dict[str, Any]] = mapped_column(
+        JSONB, nullable=False, server_default=text("'{}'"))
+    decisions: Mapped[list[dict[str, Any]]] = mapped_column(
+        JSONB, nullable=False, server_default=text("'[]'"))
+    delta: Mapped[dict[str, Any]] = mapped_column(
+        JSONB, nullable=False, server_default=text("'{}'"))
+    reason: Mapped[str] = mapped_column(Text, nullable=False, server_default=text("''"))
+    created_at: Mapped[datetime] = _created_at()
+
+    __table_args__ = (
+        UniqueConstraint("session_id", "state_version",
+                         name="uq_chat_context_events_session_version"),
+        CheckConstraint("state_version >= 0", name="state_version_non_negative"),
+        CheckConstraint(
+            "event_type IN ('delta', 'confirm', 'reject', 'retract', 'replace', "
+            "'reset_topic', 'recovery')",
+            name="event_type_allowed",
+        ),
+        CheckConstraint("actor IN ('extract', 'user', 'system')", name="actor_allowed"),
+        Index("ix_chat_context_events_session_created_at", "session_id", "created_at"),
+    )
+
+
+class ChatArtifactVersion(Base):
+    """`chat_artifact_versions` — 文案 / 线索版本（数据契约 §3.9，S7.25）。
+
+    请求认领行先提交（`pending`），成功后**同一事务**写 `version_no` / `content` 并切换会话
+    `artifact_heads`；失败 / 拒绝 / 中断只更新终态，不占成功版本号。
+    """
+
+    __tablename__ = "chat_artifact_versions"
+
+    id: Mapped[uuid.UUID] = _pk()
+    session_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("chat_sessions.id", ondelete="CASCADE"), nullable=False)
+    object_key: Mapped[str] = mapped_column(Text, nullable=False)
+    object_type: Mapped[str] = mapped_column(Text, nullable=False)
+    run_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
+    hotspot_position: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    request_key: Mapped[str] = mapped_column(Text, nullable=False)
+    status: Mapped[str] = mapped_column(Text, nullable=False, server_default=text("'pending'"))
+    version_no: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    base_version_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
+    content: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
+    source: Mapped[dict[str, Any]] = mapped_column(
+        JSONB, nullable=False, server_default=text("'{}'"))
+    prompt_versions: Mapped[dict[str, int]] = mapped_column(
+        JSONB, nullable=False, server_default=text("'{}'"))
+    usage: Mapped[dict[str, Any]] = mapped_column(
+        JSONB, nullable=False, server_default=text("'{}'"))
+    error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = _created_at()
+    updated_at: Mapped[datetime] = _created_at()
+
+    __table_args__ = (
+        UniqueConstraint("session_id", "request_key",
+                         name="uq_chat_artifact_versions_session_request"),
+        # 只有成功版本占号：失败 / 拒绝 / 中断记录不参与唯一性（部分唯一索引）
+        Index("uq_chat_artifact_versions_object_version", "session_id", "object_key",
+              "version_no", unique=True, postgresql_where=text("status = 'succeeded'")),
+        Index("ix_chat_artifact_versions_object_version", "session_id", "object_key",
+              "version_no"),
+        CheckConstraint(
+            "status IN ('pending', 'succeeded', 'failed', 'refused', 'interrupted')",
+            name="status_allowed",
+        ),
+        CheckConstraint("object_type IN ('draft', 'clue')", name="object_type_allowed"),
+        CheckConstraint("version_no IS NULL OR version_no >= 1", name="version_no_positive"),
+        CheckConstraint(
+            "(status = 'succeeded') = (version_no IS NOT NULL)",
+            name="succeeded_has_version",
+        ),
+        CheckConstraint("base_version_id IS NULL OR base_version_id <> id",
+                        name="base_not_self"),
+        CheckConstraint("hotspot_position IS NULL OR hotspot_position >= 1",
+                        name="position_positive"),
+    )
+
+
+class ChatImageParseCache(Base):
+    """`chat_image_parse_cache` — 图片解析持久缓存（数据契约 §3.10，S7.27）。
+
+    **缓存对象，不是业务产物**：到期 / 删除只影响复用，不影响 `chat_artifact_versions` 里
+    用户确认或编辑过的线索版本。
+    """
+
+    __tablename__ = "chat_image_parse_cache"
+
+    id: Mapped[uuid.UUID] = _pk()
+    session_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("chat_sessions.id", ondelete="CASCADE"), nullable=False)
+    cache_key: Mapped[str] = mapped_column(Text, nullable=False)
+    identity: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)
+    payload: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)
+    source: Mapped[dict[str, Any]] = mapped_column(
+        JSONB, nullable=False, server_default=text("'{}'"))
+    created_at: Mapped[datetime] = _created_at()
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+    __table_args__ = (
+        UniqueConstraint("session_id", "cache_key",
+                         name="uq_chat_image_parse_cache_session_key"),
+        CheckConstraint("expires_at > created_at", name="expires_after_created"),
+        Index("ix_chat_image_parse_cache_expires_at", "expires_at"),
+    )
+
+
+class ContextObservation(Base):
+    """`context_observations` — 上下文与缓存度量事实源（数据契约 §3.11，S7.28）。
+
+    旁路表：写入失败只告警，不阻断业务；`event_id` 是稳定 ID，重复投递按主键冲突忽略。
+    """
+
+    __tablename__ = "context_observations"
+
+    event_id: Mapped[str] = mapped_column(Text, primary_key=True)
+    session_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("chat_sessions.id", ondelete="CASCADE"), nullable=False)
+    event_type: Mapped[str] = mapped_column(Text, nullable=False)
+    turn_id: Mapped[str | None] = mapped_column(Text, nullable=True)
+    call_id: Mapped[str | None] = mapped_column(Text, nullable=True)
+    attempt: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    model: Mapped[str | None] = mapped_column(Text, nullable=True)
+    prompt_version: Mapped[str | None] = mapped_column(Text, nullable=True)
+    policy_version: Mapped[str | None] = mapped_column(Text, nullable=True)
+    payload: Mapped[dict[str, Any]] = mapped_column(
+        JSONB, nullable=False, server_default=text("'{}'"))
+    created_at: Mapped[datetime] = _created_at()
+
+    __table_args__ = (
+        CheckConstraint(
+            "event_type IN ('context_state_decision', 'context_assembled', "
+            "'artifact_version_committed', 'cache_lookup_finished', "
+            "'artifact_consumed', 'model_attempt_finished')",
+            name="event_type_allowed",
+        ),
+        CheckConstraint("attempt IS NULL OR attempt >= 1", name="attempt_positive"),
+        Index("ix_context_observations_session_created_at", "session_id", "created_at"),
+        Index("ix_context_observations_type_created_at", "event_type", "created_at"),
     )

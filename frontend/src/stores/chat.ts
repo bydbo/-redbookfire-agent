@@ -4,8 +4,20 @@ import { computed, ref } from 'vue'
 import type { RunDetail } from '@/api/analysis'
 import { getRun } from '@/api/analysis'
 import { ApiRequestError } from '@/api/client'
-import type { ChatMessage, ChatSessionSummary } from '@/api/chat'
-import { createChatSession, getChatSession, listChatSessions, streamMessage } from '@/api/chat'
+import type {
+  ChatContext,
+  ChatMessage,
+  ChatSessionSummary,
+  ContextActionRequest,
+} from '@/api/chat'
+import {
+  createChatSession,
+  getChatContext,
+  getChatSession,
+  listChatSessions,
+  postChatContextAction,
+  streamMessage,
+} from '@/api/chat'
 
 // 一次工具调用的进度步骤（S7.4 的 tool_started / tool_progress / tool_finished 归约而成）。
 export interface ToolStep {
@@ -120,6 +132,11 @@ export const useChatStore = defineStore('chat', () => {
   const streamText = ref('')
   const toolSteps = ref<ToolStep[]>([])
   const error = ref<string | null>(null)
+
+  // 上下文状态（S7.24）：生效 / 待确认事实与版本；刷新和每轮结束后都从服务端取回
+  const context = ref<ChatContext | null>(null)
+  const contextLoading = ref(false)
+  const contextError = ref<string | null>(null)
 
   // 当前阶段（S7.21）：SSE 实时更新 + 刷新后从 message.progress 恢复；已耗时每秒刷新
   const progress = ref<StageView | null>(null)
@@ -360,6 +377,58 @@ export const useChatStore = defineStore('chat', () => {
     }
   }
 
+  /** 拉取会话上下文（S7.24）：面板、待确认项与恢复缺口都来自它。 */
+  async function loadContext(): Promise<void> {
+    const sessionId = currentId.value
+    if (sessionId === null) {
+      context.value = null
+      return
+    }
+    contextLoading.value = true
+    contextError.value = null
+    try {
+      const loaded = await getChatContext(sessionId)
+      if (currentId.value !== sessionId) return   // 旧会话响应不覆盖新会话
+      context.value = loaded
+    } catch (err) {
+      contextError.value = describeError(err)
+    } finally {
+      contextLoading.value = false
+    }
+  }
+
+  /** 上下文动作（确认 / 拒绝 / 撤回 / 替换 / 换话题）。
+   *
+   *  带 `expected_state_version` 做 CAS：409 时刷新面板并返回「状态已变化」，由用户重试——
+   *  前端不隐藏选项来代替服务端校验，也不在冲突时静默重放。
+   */
+  async function actOnContext(
+    action: ContextActionRequest['action'],
+    targetId?: string,
+    value?: string,
+  ): Promise<string | null> {
+    const sessionId = currentId.value
+    const current = context.value
+    if (sessionId === null || current === null) return '上下文还没加载好，请稍后重试'
+    try {
+      const body: ContextActionRequest = {
+        action,
+        expected_state_version: current.state_version,
+      }
+      if (targetId !== undefined && targetId !== '') body.target_id = targetId
+      if (value !== undefined && value !== '') body.value = value
+      const result = await postChatContextAction(sessionId, body)
+      if (currentId.value === sessionId) context.value = result.context
+      return null
+    } catch (err) {
+      if (err instanceof ApiRequestError && err.httpStatus === 409) {
+        await loadContext()
+        return '状态已变化，已刷新当前版本，请重新操作'
+      }
+      return describeError(err)
+    }
+  }
+
   async function loadSessions(): Promise<void> {
     sessionsLoading.value = true
     sessionsError.value = null
@@ -384,6 +453,7 @@ export const useChatStore = defineStore('chat', () => {
       progress.value = null
       progressScope.value = { messageId: '', turnId: '' }
       error.value = null
+      context.value = null
       await loadSessions()
       return null
     } catch (err) {
@@ -416,6 +486,7 @@ export const useChatStore = defineStore('chat', () => {
       messages.value = detail.messages
       syncProgressFromMessages(detail.messages)
       if (hasRunning(detail.messages)) startPolling()
+      void loadContext()
     } catch (err) {
       messages.value = []
       error.value = describeError(err)
@@ -539,6 +610,7 @@ export const useChatStore = defineStore('chat', () => {
       sending.value = false
       streamText.value = ''
       await refreshMessages()
+      await loadContext()
       await loadSessions()
       // 这一轮如果产出了 run，顺手把结果卡片的数据取回来
       const latest = [...messages.value].reverse().find((item) => item.run_id)
@@ -565,6 +637,7 @@ export const useChatStore = defineStore('chat', () => {
     stopPolling()
     stopClock()
     currentId.value = null
+    context.value = null
     messages.value = []
     streamText.value = ''
     toolSteps.value = []
@@ -578,7 +651,9 @@ export const useChatStore = defineStore('chat', () => {
     currentId, currentSession, messages, messagesLoading,
     sending, busy, streamText, toolSteps, error, runs,
     progress, stageElapsedMs, stageLongRunning,
-    loadSessions, init, newSession, openSession, refreshMessages, send, ensureRun, reset,
+    context, contextLoading, contextError,
+    loadSessions, loadContext, actOnContext,
+    init, newSession, openSession, refreshMessages, send, ensureRun, reset,
     stopPolling, toolLabel,
   }
 })

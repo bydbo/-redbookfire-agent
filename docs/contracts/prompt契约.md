@@ -6,7 +6,7 @@
 
 ## 一、适用范围与地位
 
-**prompt 文本的唯一来源是 `src/xhs_agent/prompts/<task_id>.md`。禁止在代码里内联 prompt 字符串**，也禁止另起一套模板目录。当前适用七个任务：
+**prompt 文本的唯一来源是 `src/xhs_agent/prompts/<task_id>.md`。禁止在代码里内联 prompt 字符串**，也禁止另起一套模板目录。当前适用九个任务：
 
 | task_id | 用途 | 调用方 |
 | --- | --- | --- |
@@ -18,6 +18,7 @@
 | `image_hotspot_clue_multi` | **一组图**（1–9 张）→ 一份热点描述 + 一份爆点线索（多模态，S7.15） | `services/image_clue.py`（`parse_image_clue_multi`） |
 | `chat_supervisor` | 对话层：读用户消息 → 决定直接回答或调工具 → 把结果讲成人话 | `agents/supervisor.py`（S7.3 落地） |
 | `copy_revise` | 已有初稿 + 用户要求 → 改后初稿（要求越界时只回拒绝理由，不给变通写法） | `agents/revise.py`（S7.8 落地） |
+| `context_extract` | 本轮用户原文 + 现有状态 → 有限类型的状态增量（新增 / 撤回 / 显式替换 / 待确认提案） | `services/context_state.py`（S7.24 落地） |
 
 三条硬规则：
 
@@ -48,6 +49,18 @@
 **工具类 prompt 的控制字段（S7.8 起）**：工具类 prompt 允许在最外层带**控制字段**——用来表达
 "这次不产出领域对象"（例如 `copy_revise` 的 `refused` / `reason`）。领域字段仍必须引用数据契约 /
 API 契约里的既有 schema，不得自造字段（§二 05 Output Schema 与 §五 的"不新造字段"说的是这一层）。
+
+**上下文状态抽取（S7.24）**：`context_extract` 是**状态增量**任务，不是对话任务，口径四条：
+
+1. 占位符固定为 `{{ user_text }}`（本轮用户原文，必填）、`{{ state }}`（现有生效 / 待确认事实的
+   确定性 JSON 渲染，可为 `[]`）、`{{ refs }}`（服务端已验证的对象引用数组，可为 `[]`）；
+2. 输出必须是 JSON 对象 `{operations: [...], proposals: [...]}`：`operations` 只允许
+   `add` / `retract` / `replace` 三种，`proposals` 只用于推断、歧义或替换意图不明的冲突；
+3. 每条操作必须带 `evidence`（用户原文的**逐字片段**）与 `target_fact_id`（撤回 / 替换时）；
+   服务端会做子串匹配与归属校验，匹配不上直接拒绝该条，**不采信模型的置信度字段**；
+4. 抽取默认输出上限 2048 tokens（`[context].extract_max_tokens`），结构解析失败最多修复一次
+   （`[context].extract_repair_max`），修复也是一次真实请求、逐次计费。prompt 正文里不写
+   "你可以确认"这类越权话术——确认只能由用户动作产生。
 
 **机读数据资产（S7.11 起，ADR 0016）**：`src/xhs_agent/prompts/` 除 `<task_id>.md` 外，允许放
 **机读数据资产** `<name>.json`，规则三条：① 它不是 prompt 任务（`.json` 不进 `available_tasks()`

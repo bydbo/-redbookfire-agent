@@ -10,6 +10,15 @@ export type ChatSessionDetail = components['schemas']['ChatSessionDetail']
 export type ChatMessage = components['schemas']['ChatMessage']
 export type ChatToolCall = components['schemas']['ChatToolCall']
 export type ChatAttachment = components['schemas']['ChatAttachment']
+// E7 第六批（S7.24 / S7.25）：上下文状态与产物版本
+export type ChatContext = components['schemas']['ChatContext']
+export type ContextFact = components['schemas']['ContextFact']
+export type ContextProposal = components['schemas']['ContextProposal']
+export type ArtifactHead = components['schemas']['ArtifactHead']
+export type ContextActionRequest = components['schemas']['ContextActionRequest']
+export type ContextActionResponse = components['schemas']['ContextActionResponse']
+export type ArtifactVersion = components['schemas']['ArtifactVersion']
+export type ArtifactVersionList = components['schemas']['ArtifactVersionList']
 
 // 建一个空会话（前端「新对话」）；标题等首条用户消息落库时自动补。
 export function createChatSession(): Promise<ChatSession> {
@@ -37,6 +46,43 @@ export function getChatSession(sessionId: string, limit?: number): Promise<ChatS
 export function chatAttachmentUrl(sessionId: string, messageId: string, index: number): string {
   return apiUrl(`/chat/sessions/${encodeURIComponent(sessionId)}`
                 + `/attachments/${encodeURIComponent(messageId)}/${String(index)}`)
+}
+
+// 会话上下文（S7.24）：生效 / 待确认事实、状态版本、恢复状态与产物 head。
+export function getChatContext(sessionId: string): Promise<ChatContext> {
+  return apiFetch<ChatContext>(`/chat/sessions/${encodeURIComponent(sessionId)}/context`)
+}
+
+// 上下文动作（S7.24）：confirm / reject / retract / replace / reset_topic。
+// `expected_state_version` 是 CAS 条件：与服务端不一致时返回 409（调用方刷新后重试）。
+export function postChatContextAction(
+  sessionId: string,
+  body: ContextActionRequest,
+): Promise<ContextActionResponse> {
+  return apiFetch<ContextActionResponse>(
+    `/chat/sessions/${encodeURIComponent(sessionId)}/context/actions`,
+    { method: 'POST', body },
+  )
+}
+
+// 按对象列版本（S7.25）；不传 object_key 时给每个对象的最新成功版本。
+export function listChatArtifacts(
+  sessionId: string,
+  objectKey?: string,
+): Promise<ArtifactVersionList> {
+  const query = objectKey === undefined || objectKey === ''
+    ? ''
+    : `?object_key=${encodeURIComponent(objectKey)}`
+  return apiFetch<ArtifactVersionList>(
+    `/chat/sessions/${encodeURIComponent(sessionId)}/artifacts${query}`,
+  )
+}
+
+// 读取指定不可变版本（含来源、基础版本与用量）。
+export function getChatArtifact(sessionId: string, versionId: string): Promise<ArtifactVersion> {
+  return apiFetch<ArtifactVersion>(
+    `/chat/sessions/${encodeURIComponent(sessionId)}/artifacts/${encodeURIComponent(versionId)}`,
+  )
 }
 
 // 一条 SSE 事件：event 是事件名，data 是那行 JSON 解出来的对象。

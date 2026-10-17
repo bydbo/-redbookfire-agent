@@ -43,6 +43,8 @@ DEFAULT_CONFIG_PATH = os.path.join(PROJECT_ROOT, "config", "config.toml")
 LLM_PROVIDERS = ("openai_compatible", "openai", "deepseek", "qwen", "dashscope", "compatible")
 LOG_LEVELS = ("DEBUG", "INFO", "WARNING", "ERROR")
 LOG_FORMATS = ("console", "json")
+# 上下文可靠性（E7 第六批）：三档放行，默认 off（不改既有行为）
+CONTEXT_MODES = ("off", "shadow", "enforce")
 
 # 素材上传允许的扩展名默认值（S6.4）：与 tools/media.py 的 MEDIA_EXT 同源，
 # 由 tests/unit/test_config.py::test_upload_defaults_match_media_tool 守着一致性。
@@ -370,6 +372,101 @@ class ChatConfig(_Section):
     turn_stale_seconds: int = Field(300, ge=30, le=86400)
 
 
+class ContextConfig(_Section):
+    """上下文可靠性与缓存度量（E7 第六批，S7.23–S7.28）。契约见《配置契约》§3.13。
+
+    三段式放行：`off`（不改行为）/ `shadow`（只记录候选状态与预算判定）/ `enforce`（生效）。
+    **模型窗口必须显式核实**：`model_context_window` 为空或 `model_window_verified=false` 时
+    `enforce` 在运行时降级为 `shadow`，并在观测里写明 `window_unverified`——不按模型名猜窗口。
+    """
+
+    mode: str = "off"
+    enabled_sessions: list[str] = Field(default_factory=list)
+    request_token_limit: int = Field(65536, ge=1024, le=262144)
+    model_context_window: int | None = Field(None, ge=1024, le=4_000_000)
+    model_window_verified: bool = False
+    extract_max_tokens: int = Field(2048, ge=128, le=8192)
+    extract_repair_max: int = Field(1, ge=0, le=2)
+    image_cache_ttl_days: int = Field(7, ge=1, le=90)
+    image_cache_enabled: bool = True
+    observation_retention_days: int = Field(30, ge=1, le=365)
+    price_cache_hit_per_m: float | None = Field(None, ge=0)
+    price_cache_miss_per_m: float | None = Field(None, ge=0)
+    price_cache_currency: str = "CNY"
+    price_cache_version: str = ""
+
+    @field_validator("mode", mode="before")
+    @classmethod
+    def _norm_mode(cls, value: Any) -> str:
+        text = str(value or "off").strip().lower()
+        if text not in CONTEXT_MODES:
+            raise ValueError("mode 只能是 " + " / ".join(CONTEXT_MODES))
+        return text
+
+    @field_validator("enabled_sessions", mode="before")
+    @classmethod
+    def _norm_sessions(cls, value: Any) -> list[str]:
+        items = [value] if isinstance(value, str) else list(value or [])
+        out: list[str] = []
+        for item in items:
+            text = str(item or "").strip().lower()
+            if text and text not in out:
+                out.append(text)
+        return out
+
+    @field_validator("price_cache_currency", mode="before")
+    @classmethod
+    def _norm_currency(cls, value: Any) -> str:
+        text = str(value or "CNY").strip().upper()
+        if not text:
+            raise ValueError("price_cache_currency 不能为空")
+        return text
+
+    @model_validator(mode="after")
+    def _check_consistency(self) -> ContextConfig:
+        if self.model_window_verified and self.model_context_window is None:
+            raise ValueError(
+                "model_window_verified=true 时必须给出 model_context_window（不按模型名猜窗口）"
+            )
+        hit = self.price_cache_hit_per_m
+        miss = self.price_cache_miss_per_m
+        if (hit is None) != (miss is None):
+            raise ValueError(
+                "price_cache_hit_per_m 与 price_cache_miss_per_m 要么都给、要么都空"
+            )
+        if hit is not None and miss is not None and hit > miss:
+            raise ValueError("缓存命中单价不应高于未命中单价")
+        return self
+
+    # ---------- 运行时判定 ----------
+
+    def applies_to(self, session_id: str) -> bool:
+        """该会话是否在放行范围内（允许列表为空 = 全部会话按 mode 生效）。"""
+        if self.mode == "off":
+            return False
+        return not self.enabled_sessions or str(session_id).lower() in self.enabled_sessions
+
+    def effective_mode(self, session_id: str) -> str:
+        """运行时实际生效的模式：enforce 在窗口未核实时降级为 shadow。"""
+        if not self.applies_to(session_id):
+            return "off"
+        if self.mode == "enforce" and not (
+            self.model_window_verified and self.model_context_window
+        ):
+            return "shadow"
+        return self.mode
+
+    def enforces(self, session_id: str) -> bool:
+        return self.effective_mode(session_id) == "enforce"
+
+    def effective_limit(self) -> tuple[int, str]:
+        """(有效上限, 估算器标识)。窗口未核实时只用应用上限，并如实标注。"""
+        if self.model_context_window:
+            limit = min(self.request_token_limit, int(self.model_context_window))
+            return limit, "app_limit+model_window"
+        return self.request_token_limit, "app_limit_only"
+
+
 class AppConfig(_Section):
     """工程配置全量视图：11 个段与契约 §3 一一对应。"""
 
@@ -384,6 +481,7 @@ class AppConfig(_Section):
     frontend: FrontendConfig = Field(default_factory=FrontendConfig)
     upload: UploadConfig = Field(default_factory=UploadConfig)
     chat: ChatConfig = Field(default_factory=ChatConfig)
+    context: ContextConfig = Field(default_factory=ContextConfig)
     log_level: str = "INFO"
     log_format: str = "console"
 
@@ -484,6 +582,18 @@ class AppConfig(_Section):
                 "history_max_messages": self.chat.history_max_messages,
                 "history_token_budget": self.chat.history_token_budget,
                 "turn_stale_seconds": self.chat.turn_stale_seconds,
+            },
+            "context": {
+                "mode": self.context.mode,
+                "enabled_sessions": len(self.context.enabled_sessions),
+                "request_token_limit": self.context.request_token_limit,
+                "model_window_verified": bool(
+                    self.context.model_window_verified
+                    and self.context.model_context_window
+                ),
+                "image_cache_enabled": self.context.image_cache_enabled,
+                "image_cache_ttl_days": self.context.image_cache_ttl_days,
+                "observation_retention_days": self.context.observation_retention_days,
             },
             "paths": {
                 "materials_dir": self.materials_dir(),

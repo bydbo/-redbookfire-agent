@@ -62,8 +62,9 @@ from ..agents.revise import ReviseOutcome
 from ..agents.revise import revise_draft as revise_agent
 from ..config import AppConfig
 from ..core import progress as progress_tool
-from ..core.errors import ApiError, BadRequestError
+from ..core.errors import ApiError, BadRequestError, ConflictError
 from ..schemas import TYPE_LABELS, Element, HotspotClue, SchemaError
+from ..services import artifact_versions, context_state, image_cache
 from ..services.chat import latest_run_id, resolve_attachment
 from ..services.image_clue import (
     ImageClueParse,
@@ -248,6 +249,11 @@ TOOLS: list[dict[str, Any]] = [
                         "minimum": 1,
                         "description": "改第几条热点的初稿，默认 1。",
                     },
+                    "base_version_id": {
+                        "type": "string",
+                        "description": "可选：以哪个版本为基础改（版本 id）。用户明确说「回到第一版"
+                        "再改」时传它；留空则用该对象**最近成功版本**（不是运行初稿）。",
+                    },
                 },
                 "required": ["request"],
             },
@@ -319,6 +325,8 @@ class ToolContext:
     # 同步检查点由轮次运行器装配；工具层只提交已完成子步骤的事实。
     checkpoint: Callable[[dict[str, Any]], None] | None = None
     checkpoint_scope: str = ""
+    # E7 第六批（S7.27）：本轮标识（缓存消费 / 观测的关联键）
+    turn_id: str = ""
 
 
 @dataclass
@@ -548,12 +556,19 @@ def _image_group(
 async def _image_clue_for(
     ctx: ToolContext, attachments: list[dict[str, Any]]
 ) -> ImageClueParse:
-    """解析一组图片（同一轮内同一组只解析一次）；返回解析结果（含它自己的 prompt 版本）。
+    """解析一组图片（轮内缓存 → 持久缓存 → 真实调用）；返回解析结果与 prompt 版本。
 
     1 张走单图口径（`image_hotspot_clue`）、多张走合并口径（`image_hotspot_clue_multi`，
-    一次调用一份线索，S7.15/S7.16）。缓存键是**整组路径**——顺序变了算另一组（顺序即图号，
-    `evidence` 要指图）。缓存命中时把用量清零（与 `_clue_for` 同一口径）：钱只在真正发生的
-    那一次调用上记，「先解析图片、再跑完整分析」这类同轮组合不会把一次多模态调用记两遍。
+    一次调用一份线索，S7.15/S7.16）。缓存键是**整组内容摘要**（顺序即图号，`evidence` 要指图）。
+
+    E7 第六批（S7.27）三层顺序，且**一次逻辑查询只写一条主结果**：
+
+    1. 轮内（`ToolCache`）：命中只记一条 `hit/turn`，不再查库；
+    2. 持久层（`chat_image_parse_cache`）：按内容身份查；命中解析并校验结构后交付；
+    3. 真实调用：成功后写缓存（写失败不阻断本次解析，但标 `cache_store=failed`）。
+
+    命中时用量清零（钱只在真正发生的那一次调用上记），`usage_status=cached`、
+    `cache_status=hit`——「先解析图片、再跑完整分析」不会把一次多模态调用记两遍。
     """
     group = [item for item in attachments if item]
     key = "|".join(str(item.get("path") or "") for item in group)
@@ -563,28 +578,93 @@ async def _image_clue_for(
         # R3（OBS-06）：缓存命中只记"命中 + 数量"，不虚构 generation、不新增费用
         # R5（E7OBS2-04）：口径标 cached——本轮无新增消费，与免费真实请求区分
         logger.info("图片线索缓存命中：%d 张（不重复计费）", len(group))
+        if ctx.session_id is not None and ctx.cfg.context.image_cache_enabled:
+            await image_cache.record_turn_hit(
+                ctx.session,
+                session_id=ctx.session_id,
+                key=key or str(len(group)),
+                turn_id=ctx.turn_id,
+                call_id=ctx.checkpoint_scope,
+                images=len(group),
+            )
         cached_result = replace(
             parsed,
             cost_cny=0.0,
             prompt_tokens=0,
             completion_tokens=0,
             usage_status="cached",
+            cache_status="hit",
+            cache_level="turn",
         )
         _checkpoint(ctx, "image_parse", cost_cny=0.0, prompt_tokens=0,
                     completion_tokens=0, usage_status="cached",
                     prompt_versions=dict(cached_result.prompt_versions))
         return cached_result
+
+    identity: dict[str, Any] | None = None
+    lookup = None
+    if ctx.session_id is not None:
+        digests, digest_ms, failures = await image_cache.ensure_digests(
+            ctx.cfg, str(ctx.session_id), group
+        )
+        if not failures and all(digests):
+            identity = image_cache.build_identity(ctx.cfg, digests)
+            lookup = await image_cache.lookup(
+                ctx.session,
+                ctx.cfg,
+                session_id=ctx.session_id,
+                identity=identity,
+                turn_id=ctx.turn_id,
+                call_id=ctx.checkpoint_scope,
+            )
+            if lookup.hit and lookup.payload:
+                cached_parsed = _parse_cached_clue(ctx.cfg, lookup.payload)
+                if cached_parsed is not None:
+                    logger.info("图片解析持久缓存命中：%d 张（跨轮=%s）",
+                                len(group), lookup.cross_turn)
+                    await image_cache.consume(
+                        ctx.session,
+                        session_id=ctx.session_id,
+                        lookup_result=lookup,
+                        turn_id=ctx.turn_id,
+                        call_id=ctx.checkpoint_scope,
+                    )
+                    ctx.cache.image_clues[key] = (
+                        cached_parsed, _prompt_version_of(cached_parsed)
+                    )
+                    _checkpoint(ctx, "image_parse", cost_cny=0.0, prompt_tokens=0,
+                                completion_tokens=0, usage_status="cached",
+                                cache_level=lookup.level, digest_ms=digest_ms,
+                                prompt_versions=dict(cached_parsed.prompt_versions))
+                    return cached_parsed
+                # 结构校验失败：不能当作正常 miss 复用，按错误记录后走真实调用
+                logger.warning("图片缓存条目的结构无法解析，按失效处理")
+
     images = [await _read_image(ctx, item) for item in group]
     if len(images) == 1:
         data, mime = images[0]
         parsed = await parse_image_clue(ctx.cfg, data, mime, http=ctx.http)
     else:
         parsed = await parse_image_clue_multi(ctx.cfg, images, http=ctx.http)
-    version = int(
-        next(iter(parsed.prompt_versions.values())) if parsed.prompt_versions else 1
-    )
+    version = _prompt_version_of(parsed)
     if key:
         ctx.cache.image_clues[key] = (parsed, version)
+    stored: bool | None = None
+    if identity is not None and ctx.session_id is not None:
+        stored = await image_cache.store(
+            ctx.session,
+            ctx.cfg,
+            session_id=ctx.session_id,
+            identity=identity,
+            payload={
+                "clue": parsed.clue.to_dict(),
+                "raw_text": parsed.raw_text,
+                "prompt_versions": dict(parsed.prompt_versions),
+            },
+            turn_id=ctx.turn_id,
+            message_id=str((group[0] or {}).get("message_id") or ""),
+            order=len(group),
+        )
     _checkpoint(
         ctx,
         "image_parse",
@@ -593,8 +673,49 @@ async def _image_clue_for(
         completion_tokens=int(parsed.completion_tokens),
         usage_status=str(parsed.usage_status or "estimated"),
         prompt_versions=dict(parsed.prompt_versions),
+        cache_level=(lookup.level if lookup else "none"),
+        cache_store=("stored" if stored else "failed") if stored is not None else "off",
     )
+    if stored is not None:
+        parsed = replace(
+            parsed,
+            cache_status="miss" if stored else "error",
+            cache_level="persistent",
+        )
     return parsed
+
+
+def _prompt_version_of(parsed: ImageClueParse) -> int:
+    return int(
+        next(iter(parsed.prompt_versions.values())) if parsed.prompt_versions else 1
+    )
+
+
+def _parse_cached_clue(cfg: AppConfig, payload: dict[str, Any]) -> ImageClueParse | None:
+    """把缓存 payload 还原成解析结果；结构不合法返回 None（按失效处理，不当正常 miss）。"""
+    raw_text = str(payload.get("raw_text") or "").strip()
+    clue_payload = payload.get("clue")
+    if not raw_text or not isinstance(clue_payload, dict):
+        return None
+    try:
+        clue = HotspotClue.from_dict(clue_payload, hotspot_raw=raw_text)
+    except SchemaError:
+        return None
+    _ = cfg
+    return ImageClueParse(
+        raw_text=raw_text,
+        clue=clue,
+        prompt_versions={
+            str(key): int(value)
+            for key, value in (payload.get("prompt_versions") or {}).items()
+        },
+        cost_cny=0.0,
+        prompt_tokens=0,
+        completion_tokens=0,
+        usage_status="cached",
+        cache_status="hit",
+        cache_level="persistent",
+    )
 
 
 async def run_hotspot_analysis(
@@ -1095,6 +1216,155 @@ async def revise_draft(
         return ToolOutcome(
             status="failed", steps=steps, error="改写失败：对话工具缺少文本模型 caller"
         )
+    # ---- S7.25：对象键 → 初始版本 → 实际基础版本 → 请求认领（先提交再付费）----
+    # 离线 / 非会话路径（`session=None`）不做版本登记：这类调用没有真实会话与持久层，
+    # 强行登记只会伪造版本链；生产轮次一定带 session + session_id（见 `build_tool_runner`）。
+    versioning = ctx.session is not None and ctx.session_id is not None
+    key = artifact_versions.object_key("draft", raw_run, index)
+    base: Any = None
+    claim: Any = None
+    expected_state_version: int | None = None
+    base_draft: dict[str, Any] = dict(draft)
+    req_key = ""
+    session_obj = ctx.session
+    session_uuid = ctx.session_id
+    if versioning and session_obj is not None and session_uuid is not None:
+        try:
+            initial = await artifact_versions.ensure_initial(
+                session_obj,
+                session_id=session_uuid,
+                object_key_value=key,
+                object_type="draft",
+                run_id=raw_run,
+                position=index,
+                content={"draft": dict(draft), "run_id": raw_run, "hotspot_index": index},
+                source={"actor": "run_initial"},
+                prompt_versions={
+                    str(k): int(v)
+                    for k, v in (detail.get("prompt_versions") or {}).items()
+                },
+            )
+        except ApiError as exc:
+            return ToolOutcome(status="failed", steps=steps, error=_reason(exc))
+
+        base = initial
+        raw_base = str(args.get("base_version_id") or "").strip()
+        if raw_base:
+            try:
+                requested = await artifact_versions.get_version(
+                    session_obj, session_uuid, uuid.UUID(raw_base)
+                )
+            except ValueError:
+                requested = None
+            if (
+                requested is None
+                or str(requested.object_key) != key
+                or str(requested.status) != "succeeded"
+            ):
+                return ToolOutcome(
+                    status="failed",
+                    steps=steps,
+                    payload={"object_key": key, "base_version_id": raw_base},
+                    error="指定的基础版本不属于这条热点的文案（或不是成功版本），请重新选择",
+                )
+            base = requested
+        else:
+            head = await artifact_versions.head(session_obj, session_uuid, key)
+            if head is not None:
+                base = head
+
+        stored = await context_state.load(session_obj, session_uuid)
+        expected_state_version = stored.state_version if stored is not None else None
+        base_content = dict(base.content or {}) if isinstance(base.content, dict) else {}
+        base_draft_value = base_content.get("draft")
+        if isinstance(base_draft_value, dict) and base_draft_value:
+            base_draft = base_draft_value
+
+        req_key = artifact_versions.request_key(
+            session_uuid,
+            key,
+            turn_id=ctx.turn_id,
+            call_id=ctx.checkpoint_scope,
+            request=request,
+        )
+        claim = await artifact_versions.claim(
+            session_obj,
+            session_id=session_uuid,
+            object_key_value=key,
+            object_type="draft",
+            run_id=raw_run,
+            position=index,
+            request_key_value=req_key,
+            source={
+                "turn_id": ctx.turn_id,
+                "tool_call_id": ctx.checkpoint_scope,
+                "actor": "revise_draft",
+            },
+            base_version_id=base.id,
+        )
+        if not claim.is_new and claim.row is not None:
+            if claim.status == "succeeded" and isinstance(claim.row.content, dict):
+                # 同一请求重放：返回既有结果，不再发模型调用
+                await progress("完成", 100, 100)
+                return ToolOutcome(
+                    status="succeeded",
+                    steps=steps,
+                    payload={
+                        "run_id": raw_run,
+                        "hotspot_index": index,
+                        "object_key": key,
+                        "refused": False,
+                        "revised": dict(claim.row.content.get("revised") or {}),
+                        "replayed": True,
+                        "base_version_id": str(base.id),
+                        "base_version_no": int(base.version_no or 0),
+                        "version_id": str(claim.row.id),
+                        "version_no": int(claim.row.version_no or 0),
+                        "cost_cny": 0.0,
+                        "prompt_tokens": 0,
+                        "completion_tokens": 0,
+                        "usage_status": "cached",
+                    },
+                    prompt_versions={
+                        str(k): int(v)
+                        for k, v in (claim.row.prompt_versions or {}).items()
+                    },
+                )
+            if claim.status == "pending":
+                return ToolOutcome(
+                    status="failed",
+                    steps=steps,
+                    payload={"object_key": key, "request_key": req_key},
+                    error="这次改稿还在处理中（可能上次进程中断了），请稍后重试或先看当前版本",
+                )
+            # 失败 / 拒绝 / 中断：用新的尝试身份再认领一次，并关联原请求
+            req_key = artifact_versions.request_key(
+                session_uuid,
+                key,
+                turn_id=ctx.turn_id,
+                call_id=f"{ctx.checkpoint_scope}:retry:{uuid.uuid4().hex[:8]}",
+                request=request,
+            )
+            claim = await artifact_versions.claim(
+                session_obj,
+                session_id=session_uuid,
+                object_key_value=key,
+                object_type="draft",
+                run_id=raw_run,
+                position=index,
+                request_key_value=req_key,
+                source={
+                    "turn_id": ctx.turn_id,
+                    "tool_call_id": ctx.checkpoint_scope,
+                    "actor": "revise_draft_retry",
+                    "retry_of": str(claim.version_id or ""),
+                },
+                base_version_id=base.id,
+            )
+        if claim.row is None:
+            return ToolOutcome(
+                status="failed", steps=steps, error="改写失败：请求认领没有落库，请稍后重试"
+            )
 
     candidates = item.get("candidates") or []
     material = dict(candidates[0].get("material") or {}) if candidates else None
@@ -1104,26 +1374,50 @@ async def revise_draft(
         outcome = await revise_agent(
             clue=HotspotClue.from_dict(item.get("clue") or {}),
             material=material,
-            draft=dict(draft),
+            draft=dict(base_draft),
             request=request,
             caller=ctx.caller,
         )
     except (ApiError, LLMError, SchemaError) as exc:
+        if claim is not None:
+            await artifact_versions.finish(
+                ctx.session, claim.row, status="failed", error=_reason(exc)
+            )
         return ToolOutcome(
             status="failed",
             steps=steps,
-            # R5（E7OBS2-01）：改写请求可能已发出、用量未知——如实单列，不按"没调用"漏账
-            payload={"usage_status": "unknown"},
+            payload={
+                "usage_status": "unknown",
+                "object_key": key,
+                "base_version_id": str(base.id) if base is not None else None,
+                "base_version_no": int(base.version_no or 0) if base is not None else None,
+            },
             error=f"改写失败：{_reason(exc)}",
         )
 
     cost = _records_cost(ctx.caller, before)
     prompt_tokens, completion_tokens = _records_tokens(ctx.caller, before)
+    usage_status = _records_usage_status(ctx.caller, before) or "estimated"
+    usage = {
+        "cost_cny": cost,
+        "prompt_tokens": prompt_tokens,
+        "completion_tokens": completion_tokens,
+        "usage_status": usage_status,
+    }
     result = outcome.value
     assert isinstance(result, ReviseOutcome)  # 由 `revise_agent` 保证
     versions = {REVISE_TASK: int(outcome.version or 1)}
     await progress("完成", 100, 100)
+    version_payload = {
+        "object_key": key,
+        "base_version_id": str(base.id) if base is not None else None,
+        "base_version_no": int(base.version_no or 0) if base is not None else None,
+    }
     if result.refused:
+        if claim is not None:
+            await artifact_versions.finish(
+                ctx.session, claim.row, status="refused", error=result.reason, usage=usage
+            )
         return ToolOutcome(
             status="succeeded",
             steps=steps,
@@ -1132,15 +1426,36 @@ async def revise_draft(
                 "hotspot_index": index,
                 "refused": True,
                 "reason": result.reason,
+                **version_payload,
                 "cost_cny": cost,
                 "prompt_tokens": prompt_tokens,
                 "completion_tokens": completion_tokens,
-                "usage_status": _records_usage_status(ctx.caller, before)
-                or "estimated",
+                "usage_status": usage_status,
             },
             prompt_versions=versions,
         )
     revised = result.draft.to_dict() if result.draft is not None else {}
+    committed = None
+    if claim is not None:
+        try:
+            committed = await artifact_versions.commit_success(
+                ctx.session,
+                claim_row=claim.row,
+                content={"revised": revised, "request": request, "run_id": raw_run},
+                prompt_versions=versions,
+                usage=usage,
+                expected_state_version=expected_state_version,
+            )
+        except ConflictError as exc:
+            await artifact_versions.finish(
+                ctx.session, claim.row, status="failed", error=exc.message, usage=usage
+            )
+            return ToolOutcome(
+                status="failed",
+                steps=steps,
+                payload={**version_payload, "conflict": True, "usage_status": usage_status},
+                error=f"{exc.message}（已发生的调用费用照记，未覆盖新版本）",
+            )
     return ToolOutcome(
         status="succeeded",
         steps=steps,
@@ -1149,14 +1464,20 @@ async def revise_draft(
             "hotspot_index": index,
             "refused": False,
             "revised": revised,
+            "replayed": False,
+            **version_payload,
+            "version_id": str(committed.id) if committed is not None else None,
+            "version_no": int(committed.version_no or 0) if committed is not None else None,
             "cost_cny": cost,
             "prompt_tokens": prompt_tokens,
             "completion_tokens": completion_tokens,
             # R5（E7OBS2-04）：改写调用的来源口径随结果上卷
-            "usage_status": _records_usage_status(ctx.caller, before) or "estimated",
+            "usage_status": usage_status,
         },
         prompt_versions=versions,
     )
+
+
 
 
 async def _read_image(

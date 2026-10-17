@@ -121,6 +121,12 @@ class TestLLMResult:
             "attempts": 1,
             "usage_status": "",                    # R3（OBS-07）：用量口径随记录上卷
             "error": "",
+            # E7 第六批（S7.28）：前缀缓存分项 / TTFT / 逐次传输明细随记录上卷
+            "cache_hit_tokens": None,
+            "cache_miss_tokens": None,
+            "cache_status": "unsupported",
+            "ttft_ms": None,
+            "attempts_detail": [],
         }
 
     def test_label_uses_model_name(self):
@@ -579,3 +585,52 @@ class TestResolveUsage:
         assert resolve_usage(
             None, prompt_text="一二三四五", completion_text="六"
         )[2] == "estimated"
+
+class TestResolveCacheUsage:
+    """E7 第六批（S7.28）：供应商前缀缓存分项只认完整且一致的集合（K）。
+
+    缺失 / 非法 / 冲突都不纳入 K；实际零仍是实际值；OpenAI 的 `cached_tokens` 派生要求
+    `0 <= hit <= input`。
+    """
+
+    def test_complete_pair_is_accepted(self):
+        hit, miss, status = llm.resolve_cache_usage(
+            {"prompt_cache_hit_tokens": 30, "prompt_cache_miss_tokens": 70},
+            prompt_tokens=100)
+        assert (hit, miss, status) == (30, 70, "complete")
+
+    def test_actual_zero_is_a_value(self):
+        hit, miss, status = llm.resolve_cache_usage(
+            {"prompt_cache_hit_tokens": 0, "prompt_cache_miss_tokens": 100},
+            prompt_tokens=100)
+        assert (hit, miss, status) == (0, 100, "complete")
+
+    def test_inconsistent_sum_is_incomplete(self):
+        assert llm.resolve_cache_usage(
+            {"prompt_cache_hit_tokens": 30, "prompt_cache_miss_tokens": 60},
+            prompt_tokens=100)[2] == "incomplete"
+
+    def test_missing_fields_are_unsupported(self):
+        assert llm.resolve_cache_usage({"prompt_tokens": 100}, prompt_tokens=100) == (
+            None, None, "unsupported")
+
+    def test_negative_value_is_incomplete(self):
+        assert llm.resolve_cache_usage(
+            {"prompt_cache_hit_tokens": -1, "prompt_cache_miss_tokens": 101},
+            prompt_tokens=100)[2] == "incomplete"
+
+    def test_cached_tokens_details_are_derived(self):
+        hit, miss, status = llm.resolve_cache_usage(
+            {"prompt_tokens_details": {"cached_tokens": 40}}, prompt_tokens=100)
+        assert (hit, miss, status) == (40, 60, "complete")
+
+    def test_conflicting_hit_sources_are_incomplete(self):
+        assert llm.resolve_cache_usage(
+            {"prompt_cache_hit_tokens": 30, "prompt_cache_miss_tokens": 70,
+             "prompt_tokens_details": {"cached_tokens": 20}},
+            prompt_tokens=100)[2] == "incomplete"
+
+    def test_cached_tokens_above_input_is_incomplete(self):
+        assert llm.resolve_cache_usage(
+            {"prompt_tokens_details": {"cached_tokens": 120}},
+            prompt_tokens=100)[2] == "incomplete"

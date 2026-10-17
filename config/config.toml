@@ -116,3 +116,23 @@ attachment_total_max_mb = 30        # 这一批图片的合计上限（MB）
 history_max_messages = 20            # 历史里保留原文的最近消息条数（更早的降级成摘要）
 history_token_budget = 6000          # 历史部分的 token 预算（粗估）；超了先摘要、再裁剪（S7.10）
 turn_stale_seconds = 300
+
+[context]
+# 上下文可靠性与缓存度量（E7 第六批，S7.23–S7.28）：默认 off，验收后才逐步放行。
+# 三档：off（不改行为）/ shadow（只记录候选状态与预算判定）/ enforce（生效并拦截超限请求）。
+mode = "off"
+enabled_sessions = []                # 非空时只对列表内会话生效（逐步放行）
+request_token_limit = 65536           # 单个模型请求的应用上限（含 system / tools / 状态 / 历史 / 本轮）
+# 模型窗口必须显式核实后填；model_window_verified=false 时 enforce 降级为 shadow（不按模型名猜）
+model_context_window = 393216         # deepseek-flash 实测上限；未核实前不要置 verified
+model_window_verified = false
+extract_max_tokens = 2048             # 状态抽取的输出上限（修复最多一次，均按次计费）
+extract_repair_max = 1
+image_cache_ttl_days = 7              # 图片解析缓存创建后有效天数（命中不续期）
+image_cache_enabled = true
+observation_retention_days = 30        # context_observations 保留天数（每日清理）
+# 供应商前缀缓存单价（元/百万 token）：未知留空，前缀收益记 unknown，不按统一输入价硬推
+price_cache_hit_per_m = 0.36
+price_cache_miss_per_m = 2.16
+price_cache_currency = "CNY"
+price_cache_version = "deepseek-2026-10"

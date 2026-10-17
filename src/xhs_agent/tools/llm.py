@@ -54,6 +54,9 @@ class LLMCall:
     # S7.3：真正的多轮对话（system / 历史 user+assistant / tool 结果）走 messages；
     # 给了 messages 就以它为准，system 与 user 只用于单轮任务（结构化调用那条路径）。
     messages: list[dict[str, Any]] | None = None
+    # E7 第六批（S7.24 / S7.26）：本次调用的输出预留。给了就覆盖 `[llm].max_tokens`
+    # （状态抽取按 `[context].extract_max_tokens` 单独计费，不沿用对话的长输出预算）。
+    max_tokens: int | None = None
 
 
 @dataclass
@@ -72,6 +75,16 @@ class LLMResult:
     usage_status: str = ""
     # S7.1：模型要求调用的工具（`{id, name, arguments}`，arguments 是原始 JSON 字符串）
     tool_calls: list[dict[str, Any]] = field(default_factory=list)
+    # E7 第六批（S7.28）：供应商前缀缓存分项。`cache_status` = complete / incomplete / unsupported；
+    # 只有 complete 的请求进入覆盖率分母（缺失、非法、冲突一律不纳入 K，实际零仍是实际值）。
+    cache_hit_tokens: int | None = None
+    cache_miss_tokens: int | None = None
+    cache_status: str = "unsupported"
+    # TTFT：**首个非空正文增量**的到达时间；role / reasoning / 工具调用不计。
+    # 非流式只能是 None——不能拿整体耗时冒充首 token。
+    ttft_ms: int | None = None
+    # 每次**实际传输**的明细（重试各一行）；聚合统计只从叶子调用取数，不再加轮次汇总
+    attempts_detail: list[dict[str, Any]] = field(default_factory=list)
 
     def record(self, task: str) -> dict[str, Any]:
         return {
@@ -87,6 +100,12 @@ class LLMResult:
             # 轮级完整性按调用集合计算，不再默认"完整"
             "usage_status": self.usage_status,
             "error": self.error,
+            # E7 第六批（S7.28）：缓存分项 / TTFT / 逐次传输明细随记录上卷
+            "cache_hit_tokens": self.cache_hit_tokens,
+            "cache_miss_tokens": self.cache_miss_tokens,
+            "cache_status": self.cache_status,
+            "ttft_ms": self.ttft_ms,
+            "attempts_detail": [dict(item) for item in self.attempts_detail],
         }
 
 
@@ -146,6 +165,76 @@ def _usage_total(usage: dict[str, Any]) -> tuple[bool, int | None]:
     if len(set(values)) != 1:
         return True, None
     return True, values[0]
+
+
+def resolve_cache_usage(
+    usage: dict[str, Any] | None, *, prompt_tokens: int
+) -> tuple[int | None, int | None, str]:
+    """归一化供应商前缀缓存分项，返回 `(hit, miss, status)`（E7 第六批 S7.28）。
+
+    `status`：
+
+    - `complete`：hit / miss 都合法非负，且满足 `hit + miss == input`（协议一致性）；
+    - `incomplete`：字段缺失、非法或互相冲突——**不纳入 K**，但实际零仍是实际值；
+    - `unsupported`：响应里完全没有缓存分项（该供应商 / 端点不提供）。
+
+    OpenAI 兼容端点给 `prompt_tokens_details.cached_tokens`（只给命中量）时，按
+    `miss = input - hit` 派生；派生要求 `0 <= hit <= input`，否则判 incomplete。
+    """
+    data = usage if isinstance(usage, dict) else {}
+    hit: int | None = None
+    miss: int | None = None
+
+    def _read(source: dict[str, Any], names: tuple[str, ...]) -> tuple[bool, int | None, bool]:
+        present, value, valid = _usage_direction(source, names)
+        if not present:
+            return False, None, True
+        if not valid or value is None or value < 0:
+            return True, None, False
+        return True, value, True
+
+    details = data.get("prompt_tokens_details")
+    details = details if isinstance(details, dict) else {}
+    input_details = data.get("input_tokens_details")
+    input_details = input_details if isinstance(input_details, dict) else {}
+
+    hit_present, hit_value, hit_valid = _read(
+        data, ("prompt_cache_hit_tokens", "cache_read_input_tokens")
+    )
+    miss_present, miss_value, miss_valid = _read(
+        data, ("prompt_cache_miss_tokens", "cache_creation_input_tokens")
+    )
+    derived_present, derived_value, derived_valid = _read(
+        details, ("cached_tokens",)
+    )
+    if not derived_present:
+        derived_present, derived_value, derived_valid = _read(
+            input_details, ("cached_tokens",)
+        )
+    if not (hit_present or miss_present or derived_present):
+        return None, None, "unsupported"
+    if not (hit_valid and miss_valid and derived_valid):
+        return None, None, "incomplete"
+    if hit_present and miss_present:
+        hit, miss = hit_value, miss_value
+        if hit is None or miss is None or hit + miss != prompt_tokens:
+            return None, None, "incomplete"
+        if derived_present and derived_value != hit:
+            # 第三个口径与显式命中量冲突：整次不纳入 K
+            return None, None, "incomplete"
+        return hit, miss, "complete"
+    if hit_present and derived_present and hit_value != derived_value:
+        # 两个命中口径都有：必须一致，否则视为冲突
+        return None, None, "incomplete"
+    if hit_present and hit_value is not None:
+        if hit_value > prompt_tokens:
+            return None, None, "incomplete"
+        return hit_value, prompt_tokens - hit_value, "complete"
+    if derived_present and derived_value is not None:
+        if derived_value > prompt_tokens:
+            return None, None, "incomplete"
+        return derived_value, prompt_tokens - derived_value, "complete"
+    return None, None, "incomplete"
 
 
 def resolve_usage(
@@ -249,7 +338,7 @@ class OpenAICompatibleProvider(BaseProvider):
                 {"role": "user", "content": call.user},
             ],
             "temperature": self.cfg.temperature,
-            "max_tokens": self.cfg.max_tokens,
+            "max_tokens": int(call.max_tokens or self.cfg.max_tokens),
         }
         if call.json_mode:
             payload["response_format"] = {"type": "json_object"}
@@ -266,14 +355,20 @@ class OpenAICompatibleProvider(BaseProvider):
 
     def _result(self, call: LLMCall, *, text: str, tool_calls: list[dict[str, Any]],
                 usage: dict[str, Any] | None, attempt: int, started: float,
-                error: str = "") -> LLMResult:
-        """统一记账口径：token 取 `usage`，缺失时按字符估算（与 S7.1 之前一致）。"""
+                error: str = "", ttft_ms: int | None = None,
+                attempts_detail: list[dict[str, Any]] | None = None) -> LLMResult:
+        """统一记账口径：token 取 `usage`，缺失时按字符估算（与 S7.1 之前一致）。
+
+        E7 第六批（S7.28）：同时解析供应商前缀缓存分项与 TTFT；分项不完整时判 `incomplete`，
+        **不填零**（零是实际值，缺失是未知，两者不能混）。
+        """
         prompt_tokens, completion_tokens, usage_status = resolve_usage(
             usage,
             prompt_text=_prompt_text(call),
             completion_text=text,
             error=error,
         )
+        hit, miss, cache_status = resolve_cache_usage(usage, prompt_tokens=prompt_tokens)
         cost = (prompt_tokens / 1_000_000 * self.cfg.price_in_per_m
                 + completion_tokens / 1_000_000 * self.cfg.price_out_per_m)
         return LLMResult(
@@ -288,6 +383,11 @@ class OpenAICompatibleProvider(BaseProvider):
             error=error,
             usage_status=usage_status,
             tool_calls=list(tool_calls),
+            cache_hit_tokens=hit,
+            cache_miss_tokens=miss,
+            cache_status=cache_status,
+            ttft_ms=ttft_ms,
+            attempts_detail=list(attempts_detail or []),
         )
 
     async def complete(self, call: LLMCall) -> LLMResult:
@@ -303,53 +403,103 @@ class OpenAICompatibleProvider(BaseProvider):
         重试口径与原来一致（`max_retries + 1` 次、退避见 `tools/http.py`、400/401/403 不重试）。
         唯一的例外：**流式已经开始回吐正文就不再重试**——重试会让下游（和用户）看到重复文本，
         此时把已吐出的半截文本连同 `error` 一起返回，由调用方决定怎么收尾。
+
+        E7 第六批（S7.28）：每次**实际传输**都记一条 `attempts_detail`（状态 / 用量 / 缓存分项 /
+        TTFT / 耗时），重试不覆盖前一次——报告按传输次数统计，不只看最后成功那次。
         """
         payload = self._payload(call)
         url = f"{self.base_url}/chat/completions"
         headers = self._headers()
         last_error = ""
         started = time.time()
+        attempts: list[dict[str, Any]] = []
+
+        def _attempt_row(*, attempt: int, status: str, usage: dict[str, Any] | None,
+                         text: str, error: str, ttft_ms: int | None,
+                         at: float) -> dict[str, Any]:
+            prompt_tokens, completion_tokens, usage_status = resolve_usage(
+                usage, prompt_text=_prompt_text(call), completion_text=text, error=error,
+            )
+            hit, miss, cache_status = resolve_cache_usage(
+                usage, prompt_tokens=prompt_tokens
+            )
+            return {
+                "attempt": attempt,
+                "status": status,
+                "prompt_tokens": prompt_tokens,
+                "completion_tokens": completion_tokens,
+                "usage_status": usage_status,
+                "cache_hit_tokens": hit,
+                "cache_miss_tokens": miss,
+                "cache_status": cache_status,
+                "ttft_ms": ttft_ms,
+                "latency_ms": int((time.time() - at) * 1000),
+                "error": error,
+            }
 
         for attempt in range(1, self.cfg.max_retries + 2):
-            sink: dict[str, Any] = {"text": ""}
+            sink: dict[str, Any] = {"text": "", "ttft_ms": None}
+            attempt_started = time.time()
             try:
                 if call.stream:
                     text, tool_calls, usage = await self._consume_stream(
                         url, payload, headers, on_delta, sink)
+                    attempts.append(_attempt_row(
+                        attempt=attempt, status="succeeded", usage=usage, text=text,
+                        error="", ttft_ms=sink.get("ttft_ms"), at=attempt_started))
                     return self._result(call, text=text, tool_calls=tool_calls, usage=usage,
-                                        attempt=attempt, started=started)
+                                        attempt=attempt, started=started,
+                                        ttft_ms=sink.get("ttft_ms"),
+                                        attempts_detail=attempts)
                 response = await self.client.post(url, json=payload, headers=headers,
                                                   timeout=self.cfg.timeout_s)
                 if response.status_code < 400:
                     data = response.json()
                     message = _first_message(data)
-                    return self._result(call, text=_content_text(message.get("content")),
+                    text = _content_text(message.get("content"))
+                    usage = data.get("usage") or {}
+                    attempts.append(_attempt_row(
+                        attempt=attempt, status="succeeded", usage=usage, text=text,
+                        error="", ttft_ms=None, at=attempt_started))
+                    return self._result(call, text=text,
                                         tool_calls=_tool_calls_of(message),
-                                        usage=data.get("usage") or {},
-                                        attempt=attempt, started=started)
+                                        usage=usage,
+                                        attempt=attempt, started=started,
+                                        attempts_detail=attempts)
                 detail = response.text[:300]
                 last_error = (f"HTTP {response.status_code}: "
                               f"{detail or response.reason_phrase}")
+                attempts.append(_attempt_row(
+                    attempt=attempt, status="failed", usage=None, text="", error=last_error,
+                    ttft_ms=None, at=attempt_started))
                 if response.status_code in (401, 403, 400):
                     break
             except _StreamHTTPError as exc:      # 流式响应的 4xx/5xx
                 last_error = str(exc)
+                attempts.append(_attempt_row(
+                    attempt=attempt, status="failed", usage=None, text=sink.get("text", ""),
+                    error=last_error, ttft_ms=sink.get("ttft_ms"), at=attempt_started))
                 if exc.status in (401, 403, 400):
                     break
                 if sink["text"]:
                     return self._result(call, text=sink["text"], tool_calls=[], usage=None,
-                                        attempt=attempt, started=started, error=last_error)
+                                        attempt=attempt, started=started, error=last_error,
+                                        ttft_ms=sink.get("ttft_ms"), attempts_detail=attempts)
             except (httpx.HTTPError, json.JSONDecodeError) as exc:
                 last_error = f"{type(exc).__name__}: {exc}"
+                attempts.append(_attempt_row(
+                    attempt=attempt, status="failed", usage=None, text=sink.get("text", ""),
+                    error=last_error, ttft_ms=sink.get("ttft_ms"), at=attempt_started))
                 if sink["text"]:
                     return self._result(call, text=sink["text"], tool_calls=[], usage=None,
-                                        attempt=attempt, started=started, error=last_error)
+                                        attempt=attempt, started=started, error=last_error,
+                                        ttft_ms=sink.get("ttft_ms"), attempts_detail=attempts)
             if attempt <= self.cfg.max_retries:
                 await asyncio.sleep(backoff_seconds(attempt))
 
         return self._result(call, text="", tool_calls=[], usage=None,
                             attempt=self.cfg.max_retries + 1, started=started,
-                            error=last_error or "调用失败")
+                            error=last_error or "调用失败", attempts_detail=attempts)
 
     async def _consume_stream(
         self, url: str, payload: dict[str, Any], headers: dict[str, str],
@@ -362,6 +512,8 @@ class OpenAICompatibleProvider(BaseProvider):
         text_parts: list[str] = []
         calls: dict[int, dict[str, Any]] = {}
         usage: dict[str, Any] | None = None
+        first_delta_at: float | None = None
+        stream_started = time.time()
         async with self.client.stream("POST", url, json=payload, headers=headers,
                                       timeout=self.cfg.timeout_s) as response:
             if response.status_code >= 400:
@@ -386,6 +538,10 @@ class OpenAICompatibleProvider(BaseProvider):
                 delta = choices[0].get("delta") or {}
                 piece = _content_text(delta.get("content"))
                 if piece:
+                    if first_delta_at is None:
+                        # TTFT 只认**首个非空正文增量**；role / reasoning / 工具调用都不计
+                        first_delta_at = time.time()
+                        sink["ttft_ms"] = int((first_delta_at - stream_started) * 1000)
                     text_parts.append(piece)
                     sink["text"] = "".join(text_parts)
                     if on_delta is not None:
@@ -493,13 +649,15 @@ class StructuredCaller:
         parse: Callable[[Any], T],
         context: dict[str, Any] | None = None,
         json_mode: bool = True,
+        max_tokens: int | None = None,
     ) -> tuple[T, LLMResult]:
         prompt = user
         last_error = ""
         for _attempt in range(self.max_repairs + 1):
             result = await self.provider.complete(
                 LLMCall(task=task, system=system, user=prompt,
-                        context=context or {}, json_mode=json_mode))
+                        context=context or {}, json_mode=json_mode,
+                        max_tokens=max_tokens))
             self.records.append(result.record(task))
             if result.error:
                 last_error = result.error

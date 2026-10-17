@@ -3,14 +3,29 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import type { RunDetail } from '@/api/analysis'
 import { getRun } from '@/api/analysis'
-import type { ChatMessage, ChatSessionDetail, ChatSessionList } from '@/api/chat'
-import { createChatSession, getChatSession, listChatSessions, streamMessage } from '@/api/chat'
+import type {
+  ChatContext,
+  ChatMessage,
+  ChatSessionDetail,
+  ChatSessionList,
+} from '@/api/chat'
+import {
+  createChatSession,
+  getChatContext,
+  getChatSession,
+  listChatSessions,
+  postChatContextAction,
+  streamMessage,
+} from '@/api/chat'
+import { ApiRequestError } from '@/api/client'
 import { TOOL_LABELS, errorCategoryLabel, stageLabel, toolLabel, useChatStore } from '@/stores/chat'
 
 vi.mock('@/api/chat', () => ({
   createChatSession: vi.fn(),
   listChatSessions: vi.fn(),
   getChatSession: vi.fn(),
+  getChatContext: vi.fn(),
+  postChatContextAction: vi.fn(),
   streamMessage: vi.fn(),
 }))
 
@@ -594,5 +609,85 @@ describe('权威快照投影（E7OBS4-04）', () => {
       expect(store.progress?.stage).toBe('report')
       expect(store.progress?.progressRevision).toBe(8)
     })
+  })
+})
+
+// ---- 上下文面板（S7.24）----
+
+function context(overrides: Partial<ChatContext> = {}): ChatContext {
+  return {
+    session_id: 's-1',
+    state_version: 3,
+    recovery_status: 'complete',
+    facts: [{
+      fact_id: 'f-1',
+      kind: 'constraint',
+      value: '控制在 300 字以内',
+      scope: 'topic',
+      scope_id: 'topic:t1',
+      status: 'active',
+      evidence: '300 字以内',
+      source_ref: { message_id: 'm-0' },
+      created_version: 1,
+    }],
+    proposals: [],
+    artifact_heads: [],
+    effective_mode: 'enforce',
+    blocking_proposals: 0,
+    ...overrides,
+  }
+}
+
+describe('chat store · 上下文状态（S7.24）', () => {
+  it('打开会话时拉取上下文，供面板展示', async () => {
+    vi.mocked(getChatSession).mockResolvedValue(detail([message()]))
+    vi.mocked(getChatContext).mockResolvedValue(context())
+    const store = useChatStore()
+    await store.openSession('s-1')
+    expect(store.context?.state_version).toBe(3)
+    expect(store.context?.facts).toHaveLength(1)
+  })
+
+  it('确认提案：带 expected_state_version 提交，并应用返回的最新上下文', async () => {
+    vi.mocked(getChatSession).mockResolvedValue(detail([message()]))
+    vi.mocked(getChatContext).mockResolvedValue(context({
+      proposals: [{
+        proposal_id: 'p-1', kind: 'preference', value: '更口语', scope: 'topic',
+        reason: 'inferred', conflicts_with: [], created_version: 3,
+      }],
+      blocking_proposals: 1,
+    }))
+    const store = useChatStore()
+    await store.openSession('s-1')
+
+    vi.mocked(postChatContextAction).mockResolvedValue({
+      session_id: 's-1',
+      state_version: 4,
+      action: 'confirm',
+      decision: 'applied',
+      reason: '',
+      context: context({ state_version: 4, proposals: [], blocking_proposals: 0 }),
+    })
+    const result = await store.actOnContext('confirm', 'p-1')
+    expect(result).toBeNull()
+    const body = vi.mocked(postChatContextAction).mock.calls[0][1]
+    expect(body).toEqual({ action: 'confirm', expected_state_version: 3, target_id: 'p-1' })
+    expect(store.context?.state_version).toBe(4)
+    expect(store.context?.proposals).toHaveLength(0)
+  })
+
+  it('409 冲突：刷新面板并提示重新操作，不静默重放', async () => {
+    vi.mocked(getChatSession).mockResolvedValue(detail([message()]))
+    vi.mocked(getChatContext).mockResolvedValue(context())
+    const store = useChatStore()
+    await store.openSession('s-1')
+
+    vi.mocked(postChatContextAction).mockRejectedValue(
+      new ApiRequestError('状态已变化', 'conflict', 409),
+    )
+    vi.mocked(getChatContext).mockResolvedValue(context({ state_version: 9 }))
+    const result = await store.actOnContext('retract', 'f-1')
+    expect(result).toContain('状态已变化')
+    expect(store.context?.state_version).toBe(9)
   })
 })

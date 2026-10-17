@@ -27,6 +27,7 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import Any
 
+from ..core.budget import fit_history
 from ..tools import prompt as prompt_tool
 from ..tools.llm import BaseProvider, LLMCall, LLMError, estimate_tokens
 
@@ -57,14 +58,18 @@ def initial_messages(history: list[dict[str, Any]], user_text: str, *,
                      attachment_note: str = "",
                      keep_messages: int = DEFAULT_KEEP_MESSAGES,
                      token_budget: int = DEFAULT_TOKEN_BUDGET,
+                     grouped: bool = False,
+                     state_text: str = "",
                      ) -> tuple[prompt_tool.RenderedPrompt, list[dict[str, Any]]]:
-    """首轮消息：渲染 prompt（拿版本号）+ 组装 system / 任务说明 / 历史 / 本轮用户消息。"""
+    """首轮消息：渲染 prompt（拿版本号）+ 组装 system / 任务说明 / 状态 / 历史 / 本轮用户消息。"""
     rendered = prompt_tool.render(TASK_ID,
                                   capabilities=prompt_tool.render_capabilities())
     return rendered, build_messages(rendered, history, user_text,
                                     attachment_note=attachment_note,
                                     keep_messages=keep_messages,
-                                    token_budget=token_budget)
+                                    token_budget=token_budget,
+                                    grouped=grouped,
+                                    state_text=state_text)
 
 
 def _clip(text: Any, limit: int) -> str:
@@ -132,6 +137,9 @@ def assemble_history(history: list[dict[str, Any]], *,
     最近一轮的上下文。返回（按时间正序的消息列表，被丢掉的消息条数）。
 
     **跨会话不串味由调用方保证**：只喂本会话的消息，本函数不做任何跨会话合并。
+
+    这是 `[context].mode=off` 的**旧路径**。新路径见 `assemble_history_groups`：按完整轮次组
+    做连续后缀（S7.26），不会跳过超限的最近一组去找更早的短消息。
     """
     entries = [item for item in history
                if str(item.get("role") or "") in ("user", "assistant")]
@@ -153,17 +161,55 @@ def assemble_history(history: list[dict[str, Any]], *,
     return [{"role": role, "content": text} for role, text in reversed(picked)], dropped
 
 
+def assemble_history_groups(history: list[dict[str, Any]], *,
+                            token_budget: int = DEFAULT_TOKEN_BUDGET,
+                            ) -> tuple[list[dict[str, Any]], int, int]:
+    """按**完整轮次组**保留预算内的连续后缀（S7.26）。
+
+    与旧路径的差别：① 不再把更早的正文压成 60 字摘要（摘要会丢约束，正是本批要修的问题）；
+    ② 超限时**整组丢弃并停止向前**，不跳过最近一组去找更早的短消息；③ 工具摘要行随组保留，
+    模型仍能拿到 `run_id`。
+
+    返回（消息列表, 丢掉的消息条数, 保留的组数）。
+    """
+    entries: list[dict[str, Any]] = []
+    for item in history:
+        role = str(item.get("role") or "")
+        if role not in ("user", "assistant"):
+            continue
+        text = _entry_text(item, digest=False)
+        if not text:
+            continue
+        entries.append({"role": role, "content": text})
+    kept, dropped_groups, kept_groups = fit_history(entries, max_tokens=token_budget)
+    dropped_messages = len(entries) - len(kept)
+    _ = dropped_groups
+    return kept, dropped_messages, kept_groups
+
+
 def build_messages(rendered: prompt_tool.RenderedPrompt, history: list[dict[str, Any]],
                    user_text: str, *, attachment_note: str = "",
                    keep_messages: int = DEFAULT_KEEP_MESSAGES,
-                   token_budget: int = DEFAULT_TOKEN_BUDGET) -> list[dict[str, Any]]:
-    """组装给模型的消息序列：system 指令 → 任务说明 → 历史（预算内）→ 本轮用户消息。"""
+                   token_budget: int = DEFAULT_TOKEN_BUDGET,
+                   grouped: bool = False,
+                   state_text: str = "") -> list[dict[str, Any]]:
+    """组装给模型的消息序列：system 指令 → 任务说明 → 状态 → 历史（预算内）→ 本轮用户消息。
+
+    `grouped=True` 走 S7.26 的完整组后缀（`[context].mode != off` 时启用）；
+    `state_text` 是服务端验证过的有效状态，放在**固定前缀之后**（不为命中缓存保留过期事实）。
+    """
     messages: list[dict[str, Any]] = [
         {"role": "system", "content": rendered.system},
         {"role": "user", "content": rendered.user},
     ]
-    assembled, dropped = assemble_history(history, keep_messages=keep_messages,
-                                         token_budget=token_budget)
+    if state_text.strip():
+        messages.append({"role": "system", "content": state_text.strip()})
+    if grouped:
+        assembled, dropped, _kept_groups = assemble_history_groups(
+            history, token_budget=token_budget)
+    else:
+        assembled, dropped = assemble_history(
+            history, keep_messages=keep_messages, token_budget=token_budget)
     messages.extend(assembled)
     current = user_text.strip() or "（这条消息没有文字，只有附件）"
     notes: list[str] = []

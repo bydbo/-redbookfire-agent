@@ -331,7 +331,9 @@ describe('ChatView（S7.5 对话首页）', () => {
     await input.trigger('change')
     await flushPromises()
 
-    expect(wrapper.findAll('.n-tag')).toHaveLength(3)
+    // 只数输入区卡片里的标签：页面上还有上下文面板（S7.24）的标签，不能混在一起数
+    const composer = wrapper.find('textarea').element.closest('.n-card') as HTMLElement
+    expect(composer.querySelectorAll('.n-tag')).toHaveLength(3)
     expect(wrapper.text()).toContain('已选 3 / 9 张')
 
     await clickButton(wrapper, '发送')
@@ -358,7 +360,9 @@ describe('ChatView（S7.5 对话首页）', () => {
     await flushPromises()
 
     // 粘贴的图进选中区（截图没名字 → 生成可读名），且绝不自动发送
-    expect(wrapper.findAll('.n-tag')).toHaveLength(2)
+    // 只数输入区卡片里的标签（上下文面板的标签不计入，S7.24）
+    const composer = wrapper.find('textarea').element.closest('.n-card') as HTMLElement
+    expect(composer.querySelectorAll('.n-tag')).toHaveLength(2)
     expect(wrapper.text()).toContain('粘贴图片-1.png')
     expect(streamMessage).not.toHaveBeenCalled()
   })

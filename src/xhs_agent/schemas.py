@@ -743,3 +743,370 @@ class Draft(_Contract):
             )
         except ValidationError as exc:
             raise _invalid("文案", exc) from exc
+
+
+# ---------------------------------------------------------------------------
+# E7 第六批（S7.24 / S7.25）：上下文事实、提案与产物版本
+# ---------------------------------------------------------------------------
+# 口径：这里的结构是**内存契约**，落库形状见《数据契约》§3.8 / §3.9。
+# 模型输出先落成 `ContextDelta`，经服务端证据 / 归属 / 作用域校验后才允许写进会话快照；
+# 模型给的 `fact_id`、`status`、`created_version` 一律不采信——由服务端生成。
+
+FACT_KINDS: tuple[str, ...] = (
+    "goal",         # 目标：这条任务要达成什么
+    "constraint",   # 限制：长度、字数、不得出现的内容
+    "preference",   # 偏好：语气、风格、表达习惯
+    "audience",     # 受众：给谁看
+    "format",       # 形式：体裁、结构、平台要求
+)
+FACT_STATUSES: tuple[str, ...] = (
+    "active",
+    "pending_confirmation",
+    "superseded",
+    "retracted",
+)
+FACT_SCOPES: tuple[str, ...] = ("session", "topic", "artifact")
+CONTEXT_ACTIONS: tuple[str, ...] = ("confirm", "reject", "retract", "replace", "reset_topic")
+OBJECT_TYPES: tuple[str, ...] = ("draft", "clue")
+VERSION_STATUSES: tuple[str, ...] = (
+    "pending",
+    "succeeded",
+    "failed",
+    "refused",
+    "interrupted",
+)
+# 单条事实 / 提案的长度上限：状态要能装进请求预算，不能变成第二份正文
+MAX_FACT_CHARS = 200
+# 作用域内最多保留多少条生效事实（超出时归档最旧的非 session 项，session 项不自动丢）
+MAX_FACTS_PER_SCOPE = 40
+
+
+class ContextFact(BaseModel):
+    """一条会话事实（S7.24）。
+
+    `evidence` 必须是用户原文的真实片段；`source_ref` 至少带 `message_id` 或 `action_id`。
+    `status=active` 且缺证据时**不允许**构造——证据是生效的必要条件，不是装饰。
+    """
+
+    model_config = ConfigDict(extra="ignore")
+
+    fact_id: str
+    kind: str
+    value: str
+    scope: str = "topic"
+    scope_id: str = ""
+    status: str = "active"
+    source_ref: dict[str, Any] = Field(default_factory=dict)
+    evidence: str = ""
+    created_version: int = 0
+    replaces: str | None = None
+    updated_at: str = Field(default_factory=now_iso)
+
+    @field_validator("fact_id", "value", "scope_id", "evidence", "updated_at", mode="before")
+    @classmethod
+    def _norm_text(cls, value: Any) -> str:
+        return _clean_str(value)
+
+    @field_validator("replaces", mode="before")
+    @classmethod
+    def _norm_optional(cls, value: Any) -> str | None:
+        text = _clean_str(value)
+        return text or None
+
+    @field_validator("source_ref", mode="before")
+    @classmethod
+    def _norm_source(cls, value: Any) -> dict[str, Any]:
+        return dict(value) if isinstance(value, dict) else {}
+
+    @field_validator("created_version", mode="before")
+    @classmethod
+    def _norm_version(cls, value: Any) -> int:
+        return max(0, _as_int(value, 0))
+
+    @model_validator(mode="after")
+    def _check(self) -> ContextFact:
+        if not self.fact_id:
+            raise ValueError("fact_id 不能为空")
+        if self.kind not in FACT_KINDS:
+            raise ValueError(f"kind 只能是 {' / '.join(FACT_KINDS)}")
+        if self.status not in FACT_STATUSES:
+            raise ValueError(f"status 只能是 {' / '.join(FACT_STATUSES)}")
+        if self.scope not in FACT_SCOPES:
+            raise ValueError(f"scope 只能是 {' / '.join(FACT_SCOPES)}")
+        if not self.value:
+            raise ValueError("value 不能为空")
+        if len(self.value) > MAX_FACT_CHARS:
+            raise ValueError(f"value 不能超过 {MAX_FACT_CHARS} 字")
+        if self.status == "active" and not self.evidence:
+            raise ValueError("生效事实必须有 evidence（用户原文片段）")
+        if self.status == "active" and not (
+            self.source_ref.get("message_id") or self.source_ref.get("action_id")
+        ):
+            raise ValueError("生效事实必须有来源（message_id / action_id）")
+        return self
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "fact_id": self.fact_id,
+            "kind": self.kind,
+            "value": self.value,
+            "scope": self.scope,
+            "scope_id": self.scope_id,
+            "status": self.status,
+            "source_ref": dict(self.source_ref),
+            "evidence": self.evidence,
+            "created_version": self.created_version,
+            "replaces": self.replaces,
+            "updated_at": self.updated_at,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> ContextFact:
+        if not isinstance(data, dict):
+            raise SchemaError("事实必须是一个 JSON 对象")
+        try:
+            return cls(**data)
+        except ValidationError as exc:
+            raise _invalid("事实", exc) from exc
+
+
+class ContextProposal(BaseModel):
+    """一条待确认提案（S7.24）：推断、歧义或替换意图不明的冲突。
+
+    `proposal_id` 由服务端生成；模型只能给内容与理由。提案**不生效**，确认后才转成事实。
+    """
+
+    model_config = ConfigDict(extra="ignore")
+
+    proposal_id: str
+    kind: str
+    value: str
+    scope: str = "topic"
+    scope_id: str = ""
+    reason: str = ""
+    evidence: str = ""
+    source_ref: dict[str, Any] = Field(default_factory=dict)
+    conflicts_with: list[str] = Field(default_factory=list)
+    created_version: int = 0
+
+    @field_validator("proposal_id", "value", "scope_id", "reason", "evidence", mode="before")
+    @classmethod
+    def _norm_text(cls, value: Any) -> str:
+        return _clean_str(value)
+
+    @field_validator("source_ref", mode="before")
+    @classmethod
+    def _norm_source(cls, value: Any) -> dict[str, Any]:
+        return dict(value) if isinstance(value, dict) else {}
+
+    @field_validator("conflicts_with", mode="before")
+    @classmethod
+    def _norm_conflicts(cls, value: Any) -> list[str]:
+        return _as_str_list(value)
+
+    @field_validator("created_version", mode="before")
+    @classmethod
+    def _norm_version(cls, value: Any) -> int:
+        return max(0, _as_int(value, 0))
+
+    @model_validator(mode="after")
+    def _check(self) -> ContextProposal:
+        if not self.proposal_id:
+            raise ValueError("proposal_id 不能为空")
+        if self.kind not in FACT_KINDS:
+            raise ValueError(f"kind 只能是 {' / '.join(FACT_KINDS)}")
+        if self.scope not in FACT_SCOPES:
+            raise ValueError(f"scope 只能是 {' / '.join(FACT_SCOPES)}")
+        if not self.value:
+            raise ValueError("value 不能为空")
+        if len(self.value) > MAX_FACT_CHARS:
+            raise ValueError(f"value 不能超过 {MAX_FACT_CHARS} 字")
+        return self
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "proposal_id": self.proposal_id,
+            "kind": self.kind,
+            "value": self.value,
+            "scope": self.scope,
+            "scope_id": self.scope_id,
+            "reason": self.reason,
+            "evidence": self.evidence,
+            "source_ref": dict(self.source_ref),
+            "conflicts_with": list(self.conflicts_with),
+            "created_version": self.created_version,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> ContextProposal:
+        if not isinstance(data, dict):
+            raise SchemaError("提案必须是一个 JSON 对象")
+        try:
+            return cls(**data)
+        except ValidationError as exc:
+            raise _invalid("提案", exc) from exc
+
+
+class ContextSnapshot(BaseModel):
+    """会话状态快照（`chat_sessions.context_state` 的内存投影）。"""
+
+    model_config = ConfigDict(extra="ignore")
+
+    state_version: int = 0
+    topic_id: str | None = None
+    facts: list[ContextFact] = Field(default_factory=list)
+    proposals: list[ContextProposal] = Field(default_factory=list)
+    object_refs: list[dict[str, Any]] = Field(default_factory=list)
+    archived: list[ContextFact] = Field(default_factory=list)
+    recovery_status: str = "complete"
+    recovery_reason: str = ""
+
+    @field_validator("state_version", mode="before")
+    @classmethod
+    def _norm_version(cls, value: Any) -> int:
+        return max(0, _as_int(value, 0))
+
+    @field_validator("facts", "proposals", "archived", mode="before")
+    @classmethod
+    def _norm_items(cls, value: Any) -> list[Any]:
+        return _as_list(value)
+
+    @field_validator("object_refs", mode="before")
+    @classmethod
+    def _norm_refs(cls, value: Any) -> list[dict[str, Any]]:
+        return [dict(item) for item in _as_list(value) if isinstance(item, dict)]
+
+    @model_validator(mode="after")
+    def _check(self) -> ContextSnapshot:
+        if self.recovery_status not in ("complete", "partial"):
+            raise ValueError("recovery_status 只能是 complete / partial")
+        return self
+
+    def active(self, *, scope_id: str | None = None, kind: str | None = None) -> list[ContextFact]:
+        """生效事实（可按作用域对象 / 类型过滤；`session` 作用域始终有效）。"""
+        out = []
+        for fact in self.facts:
+            if fact.status != "active":
+                continue
+            if scope_id is not None and fact.scope != "session" \
+                    and fact.scope_id and fact.scope_id != scope_id:
+                continue
+            if kind is not None and fact.kind != kind:
+                continue
+            out.append(fact)
+        return out
+
+    def pending(self) -> list[ContextProposal]:
+        return list(self.proposals)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "facts": [item.to_dict() for item in self.facts],
+            "proposals": [item.to_dict() for item in self.proposals],
+            "object_refs": [dict(item) for item in self.object_refs],
+            "archived": [item.to_dict() for item in self.archived],
+            "recovery_status": self.recovery_status,
+            "recovery_reason": self.recovery_reason,
+        }
+
+    @classmethod
+    def from_dict(
+        cls, data: dict[str, Any] | None, *, state_version: int = 0,
+        topic_id: str | None = None, recovery_status: str = "complete",
+    ) -> ContextSnapshot:
+        """从库里读回；坏数据不抛错——**降级成 partial**（旧会话 / 手工改库都要能读）。"""
+        raw = dict(data or {})
+        facts: list[ContextFact] = []
+        proposals: list[ContextProposal] = []
+        try:
+            facts = [ContextFact.from_dict(item) for item in _as_list(raw.get("facts"))]
+            proposals = [
+                ContextProposal.from_dict(item) for item in _as_list(raw.get("proposals"))
+            ]
+        except SchemaError:
+            return cls(
+                state_version=state_version, topic_id=topic_id,
+                recovery_status="partial",
+                recovery_reason="状态快照中有无法解析的条目",
+            )
+        archived: list[ContextFact] = []
+        try:
+            archived = [
+                ContextFact.from_dict(item) for item in _as_list(raw.get("archived"))
+            ]
+        except SchemaError:
+            archived = []
+        return cls(
+            state_version=state_version,
+            topic_id=topic_id,
+            facts=facts,
+            proposals=proposals,
+            object_refs=[dict(item) for item in _as_list(raw.get("object_refs"))
+                         if isinstance(item, dict)],
+            archived=archived,
+            recovery_status=recovery_status,
+            recovery_reason=_clean_str(raw.get("recovery_reason")),
+        )
+
+
+class ContextOperation(BaseModel):
+    """抽取增量里的一条操作（`add` / `retract` / `replace`），尚未经服务端校验。"""
+
+    model_config = ConfigDict(extra="ignore")
+
+    op: str
+    kind: str = ""
+    value: str = ""
+    scope: str = "topic"
+    scope_id: str = ""
+    target_fact_id: str = ""
+    evidence: str = ""
+    reason: str = ""
+
+    @field_validator("op", "kind", "value", "scope", "scope_id", "target_fact_id",
+                     "evidence", "reason", mode="before")
+    @classmethod
+    def _norm_text(cls, value: Any) -> str:
+        return _clean_str(value)
+
+    @model_validator(mode="after")
+    def _check(self) -> ContextOperation:
+        if self.op not in ("add", "retract", "replace"):
+            raise ValueError("op 只能是 add / retract / replace")
+        if self.op in ("add", "replace") and not self.value:
+            raise ValueError(f"{self.op} 需要 value")
+        if self.op == "add" and self.kind not in FACT_KINDS:
+            raise ValueError(f"add 的 kind 只能是 {' / '.join(FACT_KINDS)}")
+        if self.op in ("retract", "replace") and not self.target_fact_id:
+            raise ValueError(f"{self.op} 需要 target_fact_id")
+        if self.scope not in FACT_SCOPES:
+            raise ValueError(f"scope 只能是 {' / '.join(FACT_SCOPES)}")
+        return self
+
+
+class ContextDelta(BaseModel):
+    """一次抽取的完整增量：操作 + 待确认提案（提案内容未经服务端编号）。"""
+
+    model_config = ConfigDict(extra="ignore")
+
+    operations: list[ContextOperation] = Field(default_factory=list)
+    proposals: list[dict[str, Any]] = Field(default_factory=list)
+
+    @field_validator("operations", mode="before")
+    @classmethod
+    def _norm_ops(cls, value: Any) -> list[Any]:
+        return _as_list(value)
+
+    @field_validator("proposals", mode="before")
+    @classmethod
+    def _norm_proposals(cls, value: Any) -> list[dict[str, Any]]:
+        return [dict(item) for item in _as_list(value) if isinstance(item, dict)]
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> ContextDelta:
+        if not isinstance(data, dict):
+            raise SchemaError("状态增量必须是一个 JSON 对象")
+        try:
+            return cls(**data)
+        except ValidationError as exc:
+            raise _invalid("状态增量", exc) from exc

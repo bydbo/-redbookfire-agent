@@ -393,6 +393,11 @@ class ChatToolCall(_Response):
     latency_ms: int = 0
     error: str = ""
     steps: list[dict[str, Any]] = Field(default_factory=list)
+    # E7 第六批（S7.25）：改稿的实际基础版本与成功版本（前端据此显示版本链）
+    object_key: str = ""
+    version_id: UuidStr | None = None
+    version_no: int | None = None
+    base_version_no: int | None = None
 
 
 class ChatMessage(_Response):
@@ -448,14 +453,132 @@ class ChatSessionList(_Response):
     total: int
 
 
+# ---- E7 第六批（S7.24 / S7.25）：上下文状态与产物版本 ----
+FactKind = Literal["goal", "constraint", "preference", "audience", "format"]
+FactStatus = Literal["active", "pending_confirmation", "superseded", "retracted"]
+FactScope = Literal["session", "topic", "artifact"]
+ContextAction = Literal["confirm", "reject", "retract", "replace", "reset_topic"]
+ArtifactStatus = Literal["pending", "succeeded", "failed", "refused", "interrupted"]
+ArtifactType = Literal["draft", "clue"]
+ContextMode = Literal["off", "shadow", "enforce"]
+
+
+class ContextFact(_Response):
+    """一条会话事实（契约 `ContextFact`）。"""
+
+    fact_id: str
+    kind: FactKind
+    value: str
+    scope: FactScope
+    status: FactStatus
+    evidence: str
+    created_version: int = Field(ge=0)
+    scope_id: str = ""
+    source_ref: dict[str, Any] = Field(default_factory=dict)
+    replaces: str | None = None
+    updated_at: DateTimeStr = ""
+
+
+class ContextProposal(_Response):
+    """一条待确认提案（契约 `ContextProposal`）。"""
+
+    proposal_id: str
+    kind: FactKind
+    value: str
+    scope: FactScope
+    reason: str
+    scope_id: str = ""
+    evidence: str = ""
+    source_ref: dict[str, Any] = Field(default_factory=dict)
+    conflicts_with: list[str] = Field(default_factory=list)
+    created_version: int = Field(default=0, ge=0)
+
+
+class ArtifactHead(_Response):
+    """产物对象当前指向的成功版本（契约 `ArtifactHead`）。"""
+
+    object_key: str
+    version_id: UuidStr
+    version_no: int = Field(ge=1)
+    updated_at: DateTimeStr = ""
+
+
+class ChatContext(_Response):
+    """会话上下文（契约 `ChatContext`）。"""
+
+    session_id: UuidStr
+    state_version: int = Field(ge=0)
+    recovery_status: Literal["complete", "partial"]
+    facts: list[ContextFact]
+    proposals: list[ContextProposal]
+    artifact_heads: list[ArtifactHead]
+    effective_mode: ContextMode
+    topic_id: str | None = None
+    blocking_proposals: int = Field(default=0, ge=0)
+
+
+class ContextActionRequest(BaseModel):
+    """`POST .../context/actions` 请求体（契约 `ContextActionRequest`）。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    action: ContextAction
+    expected_state_version: int = Field(ge=0)
+    target_id: str | None = None
+    value: str | None = None
+
+
+class ContextActionResponse(_Response):
+    """动作结果与最新上下文（契约 `ContextActionResponse`）。"""
+
+    session_id: UuidStr
+    state_version: int = Field(ge=0)
+    action: ContextAction
+    decision: Literal["applied", "noop", "conflict"]
+    context: ChatContext
+    reason: str = ""
+
+
+class ArtifactVersion(_Response):
+    """一个不可变的文案 / 线索版本（契约 `ArtifactVersion`）。"""
+
+    version_id: UuidStr
+    session_id: UuidStr
+    object_key: str
+    object_type: ArtifactType
+    status: ArtifactStatus
+    prompt_versions: dict[str, int]
+    usage: dict[str, Any]
+    created_at: DateTimeStr
+    run_id: UuidStr | None = None
+    hotspot_position: int | None = None
+    version_no: int | None = None
+    base_version_id: UuidStr | None = None
+    content: dict[str, Any] | None = None
+    source: dict[str, Any] = Field(default_factory=dict)
+    error: str | None = None
+    updated_at: DateTimeStr = ""
+
+
+class ArtifactVersionList(_Response):
+    """版本列表（契约 `ArtifactVersionList`）。"""
+
+    items: list[ArtifactVersion]
+    total: int = Field(ge=0)
+
+
 class ChatSessionDetail(_Response):
-    """会话详情：会话字段 + 消息数组（同样扁平写全）。"""
+    """会话详情：会话字段 + 消息数组（同样扁平写全）。
+
+    E7 第六批（S7.24）：可选 `context`——上下文状态摘要（旧客户端忽略即可）。
+    """
 
     session_id: UuidStr
     title: str
     created_at: DateTimeStr
     updated_at: DateTimeStr
     messages: list[ChatMessage]
+    context: ChatContext | None = None
 
 
 class MatchCandidate(_Response):

@@ -39,8 +39,10 @@ from typing_extensions import TypedDict
 
 from ..agents.supervisor import TASK_ID, initial_messages, supervise
 from ..config import AppConfig
+from ..core import budget as budget_tool
 from ..core import ledger as ledger_projection
 from ..core import progress as progress_tool
+from ..core.budget import BudgetDecision, BudgetPolicy
 from ..core.progress import error_category as error_category_of
 from ..services import chat_tools
 from ..services.chat_tools import ToolOutcome
@@ -49,6 +51,8 @@ from ..util import now_iso
 
 EventFn = Callable[[str, dict[str, Any]], Awaitable[None]]
 ToolRunner = Callable[..., Awaitable[ToolOutcome]]
+#: 预算判定观察者（落 `context_assembled` 观测；不阻断图执行）
+BudgetFn = Callable[[BudgetDecision], Awaitable[None]]
 
 # 节点级重试：只重试"上游抖动"这一类（与 `workflows/analysis.py` 的默认策略一致）
 RETRY_POLICY = RetryPolicy(max_attempts=3)
@@ -134,8 +138,16 @@ def _build_graph(
     stream: bool,
     version: int,
     ledger: dict[str, Any],
+    budget_policy: BudgetPolicy | None = None,
+    on_budget: BudgetFn | None = None,
 ) -> Any:
-    """按这一轮的实际依赖构图（provider / 工具执行器都是闭包注入，便于离线测试）。"""
+    """按这一轮的实际依赖构图（provider / 工具执行器都是闭包注入，便于离线测试）。
+
+    S7.26：`budget_policy.enforce` 时**每次 supervisor 调用前**做完整预算判定（含工具返回后的
+    再检查）；超限抛 `BudgetError`（类别 `required_context_overflow`），不发请求。
+    `shadow` 只记录判定，不改变执行。
+    """
+    policy = budget_policy or BudgetPolicy()
     # 调用身份注入（E7OBS4-01）：一次签名检查决定是否给 runner 传内部 `meta`；
     # 旧测试 runner 天然兼容，**不**用"捕获 TypeError 再重跑工具"来试探签名。
     try:
@@ -147,11 +159,40 @@ def _build_graph(
         if on_event is not None:
             await on_event(event, payload)
 
+    async def check_budget(messages: list[dict[str, Any]],
+                           tools: list[dict[str, Any]]) -> BudgetDecision | None:
+        """每次真实请求前的统一入口；返回判定（off 模式返回 None，不产生额外开销）。"""
+        if not policy.checks:
+            return None
+        decision = budget_tool.decide(
+            messages=messages,
+            tools=tools,
+            output_reserve=policy.output_tokens,
+            application_limit=policy.application_limit,
+            model_window=policy.model_window,
+            mode=policy.mode,
+            protected=policy.protected,
+        )
+        if on_budget is not None:
+            await on_budget(decision)
+        if policy.enforces and not decision.allowed:
+            # 必要内容装不下就不发请求：让用户缩小范围，而不是静默截断约束
+            raise budget_tool.BudgetError(
+                "当前问题的必需上下文超出模型请求预算，请缩小范围后重试",
+                reason="required_context_overflow",
+            )
+        return decision
+
     async def supervisor_node(state: ChatState) -> dict[str, Any]:
         rounds = int(state.get("tool_rounds") or 0)
         attempt = rounds + 1  # 第几轮决策（多轮决策不等于重试）
         remaining = max(0, int(max_rounds) - rounds)
         tools = chat_tools.TOOLS if remaining > 0 else []  # 到上限就不给工具，逼出正文
+        messages = list(state.get("messages") or [])
+        # S7.26：工具返回后、下一次调用前重新检查（mutation 不绕过预算入口）
+        if policy.enforces:
+            budget_tool.check_tool_structure(messages)
+        await check_budget(messages, tools)
 
         # S7.20：决策阶段的生命周期事件——前端据此区分"理解与决策 / 工具 / 排队 / 回复"
         await emit(
@@ -172,7 +213,7 @@ def _build_graph(
         try:
             turn = await supervise(
                 provider,
-                state.get("messages") or [],
+                messages,
                 tools=tools,
                 on_delta=delta if stream else None,
                 stream=stream,
@@ -412,6 +453,11 @@ def _build_graph(
                 "latency_ms": int((time.monotonic() - started) * 1000),
                 "error": outcome.error,
                 "steps": outcome.steps,
+                # E7 第六批（S7.25）：改稿的版本链随调用记录落库（前端显示成功版本 / 基础版本）
+                "object_key": str(outcome.payload.get("object_key") or ""),
+                "version_id": outcome.payload.get("version_id"),
+                "version_no": outcome.payload.get("version_no"),
+                "base_version_no": outcome.payload.get("base_version_no"),
             }
             history.append(entry)
             # R3（OBS-10）：稳定边界账目——工具调用记录带已知用量与身份
@@ -441,7 +487,13 @@ def _build_graph(
                 {
                     "role": "tool",
                     "tool_call_id": call_id,
-                    "content": outcome.as_tool_message(),
+                    # S7.26：enforce 时超长工具结果按字段限量（保留对象 ID / 版本 / 可读引用）；
+                    # shadow 不改工具执行，off 保持原样
+                    "content": (
+                        budget_tool.compact_tool_message(outcome.as_tool_message())
+                        if policy.enforces
+                        else outcome.as_tool_message()
+                    ),
                 }
             )
             # R5（E7OBS2-03）：worker 来源事实（结构化标记 / 源尝试号 / 重试 / 最后状态）
@@ -500,11 +552,18 @@ async def run_turn(
     on_event: EventFn | None = None,
     stream: bool = True,
     ledger: dict[str, Any] | None = None,
+    state_text: str = "",
+    grouped: bool = False,
+    budget_policy: BudgetPolicy | None = None,
+    on_budget: BudgetFn | None = None,
 ) -> ChatTurn:
     """跑一轮对话：组装消息 → 图（supervisor ⇄ 工具）→ 汇总成 `ChatTurn`。
 
     `ledger` 可注入（R5 / E7OBS2-01）：对话运行器在**稳定边界**持有同一份账本，取消 /
     外层异常收尾时也能读出已完成的模型与工具记录（已知消费不丢，未知单列）。
+
+    S7.24 / S7.26：`state_text` 是服务端验证过的有效状态（放固定前缀之后）；`grouped`
+    启用完整轮次组裁剪；`budget_policy` 非 off 时每次实际请求前做完整预算判定。
     """
     started = time.monotonic()
     rounds = int(max_rounds if max_rounds is not None else cfg.chat.max_tool_rounds)
@@ -514,6 +573,8 @@ async def run_turn(
         attachment_note=attachment_note,
         keep_messages=cfg.chat.history_max_messages,
         token_budget=cfg.chat.history_token_budget,
+        grouped=grouped,
+        state_text=state_text,
     )
     # R3（OBS-10）：轮内账目挂在**稳定边界**（闭包持有的 ledger）——图抛异常时，
     # 已完成的模型 / 工具调用记录仍能带出，失败轮次不丢已知消费与引用
@@ -542,6 +603,8 @@ async def run_turn(
         stream=stream,
         version=rendered.version,
         ledger=ledger,
+        budget_policy=budget_policy,
+        on_budget=on_budget,
     )
     try:
         final = await graph.ainvoke(

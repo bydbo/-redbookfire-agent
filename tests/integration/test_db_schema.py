@@ -50,6 +50,9 @@ COLUMN_SPECS: dict[str, dict[str, str]] = {
     },
     "chat_sessions": {
         "id": "uuid", "title": "text", "created_at": "timestamptz", "updated_at": "timestamptz",
+        # E7 第六批（S7.24）：结构化上下文状态与产物 head
+        "state_version": "int4", "topic_id": "text", "context_state": "jsonb",
+        "artifact_heads": "jsonb", "recovery_status": "text",
     },
     "chat_messages": {
         "id": "uuid", "session_id": "uuid", "role": "text", "content": "text",
@@ -60,6 +63,30 @@ COLUMN_SPECS: dict[str, dict[str, str]] = {
         # S7.21：轮次关联（turn_id / trace_id）与阶段快照（progress）
         "turn_id": "uuid", "trace_id": "text", "progress": "jsonb",
     },
+    # E7 第六批（S7.24–S7.28）：状态审计 / 产物版本 / 图片缓存 / 观测
+    "chat_context_events": {
+        "id": "uuid", "session_id": "uuid", "state_version": "int4", "event_type": "text",
+        "actor": "text", "source_ref": "jsonb", "decisions": "jsonb", "delta": "jsonb",
+        "reason": "text", "created_at": "timestamptz",
+    },
+    "chat_artifact_versions": {
+        "id": "uuid", "session_id": "uuid", "object_key": "text", "object_type": "text",
+        "run_id": "uuid", "hotspot_position": "int4", "request_key": "text",
+        "status": "text", "version_no": "int4", "base_version_id": "uuid",
+        "content": "jsonb", "source": "jsonb", "prompt_versions": "jsonb",
+        "usage": "jsonb", "error": "text", "created_at": "timestamptz",
+        "updated_at": "timestamptz",
+    },
+    "chat_image_parse_cache": {
+        "id": "uuid", "session_id": "uuid", "cache_key": "text", "identity": "jsonb",
+        "payload": "jsonb", "source": "jsonb", "created_at": "timestamptz",
+        "expires_at": "timestamptz",
+    },
+    "context_observations": {
+        "event_id": "text", "session_id": "uuid", "event_type": "text", "turn_id": "text",
+        "call_id": "text", "attempt": "int4", "model": "text", "prompt_version": "text",
+        "policy_version": "text", "payload": "jsonb", "created_at": "timestamptz",
+    },
 }
 
 NULLABLE_COLUMNS: dict[str, set[str]] = {
@@ -68,8 +95,14 @@ NULLABLE_COLUMNS: dict[str, set[str]] = {
     "runs": {"started_at", "finished_at", "error", "request_id"},
     "run_hotspots": {"draft", "error"},
     "run_matches": set(),
-    "chat_sessions": set(),
+    "chat_sessions": {"topic_id"},
     "chat_messages": {"run_id", "error", "turn_id", "trace_id"},
+    "chat_context_events": set(),
+    "chat_artifact_versions": {"run_id", "hotspot_position", "version_no",
+                               "base_version_id", "content", "error"},
+    "chat_image_parse_cache": set(),
+    "context_observations": {"turn_id", "call_id", "attempt", "model",
+                             "prompt_version", "policy_version"},
 }
 
 # 数据契约 §4.1 的 16 条索引（唯一约束在 PG 里也是索引）
@@ -80,6 +113,16 @@ EXPECTED_INDEXES = {
     "uq_run_hotspots_run_id_position", "ix_run_hotspots_hotspot_id",
     "uq_run_matches_run_hotspot_id_rank", "ix_run_matches_material_id",
     "ix_chat_sessions_updated_at", "ix_chat_messages_session_id_created_at",
+    # E7 第六批：状态版本唯一、请求认领唯一、成功版本部分唯一、到期与观测索引
+    "uq_chat_context_events_session_version",
+    "ix_chat_context_events_session_created_at",
+    "uq_chat_artifact_versions_session_request",
+    "uq_chat_artifact_versions_object_version",
+    "ix_chat_artifact_versions_object_version",
+    "uq_chat_image_parse_cache_session_key",
+    "ix_chat_image_parse_cache_expires_at",
+    "ix_context_observations_session_created_at",
+    "ix_context_observations_type_created_at",
 }
 
 

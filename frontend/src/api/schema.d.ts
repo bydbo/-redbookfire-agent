@@ -486,6 +486,93 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/chat/sessions/{session_id}/context": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * 读取会话的上下文状态
+         * @description 返回会话的结构化上下文（S7.24）：生效事实、待确认提案、状态版本、话题、恢复状态与产物 head。
+         *     `effective_mode` 是**运行时实际生效**的模式（`enforce` 在模型窗口未核实时降级为 `shadow`）；
+         *     `recovery_status=partial` 表示旧会话历史不完整，前端应显示「历史状态未完整恢复」。
+         *     状态版本用于前端提交动作时做 CAS（`expected_state_version`），过期即 409。
+         */
+        get: operations["getChatContext"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/chat/sessions/{session_id}/context/actions": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * 对上下文事实执行确认 / 拒绝 / 撤回 / 替换 / 切换话题
+         * @description 用户动作（S7.24）：`confirm` / `reject` 针对具体 `target_id`（事实或提案），`retract`
+         *     撤回生效事实，`replace` 用 `value` 显式替换，`reset_topic` 归档当前话题的有效项并新开话题。
+         *     **必须带 `expected_state_version`**：与服务端当前版本不一致返回 409（响应里给当前版本，
+         *     前端刷新后重新操作），同一版本重复提交不会再次推进状态。
+         */
+        post: operations["postChatContextAction"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/chat/sessions/{session_id}/artifacts": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * 列出版本与基础版本
+         * @description 按对象列出版本（S7.25）；不传 `object_key` 时列出本会话全部对象的最新成功版本。
+         *     **只返回本会话的版本**——跨会话一律 404 / 空列表，不靠前端隐藏选项。
+         */
+        get: operations["listChatArtifacts"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/chat/sessions/{session_id}/artifacts/{version_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * 读取指定的不可变版本
+         * @description 取指定版本及它的来源、基础版本与用量（S7.25）。版本不属于该会话一律 404。
+         */
+        get: operations["getChatArtifact"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
 }
 export type webhooks = Record<string, never>;
 export interface components {
@@ -817,6 +904,14 @@ export interface components {
             steps?: {
                 [key: string]: unknown;
             }[];
+            /** @description 产物对象键（S7.25，`draft:<run_id>:<position>`） */
+            object_key?: string;
+            /** @description 本次改稿提交的成功版本（拒绝 / 失败时为空） */
+            version_id?: string | null;
+            /** @description 成功版本号（从 1 起；同对象内单调递增） */
+            version_no?: number | null;
+            /** @description 实际基础版本号（首个版本的基础是运行初稿，登记为 1） */
+            base_version_no?: number | null;
         };
         ChatMessage: {
             /** Format: uuid */
@@ -921,6 +1016,131 @@ export interface components {
             /** Format: date-time */
             updated_at: string;
             messages: components["schemas"]["ChatMessage"][];
+        };
+        /** @description 一条会话事实（S7.24）：目标、限制、偏好、受众或形式。 */
+        ContextFact: {
+            fact_id: string;
+            /** @enum {string} */
+            kind: "goal" | "constraint" | "preference" | "audience" | "format";
+            value: string;
+            /** @enum {string} */
+            scope: "session" | "topic" | "artifact";
+            /** @description 作用域对象标识（`topic` = 当前话题，`artifact` = 对象键） */
+            scope_id?: string;
+            /** @enum {string} */
+            status: "active" | "pending_confirmation" | "superseded" | "retracted";
+            /** @description 用户原文中的真实片段（服务端做子串校验） */
+            evidence: string;
+            /** @description 来源（`message_id` / `action_id` / `turn_id`），模型解释不作为来源 */
+            source_ref?: {
+                [key: string]: unknown;
+            };
+            created_version: number;
+            replaces?: string | null;
+            /** Format: date-time */
+            updated_at?: string;
+        };
+        /** @description 待确认提案（推断、歧义或替换意图不明的冲突，S7.24）。 */
+        ContextProposal: {
+            proposal_id: string;
+            /** @enum {string} */
+            kind: "goal" | "constraint" | "preference" | "audience" | "format";
+            value: string;
+            /** @enum {string} */
+            scope: "session" | "topic" | "artifact";
+            scope_id?: string;
+            /** @description 安全原因（歧义 / 推断 / 冲突），不含用户原文 */
+            reason: string;
+            evidence?: string;
+            source_ref?: {
+                [key: string]: unknown;
+            };
+            conflicts_with?: string[];
+            created_version?: number;
+        };
+        /** @description 一个产物对象当前指向的成功版本（S7.25）。 */
+        ArtifactHead: {
+            object_key: string;
+            /** Format: uuid */
+            version_id: string;
+            version_no: number;
+            /** Format: date-time */
+            updated_at?: string;
+        };
+        /** @description 会话上下文（S7.24）。`effective_mode` 是运行时实际生效的模式。 */
+        ChatContext: {
+            /** Format: uuid */
+            session_id: string;
+            state_version: number;
+            topic_id?: string | null;
+            /** @enum {string} */
+            recovery_status: "complete" | "partial";
+            facts: components["schemas"]["ContextFact"][];
+            proposals: components["schemas"]["ContextProposal"][];
+            artifact_heads: components["schemas"]["ArtifactHead"][];
+            /** @enum {string} */
+            effective_mode: "off" | "shadow" | "enforce";
+            /** @description 阻断当前任务的待确认提案数（>0 时应先确认再继续） */
+            blocking_proposals?: number;
+        };
+        /** @description 上下文用户动作（S7.24）；`expected_state_version` 是 CAS 条件。 */
+        ContextActionRequest: {
+            /** @enum {string} */
+            action: "confirm" | "reject" | "retract" | "replace" | "reset_topic";
+            expected_state_version: number;
+            /** @description 事实 / 提案标识（confirm / reject / retract / replace 必填） */
+            target_id?: string;
+            /** @description 替换后的新值（replace 必填） */
+            value?: string;
+        };
+        /** @description 动作结果与最新上下文（S7.24）。 */
+        ContextActionResponse: {
+            /** Format: uuid */
+            session_id: string;
+            state_version: number;
+            /** @enum {string} */
+            action: "confirm" | "reject" | "retract" | "replace" | "reset_topic";
+            /** @enum {string} */
+            decision: "applied" | "noop" | "conflict";
+            reason?: string;
+            context: components["schemas"]["ChatContext"];
+        };
+        /** @description 一个不可变的文案 / 线索版本（S7.25）。 */
+        ArtifactVersion: {
+            /** Format: uuid */
+            version_id: string;
+            /** Format: uuid */
+            session_id: string;
+            object_key: string;
+            /** @enum {string} */
+            object_type: "draft" | "clue";
+            run_id?: string | null;
+            hotspot_position?: number | null;
+            /** @enum {string} */
+            status: "pending" | "succeeded" | "failed" | "refused" | "interrupted";
+            version_no?: number | null;
+            base_version_id?: string | null;
+            content?: {
+                [key: string]: unknown;
+            } | null;
+            source?: {
+                [key: string]: unknown;
+            };
+            prompt_versions: {
+                [key: string]: number;
+            };
+            usage: {
+                [key: string]: unknown;
+            };
+            error?: string | null;
+            /** Format: date-time */
+            created_at: string;
+            /** Format: date-time */
+            updated_at?: string;
+        };
+        ArtifactVersionList: {
+            items: components["schemas"]["ArtifactVersion"][];
+            total: number;
         };
         /** @description 素材索引任务的状态；未知或已过期的 task_id 也返回它（state=PENDING）。 */
         MaterialTask: {
@@ -1778,6 +1998,132 @@ export interface operations {
                     "image/jpeg": string;
                     "image/png": string;
                     "image/webp": string;
+                };
+            };
+            404: components["responses"]["NotFound"];
+            503: components["responses"]["DependencyUnavailable"];
+        };
+    };
+    getChatContext: {
+        parameters: {
+            query?: never;
+            header?: {
+                /** @description 客户端生成的请求标识；未提供时由服务端生成。用于贯穿日志、调用追踪与数据库记录。 */
+                "X-Request-ID"?: components["parameters"]["RequestId"];
+            };
+            path: {
+                session_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description 会话上下文 */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ChatContext"];
+                };
+            };
+            404: components["responses"]["NotFound"];
+            503: components["responses"]["DependencyUnavailable"];
+        };
+    };
+    postChatContextAction: {
+        parameters: {
+            query?: never;
+            header?: {
+                /** @description 客户端生成的请求标识；未提供时由服务端生成。用于贯穿日志、调用追踪与数据库记录。 */
+                "X-Request-ID"?: components["parameters"]["RequestId"];
+            };
+            path: {
+                session_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ContextActionRequest"];
+            };
+        };
+        responses: {
+            /** @description 动作结果与最新上下文 */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ContextActionResponse"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            /** @description 状态版本冲突（响应带当前版本，可重试） */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            422: components["responses"]["ValidationError"];
+            503: components["responses"]["DependencyUnavailable"];
+        };
+    };
+    listChatArtifacts: {
+        parameters: {
+            query?: {
+                object_key?: string;
+            };
+            header?: {
+                /** @description 客户端生成的请求标识；未提供时由服务端生成。用于贯穿日志、调用追踪与数据库记录。 */
+                "X-Request-ID"?: components["parameters"]["RequestId"];
+            };
+            path: {
+                session_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description 版本列表 */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ArtifactVersionList"];
+                };
+            };
+            404: components["responses"]["NotFound"];
+            503: components["responses"]["DependencyUnavailable"];
+        };
+    };
+    getChatArtifact: {
+        parameters: {
+            query?: never;
+            header?: {
+                /** @description 客户端生成的请求标识；未提供时由服务端生成。用于贯穿日志、调用追踪与数据库记录。 */
+                "X-Request-ID"?: components["parameters"]["RequestId"];
+            };
+            path: {
+                session_id: string;
+                version_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description 版本内容 */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ArtifactVersion"];
                 };
             };
             404: components["responses"]["NotFound"];

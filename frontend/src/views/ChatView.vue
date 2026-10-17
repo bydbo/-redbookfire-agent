@@ -1,10 +1,20 @@
 <script setup lang="ts">
 // 对话首页（S7.5）：传图（最多 9 张，S7.18）+ 一句话 → 模型自己决定要不要调「跑完整分析」→ 过程流式可见 →
 // 结果卡片回到对话里。刷新后会话与消息仍在（库里读回来），运行中的那轮靠轮询补齐。
-import { NAlert, NButton, NCard, NEmpty, NInput, NSpin, NTag } from 'naive-ui'
-import { nextTick, onMounted, ref, watch } from 'vue'
+import {
+  NAlert,
+  NButton,
+  NCard,
+  NCollapse,
+  NCollapseItem,
+  NEmpty,
+  NInput,
+  NSpin,
+  NTag,
+} from 'naive-ui'
+import { computed, nextTick, onMounted, ref, watch } from 'vue'
 
-import type { ChatMessage } from '@/api/chat'
+import type { ChatMessage, ContextFact, ContextProposal } from '@/api/chat'
 import HotspotResult from '@/components/HotspotResult.vue'
 import ImageIntake from '@/components/ImageIntake.vue'
 import { errorCategoryLabel, stageLabel, useChatStore } from '@/stores/chat'
@@ -121,6 +131,83 @@ function failureHint(message: ChatMessage): string {
 function sessionLabel(item: { title: string; session_id: string }): string {
   return item.title || '新对话'
 }
+
+// ---- 上下文面板（S7.24）：生效 / 待确认、作用域、来源与恢复缺口 ----
+const FACT_KIND_LABELS: Record<string, string> = {
+  goal: '目标',
+  constraint: '限制',
+  preference: '偏好',
+  audience: '受众',
+  format: '形式',
+}
+
+const SCOPE_LABELS: Record<string, string> = {
+  session: '整个会话',
+  topic: '当前话题',
+  artifact: '产物',
+}
+
+const PROPOSAL_REASON_LABELS: Record<string, string> = {
+  inferred: '推断',
+  conflict: '与现有要求冲突',
+  ambiguous_reference: '指代不明确',
+  scope_unresolved: '对象未确认',
+}
+
+const MODE_LABELS: Record<string, string> = {
+  off: '未启用',
+  shadow: '影子模式',
+  enforce: '已生效',
+}
+
+const contextActionError = ref<string | null>(null)
+const contextBusy = ref(false)
+
+const facts = computed<ContextFact[]>(() => store.context?.facts ?? [])
+const proposals = computed<ContextProposal[]>(() => store.context?.proposals ?? [])
+const activeFacts = computed(() => facts.value.filter((item) => item.status === 'active'))
+const pendingFacts = computed(
+  () => facts.value.filter((item) => item.status === 'pending_confirmation'),
+)
+const contextSummary = computed(() => {
+  const loaded = store.context
+  if (loaded === null) return '尚未加载'
+  return `生效 ${activeFacts.value.length} 条 · 待确认 ${proposals.value.length} 条`
+})
+
+function factKindLabel(kind: string): string {
+  return FACT_KIND_LABELS[kind] ?? kind
+}
+
+function scopeLabel(fact: ContextFact): string {
+  const base = SCOPE_LABELS[fact.scope] ?? fact.scope
+  return fact.scope === 'session' || !fact.scope_id ? base : `${base}（${fact.scope_id}）`
+}
+
+function proposalReasonLabel(reason: string): string {
+  return PROPOSAL_REASON_LABELS[reason] ?? reason
+}
+
+async function actOnContext(
+  action: 'confirm' | 'reject',
+  proposalId: string,
+): Promise<void> {
+  contextActionError.value = null
+  contextBusy.value = true
+  try {
+    contextActionError.value = await store.actOnContext(action, proposalId)
+  } finally {
+    contextBusy.value = false
+  }
+}
+
+function versionTag(call: { version_no?: number | null; base_version_no?: number | null }): string | null {
+  if (call.version_no === null || call.version_no === undefined) return null
+  const base = call.base_version_no !== null && call.base_version_no !== undefined
+    ? `（基础 第 ${call.base_version_no} 版）`
+    : ''
+  return `第 ${call.version_no} 版${base}`
+}
 </script>
 
 <template>
@@ -142,6 +229,103 @@ function sessionLabel(item: { title: string; session_id: string }): string {
       </header>
 
       <n-alert v-if="store.error" class="shrink-0" type="error" :title="store.error" />
+
+      <!-- 当前目标与限制（S7.24）：折叠面板；刷新、重连后与服务端一致，不被流式正文重置 -->
+      <n-card v-if="store.currentId" size="small" class="shrink-0">
+        <n-collapse :default-expanded-names="proposals.length > 0 ? ['context'] : []">
+          <n-collapse-item name="context">
+            <template #header>
+              <div class="flex flex-wrap items-center gap-2">
+                <span class="text-sm font-medium text-ink-strong">当前目标与限制</span>
+                <n-tag size="tiny" :bordered="false">
+                  {{ contextSummary }}
+                </n-tag>
+                <n-tag
+                  v-if="store.context"
+                  size="tiny"
+                  :type="store.context.effective_mode === 'enforce' ? 'success' : 'default'"
+                  :bordered="false"
+                >
+                  {{ MODE_LABELS[store.context.effective_mode] ?? store.context.effective_mode }}
+                </n-tag>
+              </div>
+            </template>
+
+            <div class="flex flex-col gap-2 text-sm">
+              <n-alert
+                v-if="store.context?.recovery_status === 'partial'"
+                type="warning"
+                title="历史状态未完整恢复：更早的要求可能没读回来，请补充关键限制"
+              />
+              <n-alert v-if="store.contextError" type="warning" :title="store.contextError" />
+              <n-alert v-if="contextActionError" type="warning" :title="contextActionError" />
+
+              <div v-if="store.contextLoading" class="text-xs text-ink-muted">加载中…</div>
+
+              <template v-else-if="activeFacts.length === 0 && proposals.length === 0">
+                <span class="text-xs text-ink-muted">
+                  还没有明确的目标或限制。直接说「控制在 100 字以内」「别提价格」这类要求即可。
+                </span>
+              </template>
+
+              <ul v-if="activeFacts.length > 0" class="flex flex-col gap-1">
+                <li
+                  v-for="fact in activeFacts"
+                  :key="fact.fact_id"
+                  class="flex flex-wrap items-baseline gap-2"
+                >
+                  <n-tag size="tiny" type="success" :bordered="false">
+                    {{ factKindLabel(fact.kind) }}
+                  </n-tag>
+                  <span class="text-ink-strong">{{ fact.value }}</span>
+                  <span class="text-xs text-ink-muted">{{ scopeLabel(fact) }}</span>
+                  <span v-if="fact.evidence" class="text-xs text-ink-muted">
+                    · 原文「{{ fact.evidence }}」
+                  </span>
+                </li>
+              </ul>
+
+              <div v-if="proposals.length > 0" class="flex flex-col gap-2 border-t border-line pt-2">
+                <span class="text-xs text-ink-muted">待确认（确认前不按它执行）</span>
+                <div
+                  v-for="proposal in proposals"
+                  :key="proposal.proposal_id"
+                  class="flex flex-wrap items-center gap-2"
+                >
+                  <n-tag size="tiny" type="warning" :bordered="false">
+                    {{ factKindLabel(proposal.kind) }}
+                  </n-tag>
+                  <span class="text-ink-strong">{{ proposal.value }}</span>
+                  <span class="text-xs text-ink-muted">
+                    {{ proposalReasonLabel(proposal.reason) }}
+                  </span>
+                  <div class="ml-auto flex gap-2">
+                    <n-button
+                      size="tiny"
+                      type="primary"
+                      :disabled="contextBusy"
+                      @click="actOnContext('confirm', proposal.proposal_id)"
+                    >
+                      确认
+                    </n-button>
+                    <n-button
+                      size="tiny"
+                      :disabled="contextBusy"
+                      @click="actOnContext('reject', proposal.proposal_id)"
+                    >
+                      拒绝
+                    </n-button>
+                  </div>
+                </div>
+              </div>
+
+              <span v-if="pendingFacts.length > 0" class="text-xs text-ink-muted">
+                另有 {{ pendingFacts.length }} 条生效事实等待补全来源
+              </span>
+            </div>
+          </n-collapse-item>
+        </n-collapse>
+      </n-card>
 
       <div class="flex min-h-0 flex-1 flex-col gap-4 md:flex-row md:gap-6">
         <!-- 历史会话侧栏：消息区之外，自己滚；窄屏限高，别把消息区挤没 -->
@@ -254,6 +438,7 @@ function sessionLabel(item: { title: string; session_id: string }): string {
                 >
                   {{ store.toolLabel(call.tool) }} ·
                   {{ call.status === 'succeeded' ? '已跑完' : '失败了' }}
+                  <template v-if="versionTag(call)"> · {{ versionTag(call) }}</template>
                 </n-tag>
               </div>
 

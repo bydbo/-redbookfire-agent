@@ -906,6 +906,152 @@ paths:
         '503':
           $ref: '#/components/responses/DependencyUnavailable'
 
+  /api/chat/sessions/{session_id}/context:
+    get:
+      tags:
+        - 对话
+      summary: 读取会话的上下文状态
+      description: |
+        返回会话的结构化上下文（S7.24）：生效事实、待确认提案、状态版本、话题、恢复状态与产物 head。
+        `effective_mode` 是**运行时实际生效**的模式（`enforce` 在模型窗口未核实时降级为 `shadow`）；
+        `recovery_status=partial` 表示旧会话历史不完整，前端应显示「历史状态未完整恢复」。
+        状态版本用于前端提交动作时做 CAS（`expected_state_version`），过期即 409。
+      operationId: getChatContext
+      parameters:
+        - $ref: '#/components/parameters/RequestId'
+        - name: session_id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: 会话上下文
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ChatContext'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '503':
+          $ref: '#/components/responses/DependencyUnavailable'
+
+  /api/chat/sessions/{session_id}/context/actions:
+    post:
+      tags:
+        - 对话
+      summary: 对上下文事实执行确认 / 拒绝 / 撤回 / 替换 / 切换话题
+      description: |
+        用户动作（S7.24）：`confirm` / `reject` 针对具体 `target_id`（事实或提案），`retract`
+        撤回生效事实，`replace` 用 `value` 显式替换，`reset_topic` 归档当前话题的有效项并新开话题。
+        **必须带 `expected_state_version`**：与服务端当前版本不一致返回 409（响应里给当前版本，
+        前端刷新后重新操作），同一版本重复提交不会再次推进状态。
+      operationId: postChatContextAction
+      parameters:
+        - $ref: '#/components/parameters/RequestId'
+        - name: session_id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ContextActionRequest'
+      responses:
+        '200':
+          description: 动作结果与最新上下文
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ContextActionResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          description: 状态版本冲突（响应带当前版本，可重试）
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '422':
+          $ref: '#/components/responses/ValidationError'
+        '503':
+          $ref: '#/components/responses/DependencyUnavailable'
+
+  /api/chat/sessions/{session_id}/artifacts:
+    get:
+      tags:
+        - 对话
+      summary: 列出版本与基础版本
+      description: |
+        按对象列出版本（S7.25）；不传 `object_key` 时列出本会话全部对象的最新成功版本。
+        **只返回本会话的版本**——跨会话一律 404 / 空列表，不靠前端隐藏选项。
+      operationId: listChatArtifacts
+      parameters:
+        - $ref: '#/components/parameters/RequestId'
+        - name: session_id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+        - name: object_key
+          in: query
+          required: false
+          schema:
+            type: string
+      responses:
+        '200':
+          description: 版本列表
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ArtifactVersionList'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '503':
+          $ref: '#/components/responses/DependencyUnavailable'
+
+  /api/chat/sessions/{session_id}/artifacts/{version_id}:
+    get:
+      tags:
+        - 对话
+      summary: 读取指定的不可变版本
+      description: |
+        取指定版本及它的来源、基础版本与用量（S7.25）。版本不属于该会话一律 404。
+      operationId: getChatArtifact
+      parameters:
+        - $ref: '#/components/parameters/RequestId'
+        - name: session_id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+        - name: version_id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: 版本内容
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ArtifactVersion'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '503':
+          $ref: '#/components/responses/DependencyUnavailable'
+
 components:
   parameters:
     RequestId:
@@ -1824,6 +1970,25 @@ components:
           items:
             type: object
             additionalProperties: true
+        object_key:
+          type: string
+          description: 产物对象键（S7.25，`draft:<run_id>:<position>`）
+        version_id:
+          oneOf:
+            - type: string
+              format: uuid
+            - type: 'null'
+          description: 本次改稿提交的成功版本（拒绝 / 失败时为空）
+        version_no:
+          oneOf:
+            - type: integer
+            - type: 'null'
+          description: 成功版本号（从 1 起；同对象内单调递增）
+        base_version_no:
+          oneOf:
+            - type: integer
+            - type: 'null'
+          description: 实际基础版本号（首个版本的基础是运行初稿，登记为 1）
 
     ChatMessage:
       type: object
@@ -2071,6 +2236,333 @@ components:
           type: array
           items:
             $ref: '#/components/schemas/ChatMessage'
+
+    ContextFact:
+      type: object
+      description: 一条会话事实（S7.24）：目标、限制、偏好、受众或形式。
+      required:
+        - fact_id
+        - kind
+        - value
+        - scope
+        - status
+        - evidence
+        - created_version
+      properties:
+        fact_id:
+          type: string
+        kind:
+          type: string
+          enum:
+            - goal
+            - constraint
+            - preference
+            - audience
+            - format
+        value:
+          type: string
+        scope:
+          type: string
+          enum:
+            - session
+            - topic
+            - artifact
+        scope_id:
+          type: string
+          description: 作用域对象标识（`topic` = 当前话题，`artifact` = 对象键）
+        status:
+          type: string
+          enum:
+            - active
+            - pending_confirmation
+            - superseded
+            - retracted
+        evidence:
+          type: string
+          description: 用户原文中的真实片段（服务端做子串校验）
+        source_ref:
+          type: object
+          additionalProperties: true
+          description: 来源（`message_id` / `action_id` / `turn_id`），模型解释不作为来源
+        created_version:
+          type: integer
+          minimum: 0
+        replaces:
+          oneOf:
+            - type: string
+            - type: 'null'
+        updated_at:
+          type: string
+          format: date-time
+
+    ContextProposal:
+      type: object
+      description: 待确认提案（推断、歧义或替换意图不明的冲突，S7.24）。
+      required:
+        - proposal_id
+        - kind
+        - value
+        - scope
+        - reason
+      properties:
+        proposal_id:
+          type: string
+        kind:
+          type: string
+          enum:
+            - goal
+            - constraint
+            - preference
+            - audience
+            - format
+        value:
+          type: string
+        scope:
+          type: string
+          enum:
+            - session
+            - topic
+            - artifact
+        scope_id:
+          type: string
+        reason:
+          type: string
+          description: 安全原因（歧义 / 推断 / 冲突），不含用户原文
+        evidence:
+          type: string
+        source_ref:
+          type: object
+          additionalProperties: true
+        conflicts_with:
+          type: array
+          items:
+            type: string
+        created_version:
+          type: integer
+          minimum: 0
+
+    ArtifactHead:
+      type: object
+      description: 一个产物对象当前指向的成功版本（S7.25）。
+      required:
+        - object_key
+        - version_id
+        - version_no
+      properties:
+        object_key:
+          type: string
+        version_id:
+          type: string
+          format: uuid
+        version_no:
+          type: integer
+          minimum: 1
+        updated_at:
+          type: string
+          format: date-time
+
+    ChatContext:
+      type: object
+      description: 会话上下文（S7.24）。`effective_mode` 是运行时实际生效的模式。
+      required:
+        - session_id
+        - state_version
+        - recovery_status
+        - facts
+        - proposals
+        - artifact_heads
+        - effective_mode
+      properties:
+        session_id:
+          type: string
+          format: uuid
+        state_version:
+          type: integer
+          minimum: 0
+        topic_id:
+          oneOf:
+            - type: string
+            - type: 'null'
+        recovery_status:
+          type: string
+          enum:
+            - complete
+            - partial
+        facts:
+          type: array
+          items:
+            $ref: '#/components/schemas/ContextFact'
+        proposals:
+          type: array
+          items:
+            $ref: '#/components/schemas/ContextProposal'
+        artifact_heads:
+          type: array
+          items:
+            $ref: '#/components/schemas/ArtifactHead'
+        effective_mode:
+          type: string
+          enum:
+            - 'off'
+            - shadow
+            - enforce
+        blocking_proposals:
+          type: integer
+          minimum: 0
+          description: 阻断当前任务的待确认提案数（>0 时应先确认再继续）
+
+    ContextActionRequest:
+      type: object
+      description: 上下文用户动作（S7.24）；`expected_state_version` 是 CAS 条件。
+      additionalProperties: false
+      required:
+        - action
+        - expected_state_version
+      properties:
+        action:
+          type: string
+          enum:
+            - confirm
+            - reject
+            - retract
+            - replace
+            - reset_topic
+        expected_state_version:
+          type: integer
+          minimum: 0
+        target_id:
+          type: string
+          description: 事实 / 提案标识（confirm / reject / retract / replace 必填）
+        value:
+          type: string
+          description: 替换后的新值（replace 必填）
+
+    ContextActionResponse:
+      type: object
+      description: 动作结果与最新上下文（S7.24）。
+      required:
+        - session_id
+        - state_version
+        - action
+        - decision
+        - context
+      properties:
+        session_id:
+          type: string
+          format: uuid
+        state_version:
+          type: integer
+          minimum: 0
+        action:
+          type: string
+          enum:
+            - confirm
+            - reject
+            - retract
+            - replace
+            - reset_topic
+        decision:
+          type: string
+          enum:
+            - applied
+            - noop
+            - conflict
+        reason:
+          type: string
+        context:
+          $ref: '#/components/schemas/ChatContext'
+
+    ArtifactVersion:
+      type: object
+      description: 一个不可变的文案 / 线索版本（S7.25）。
+      required:
+        - version_id
+        - session_id
+        - object_key
+        - object_type
+        - status
+        - prompt_versions
+        - usage
+        - created_at
+      properties:
+        version_id:
+          type: string
+          format: uuid
+        session_id:
+          type: string
+          format: uuid
+        object_key:
+          type: string
+        object_type:
+          type: string
+          enum:
+            - draft
+            - clue
+        run_id:
+          oneOf:
+            - type: string
+              format: uuid
+            - type: 'null'
+        hotspot_position:
+          oneOf:
+            - type: integer
+            - type: 'null'
+        status:
+          type: string
+          enum:
+            - pending
+            - succeeded
+            - failed
+            - refused
+            - interrupted
+        version_no:
+          oneOf:
+            - type: integer
+            - type: 'null'
+        base_version_id:
+          oneOf:
+            - type: string
+              format: uuid
+            - type: 'null'
+        content:
+          oneOf:
+            - type: object
+              additionalProperties: true
+            - type: 'null'
+        source:
+          type: object
+          additionalProperties: true
+        prompt_versions:
+          type: object
+          additionalProperties:
+            type: integer
+        usage:
+          type: object
+          additionalProperties: true
+        error:
+          oneOf:
+            - type: string
+            - type: 'null'
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+
+    ArtifactVersionList:
+      type: object
+      required:
+        - items
+        - total
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/ArtifactVersion'
+        total:
+          type: integer
+          minimum: 0
 
     MaterialTask:
       type: object

@@ -29,6 +29,7 @@ from fastapi.responses import FileResponse, StreamingResponse
 from ...config import AppConfig
 from ...core.errors import BadRequestError, NotFoundError
 from ...core.tracing import get_tracer
+from ...services import artifact_versions, context_state
 from ...services.chat import (
     append_message,
     create_session,
@@ -43,10 +44,15 @@ from ...services.chat_turns import HEARTBEAT_S, TurnEvents, sse_frame, start_tur
 from ...tools.vision import sniff_image_mime
 from ..deps import ConfigDep, DispatcherDep, SessionDep, request_id_header
 from ..models import (
+    ArtifactVersion,
+    ArtifactVersionList,
+    ChatContext,
     ChatSession,
     ChatSessionCreate,
     ChatSessionDetail,
     ChatSessionList,
+    ContextActionRequest,
+    ContextActionResponse,
     UuidPath,
     error_response,
 )
@@ -169,6 +175,15 @@ async def get_chat_session(session_id: UuidPath, cfg: ConfigDep, session: Sessio
     detail = await load_session(session, chat_id, limit=limit)
     if detail is None:
         raise NotFoundError(f"会话不存在：{session_id}", {"session_id": session_id})
+    # S7.24：详情里带一份上下文摘要（旧客户端忽略即可）；off 模式不额外读状态
+    if cfg.context.mode != "off":
+        stored = await context_state.load(session, chat_id)
+        if stored is not None:
+            await context_state.assess_recovery(session, chat_id)
+            stored = await context_state.load(session, chat_id)
+            detail["context"] = (
+                context_state.context_view(cfg, stored) if stored is not None else None
+            )
     # S7.21：有有效 trace 关联且追踪可用时才给回看地址；追踪关闭 / 旧数据下为 None，
     # 但阶段与失败信息照常可见（它们来自数据库，不依赖 Langfuse）。
     tracer = get_tracer(cfg)
@@ -219,8 +234,8 @@ async def post_chat_message(
                 "tool_calls": item.get("tool_calls") or [],
                 "attachments": item.get("attachments") or []}
                for item in detail["messages"]]
-    await append_message(session, chat_id, role="user", content=body,
-                         attachments=attachments)
+    user = await append_message(session, chat_id, role="user", content=body,
+                                attachments=attachments)
     assistant = await append_message(session, chat_id, role="assistant", status="running")
     if assistant is None:                        # pragma: no cover - 会话刚查过，理论上不会
         raise NotFoundError(f"会话不存在：{session_id}", {"session_id": session_id})
@@ -230,7 +245,9 @@ async def post_chat_message(
     start_turn(cfg, events, session_id=chat_id,
                message_id=uuid.UUID(assistant["message_id"]), history=history,
                user_text=body, attachment_note=note, attachments=attachments,
-               dispatcher=dispatcher)
+               dispatcher=dispatcher,
+               # S7.24：本轮用户消息的**真实 ID**（状态证据与来源都落到它上面）
+               user_message_id=uuid.UUID(user["message_id"]) if user else None)
     return StreamingResponse(sse_stream(events), media_type="text/event-stream",
                              headers={"Cache-Control": "no-cache",
                                       "X-Accel-Buffering": "no"})
@@ -271,6 +288,94 @@ async def sse_stream(events: TurnEvents) -> AsyncIterator[str]:
             await pump_task
         with suppress(Exception):
             await events.aclose()
+
+
+@router.get("/chat/sessions/{session_id}/context", response_model=ChatContext,
+            responses={404: error_response("资源不存在"),
+                       503: error_response("依赖不可用（不做降级，直接返回错误）")})
+async def get_chat_context(session_id: UuidPath, cfg: ConfigDep,
+                           session: SessionDep) -> dict[str, Any]:
+    """会话上下文（S7.24）：有效 / 待确认状态、版本、来源、恢复状态与产物 head。
+
+    读的时候顺手做一次恢复判定：历史扫描不完整、来源消息已删或证据对不上时标 `partial`，
+    前端显示「历史状态未完整恢复」——**不从旧摘要猜回约束**。
+    """
+    chat_id = _uuid(session_id, what="会话")
+    stored = await context_state.load(session, chat_id)
+    if stored is None:
+        raise NotFoundError(f"会话不存在：{session_id}", {"session_id": session_id})
+    await context_state.assess_recovery(session, chat_id)
+    stored = await context_state.load(session, chat_id)
+    if stored is None:  # pragma: no cover - 刚读过
+        raise NotFoundError(f"会话不存在：{session_id}", {"session_id": session_id})
+    return context_state.context_view(cfg, stored)
+
+
+@router.post("/chat/sessions/{session_id}/context/actions",
+             response_model=ContextActionResponse,
+             responses={400: error_response("请求格式或参数不合法"),
+                        404: error_response("资源不存在"),
+                        409: error_response("状态版本冲突（响应带当前版本，可重试）"),
+                        422: error_response("字段级校验失败"),
+                        503: error_response("依赖不可用（不做降级，直接返回错误）")})
+async def post_chat_context_action(session_id: UuidPath, payload: ContextActionRequest,
+                                   cfg: ConfigDep, session: SessionDep) -> dict[str, Any]:
+    """确认 / 拒绝 / 撤回 / 替换 / 切换话题（S7.24）；版本不一致返回 409。"""
+    chat_id = _uuid(session_id, what="会话")
+    applied, stored = await context_state.perform_action(
+        session,
+        chat_id,
+        action=payload.action,
+        target_id=payload.target_id or "",
+        value=payload.value or "",
+        expected_state_version=payload.expected_state_version,
+    )
+    decision = "applied" if applied.applied else (
+        "conflict" if applied.conflict else "noop"
+    )
+    return {
+        "session_id": str(chat_id),
+        "state_version": int(stored.state_version),
+        "action": payload.action,
+        "decision": decision,
+        "reason": applied.reason,
+        "context": context_state.context_view(cfg, stored),
+    }
+
+
+@router.get("/chat/sessions/{session_id}/artifacts",
+            response_model=ArtifactVersionList,
+            responses={404: error_response("资源不存在"),
+                       503: error_response("依赖不可用（不做降级，直接返回错误）")})
+async def list_chat_artifacts(session_id: UuidPath, session: SessionDep,
+                              object_key: Annotated[str | None, Query()] = None
+                              ) -> dict[str, Any]:
+    """按对象列出版本（S7.25）；不传对象键时给每个对象的最新成功版本。"""
+    chat_id = _uuid(session_id, what="会话")
+    detail = await load_session(session, chat_id, limit=1)
+    if detail is None:
+        raise NotFoundError(f"会话不存在：{session_id}", {"session_id": session_id})
+    rows = await artifact_versions.list_versions(
+        session, chat_id, object_key_value=object_key or None
+    )
+    return {"items": [artifact_versions.view(row) for row in rows], "total": len(rows)}
+
+
+@router.get("/chat/sessions/{session_id}/artifacts/{version_id}",
+            response_model=ArtifactVersion,
+            responses={404: error_response("资源不存在"),
+                       503: error_response("依赖不可用（不做降级，直接返回错误）")})
+async def get_chat_artifact(session_id: UuidPath, version_id: UuidPath,
+                            session: SessionDep) -> dict[str, Any]:
+    """读取指定不可变版本；不属于该会话一律 404。"""
+    chat_id = _uuid(session_id, what="会话")
+    row = await artifact_versions.get_version(
+        session, chat_id, _uuid(version_id, what="版本")
+    )
+    if row is None:
+        raise NotFoundError(f"版本不存在：{version_id}",
+                            {"session_id": session_id, "version_id": version_id})
+    return artifact_versions.view(row)
 
 
 @router.get("/chat/sessions/{session_id}/attachments/{message_id}/{index}",

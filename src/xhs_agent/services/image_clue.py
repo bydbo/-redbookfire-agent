@@ -64,6 +64,10 @@ class ImageClueParse:
     # R5（E7OBS2-04）：用量来源口径——actual（供应商给了 usage）/ estimated（按字符估算）/
     # cached（本轮缓存命中，无新增消费）。随结果上卷到工具 payload 与轮级汇总。
     usage_status: str = ""
+    # E7 第六批（S7.27）：缓存结论（hit / miss / error / bypass / 空=未启用），供工具记录与
+    # 报告区分"复用"与"真实调用"；命中时 `usage_status=cached` 且用量清零。
+    cache_status: str = ""
+    cache_level: str = ""
 
 
 def _cost_cny(cfg: AppConfig, completion: ImageCompletion) -> float:

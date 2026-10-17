@@ -91,6 +91,12 @@ ERROR_CATEGORIES: tuple[str, ...] = (
     "cancelled",
     "dependency_unavailable",
     "internal",
+    # E7 第六批（S7.24–S7.27）：上下文可靠性的稳定失败类别（方案 §3.2）
+    "required_context_overflow",
+    "history_group_broken",
+    "state_version_conflict",
+    "artifact_version_mismatch",
+    "cache_stale_or_invalid",
 )
 
 _ERROR_BY_NAME: dict[str, str] = {
@@ -112,6 +118,12 @@ _ERROR_BY_NAME: dict[str, str] = {
     "PoolTimeout": "timeout",
     "SoftTimeLimitExceeded": "timeout",
     "CancelledError": "cancelled",
+    # 上下文预算 / 结构 / 版本冲突：只记类别，不含正文（方案 §3.2）
+    "BudgetError": "required_context_overflow",
+    "HistoryGroupError": "history_group_broken",
+    "StateVersionConflict": "state_version_conflict",
+    "ArtifactVersionMismatch": "artifact_version_mismatch",
+    "CacheInvalidError": "cache_stale_or_invalid",
 }
 
 
