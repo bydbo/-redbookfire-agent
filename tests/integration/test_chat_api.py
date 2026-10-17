@@ -31,7 +31,7 @@ from xhs_agent.config import AppConfig, load_config
 from xhs_agent.db import Base
 from xhs_agent.db.models import ChatMessage
 from xhs_agent.services import chat as chat_service
-from xhs_agent.services import chat_turns
+from xhs_agent.services import chat_tools, chat_turns
 from xhs_agent.services.chat_tools import TOOL_RUN_ANALYSIS, ToolOutcome
 from xhs_agent.services.chat_turns import TurnEvents, start_turn
 from xhs_agent.tools import llm
@@ -624,3 +624,146 @@ class TestMultiImage:
 
         assert response.status_code == 400
         assert "合计超过 1 MB 上限" in response.json()["message"]
+
+
+class TestPartialRecordThroughSessionRoute:
+    """E7OBS4-01（A1 / B1）：取消后会话 GET 正常，部分记录保留真实调用信息。
+
+    贯穿真实对话图、真实工具编排入口（`build_tool_runner` 换成会挂住的替身）、
+    真实 `Task.cancel()`、临时 Postgres 与项目会话路由——不是最小响应模型。
+    """
+
+    @pytest.mark.asyncio
+    async def test_cancelled_turn_is_readable_with_real_identity(
+        self, client: TestClient, cfg: AppConfig, db_engine: AsyncEngine,
+        provider: ScriptedProvider, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        started = asyncio.Event()
+
+        class HangingRunner:
+            async def __call__(self, name: str, args: dict[str, Any], *,
+                               on_progress: Any = None, meta: Any = None) -> ToolOutcome:
+                if on_progress is not None:
+                    await on_progress("解析图片", 0, 0)
+                    await on_progress("提交分析", 0, 0)
+                started.set()
+                await asyncio.sleep(3600)
+                return ToolOutcome(status="succeeded")  # pragma: no cover
+
+        monkeypatch.setattr(
+            chat_turns, "build_tool_runner", lambda *_a, **_kw: HangingRunner()
+        )
+        provider.steps = [
+            {"text": "", "tool_calls": [tool_call(arguments='{"hotspot": "夜跑", "topk": 3}')]},
+            {"text": "不会走到这里"},
+        ]
+        session_id = uuid.UUID(new_session(client))
+
+        factory = async_sessionmaker(db_engine, expire_on_commit=False)
+        async with factory() as session:
+            await chat_service.append_message(
+                session, session_id, role="user", content="帮我蹭一下这个热点"
+            )
+            assistant = await chat_service.append_message(
+                session, session_id, role="assistant", status="running"
+            )
+            assert assistant is not None
+        events = TurnEvents(cfg, turn_id=str(uuid.uuid4()))
+        task = start_turn(
+            cfg, events, session_id=session_id,
+            message_id=uuid.UUID(str(assistant["message_id"])),
+            history=[], user_text="帮我蹭一下这个热点",
+        )
+        await asyncio.wait_for(started.wait(), timeout=30)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(task, timeout=30)
+
+        # 取消后会话 GET 必须 200：部分记录能满足公开响应模型（旧实现这里 500）
+        response = client.get(f"/api/chat/sessions/{session_id}")
+        assert response.status_code == 200, response.text
+        assistant = response.json()["messages"][-1]
+        assert assistant["status"] == "interrupted"
+        calls = assistant["tool_calls"]
+        assert len(calls) == 1
+        assert calls[0]["tool"] == TOOL_RUN_ANALYSIS
+        assert calls[0]["status"] == "interrupted"
+        assert calls[0]["args"] == {"hotspot": "夜跑", "topk": 3}
+        assert calls[0]["call_id"] and calls[0]["attempt"] == 1
+        assert calls[0]["run_id"] is None            # 没提交过：不编 uuid
+        assert [step["stage"] for step in calls[0]["steps"]] == ["解析图片", "提交分析"]
+        assert assistant["progress"]["status"] == "interrupted"
+        assert assistant["progress"]["error_category"] == "cancelled"
+
+    @pytest.mark.asyncio
+    async def test_failed_turn_keeps_known_consumption_across_paths(
+        self, client: TestClient, cfg: AppConfig, db_engine: AsyncEngine,
+        provider: ScriptedProvider, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """B1：已知消费在外层异常收尾后一致落库（不因失败而丢，也不双计）。
+
+        固定样本：supervisor 0.002 元 / 10·5（本文件的替身价目）+ 图片 0.003 元 / 500·20
+        = **0.005 元、510/25 tokens**，分析已提交（run_id 保留），随后普通 RuntimeError
+        让这一轮失败。文档 §4.4 的 0.001 元样本在 `tests/unit/test_ledger.py` 逐条钉住。
+        """
+        run_id = str(uuid.uuid4())
+
+        async def partial_handler(ctx: Any, args: dict[str, Any], *,
+                                  attachments: Any = None,
+                                  on_progress: Any = None) -> ToolOutcome:
+            scope = ctx.checkpoint_scope
+            assert scope                       # 真实 runner 已把 scope 绑成 call_id
+            ctx.checkpoint({
+                "scope": scope, "component": "image_parse",
+                "cost_cny": 0.003, "prompt_tokens": 500, "completion_tokens": 20,
+                "usage_status": "actual",
+                "prompt_versions": {"image_hotspot_clue": 3},
+            })
+            ctx.checkpoint({
+                "scope": scope, "component": "submission",
+                "run_id": run_id, "job_id": str(uuid.uuid4()), "status": "submitted",
+            })
+            raise RuntimeError("等待分析时炸了")
+
+        monkeypatch.setitem(
+            chat_tools.HANDLERS, TOOL_RUN_ANALYSIS, partial_handler
+        )
+        provider.steps = [
+            {"text": "", "tool_calls": [tool_call(arguments='{"hotspot": "夜跑"}')]},
+            {"text": "不会走到这里"},
+        ]
+        session_id = uuid.UUID(new_session(client))
+
+        factory = async_sessionmaker(db_engine, expire_on_commit=False)
+        async with factory() as session:
+            await chat_service.append_message(
+                session, session_id, role="user", content="帮我蹭一下这个热点"
+            )
+            assistant = await chat_service.append_message(
+                session, session_id, role="assistant", status="running"
+            )
+            assert assistant is not None
+        events = TurnEvents(cfg, turn_id=str(uuid.uuid4()))
+        await asyncio.wait_for(
+            start_turn(
+                cfg, events, session_id=session_id,
+                message_id=uuid.UUID(str(assistant["message_id"])),
+                history=[], user_text="帮我蹭一下这个热点",
+            ),
+            timeout=60,
+        )
+
+        response = client.get(f"/api/chat/sessions/{session_id}")
+        assert response.status_code == 200, response.text
+        row = response.json()["messages"][-1]
+        assert row["status"] == "failed"
+        # supervisor 0.002/10·5 + 图片 0.003/500·20：已知合计 0.005 元、510/25 tokens
+        assert row["cost_cny"] == pytest.approx(0.005)
+        assert (row["prompt_tokens"], row["completion_tokens"]) == (510, 25)
+        assert row["run_id"] == run_id                 # 提交成功即保留运行引用
+        call = row["tool_calls"][0]
+        assert call["status"] == "failed"
+        assert call["args"] == {"hotspot": "夜跑"}
+        assert call["cost_cny"] == pytest.approx(0.003)
+        assert call["run_id"] == run_id
+        assert call["usage_status"] == "unknown"       # submission 让 worker 用量不可解释

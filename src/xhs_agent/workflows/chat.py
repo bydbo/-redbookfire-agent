@@ -26,6 +26,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import time
 from collections.abc import Awaitable, Callable
 from contextlib import suppress
@@ -38,6 +39,7 @@ from typing_extensions import TypedDict
 
 from ..agents.supervisor import TASK_ID, initial_messages, supervise
 from ..config import AppConfig
+from ..core import ledger as ledger_projection
 from ..core import progress as progress_tool
 from ..core.progress import error_category as error_category_of
 from ..services import chat_tools
@@ -134,6 +136,12 @@ def _build_graph(
     ledger: dict[str, Any],
 ) -> Any:
     """按这一轮的实际依赖构图（provider / 工具执行器都是闭包注入，便于离线测试）。"""
+    # 调用身份注入（E7OBS4-01）：一次签名检查决定是否给 runner 传内部 `meta`；
+    # 旧测试 runner 天然兼容，**不**用"捕获 TypeError 再重跑工具"来试探签名。
+    try:
+        meta_aware = "meta" in inspect.signature(run_tool).parameters
+    except (TypeError, ValueError):  # 内建 / C 实现没有可查签名
+        meta_aware = False
 
     async def emit(event: str, payload: dict[str, Any]) -> None:
         if on_event is not None:
@@ -281,7 +289,26 @@ def _build_graph(
                 "retries": 0,
                 "status": "",
                 "latency": 0,
+                "source_id": "",
+                "stage_instance_id": "",
+                "source_seq": 0,
+                "progress_revision": 0,
+                "generation": 0,
             }
+            # E7OBS4-01：调用开始即登记真实身份与参数——取消 / 失败时由**同一条记录**
+            # 派生部分终态，不靠事后补字段；内部 `scope` 用 call_id（单次调用唯一）。
+            draft: dict[str, Any] = {
+                "tool": name,
+                "call_id": call_id,
+                "attempt": attempt,
+                "args": dict(call["args"]) if isinstance(call["args"], dict) else {},
+                "scope": call_id,
+                "stage_key": "",
+                "run_id": "",
+                "latency_ms": 0,
+                "steps": [],
+            }
+            ledger.setdefault("calls", {})[call_id] = draft
 
             async def progress(
                 stage: str,
@@ -293,6 +320,8 @@ def _build_graph(
                 _call_id: str = call_id,
                 _attempt: int = attempt,
                 _holder: dict[str, Any] = stage_holder,
+                _draft: dict[str, Any] = draft,
+                _started: float = started,
             ) -> None:
                 """工具进度 → `tool_progress` 事件（S7.20 / R3 / R5）。
 
@@ -305,12 +334,28 @@ def _build_graph(
                 key = str(data.get("stage_key") or progress_tool.key_for_label(stage))
                 if key:
                     _holder["key"] = key
+                    _draft["stage_key"] = key
+                # 部分记录要能说明"真实发生过的步骤"：按标签变化收集，未拿到的步骤不补造
+                _draft["latency_ms"] = int((time.monotonic() - _started) * 1000)
+                label = str(data.get("label") or stage)
+                steps = _draft.setdefault("steps", [])
+                if label and (not steps or steps[-1].get("stage") != label):
+                    steps.append({"stage": label, "done": done, "total": total})
                 if data:  # 结构化来源：记下 worker 身份供收尾对齐
                     _holder["structured"] = True
                     _holder["attempt"] = int(data.get("attempt") or 0)
                     _holder["retries"] = int(data.get("retries") or 0)
                     _holder["status"] = str(data.get("status") or "")
                     _holder["latency"] = int(data.get("latency_ms") or 0)
+                    _holder["source_id"] = str(data.get("source_id") or "")
+                    _holder["stage_instance_id"] = str(
+                        data.get("stage_instance_id") or ""
+                    )
+                    _holder["source_seq"] = int(data.get("source_seq") or 0)
+                    _holder["progress_revision"] = int(
+                        data.get("progress_revision") or 0
+                    )
+                    _holder["generation"] = int(data.get("generation") or 0)
                 body: dict[str, Any] = {
                     "tool": _call["name"],
                     "stage": str(data.get("label") or stage),
@@ -328,12 +373,24 @@ def _build_graph(
                     "latency_ms": int(data.get("latency_ms") or 0),
                     "run_id": data.get("run_id") or None,
                     "job_id": data.get("job_id") or None,
+                    "source_id": data.get("source_id") or None,
+                    "stage_instance_id": data.get("stage_instance_id") or None,
+                    "source_seq": int(data.get("source_seq") or 0),
+                    "progress_revision": int(data.get("progress_revision") or 0),
+                    "generation": int(data.get("generation") or 0),
                     "updated_at": now_iso(),
                 }
                 await emit("tool_progress", body)
 
             if call.get("args_error"):
                 outcome = ToolOutcome(status="failed", error=str(call["args_error"]))
+            elif meta_aware:
+                outcome = await run_tool(
+                    call["name"],
+                    call["args"],
+                    on_progress=progress,
+                    meta={"call_id": call_id, "attempt": attempt, "scope": call_id},
+                )
             else:
                 outcome = await run_tool(
                     call["name"], call["args"], on_progress=progress
@@ -358,6 +415,8 @@ def _build_graph(
             }
             history.append(entry)
             # R3（OBS-10）：稳定边界账目——工具调用记录带已知用量与身份
+            # E7OBS4-02：调用草稿在这里"结清"；投影只从已完成记录取一次账目。
+            ledger.setdefault("calls", {}).pop(call_id, None)
             ledger["tool_calls"].append(dict(entry))
             ledger["versions"].update(outcome.prompt_versions)
             # 工具内部用掉的 prompt 版本（拆解 / 改写…）一并计入这一轮
@@ -397,6 +456,11 @@ def _build_graph(
                     "worker_retries": int(stage_holder["retries"]),
                     "worker_status": str(stage_holder["status"]),
                     "worker_latency": int(stage_holder["latency"]),
+                    "source_id": stage_holder["source_id"] or None,
+                    "stage_instance_id": stage_holder["stage_instance_id"] or None,
+                    "source_seq": int(stage_holder["source_seq"]),
+                    "progress_revision": int(stage_holder["progress_revision"]),
+                    "generation": int(stage_holder["generation"]),
                 },
             )
             run_id = str(outcome.payload.get("run_id") or run_id)
@@ -454,10 +518,20 @@ async def run_turn(
     # R3（OBS-10）：轮内账目挂在**稳定边界**（闭包持有的 ledger）——图抛异常时，
     # 已完成的模型 / 工具调用记录仍能带出，失败轮次不丢已知消费与引用
     if ledger is None:
-        ledger = {"records": [], "tool_calls": [], "versions": {}, "run_id": ""}
+        ledger = {
+            "records": [],
+            "calls": {},
+            "tool_calls": [],
+            "components": {},
+            "versions": {},
+            "run_id": "",
+        }
     else:  # 注入的账本：按本轮起点清空，避免串轮
         ledger["records"] = []
+        ledger["calls"] = {}
         ledger["tool_calls"] = []
+        ledger["components"] = {}
+        ledger.pop("active_scope", None)
         ledger["versions"] = {}
         ledger["run_id"] = ""
     graph = _build_graph(
@@ -485,55 +559,47 @@ async def run_turn(
             }
         )
     except Exception as exc:  # noqa: BLE001 - 整轮失败要落库，不能炸进程
+        # E7OBS4-02：普通异常返回与取消 / 外层异常共用**同一份账目投影**——
+        # 工具内部已完成组件的消费（如"图片成功、等待分析时报错"）在这条路径同样保留。
+        projected = ledger_projection.project(ledger, open_status="failed")
         records = list(ledger["records"])
-        tool_calls = list(ledger["tool_calls"])
-        versions = dict(ledger["versions"])
+        tool_calls = list(projected["tool_calls"])
+        versions = dict(projected["prompt_versions"])
         versions.setdefault(TASK_ID, rendered.version)
-        # 失败的那次调用本身：请求可能已发出、用量未知——单列，不填零冒充准确
         usage_complete, unknown = _usage_accounting(records, tool_calls)
+        if not projected["open_calls"]:
+            # 没有未完成的工具调用时，失败的是模型那次调用本身：用量未知，单列一次
+            unknown += 1
         return ChatTurn(
             status="failed",
             error=f"{type(exc).__name__}: {exc}",
             error_category=error_category_of(exc),
             latency_ms=int((time.monotonic() - started) * 1000),
             tool_calls=tool_calls,
-            run_id=str(ledger["run_id"]),
-            cost_cny=round(
-                sum(
-                    float(item.get("cost_cny") or 0) for item in (*records, *tool_calls)
-                ),
-                4,
-            ),
-            prompt_tokens=sum(
-                int(item.get("prompt_tokens") or 0) for item in (*records, *tool_calls)
-            ),
-            completion_tokens=sum(
-                int(item.get("completion_tokens") or 0)
-                for item in (*records, *tool_calls)
-            ),
+            run_id=str(projected["run_id"]),
+            cost_cny=float(projected["cost_cny"]),
+            prompt_tokens=int(projected["prompt_tokens"]),
+            completion_tokens=int(projected["completion_tokens"]),
             prompt_versions=versions,
             usage_complete=False,
-            usage_unknown_calls=unknown + 1,
+            usage_unknown_calls=unknown,
         )
 
     records = list(final.get("records") or [])
+    # 展示用工具列表保留图里全部已完成条目（含模型点名不存在的工具等零消费记录）；
+    # 账目与"部分记录"来自统一投影，保证四条收尾路径口径一致。
     tool_calls = list(final.get("tool_calls") or [])
+    projected = ledger_projection.project(ledger)
     versions = dict(final.get("prompt_versions") or {})
     versions.setdefault(TASK_ID, rendered.version)
-    cost = sum(float(item.get("cost_cny") or 0) for item in records) + sum(
-        float(item.get("cost_cny") or 0) for item in tool_calls
-    )
-    prompt_tokens = sum(
-        int(item.get("prompt_tokens") or 0) for item in (*records, *tool_calls)
-    )
-    completion_tokens = sum(
-        int(item.get("completion_tokens") or 0) for item in (*records, *tool_calls)
-    )
-    usage_complete, unknown = _usage_accounting(records, tool_calls)
+    cost = float(projected["cost_cny"])
+    prompt_tokens = int(projected["prompt_tokens"])
+    completion_tokens = int(projected["completion_tokens"])
+    usage_complete, unknown = _usage_accounting(records, projected["tool_calls"])
     return ChatTurn(
         reply=str(final.get("reply") or ""),
         tool_calls=tool_calls,
-        run_id=str(final.get("run_id") or ""),
+        run_id=str(final.get("run_id") or projected["run_id"] or ""),
         usage_complete=usage_complete,
         usage_unknown_calls=unknown,
         cost_cny=round(cost, 4),

@@ -883,3 +883,48 @@ class TestCancellationConsistency:
         assert all(
             p.get("status") != "failed" for _n, p in events.items if _n == "stage"
         )
+
+
+class TestCallIdentity:
+    """E7OBS4-01 / A3：同名工具执行两次，call_id 与运行引用一一对应。"""
+
+    @pytest.mark.asyncio
+    async def test_same_tool_twice_keeps_distinct_identity(self, tmp_path: Path) -> None:
+        cfg = write_config(tmp_path)
+        metas: list[dict[str, Any]] = []
+
+        class TwoRuns(FakeTools):
+            async def __call__(
+                self, name: str, args: dict[str, Any], *, on_progress=None, meta=None
+            ) -> ToolOutcome:
+                metas.append(dict(meta or {}))
+                index = len(metas)
+                return ToolOutcome(
+                    status="succeeded",
+                    payload={"run_id": f"r-{index}", "cost_cny": 0.01 * index},
+                    steps=[],
+                )
+
+        provider = ScriptedProvider(
+            [
+                {"tool_calls": [tool_call(call_id="call-a")]},
+                {
+                    "tool_calls": [
+                        tool_call(call_id="call-b", arguments='{"hotspot": "晨跑"}')
+                    ]
+                },
+                {"text": "两次都跑完了"},
+            ]
+        )
+
+        turn, _provider, _runner = await run(cfg, provider=provider, tools=TwoRuns())
+
+        assert [item["call_id"] for item in turn.tool_calls] == ["call-a", "call-b"]
+        assert [item["attempt"] for item in turn.tool_calls] == [1, 2]
+        assert [item["run_id"] for item in turn.tool_calls] == ["r-1", "r-2"]
+        assert [item["args"]["hotspot"] for item in turn.tool_calls] == ["夜跑", "晨跑"]
+        # 内部 scope 就是 call_id：不靠可变的 active_scope 反推身份
+        assert [item["scope"] for item in metas] == ["call-a", "call-b"]
+        assert turn.run_id == "r-2"
+        # 三次 supervisor 记录（0.001×3）+ 两次工具（0.01 + 0.02）：各自一次，不双计
+        assert turn.cost_cny == pytest.approx(0.033)

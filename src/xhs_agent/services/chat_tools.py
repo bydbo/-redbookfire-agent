@@ -316,6 +316,9 @@ class ToolContext:
     # 本会话最近**一组**图片附件（跨轮图片回落，S7.10 单张 → S7.16 整组）；
     # 运行器注入，离线测试直接给假实现。空列表 = 本会话还没有图。
     recent_attachments: list[dict[str, Any]] = field(default_factory=list)
+    # 同步检查点由轮次运行器装配；工具层只提交已完成子步骤的事实。
+    checkpoint: Callable[[dict[str, Any]], None] | None = None
+    checkpoint_scope: str = ""
 
 
 @dataclass
@@ -338,6 +341,13 @@ class ToolOutcome:
         if self.error:
             body["error"] = self.error
         return json.dumps(body, ensure_ascii=False)
+
+
+def _checkpoint(ctx: ToolContext, component: str, **facts: Any) -> None:
+    """在下一次可取消 await 前登记已完成的工具内部子步骤。"""
+    if ctx.checkpoint is None:
+        return
+    ctx.checkpoint({"scope": ctx.checkpoint_scope, "component": component, **facts})
 
 
 def _step(
@@ -377,22 +387,27 @@ def _records_tokens(caller: StructuredCaller, before: int) -> tuple[int, int]:
 def _records_usage_status(caller: StructuredCaller, before: int) -> str:
     """取 `StructuredCaller` 这次调用新增记录的**用量来源**（R5 / E7OBS2-04）。
 
-    一段窗口可能包含多次调用：unknown 优先（有一段未知就不能宣称完整），其次 actual，
-    再次 estimated；窗口为空（如调用失败没留下记录）返回空串，由调用方按场景处理。
+    一段窗口可能包含多次调用，按事实汇总（E7OBS4-05）：
+    - **缺来源（空串）按 unknown**——模型记录存在但口径缺失，不能被同窗口的 actual 掩盖
+      （数值即使全零也是调用事实）；`actual + estimated` 汇总为 estimated，不冒充 actual；
+    - 只有全窗口都是 cached 才是 cached（缓存与真实调用混合时按真实调用集合汇总）；
+    - 窗口为空（如调用失败没留下记录）返回空串，由调用方按场景处理。
     """
-    statuses = {str(item.get("usage_status") or "") for item in caller.records[before:]}
-    if "unknown" in statuses:
+    statuses = [str(item.get("usage_status") or "") for item in caller.records[before:]]
+    if not statuses:
+        return ""
+    if any(status in ("", "unknown") for status in statuses):
         return "unknown"
-    if "actual" in statuses:
-        return "actual"
     if "estimated" in statuses:
         return "estimated"
-    return ""
+    if all(status == "cached" for status in statuses):
+        return "cached"
+    return "actual"
 
 
 def _element_view(element: Element) -> dict[str, Any]:
     """要素 → 回给模型的精简形状（带中文标签，省得模型自己翻译）。"""
-    return {
+    result = {
         "type": element.type,
         "label": TYPE_LABELS.get(element.type, element.type),
         "value": element.value,
@@ -400,6 +415,7 @@ def _element_view(element: Element) -> dict[str, Any]:
         "confidence": round(float(element.confidence), 3),
         "evidence": element.evidence,
     }
+    return result
 
 
 def _elements_of(clue: dict[str, Any] | HotspotClue) -> list[dict[str, Any]]:
@@ -413,7 +429,7 @@ def _candidate_view(candidate: Any) -> dict[str, Any]:
     """候选 → 回给模型的精简形状（不塞整份素材对象，省上下文）。"""
     material = candidate.material
     title = material.title or Path(str(material.path or "")).name
-    return {
+    result = {
         "rank": candidate.rank,
         "score": round(float(candidate.score), 3),
         "material_id": str(candidate.material_id),
@@ -427,6 +443,7 @@ def _candidate_view(candidate: Any) -> dict[str, Any]:
         ][:HIT_PREVIEW_LIMIT],
         "usage": candidate.usage,
     }
+    return result
 
 
 def _check_hotspot(args: dict[str, Any]) -> tuple[str, str]:
@@ -481,6 +498,15 @@ async def _clue_for(ctx: ToolContext, text: str) -> ClueRecord:
         usage_status=_records_usage_status(ctx.caller, before),
     )
     ctx.cache.clues[text] = record
+    _checkpoint(
+        ctx,
+        "clue",
+        cost_cny=record.cost_cny,
+        prompt_tokens=record.prompt_tokens,
+        completion_tokens=record.completion_tokens,
+        usage_status=record.usage_status,
+        prompt_versions={CLUE_TASK: record.version},
+    )
     return record
 
 
@@ -537,13 +563,17 @@ async def _image_clue_for(
         # R3（OBS-06）：缓存命中只记"命中 + 数量"，不虚构 generation、不新增费用
         # R5（E7OBS2-04）：口径标 cached——本轮无新增消费，与免费真实请求区分
         logger.info("图片线索缓存命中：%d 张（不重复计费）", len(group))
-        return replace(
+        cached_result = replace(
             parsed,
             cost_cny=0.0,
             prompt_tokens=0,
             completion_tokens=0,
             usage_status="cached",
         )
+        _checkpoint(ctx, "image_parse", cost_cny=0.0, prompt_tokens=0,
+                    completion_tokens=0, usage_status="cached",
+                    prompt_versions=dict(cached_result.prompt_versions))
+        return cached_result
     images = [await _read_image(ctx, item) for item in group]
     if len(images) == 1:
         data, mime = images[0]
@@ -555,6 +585,15 @@ async def _image_clue_for(
     )
     if key:
         ctx.cache.image_clues[key] = (parsed, version)
+    _checkpoint(
+        ctx,
+        "image_parse",
+        cost_cny=float(parsed.cost_cny or 0),
+        prompt_tokens=int(parsed.prompt_tokens),
+        completion_tokens=int(parsed.completion_tokens),
+        usage_status=str(parsed.usage_status or "estimated"),
+        prompt_versions=dict(parsed.prompt_versions),
+    )
     return parsed
 
 
@@ -641,6 +680,15 @@ async def run_hotspot_analysis(
         )
     except ValueError as exc:  # 参数兜底（理论上前面已挡）
         return ToolOutcome(status="failed", steps=steps, error=str(exc))
+
+    # 提交成功即取得稳定运行引用；等待 worker 的可取消阶段不应阻止它落入轮次账本。
+    _checkpoint(
+        ctx,
+        "submission",
+        run_id=str(submission.run_id),
+        job_id=str(submission.job_id),
+        status="submitted",
+    )
 
     await progress("分析中", 0, 100)
     status = await _wait_for_run(ctx, submission.job_id, progress)
@@ -1150,7 +1198,7 @@ def _stage_update(
         ):
             latency_ms = int(node.get("latency_ms") or 0)
             break
-    return {
+    result = {
         "stage_key": key,
         "label": progress_tool.label_for(key),
         "status": str(snapshot.get("status") or "running"),
@@ -1161,6 +1209,13 @@ def _stage_update(
         "run_id": str(job.get("run_id") or ""),
         "job_id": str(job.get("job_id") or job_id),
     }
+    # 旧快照保持原形；新来源字段只有在生产端确实提供时才跨边界暴露。
+    for key in ("source_id", "stage_instance_id", "source_seq", "progress_revision",
+                "generation"):
+        value = snapshot.get(key)
+        if value not in (None, "", 0):
+            result[key] = value
+    return result
 
 
 def _update_marker(update: dict[str, Any]) -> tuple[Any, ...]:
@@ -1179,6 +1234,11 @@ def _update_marker(update: dict[str, Any]) -> tuple[Any, ...]:
         str(update.get("run_id") or ""),
         str(update.get("job_id") or ""),
         int(update.get("latency_ms") or 0) if update.get("status") != "running" else 0,
+        # E7OBS4-03：来源 / 实例 / 序号 / 代次属于阶段事实，不能静默去重
+        str(update.get("source_id") or ""),
+        str(update.get("stage_instance_id") or ""),
+        int(update.get("source_seq") or 0),
+        int(update.get("generation") or 0),
     )
 
 

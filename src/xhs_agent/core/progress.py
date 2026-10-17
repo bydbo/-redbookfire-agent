@@ -6,7 +6,8 @@
 输入：前一版快照（可为 None）与阶段键 / 状态 / 尝试序号；输出：合并后的**新**快照字典
       （本模块不落库、不写日志，由调用方决定何时写）。
 输出结构：`{stage, label, status, started_at, updated_at, attempt, retries, error_category,
-      last_finished_stage, run_id, job_id, nodes}`，见《数据契约》§3.3 / §3.7。
+      last_finished_stage, run_id, job_id, source_id, stage_instance_id, source_seq,
+      progress_revision, nodes}`，见《数据契约》§3.3 / §3.7。
 
 口径（改动需同步 `docs/可观测.md` 与《数据契约》）：
 
@@ -159,6 +160,11 @@ def empty() -> dict[str, Any]:
         "last_finished_stage": "",
         "run_id": None,
         "job_id": None,
+        "source_id": "",
+        "stage_instance_id": "",
+        "source_seq": 0,
+        "progress_revision": 0,
+        "generation": 0,
         "nodes": [],
     }
 
@@ -178,6 +184,9 @@ def normalize(prev: Any) -> dict[str, Any]:
     snapshot["nodes"] = list(snapshot["nodes"])[-MAX_NODES:]
     snapshot["attempt"] = max(1, int(snapshot.get("attempt") or 1))
     snapshot["retries"] = max(0, int(snapshot.get("retries") or 0))
+    snapshot["source_seq"] = max(0, int(snapshot.get("source_seq") or 0))
+    snapshot["progress_revision"] = max(0, int(snapshot.get("progress_revision") or 0))
+    snapshot["generation"] = max(0, int(snapshot.get("generation") or 0))
     return snapshot
 
 
@@ -205,48 +214,82 @@ def begin(
     retries: int = 0,
     run_id: str = "",
     job_id: str = "",
+    source_id: str = "",
+    stage_instance_id: str = "",
+    source_seq: int = 0,
+    progress_revision: int = 0,
+    generation: int = 0,
 ) -> dict[str, Any]:
-    """进入一个阶段（`running`）；同一阶段重复进入只刷新 `updated_at`，不重置计时。
+    """进入一个阶段（`running`）；同一执行**实例**重复进入只刷新 `updated_at`。
 
-    R3（OBS-12）单调合并——迟到的 `begin` 不回退、不重开：
-    - 同一阶段、`attempt` 更小：旧尝试的迟到开始事件，忽略；
-    - 同一阶段、同一 `attempt` 且当前已是终态：该执行已经结束，重复开始不重开；
-    - `nodes` 里同 `(stage, attempt, run_id)` 的执行已终结：迟到开始事件同样忽略——
-    - 只有**更高的 `attempt`**（重试）或新阶段才能启动新的运行。
-
-    R5（E7OBS2-02）：身份不一致（另一条执行）的 `begin` 不受"已终结"限制——它是新执行的
-    开始；顶层身份随当前阶段重置（事件没带身份就清空，不残留上一阶段的运行）。
+    E7OBS4-03（先裁决后更新）：
+    - 同一来源的旧序号事件（`source_seq < 当前序号`）：不接管、不重开，历史已由节点承载；
+    - 旧执行代次（worker 重试前的那一代）的迟到写入：不接管；
+    - 同一实例的更低 `attempt`：旧尝试的迟到开始，忽略；同一实例已终结：重复开始不重开；
+    - **不同实例**（同名阶段的新热点 / 新一次执行）即使 `attempt` 相同也允许启动——
+      节点查询与实例判断使用同一套身份键（source / 实例 / attempt），不再由旧三元组阻断。
     """
     snapshot = normalize(prev)
     attempt = max(1, int(attempt or 1))
     run_id = str(run_id or "")
     job_id = str(job_id or "")
+    source_id = str(source_id or run_id or "")
+    # 实例标识描述"哪一次执行"，不混入 attempt（重试属于同一实例）；生产端可显式提供更细的实例键
+    stage_instance_id = str(stage_instance_id or f"{source_id}:{stage}")
+    source_seq = max(0, int(source_seq or 0))
+    generation = max(0, int(generation or 0))
     current_stage = str(snapshot.get("stage") or "")
     current_attempt = int(snapshot.get("attempt") or 1)
     current_run = str(snapshot.get("run_id") or "")
+    current_source = str(snapshot.get("source_id") or "")
+    current_instance = str(snapshot.get("stage_instance_id") or "")
+    current_seq = int(snapshot.get("source_seq") or 0)
+    current_generation = int(snapshot.get("generation") or 0)
+    current_revision = int(snapshot.get("progress_revision") or 0)
     same_stage = current_stage == stage
-    # 身份不一致（新的 run 进来）说明这是**另一次执行**，即使 stage/attempt 相同也不受"已终结"限制
-    same_execution = not _identity_conflict(run_id, current_run)
-    if same_stage and same_execution:
-        if attempt < current_attempt:
-            return snapshot
+    conflict = _identity_conflict(run_id, current_run)
+    same_source = not (current_source and source_id and current_source != source_id)
+    seq_known = bool(source_seq and current_seq and same_source)
+    same_instance = not (
+        current_instance and stage_instance_id and current_instance != stage_instance_id
+    )
+    if generation and current_generation and generation < current_generation:
+        return snapshot  # 旧执行代次的迟到写入：不接管
+    if seq_known and source_seq < current_seq:
+        return snapshot  # 同来源旧事件：不接管、不重开
+    if same_stage and not conflict:
+        if not seq_known and same_instance and attempt < current_attempt:
+            return snapshot  # 旧格式（无序号）按尝试号兜底
         if (
             attempt == current_attempt
+            and same_instance
             and snapshot.get("status") in TERMINAL_STAGE_STATUSES
         ):
-            return snapshot
-    done = _find_node(snapshot, stage=stage, attempt=attempt, run_id=run_id)
-    if done is not None and str(done.get("status") or "") in TERMINAL_STAGE_STATUSES:
-        return snapshot
+            return snapshot  # 同一实例已终结：重复开始不重开
+    prior = _find_node(
+        snapshot,
+        stage=stage,
+        attempt=attempt,
+        run_id=run_id,
+        source_id=source_id,
+        stage_instance_id=stage_instance_id,
+    )
+    if prior is not None and str(prior.get("status") or "") in TERMINAL_STAGE_STATUSES:
+        return snapshot  # 该实例已有终态：迟到开始不重开
     same = (
         same_stage
-        and int(snapshot.get("attempt") or 1) == attempt
+        and attempt == current_attempt
         and snapshot.get("status") == "running"
-        and same_execution
+        and not conflict
+        and same_instance
+        and (not seq_known or source_seq >= current_seq)
     )
     if same:
         snapshot["updated_at"] = now_iso()
+        if seq_known:
+            snapshot["source_seq"] = source_seq
         return snapshot
+    switched = bool(current_source and source_id and current_source != source_id)
     snapshot.update(
         {
             "stage": str(stage),
@@ -257,6 +300,12 @@ def begin(
             "attempt": attempt,
             "retries": max(0, int(retries or 0)),
             "error_category": "",
+            "source_id": source_id,
+            "stage_instance_id": stage_instance_id,
+            # 新来源从自己的序号起步；同来源只允许前进（旧事件已被上面的裁决拦下）
+            "source_seq": source_seq if switched else max(source_seq, current_seq),
+            "progress_revision": max(current_revision + 1, int(progress_revision or 0)),
+            "generation": max(generation, current_generation),
         }
     )
     snapshot["run_id"] = _next_identity(run_id, current_run, same_stage=same_stage)
@@ -277,39 +326,86 @@ def end(
     retries: int = 0,
     run_id: str = "",
     job_id: str = "",
+    source_id: str = "",
+    stage_instance_id: str = "",
+    source_seq: int = 0,
+    progress_revision: int = 0,
+    generation: int = 0,
 ) -> dict[str, Any]:
-    """结束一个阶段并把它写进 `nodes`；迟到（`attempt` 更小）的更新被忽略。
+    """结束一个阶段并把它写进 `nodes`；旧来源 / 旧实例的迟到终态只补历史。
 
-    R3：`nodes` 的节点可带 `run_id` 身份（对话轮次里同轮多次分析用不同 run 隔离）；
-    可选地带上 worker 的投递重试次数（`retries`）。
-
-    R5（E7OBS2-02）——**补历史事实与推进当前状态分开**：
-    - 身份冲突（旧 run 的迟到终态）：只补 `nodes`，顶层状态 / 身份 / 起点一律不动；
-    - 同一执行、同一 `attempt` 的重复终态：同状态允许刷新耗时；**不同状态保留首个**
-      （冲突终态不翻转、不混状态）；
-    - 顶层推进时身份与起点跟随当前阶段：事件带身份用它，同阶段缺身份保留已知身份、
-      跨阶段缺身份清空；`error_category` 跨阶段推进时重置（不残留自另一阶段）。
+    E7OBS4-03：先裁决（来源 / 实例 / 序号 / 代次），再决定是否推进顶层：
+    - 同来源旧序号、旧执行代次、身份冲突（旧 run）：只补 `nodes`，顶层一律不动；
+    - 同一实例同一 `attempt`：同状态允许刷新耗时，**冲突终态保留首个**；
+    - 同名阶段但**不同实例**：该终态属于另一实例，只补历史，不改写当前实例的状态；
+    - 其余（可信的新事实）推进顶层，并把来源 / 实例 / 序号 / 代次一并更新——
+      新来源从自己的序号起步，不取跨来源的 `max`。
     """
     if status not in TERMINAL_STAGE_STATUSES:
         raise ValueError(f"阶段终态只能是 {TERMINAL_STAGE_STATUSES}，收到：{status!r}")
     snapshot = normalize(prev)
     attempt = max(1, int(attempt or 1))
     run_id = str(run_id or "")
+    job_id = str(job_id or "")
+    source_id = str(source_id or run_id or "")
+    # 实例标识描述"哪一次执行"，不混入 attempt（重试属于同一实例）；生产端可显式提供更细的实例键
+    stage_instance_id = str(stage_instance_id or f"{source_id}:{stage}")
+    source_seq = max(0, int(source_seq or 0))
+    generation = max(0, int(generation or 0))
     current_stage = str(snapshot.get("stage") or "")
     current_attempt = int(snapshot.get("attempt") or 1)
     current_run = str(snapshot.get("run_id") or "")
+    current_source = str(snapshot.get("source_id") or "")
+    current_instance = str(snapshot.get("stage_instance_id") or "")
+    current_seq = int(snapshot.get("source_seq") or 0)
+    current_generation = int(snapshot.get("generation") or 0)
+    current_revision = int(snapshot.get("progress_revision") or 0)
     conflict = _identity_conflict(run_id, current_run)
     same_stage = current_stage == stage
-    if not conflict and same_stage and attempt < current_attempt:
+    same_source = not (current_source and source_id and current_source != source_id)
+    seq_known = bool(source_seq and current_seq and same_source)
+    same_instance = not (
+        current_instance and stage_instance_id and current_instance != stage_instance_id
+    )
+    late = bool(
+        (generation and current_generation and generation < current_generation)
+        or (seq_known and source_seq < current_seq)
+    )
+    # 同一实例的既有历史节点（与 late / conflict 无关：冲突终态的裁决只看"这个实例结束过没有"）
+    prior = _find_node(
+        snapshot,
+        stage=stage,
+        attempt=attempt,
+        run_id=run_id,
+        source_id=source_id,
+        stage_instance_id=stage_instance_id,
+    )
+    if (
+        prior is not None
+        and str(prior.get("status") or "") in TERMINAL_STAGE_STATUSES
+        and str(prior.get("status") or "") != status
+    ):
+        # 冲突终态：保留首个结束事实（不翻转、不混状态）——迟到的另一种终态也不改写历史
+        return snapshot
+    if (
+        not late
+        and not conflict
+        and same_stage
+        and not seq_known
+        and same_instance
+        and attempt < current_attempt
+    ):
         return snapshot  # 旧尝试的迟到更新：不覆盖、不追加
-    if not conflict and same_stage:
-        prior = _find_node(snapshot, stage=stage, attempt=attempt, run_id=run_id)
-        if (
-            prior is not None
-            and str(prior.get("status") or "") in TERMINAL_STAGE_STATUSES
-            and str(prior.get("status") or "") != status
-        ):
-            return snapshot  # 冲突终态：保留首个结束事实（不翻转）
+    if (
+        not late
+        and not conflict
+        and not same_stage
+        and prior is not None
+        and str(prior.get("status") or "") in TERMINAL_STAGE_STATUSES
+    ):
+        late = True  # 该实例已有终态：重复终态只作历史
+    if not late and not conflict and same_stage and not same_instance:
+        late = True  # 同名阶段的另一实例：只补历史，不接管当前
     node: dict[str, Any] = {
         "stage": str(stage),
         "label": label_for(stage),
@@ -317,7 +413,10 @@ def end(
         "attempt": attempt,
         "started_at": (
             str(snapshot.get("started_at") or "")
-            if same_stage and attempt == current_attempt and not conflict
+            if same_stage
+            and attempt == current_attempt
+            and not conflict
+            and same_instance
             else ""
         ),
         "ended_at": now_iso(),
@@ -327,25 +426,42 @@ def end(
             if status in ("succeeded", "skipped")
             else _sanitize_error(error_category)
         ),
+        "source_id": source_id,
+        "stage_instance_id": stage_instance_id,
+        "source_seq": source_seq,
     }
+    if generation:
+        node["generation"] = generation
     if run_id:  # 身份可选：不传时保持旧快照形状（兼容）
         node["run_id"] = run_id
     _upsert_node(snapshot, node)
-    if conflict:
-        # 旧执行的迟到终态：历史节点已补，顶层当前状态不动（不回退、不串身份、不翻转）
+    if conflict or late:
+        # 旧来源 / 旧实例 / 冲突身份的终态：历史节点已补，顶层当前状态不动
         return snapshot
     # 跨阶段推进且本阶段没有可续的起点：如实留空，不残留上一阶段的起点
     if not same_stage:
-        prior = _find_node(snapshot, stage=stage, attempt=attempt, run_id=run_id)
+        prior = _find_node(
+            snapshot,
+            stage=stage,
+            attempt=attempt,
+            run_id=run_id,
+            source_id=source_id,
+            stage_instance_id=stage_instance_id,
+        )
         snapshot["started_at"] = str(prior.get("started_at") or "") if prior else ""
-    # 终态更新代表"最新已知事实"：无论结束的是不是当前阶段，顶层都推进到它
-    # （同阶段旧尝试的迟到更新已在上方被拦截；跨执行迟到已由身份守卫拦下）
-    if current_stage == "":
-        snapshot["label"] = label_for(stage)
+    snapshot["label"] = label_for(stage)
     snapshot["stage"] = str(stage)
     snapshot["status"] = status
     snapshot["attempt"] = max(attempt, current_attempt) if same_stage else attempt
     snapshot["updated_at"] = now_iso()
+    snapshot["source_id"] = source_id
+    snapshot["stage_instance_id"] = stage_instance_id
+    switched = bool(current_source and source_id and current_source != source_id)
+    snapshot["source_seq"] = source_seq if switched else max(source_seq, current_seq)
+    snapshot["progress_revision"] = max(
+        current_revision + 1, int(progress_revision or 0)
+    )
+    snapshot["generation"] = max(generation, current_generation)
     # 无条件写：`retries` 表示"当前阶段的投递重试次数"，随阶段切换更新（R3）
     snapshot["retries"] = max(0, int(retries or 0))
     snapshot["run_id"] = _next_identity(run_id, current_run, same_stage=same_stage)
@@ -376,6 +492,11 @@ def apply(
     latency_ms: int = 0,
     run_id: str = "",
     job_id: str = "",
+    source_id: str = "",
+    stage_instance_id: str = "",
+    source_seq: int = 0,
+    progress_revision: int = 0,
+    generation: int = 0,
 ) -> dict[str, Any]:
     """`running` 走 `begin`、终态走 `end` 的统一入口（事件 / 阶段上报都走它）。"""
     if status == "running":
@@ -386,6 +507,11 @@ def apply(
             retries=retries,
             run_id=run_id,
             job_id=job_id,
+            source_id=source_id,
+            stage_instance_id=stage_instance_id,
+            source_seq=source_seq,
+            progress_revision=progress_revision,
+            generation=generation,
         )
     return end(
         prev,
@@ -397,6 +523,11 @@ def apply(
         latency_ms=latency_ms,
         run_id=run_id,
         job_id=job_id,
+        source_id=source_id,
+        stage_instance_id=stage_instance_id,
+        source_seq=source_seq,
+        progress_revision=progress_revision,
+        generation=generation,
     )
 
 
@@ -419,7 +550,13 @@ def current_step(snapshot: Any) -> str | None:
 
 
 def _node_matches(
-    item: dict[str, Any], *, stage: str, attempt: int, run_id: str
+    item: dict[str, Any],
+    *,
+    stage: str,
+    attempt: int,
+    run_id: str,
+    source_id: str = "",
+    stage_instance_id: str = "",
 ) -> bool:
     """节点是否属于同一个执行：`(stage, attempt)` 相同，且身份不冲突。
 
@@ -431,16 +568,35 @@ def _node_matches(
     if int(item.get("attempt") or 1) != attempt:
         return False
     left, right = str(item.get("run_id") or ""), run_id
-    return not left or not right or left == right
+    if left and right and left != right:
+        return False
+    item_source = str(item.get("source_id") or "")
+    if item_source and source_id and item_source != source_id:
+        return False
+    item_instance = str(item.get("stage_instance_id") or "")
+    return not (
+        item_instance and stage_instance_id and item_instance != stage_instance_id
+    )
 
 
 def _find_node(
-    snapshot: dict[str, Any], *, stage: str, attempt: int, run_id: str = ""
+    snapshot: dict[str, Any],
+    *,
+    stage: str,
+    attempt: int,
+    run_id: str = "",
+    source_id: str = "",
+    stage_instance_id: str = "",
 ) -> dict[str, Any] | None:
     """按 `(stage, attempt, run_id)` 找已有节点（R3 的单调合并与身份隔离都用它）。"""
     for item in snapshot.get("nodes") or []:
         if isinstance(item, dict) and _node_matches(
-            item, stage=stage, attempt=attempt, run_id=run_id
+            item,
+            stage=stage,
+            attempt=attempt,
+            run_id=run_id,
+            source_id=source_id,
+            stage_instance_id=stage_instance_id,
         ):
             return item
     return None
@@ -455,6 +611,8 @@ def _upsert_node(snapshot: dict[str, Any], node: dict[str, Any]) -> None:
             stage=node["stage"],
             attempt=node["attempt"],
             run_id=str(node.get("run_id") or ""),
+            source_id=str(node.get("source_id") or ""),
+            stage_instance_id=str(node.get("stage_instance_id") or ""),
         ):
             merged = dict(item)
             merged.update(node)

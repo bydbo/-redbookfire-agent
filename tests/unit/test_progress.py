@@ -266,3 +266,135 @@ class TestIdentityIsolation:
         moved = progress.end(progress.begin(failed, stage="report", attempt=1, run_id="run-a"),
                              stage="report", status="succeeded", run_id="run-a")
         assert moved["stage"] == "report" and moved["error_category"] == ""
+
+    def test_same_source_late_stage_does_not_take_over_current(self):
+        current = progress.begin(
+            None, stage="report", run_id="run-a", source_id="source-a",
+            stage_instance_id="source-a:report:1", source_seq=5,
+        )
+        late = progress.end(
+            current, stage="draft", status="succeeded", run_id="run-a",
+            source_id="source-a", stage_instance_id="source-a:draft:1", source_seq=3,
+        )
+        assert (late["stage"], late["status"], late["run_id"]) == (
+            "report", "running", "run-a"
+        )
+        assert any(
+            item["stage"] == "draft" and item["status"] == "succeeded"
+            for item in late["nodes"]
+        )
+
+    def test_new_stage_with_new_source_can_start_at_lower_sequence(self):
+        current = progress.begin(
+            None, stage="report", run_id="run-a", source_id="source-a",
+            stage_instance_id="source-a:report:1", source_seq=5,
+        )
+        advanced = progress.begin(
+            current, stage="clue", run_id="run-b", source_id="source-b",
+            stage_instance_id="source-b:clue:1", source_seq=1,
+        )
+        assert advanced["stage"] == "clue"
+        assert advanced["source_id"] == "source-b"
+
+
+class TestStageInstanceIdentity:
+    """E7OBS4-03：stage 相同不代表实例相同；新实例能启动，旧实例只能补历史。"""
+
+    def test_second_instance_of_same_stage_starts_after_first_ended(self):
+        """C3：draft#1 成功 → report → draft#2（attempt 仍为 1）正常启动，旧终态不阻断。"""
+        snapshot = progress.end(
+            progress.begin(
+                None, stage="draft", attempt=1, run_id="run-a", source_id="src",
+                stage_instance_id="src:draft:1", source_seq=1,
+            ),
+            stage="draft", status="succeeded", attempt=1, run_id="run-a",
+            source_id="src", stage_instance_id="src:draft:1", source_seq=2,
+        )
+        snapshot = progress.begin(
+            snapshot, stage="report", attempt=1, run_id="run-a", source_id="src",
+            stage_instance_id="src:report:1", source_seq=3,
+        )
+        second = progress.begin(
+            snapshot, stage="draft", attempt=1, run_id="run-a", source_id="src",
+            stage_instance_id="src:draft:2", source_seq=4,
+        )
+        assert (second["stage"], second["status"]) == ("draft", "running")
+        assert second["stage_instance_id"] == "src:draft:2"
+        assert second["attempt"] == 1          # 新实例有自己的起点，不继承旧尝试号
+
+    def test_late_events_of_previous_instance_do_not_take_over(self):
+        """C4：second 已活动时，first 的 begin/end 迟到 —— 不接管，历史事实按规则补录。"""
+        snapshot = progress.begin(
+            None, stage="draft", attempt=1, run_id="run-a", source_id="src",
+            stage_instance_id="src:draft:1", source_seq=1,
+        )
+        snapshot = progress.end(
+            snapshot, stage="draft", status="succeeded", attempt=1, run_id="run-a",
+            source_id="src", stage_instance_id="src:draft:1", source_seq=2,
+        )
+        snapshot = progress.begin(
+            snapshot, stage="draft", attempt=1, run_id="run-a", source_id="src",
+            stage_instance_id="src:draft:2", source_seq=6,
+        )
+        late_begin = progress.begin(
+            snapshot, stage="draft", attempt=1, run_id="run-a", source_id="src",
+            stage_instance_id="src:draft:1", source_seq=3,
+        )
+        assert late_begin["stage_instance_id"] == "src:draft:2"
+        assert late_begin["source_seq"] == 6
+        late_end = progress.end(
+            snapshot, stage="draft", status="failed", attempt=1, run_id="run-a",
+            source_id="src", stage_instance_id="src:draft:1", source_seq=4,
+        )
+        assert (late_end["stage"], late_end["status"]) == ("draft", "running")
+        assert late_end["stage_instance_id"] == "src:draft:2"
+        # 冲突终态保留首个：已成功的 draft:1 不会被迟到的 failed 翻转
+        first = next(
+            node for node in late_end["nodes"]
+            if node["stage_instance_id"] == "src:draft:1"
+        )
+        assert first["status"] == "succeeded"
+
+    def test_older_generation_cannot_override_newer_execution(self):
+        """C6（纯函数侧）：旧执行代次（worker 重试前那一代）的迟到写入被拒绝。"""
+        newest = progress.begin(
+            None, stage="clue", attempt=1, run_id="run-a", source_id="worker:run-a:g1",
+            stage_instance_id="worker:run-a:g1:clue:1", source_seq=2, generation=1,
+        )
+        stale = progress.end(
+            newest, stage="clue", status="succeeded", attempt=1, run_id="run-a",
+            source_id="worker:run-a:g0", stage_instance_id="worker:run-a:g0:clue:1",
+            source_seq=9, generation=0,
+        )
+        assert (stale["stage"], stale["status"]) == ("clue", "running")
+        assert stale["generation"] == 1
+        assert stale["source_seq"] == 2
+
+    def test_node_truncation_keeps_current_state_and_guards(self):
+        """C8：节点超上限时只丢最早的历史，不影响当前阶段与重复终态判断。"""
+        snapshot = progress.begin(
+            None, stage="draft", attempt=1, run_id="run-a", source_id="src",
+            stage_instance_id="src:draft:1", source_seq=1,
+        )
+        for index in range(progress.MAX_NODES + 5):
+            snapshot = progress.begin(
+                snapshot, stage="draft", attempt=1, run_id=f"run-{index}",
+                source_id=f"src-{index}", stage_instance_id=f"src-{index}:draft:1",
+                source_seq=1,
+            )
+            snapshot = progress.end(
+                snapshot, stage="draft", status="skipped", attempt=1,
+                run_id=f"run-{index}", source_id=f"src-{index}",
+                stage_instance_id=f"src-{index}:draft:1", source_seq=2,
+            )
+        assert len(snapshot["nodes"]) <= progress.MAX_NODES
+        assert snapshot["stage"] == "draft"
+        assert snapshot["source_id"] == f"src-{progress.MAX_NODES + 4}"
+        # 重复终态不重置计时：已终结实例的 started_at 保持首个
+        again = progress.end(
+            snapshot, stage="draft", status="skipped", attempt=1,
+            run_id=f"run-{progress.MAX_NODES + 4}",
+            source_id=f"src-{progress.MAX_NODES + 4}",
+            stage_instance_id=f"src-{progress.MAX_NODES + 4}:draft:1", source_seq=3,
+        )
+        assert again["started_at"] == snapshot["started_at"]

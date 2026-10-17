@@ -38,6 +38,7 @@ from sqlalchemy import CursorResult, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..config import AppConfig
+from ..core import ledger as ledger_projection
 from ..core import progress as progress_tool
 from ..core.errors import DependencyUnavailableError
 from ..core.logging import bind_turn_id, reset_turn_id
@@ -243,6 +244,7 @@ def build_tool_runner(
     recent_attachments: list[dict[str, Any]] | None = None,
     turn_id: str = "",
     tracer: Tracer | None = None,
+    ledger: dict[str, Any] | None = None,
 ) -> Any:
     """工具执行器：按 `chat_tools.HANDLERS` 分派（S7.7a）——这里也不写具体工具名。
 
@@ -262,13 +264,52 @@ def build_tool_runner(
         caller=caller,
         recent_attachments=list(recent_attachments or []),
     )
+    scope_counts: dict[str, int] = {}
+
+    def record_component(facts: dict[str, Any]) -> None:
+        if ledger is None:
+            return
+        scope = str(facts.get("scope") or ledger.get("active_scope") or "")
+        component = str(facts.get("component") or "")
+        if not scope or not component:
+            return
+        components = ledger.setdefault("components", {})
+        key = f"{scope}:{component}"
+        previous = dict(components.get(key) or {})
+        merged = {
+            **previous,
+            **facts,
+            "scope": scope,
+            "component": component,
+            "tool": str(
+                facts.get("tool") or previous.get("tool") or scope.rsplit(":", 1)[0]
+            ),
+        }
+        components[key] = merged
+        run_id = str(merged.get("run_id") or "")
+        if run_id:
+            ledger["run_id"] = run_id
+        ledger.setdefault("versions", {}).update(merged.get("prompt_versions") or {})
+
+    context.checkpoint = record_component
 
     async def runner(
-        name: str, args: dict[str, Any], *, on_progress: Any = None
+        name: str,
+        args: dict[str, Any],
+        *,
+        on_progress: Any = None,
+        meta: dict[str, Any] | None = None,
     ) -> Any:
         handler = chat_tools.HANDLERS.get(name)
         if handler is None:  # 图已按清单过滤过；这里只是兜底，不炸整轮
             return ToolOutcome(status="failed", error=f"未知工具：{name}")
+        scope_counts[name] = scope_counts.get(name, 0) + 1
+        # E7OBS4-01：调用身份由图上登记后经 `meta` 传来（call_id 即内部 scope）；
+        # 旧调用方 / 测试 runner 不传 meta 时退回"工具名:第几次"的兼容索引。
+        scope = str((meta or {}).get("scope") or f"{name}:{scope_counts[name]}")
+        context.checkpoint_scope = scope
+        if ledger is not None:
+            ledger["active_scope"] = scope
         started = time.monotonic()
         with active.tool(
             name=f"tool.{name}", metadata={"tool": name, "turn_id": turn_id}
@@ -287,6 +328,30 @@ def build_tool_runner(
                 # 只记安全类别：错误正文可能含用户原文 / 路径，不进追踪元数据（约定 §9）
                 fields.level = LEVEL_ERROR
                 fields.status_message = "tool_failed"
+            if ledger is not None:
+                payload = outcome.payload
+                has_totals = any(
+                    key in payload
+                    for key in ("cost_cny", "prompt_tokens", "completion_tokens")
+                )
+                if has_totals:
+                    record_component(
+                        {
+                            "scope": scope,
+                            "component": "tool_total",
+                            "aggregate": True,
+                            "tool": name,
+                            "status": outcome.status,
+                            "cost_cny": float(payload.get("cost_cny") or 0),
+                            "prompt_tokens": int(payload.get("prompt_tokens") or 0),
+                            "completion_tokens": int(
+                                payload.get("completion_tokens") or 0
+                            ),
+                            "usage_status": str(payload.get("usage_status") or ""),
+                            "run_id": str(payload.get("run_id") or ""),
+                            "job_id": str(payload.get("job_id") or ""),
+                        }
+                    )
             return outcome
 
     return runner
@@ -399,7 +464,9 @@ async def run_turn_task(
     # 仍能读回已完成的工具过程、运行引用与账目（in-flight 那次拿不到，如实缺席）
     ledger: dict[str, Any] = {
         "records": [],
+        "calls": {},
         "tool_calls": [],
+        "components": {},
         "versions": {},
         "run_id": "",
     }
@@ -473,38 +540,21 @@ async def run_turn_task(
                         run_id: str = "",
                         retries: int = 0,
                         job_id: str = "",
-                    ) -> None:
+                        source_id: str = "",
+                        stage_instance_id: str = "",
+                        source_seq: int = 0,
+                        progress_revision: int = 0,
+                        generation: int = 0,
+                    ) -> dict[str, Any]:
                         """合并一条阶段更新；只有快照确实变化才写库（S7.21 的写库节流点）。
 
-                        切到新阶段时把上一个还在跑的阶段收成 `succeeded`——否则快照的 `nodes`
-                        里会留下永远 running 的旧阶段（阶段是顺序推进的：能走到下一步说明上一步成功；
-                        **只在来源确实推进到下一阶段时才这样推断**，R3）。
-                        R5（E7OBS2-02）：**身份冲突的迟到事件不触发该推断**——旧 run 的迟到
-                        事件既不能收掉当前阶段，也不能把自己推为顶层。
+                        E7OBS4-03：**先裁决、后更新**——不再在合并前把"上一阶段"推断成
+                        `succeeded`。旧做法在守卫之前就改写了快照（并把来源退回 run_id），
+                        迟到的旧来源事件因此绕过了序号比较，还能触发一次伪造的成功收尾。
+                        前序阶段是否完成，只由来源端的明确终态表达；收不到就如实保持
+                        "未结束 / 未知"，不补造成功（需要收敛时用真实的失败 / 中断语义）。
                         """
                         nonlocal snapshot, written
-                        incoming_run = str(run_id or "")
-                        current_run = str(snapshot.get("run_id") or "")
-                        same_execution = not (
-                            incoming_run and current_run and incoming_run != current_run
-                        )
-                        previous_stage = str(snapshot.get("stage") or "")
-                        if (
-                            previous_stage
-                            and previous_stage != stage
-                            and snapshot.get("status") == "running"
-                            and same_execution
-                        ):
-                            # 来源推进到下一阶段 ⇒ 上一阶段已完成（顺序流水线的可靠推断，R3）
-                            # ——对 running 与终态更新都成立；推断只在这一条件下使用；
-                            # 收尾带上当前执行的 run_id 身份，节点不会丢身份
-                            snapshot = progress_tool.end(
-                                snapshot,
-                                stage=previous_stage,
-                                status="succeeded",
-                                attempt=int(snapshot.get("attempt") or 1),
-                                run_id=str(snapshot.get("run_id") or ""),
-                            )
                         snapshot = progress_tool.apply(
                             snapshot,
                             stage=stage,
@@ -515,16 +565,22 @@ async def run_turn_task(
                             error_category=error_category,
                             run_id=run_id,
                             job_id=job_id,
+                            source_id=source_id,
+                            stage_instance_id=stage_instance_id,
+                            source_seq=source_seq,
+                            progress_revision=progress_revision,
+                            generation=generation,
                         )
                         marker = json.dumps(
                             snapshot, ensure_ascii=False, sort_keys=True
                         )
                         if marker == written:
-                            return
+                            return dict(snapshot)
                         written = marker
                         await update_message(
                             session, message_id, progress=dict(snapshot)
                         )
+                        return dict(snapshot)
 
                     async with build_http_client(cfg.llm.timeout_s) as client:
                         provider = build_turn_provider(cfg, client, tracer=tracer)
@@ -542,6 +598,7 @@ async def run_turn_task(
                             recent_attachments=recent,
                             turn_id=events.turn_id,
                             tracer=tracer,
+                            ledger=ledger,
                         )
 
                         async def on_event(event: str, payload: dict[str, Any]) -> None:
@@ -549,8 +606,14 @@ async def run_turn_task(
                             if event != "text_delta":  # 每个 token 都补关联字段没有意义
                                 body.setdefault("turn_id", events.turn_id)
                                 body.setdefault("message_id", str(message_id))
+                                # E7OBS4-03：对话轮次自己的阶段（supervisor / 收尾）显式声明
+                                # 来源。缺省会由 `begin()` 退回 run_id，多轮 / 多来源同阶段
+                                # 时身份比较失真；worker 结构化更新自带来源，不受影响。
+                                body.setdefault(
+                                    "source_id", f"chat:{events.turn_id}"
+                                )
                             if event == "stage":
-                                await persist(
+                                merged = await persist(
                                     stage=str(body.get("stage") or ""),
                                     status=str(body.get("status") or "running"),
                                     attempt=int(body.get("attempt") or 1),
@@ -558,12 +621,25 @@ async def run_turn_task(
                                         body.get("error_category") or ""
                                     ),
                                     run_id=str(body.get("run_id") or ""),
+                                    source_id=str(body.get("source_id") or ""),
+                                    stage_instance_id=str(
+                                        body.get("stage_instance_id") or ""
+                                    ),
+                                    source_seq=int(body.get("source_seq") or 0),
+                                    progress_revision=int(
+                                        body.get("progress_revision") or 0
+                                    ),
+                                    generation=int(body.get("generation") or 0),
+                                )
+                                body["progress"] = merged
+                                body["progress_revision"] = int(
+                                    merged.get("progress_revision") or 0
                                 )
                             elif event == "tool_progress" and body.get("stage_key"):
                                 # R3：worker 阶段的**结构化**更新（真实状态 / 源尝试号 / 重试 /
                                 # 错误类别 / run 身份）——不再一律写 running，也便于区分
                                 # failed / skipped / 重试；同一执行重复上报由 progress 单调合并
-                                await persist(
+                                merged = await persist(
                                     stage=str(body["stage_key"]),
                                     status=str(body.get("status") or "running"),
                                     attempt=int(body.get("attempt") or 1),
@@ -574,6 +650,19 @@ async def run_turn_task(
                                     latency_ms=int(body.get("latency_ms") or 0),
                                     run_id=str(body.get("run_id") or ""),
                                     job_id=str(body.get("job_id") or ""),
+                                    source_id=str(body.get("source_id") or ""),
+                                    stage_instance_id=str(
+                                        body.get("stage_instance_id") or ""
+                                    ),
+                                    source_seq=int(body.get("source_seq") or 0),
+                                    progress_revision=int(
+                                        body.get("progress_revision") or 0
+                                    ),
+                                    generation=int(body.get("generation") or 0),
+                                )
+                                body["progress"] = merged
+                                body["progress_revision"] = int(
+                                    merged.get("progress_revision") or 0
                                 )
                             elif event == "tool_finished" and body.get("stage_key"):
                                 # R5（E7OBS2-03）：结构化 worker 阶段的收尾用 **worker 语义**
@@ -586,7 +675,7 @@ async def run_turn_task(
                                         worker_status
                                         in progress_tool.TERMINAL_STAGE_STATUSES
                                     ):
-                                        await persist(
+                                        merged = await persist(
                                             stage=str(body["stage_key"]),
                                             status=worker_status,
                                             attempt=int(
@@ -599,10 +688,23 @@ async def run_turn_task(
                                                 body.get("worker_latency") or 0
                                             ),
                                             run_id=str(body.get("run_id") or ""),
+                                            source_id=str(body.get("source_id") or ""),
+                                            stage_instance_id=str(
+                                                body.get("stage_instance_id") or ""
+                                            ),
+                                            source_seq=int(body.get("source_seq") or 0),
+                                            progress_revision=int(
+                                                body.get("progress_revision") or 0
+                                            ),
+                                            generation=int(body.get("generation") or 0),
+                                        )
+                                        body["progress"] = merged
+                                        body["progress_revision"] = int(
+                                            merged.get("progress_revision") or 0
                                         )
                                 else:
                                     # 旧式标签阶段（解析图片 / 拆解要素）：按工具本身上报收尾
-                                    await persist(
+                                    merged = await persist(
                                         stage=str(body["stage_key"]),
                                         status=(
                                             "succeeded"
@@ -612,6 +714,19 @@ async def run_turn_task(
                                         attempt=int(body.get("attempt") or 1),
                                         latency_ms=int(body.get("latency_ms") or 0),
                                         run_id=str(body.get("run_id") or ""),
+                                        # E7OBS4-03：收尾同样带来源 / 实例 / 序号——
+                                        # 漏传时 `end()` 会把来源退回 run_id，
+                                        # 迟到事件的身份比较随之失真
+                                        source_id=str(body.get("source_id") or ""),
+                                        stage_instance_id=str(
+                                            body.get("stage_instance_id") or ""
+                                        ),
+                                        source_seq=int(body.get("source_seq") or 0),
+                                        generation=int(body.get("generation") or 0),
+                                    )
+                                    body["progress"] = merged
+                                    body["progress_revision"] = int(
+                                        merged.get("progress_revision") or 0
                                     )
                             await events.publish(event, body)
 
@@ -630,6 +745,17 @@ async def run_turn_task(
                         window["run_finished_at"] = now_iso()
                         if turn.status == "succeeded":
                             # 收尾阶段（S7.20）：正文已流式回吐，这一步只做写库与终态整理
+                            # E7OBS4-04：先合并快照、再发事件——发出的事件必须带权威 progress，
+                            # 不能出现"只携带原始阶段"的最终事件（前端不得自拼状态）
+                            closing = await persist(
+                                stage="final_reply",
+                                status="running",
+                                run_id=turn.run_id or "",
+                                # 收尾阶段属于对话轮次，来源显式声明；缺省会被 end() 退回 run_id
+                                source_id=f"chat:{events.turn_id}",
+                                stage_instance_id=f"chat:{events.turn_id}:final_reply",
+                                source_seq=1,
+                            )
                             await events.publish(
                                 "stage",
                                 {
@@ -641,12 +767,14 @@ async def run_turn_task(
                                     "attempt": 1,
                                     "started_at": now_iso(),
                                     "run_id": turn.run_id or None,
+                                    "source_id": f"chat:{events.turn_id}",
+                                    "stage_instance_id": f"chat:{events.turn_id}:final_reply",
+                                    "source_seq": 1,
+                                    "progress": dict(closing),
+                                    "progress_revision": int(
+                                        closing.get("progress_revision") or 0
+                                    ),
                                 },
-                            )
-                            await persist(
-                                stage="final_reply",
-                                status="running",
-                                run_id=turn.run_id or "",
                             )
                         status = await _finish(
                             session,
@@ -678,7 +806,7 @@ async def run_turn_task(
                     budget_s=CANCEL_FINALIZE_TIMEOUT_S,
                     ledger=ledger,
                 )
-                totals = _ledger_totals(ledger, window)
+                totals = _ledger_totals(ledger, window, open_status="interrupted")
                 raise
             except Exception as exc:  # noqa: BLE001 - 整轮失败要落库 + 广播
                 logger.exception("对话轮次异常：%s", events.turn_id)
@@ -695,7 +823,7 @@ async def run_turn_task(
                     error=f"{type(exc).__name__}: {exc}"[:200],
                     ledger=ledger,
                 )
-                totals = _ledger_totals(ledger, window)
+                totals = _ledger_totals(ledger, window, open_status="failed")
             finally:
                 tracer.finish_turn(
                     status=status,
@@ -729,25 +857,16 @@ def _turn_totals(turn: ChatTurn) -> dict[str, Any]:
     }
 
 
-def _ledger_snapshot(ledger: dict[str, Any] | None) -> dict[str, Any]:
-    """稳定边界的已消费账目（R5 / E7OBS2-01）：取消 / 外层异常收尾时读出已完成记录。
+def _ledger_snapshot(
+    ledger: dict[str, Any] | None, *, open_status: str = "interrupted"
+) -> dict[str, Any]:
+    """稳定边界的账目投影（先由 `core/ledger.project` 统一计算，E7OBS4-02）。
 
-    只包含**已完成**的调用（in-flight 的那次拿不到，如实缺席）；返回的字段与
-    `ChatTurn` 同名，供 `_finalize_turn` 尽力写回已知部分。
+    取消 / 外层异常 / 工作流内失败共用同一份纯函数投影：已完成调用取 aggregate，未完成
+    调用由调用开始时登记的真实身份 + 组件已知消费生成部分记录（状态如实为
+    failed / interrupted），不虚构参数、不补造成功。
     """
-    records = list((ledger or {}).get("records") or [])
-    tool_calls = list((ledger or {}).get("tool_calls") or [])
-    both = [*records, *tool_calls]
-    return {
-        "tool_calls": tool_calls,
-        "run_id": str((ledger or {}).get("run_id") or ""),
-        "prompt_versions": dict((ledger or {}).get("versions") or {}),
-        "cost_cny": round(sum(float(item.get("cost_cny") or 0) for item in both), 4),
-        "prompt_tokens": sum(int(item.get("prompt_tokens") or 0) for item in both),
-        "completion_tokens": sum(
-            int(item.get("completion_tokens") or 0) for item in both
-        ),
-    }
+    return ledger_projection.project(ledger, open_status=open_status)
 
 
 def _ledger_totals(
@@ -755,9 +874,10 @@ def _ledger_totals(
     window: dict[str, str],
     *,
     usage_complete: bool = False,
+    open_status: str = "interrupted",
 ) -> dict[str, Any]:
     """取消 / 异常路径的 trace 汇总：账本已知部分 + 明确不完整标记 + 轮次时间窗。"""
-    snapshot = _ledger_snapshot(ledger)
+    snapshot = _ledger_snapshot(ledger, open_status=open_status)
     return {
         "tool_calls": len(snapshot["tool_calls"]),
         "prompt_tokens": snapshot["prompt_tokens"],
@@ -783,6 +903,8 @@ def _terminal_snapshot(
     if not stage:
         return data
     if data.get("status") == "running":
+        # E7OBS4-03：收尾保留当前阶段的来源 / 实例 / 序号——缺字段时 end() 会把来源退回
+        # run_id，迟到事件的身份比较随之失真（验收 4.1 的根因之一）。
         return progress_tool.end(
             data,
             stage=stage,
@@ -790,6 +912,10 @@ def _terminal_snapshot(
             attempt=int(data.get("attempt") or 1),
             error_category=error_category,
             run_id=str(data.get("run_id") or ""),
+            job_id=str(data.get("job_id") or ""),
+            source_id=str(data.get("source_id") or ""),
+            stage_instance_id=str(data.get("stage_instance_id") or ""),
+            source_seq=int(data.get("source_seq") or 0),
         )
     if error_category and not data.get("error_category"):
         data["error_category"] = error_category
@@ -824,7 +950,9 @@ async def _finalize_turn(
         "trace_id": trace_id or None,
     }
     if ledger is not None:
-        partial = _ledger_snapshot(ledger)
+        partial = _ledger_snapshot(
+            ledger, open_status="failed" if status == "failed" else "interrupted"
+        )
         if partial["tool_calls"]:
             fields["tool_calls"] = partial["tool_calls"]
         if partial["run_id"]:
@@ -860,6 +988,7 @@ async def _finalize_turn(
         error_category=error_category,
         stage=str(final.get("stage") or ""),
         trace_id=trace_id,
+        progress=final,
     )
 
 
@@ -911,10 +1040,20 @@ async def _finish(
             error_category=category,
             stage=str(final.get("stage") or ""),
             trace_id=trace_id,
+            progress=final,
         )
         return "failed"
+    current = progress_tool.normalize(snapshot)
     final = progress_tool.end(
-        progress_tool.normalize(snapshot), stage="final_reply", status="succeeded"
+        current,
+        stage="final_reply",
+        status="succeeded",
+        attempt=int(current.get("attempt") or 1),
+        run_id=str(current.get("run_id") or turn.run_id or ""),
+        job_id=str(current.get("job_id") or ""),
+        source_id=str(current.get("source_id") or ""),
+        stage_instance_id=str(current.get("stage_instance_id") or ""),
+        source_seq=int(current.get("source_seq") or 0),
     )
     await update_message(
         session,
@@ -943,6 +1082,10 @@ async def _finish(
             "updated_at": now_iso(),
             "last_finished_stage": "final_reply",
             "run_id": turn.run_id or None,
+            # E7OBS4-04：终态事件附带**合并后的权威快照**——前端不再拿原始阶段字段
+            # 自拼状态（刷新与实时必须同一份事实）。
+            "progress": dict(final),
+            "progress_revision": int(final.get("progress_revision") or 0),
         },
     )
     await events.publish(
@@ -970,6 +1113,7 @@ async def _fail(
     error_category: str = "internal",
     stage: str = "",
     trace_id: str = "",
+    progress: dict[str, Any] | None = None,
 ) -> None:
     """失败终端事件：真实失败阶段 + 安全类别 + 已捕获的 trace 关联（OBS-03 / 04）。
 
@@ -985,5 +1129,14 @@ async def _fail(
             "stage": stage,
             "error_category": error_category,
             "trace_id": trace_id,
+            # 失败 / 取消终态同样附权威快照（含来源 / 实例 / revision）
+            **(
+                {
+                    "progress": dict(progress),
+                    "progress_revision": int(progress.get("progress_revision") or 0),
+                }
+                if progress
+                else {}
+            ),
         },
     )

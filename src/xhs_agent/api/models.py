@@ -63,6 +63,10 @@ class StageNode(_Response):
     latency_ms: int = Field(default=0, ge=0)
     error_category: str = ""
     run_id: str | None = None
+    source_id: str = ""
+    stage_instance_id: str = ""
+    source_seq: int = Field(default=0, ge=0)
+    generation: int = Field(default=0, ge=0)
 
 
 class StageInfo(_Response):
@@ -79,6 +83,11 @@ class StageInfo(_Response):
     last_finished_stage: str = ""
     run_id: UuidStr | None = None
     job_id: str | None = None
+    source_id: str = ""
+    stage_instance_id: str = ""
+    source_seq: int = Field(default=0, ge=0)
+    progress_revision: int = Field(default=0, ge=0)
+    generation: int = Field(default=0, ge=0)
     nodes: list[StageNode] = Field(default_factory=list)
 
 
@@ -372,7 +381,7 @@ class ChatToolCall(_Response):
     """一次工具调用的过程记录（挂在 assistant 消息上）。"""
 
     tool: str
-    status: Literal["succeeded", "failed"]
+    status: Literal["succeeded", "failed", "interrupted"]
     args: dict[str, Any]
     call_id: str = ""
     attempt: int = Field(default=1, ge=1)

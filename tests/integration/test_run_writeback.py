@@ -424,3 +424,43 @@ class TestRunStageSnapshot:
         job = await load_job(db_session, await _job_id_of(db_session, run_id))
         assert job["current_step"] == "拆解"
         assert job["stage"]["retries"] == 0            # 节点阶段不带投递重试号
+
+
+class TestExecutionGeneration:
+    """E7OBS4-03（C6）：worker 新代次开始后，旧代次的迟到写入被拒绝。"""
+
+    @pytest.mark.asyncio
+    async def test_older_generation_is_rejected(self, db_session: AsyncSession) -> None:
+        run_id = await start_run(db_session, ["代次热点"])
+        accepted = await set_run_stage(
+            db_session, run_id, stage="clue", status="running", attempt=1,
+            source_id="worker:run:g1", source_seq=1, generation=1,
+        )
+        assert accepted is True
+
+        stale = await set_run_stage(
+            db_session, run_id, stage="clue", status="succeeded", attempt=1,
+            source_id="worker:run:g0", source_seq=9, generation=0,
+        )
+        assert stale is False
+
+        job = await load_job(db_session, await _job_id_of(db_session, run_id))
+        assert job["stage"]["status"] == "running"
+        assert job["stage"]["source_seq"] == 1
+        assert job["stage"]["generation"] == 1
+
+    @pytest.mark.asyncio
+    async def test_same_generation_still_advances(self, db_session: AsyncSession) -> None:
+        run_id = await start_run(db_session, ["代次热点二"])
+        await set_run_stage(
+            db_session, run_id, stage="clue", status="running", attempt=1,
+            source_id="worker:run:g1", source_seq=1, generation=1,
+        )
+        await set_run_stage(
+            db_session, run_id, stage="clue", status="succeeded", attempt=1,
+            source_id="worker:run:g1", source_seq=2, generation=1, latency_ms=12,
+        )
+
+        job = await load_job(db_session, await _job_id_of(db_session, run_id))
+        assert job["stage"]["status"] == "succeeded"
+        assert job["stage"]["source_seq"] == 2

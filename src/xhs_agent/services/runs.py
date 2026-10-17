@@ -19,6 +19,7 @@
 
 from __future__ import annotations
 
+import logging
 import uuid
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
@@ -37,6 +38,8 @@ from ..schemas import SchemaError
 from ..tools import gaps as gaps_tool
 from .reporting import build_report_model
 from .retrieval import vector_coverage
+
+logger = logging.getLogger("xhs_agent.runs")
 
 # 运行状态（数据契约 §5 的枚举）
 QUEUED = "queued"
@@ -73,12 +76,20 @@ def _normalize(hotspots: Sequence[str]) -> list[str]:
     return out
 
 
-@traced_db("db.submit_analysis", operation="insert",
-           tables=("hotspots", "runs", "run_hotspots"))
-async def submit_analysis(session: AsyncSession, hotspots: Sequence[str], *,
-                          topk: int = 5, request_id: str = "",
-                          clues: Sequence[Mapping[str, Any] | None] | None = None,
-                          enqueue: Callable[[str], Awaitable[None]] | None = None) -> Submission:
+@traced_db(
+    "db.submit_analysis",
+    operation="insert",
+    tables=("hotspots", "runs", "run_hotspots"),
+)
+async def submit_analysis(
+    session: AsyncSession,
+    hotspots: Sequence[str],
+    *,
+    topk: int = 5,
+    request_id: str = "",
+    clues: Sequence[Mapping[str, Any] | None] | None = None,
+    enqueue: Callable[[str], Awaitable[None]] | None = None,
+) -> Submission:
     """落库一个待执行的运行：复用/新建 hotspots → 建 runs(queued) → 建 run_hotspots 骨架 → 投递。
 
     输入：`hotspots`（1 条以上，本函数只做去空白去重，长度与条数由接口层按契约校验）、
@@ -97,13 +108,19 @@ async def submit_analysis(session: AsyncSession, hotspots: Sequence[str], *,
         raise ValueError(f"topk 必须在 {low}–{high} 之间")
     clue_snapshots = _clue_snapshots(hotspots, clues)
 
-    existing = {row.raw_text: row for row in (await session.execute(
-        select(Hotspot).where(Hotspot.raw_text.in_(raws)))).scalars().all()}
+    existing = {
+        row.raw_text: row
+        for row in (
+            await session.execute(select(Hotspot).where(Hotspot.raw_text.in_(raws)))
+        )
+        .scalars()
+        .all()
+    }
     hotspot_rows: list[Hotspot] = []
     for raw in raws:
         row = existing.get(raw)
         if row is None:
-            row = Hotspot(raw_text=raw, clue={})   # 线索由 worker 的拆解节点回填
+            row = Hotspot(raw_text=raw, clue={})  # 线索由 worker 的拆解节点回填
             session.add(row)
             existing[raw] = row
         snapshot = clue_snapshots.get(raw)
@@ -114,14 +131,25 @@ async def submit_analysis(session: AsyncSession, hotspots: Sequence[str], *,
         hotspot_rows.append(row)
     await session.flush()
 
-    run = Run(job_id=str(uuid.uuid4()), status=QUEUED, topk=topk,
-              request_id=request_id or None)
+    run = Run(
+        job_id=str(uuid.uuid4()),
+        status=QUEUED,
+        topk=topk,
+        request_id=request_id or None,
+    )
     session.add(run)
     await session.flush()
 
     for position, hotspot in enumerate(hotspot_rows, start=1):
-        session.add(RunHotspot(run_id=run.id, hotspot_id=hotspot.id, position=position,
-                               status=QUEUED, coverage={}))
+        session.add(
+            RunHotspot(
+                run_id=run.id,
+                hotspot_id=hotspot.id,
+                position=position,
+                status=QUEUED,
+                coverage={},
+            )
+        )
     await session.flush()
 
     try:
@@ -134,8 +162,9 @@ async def submit_analysis(session: AsyncSession, hotspots: Sequence[str], *,
     return Submission(job_id=run.job_id, run_id=str(run.id))
 
 
-def _clue_snapshots(hotspots: Sequence[str],
-                    clues: Sequence[Mapping[str, Any] | None] | None) -> dict[str, dict[str, Any]]:
+def _clue_snapshots(
+    hotspots: Sequence[str], clues: Sequence[Mapping[str, Any] | None] | None
+) -> dict[str, dict[str, Any]]:
     """把「与 hotspots 等长」的 `clues` 折成 `raw_text -> 线索快照`（S6.7）。
 
     - `clues` 为 None → 空 dict（行为与不带该字段完全一致）；
@@ -147,7 +176,8 @@ def _clue_snapshots(hotspots: Sequence[str],
         return {}
     if len(clues) != len(hotspots):
         raise ValueError(
-            f"clues 必须与 hotspots 等长：hotspots {len(hotspots)}、clues {len(clues)}")
+            f"clues 必须与 hotspots 等长：hotspots {len(hotspots)}、clues {len(clues)}"
+        )
     snapshots: dict[str, dict[str, Any]] = {}
     for raw, clue in zip(hotspots, clues, strict=True):
         text = str(raw or "").strip()
@@ -158,26 +188,71 @@ def _clue_snapshots(hotspots: Sequence[str],
 
 
 async def _run_row(session: AsyncSession, run_id: uuid.UUID) -> Run | None:
-    return (await session.execute(select(Run).where(Run.id == run_id))).scalar_one_or_none()
+    return (
+        await session.execute(select(Run).where(Run.id == run_id))
+    ).scalar_one_or_none()
 
 
 @traced_db("db.set_run_stage", operation="update", tables=("runs",))
-async def set_run_stage(session: AsyncSession, run_id: uuid.UUID | str, *, stage: str,
-                        status: str, attempt: int = 1, retries: int = 0,
-                        latency_ms: int = 0, error_category: str = "") -> bool:
+async def set_run_stage(
+    session: AsyncSession,
+    run_id: uuid.UUID | str,
+    *,
+    stage: str,
+    status: str,
+    attempt: int = 1,
+    retries: int = 0,
+    latency_ms: int = 0,
+    error_category: str = "",
+    source_id: str = "",
+    stage_instance_id: str = "",
+    source_seq: int = 0,
+    progress_revision: int = 0,
+    generation: int = 0,
+) -> bool:
     """把一次运行的阶段快照写进 `runs.stage`（S7.20）；查不到该 run 返回 `False`。
 
     合并口径全在 `core/progress.py`：迟到（`attempt` 更小）的更新被忽略、`nodes` 按
     `(stage, attempt)` 去重封顶。只写快照列并提交，**不动** `runs.status` / 统计 / `error`——
     那些仍由 `RunRecorder` 收尾。调用方（worker / 工作流）负责给出阶段键与状态。
     """
-    run = (await session.execute(
-        select(Run).where(Run.id == uuid.UUID(str(run_id))))).scalar_one_or_none()
+    run = (
+        await session.execute(select(Run).where(Run.id == uuid.UUID(str(run_id))))
+    ).scalar_one_or_none()
     if run is None:
         return False
-    run.stage = progress_tool.apply(run.stage, stage=stage, status=status, attempt=attempt,
-                                    retries=retries, error_category=error_category,
-                                    latency_ms=latency_ms, run_id=str(run.id))
+    current = progress_tool.normalize(run.stage)
+    # E7OBS4-03（C6）：worker 重试后的新代次开始后，旧代次的迟到写入直接拒绝——
+    # 不能靠消费者端的序号比较兜底，也不能让旧执行覆盖新执行的阶段事实。
+    # 这里比 `core/progress.py` 严：本列的写入方只有 worker 自己（都声明代次），
+    # 所以"没声明代次（0）"不能当作通行证，它同样可能来自旧执行。
+    current_generation = int(current.get("generation") or 0)
+    if current_generation and generation < current_generation:
+        logger.warning(
+            "拒绝旧执行代次的阶段写入：run=%s generation=%s < 当前 %s（stage=%s）",
+            run.id,
+            generation,
+            current_generation,
+            stage,
+        )
+        return False
+    if not source_seq:
+        source_seq = int(current.get("source_seq") or 0) + 1
+    run.stage = progress_tool.apply(
+        current,
+        stage=stage,
+        status=status,
+        attempt=attempt,
+        retries=retries,
+        error_category=error_category,
+        latency_ms=latency_ms,
+        run_id=str(run.id),
+        source_id=source_id or str(run.id),
+        stage_instance_id=stage_instance_id or f"{run.id}:{stage}:{attempt}",
+        source_seq=source_seq,
+        progress_revision=progress_revision,
+        generation=generation,
+    )
     try:
         await session.commit()
     except BaseException:
@@ -186,19 +261,30 @@ async def set_run_stage(session: AsyncSession, run_id: uuid.UUID | str, *, stage
     return True
 
 
-@traced_db("db.load_job", operation="select",
-           tables=("runs", "run_hotspots", "hotspots"))
+@traced_db(
+    "db.load_job", operation="select", tables=("runs", "run_hotspots", "hotspots")
+)
 async def load_job(session: AsyncSession, job_id: str) -> dict[str, Any] | None:
     """`JobStatus` 形状：状态、进度（已完成热点数 / 热点总数）、当前阶段与失败原因。"""
-    run = (await session.execute(
-        select(Run).where(Run.job_id == job_id))).scalar_one_or_none()
+    run = (
+        await session.execute(select(Run).where(Run.job_id == job_id))
+    ).scalar_one_or_none()
     if run is None:
         return None
-    total = (await session.execute(select(func.count()).select_from(RunHotspot)
-                                   .where(RunHotspot.run_id == run.id))).scalar_one()
-    done = (await session.execute(select(func.count()).select_from(RunHotspot)
-                                  .where(RunHotspot.run_id == run.id,
-                                         RunHotspot.status.in_(_DONE_STATUSES)))).scalar_one()
+    total = (
+        await session.execute(
+            select(func.count())
+            .select_from(RunHotspot)
+            .where(RunHotspot.run_id == run.id)
+        )
+    ).scalar_one()
+    done = (
+        await session.execute(
+            select(func.count())
+            .select_from(RunHotspot)
+            .where(RunHotspot.run_id == run.id, RunHotspot.status.in_(_DONE_STATUSES))
+        )
+    ).scalar_one()
     snapshot = progress_tool.normalize(run.stage)
     payload: dict[str, Any] = {
         "job_id": run.job_id,
@@ -210,48 +296,57 @@ async def load_job(session: AsyncSession, job_id: str) -> dict[str, Any] | None:
         "stage": snapshot if (snapshot["stage"] or snapshot["nodes"]) else None,
     }
     if run.status == FAILED and run.error:
-        payload["error"] = {"code": "internal_error", "message": run.error,
-                            "detail": {"run_id": str(run.id)}}
+        payload["error"] = {
+            "code": "internal_error",
+            "message": run.error,
+            "detail": {"run_id": str(run.id)},
+        }
     return payload
 
 
-async def _matches_by_run_hotspot(session: AsyncSession,
-                                  run_hotspot_ids: list[uuid.UUID]) -> dict[str, list[dict[str, Any]]]:
+async def _matches_by_run_hotspot(
+    session: AsyncSession, run_hotspot_ids: list[uuid.UUID]
+) -> dict[str, list[dict[str, Any]]]:
     """按 `run_hotspots.id` 分组返回候选（含素材摘要，契约的 `MatchCandidate` 形状）。"""
     if not run_hotspot_ids:
         return {}
-    rows = (await session.execute(
-        select(RunMatch, Material)
-        .join(Material, Material.id == RunMatch.material_id)
-        .where(RunMatch.run_hotspot_id.in_(run_hotspot_ids))
-        .order_by(RunMatch.run_hotspot_id, RunMatch.rank))).all()
+    rows = (
+        await session.execute(
+            select(RunMatch, Material)
+            .join(Material, Material.id == RunMatch.material_id)
+            .where(RunMatch.run_hotspot_id.in_(run_hotspot_ids))
+            .order_by(RunMatch.run_hotspot_id, RunMatch.rank)
+        )
+    ).all()
     grouped: dict[str, list[dict[str, Any]]] = {}
     for match, material in rows:
-        grouped.setdefault(str(match.run_hotspot_id), []).append({
-            "rank": match.rank,
-            "material_id": str(match.material_id),
-            "score": float(match.score),
-            "recall_sources": list(match.recall_sources or []),
-            "hits": list(match.hits or []),
-            "missing": list(match.missing or []),
-            "reasons": list(match.reasons or []),
-            "usage": match.usage,
-            "material": {
-                "id": str(material.id),
-                "path": material.path,
-                "type": material.type,
-                "title": material.title,
-                "description": material.description,
-                "tags": list(material.tags or []),
-                # 契约 MaterialSummary 声明的其余字段必须一并投影：少了 keyframes，
-                # 报告 HTML 的关键帧缩略图会全部退化成「无预览」（E3 审查·严重项）
-                "duration_s": float(material.duration_s or 0),
-                "width": int(material.width or 0),
-                "height": int(material.height or 0),
-                "has_audio": bool(material.has_audio),
-                "keyframes": list(material.keyframes or []),
-            },
-        })
+        grouped.setdefault(str(match.run_hotspot_id), []).append(
+            {
+                "rank": match.rank,
+                "material_id": str(match.material_id),
+                "score": float(match.score),
+                "recall_sources": list(match.recall_sources or []),
+                "hits": list(match.hits or []),
+                "missing": list(match.missing or []),
+                "reasons": list(match.reasons or []),
+                "usage": match.usage,
+                "material": {
+                    "id": str(material.id),
+                    "path": material.path,
+                    "type": material.type,
+                    "title": material.title,
+                    "description": material.description,
+                    "tags": list(material.tags or []),
+                    # 契约 MaterialSummary 声明的其余字段必须一并投影：少了 keyframes，
+                    # 报告 HTML 的关键帧缩略图会全部退化成「无预览」（E3 审查·严重项）
+                    "duration_s": float(material.duration_s or 0),
+                    "width": int(material.width or 0),
+                    "height": int(material.height or 0),
+                    "has_audio": bool(material.has_audio),
+                    "keyframes": list(material.keyframes or []),
+                },
+            }
+        )
     return grouped
 
 
@@ -266,27 +361,36 @@ def _totals(run: Run) -> dict[str, Any]:
     }
 
 
-@traced_db("db.load_run", operation="select",
-           tables=("runs", "run_hotspots", "hotspots", "run_matches", "materials"))
+@traced_db(
+    "db.load_run",
+    operation="select",
+    tables=("runs", "run_hotspots", "hotspots", "run_matches", "materials"),
+)
 async def load_run(session: AsyncSession, run_id: uuid.UUID) -> dict[str, Any] | None:
     """`RunDetail` 形状：运行汇总 + 每个热点的线索、覆盖度、候选与文稿。"""
     run = await _run_row(session, run_id)
     if run is None:
         return None
-    pairs = (await session.execute(
-        select(RunHotspot, Hotspot)
-        .join(Hotspot, Hotspot.id == RunHotspot.hotspot_id)
-        .where(RunHotspot.run_id == run.id)
-        .order_by(RunHotspot.position))).all()
+    pairs = (
+        await session.execute(
+            select(RunHotspot, Hotspot)
+            .join(Hotspot, Hotspot.id == RunHotspot.hotspot_id)
+            .where(RunHotspot.run_id == run.id)
+            .order_by(RunHotspot.position)
+        )
+    ).all()
     candidates = await _matches_by_run_hotspot(session, [rh.id for rh, _ in pairs])
-    hotspots = [{
-        "hotspot_id": str(hotspot.id),
-        "hotspot_raw": hotspot.raw_text,
-        "clue": dict(hotspot.clue or {}),
-        "coverage": dict(run_hotspot.coverage or {}),
-        "candidates": candidates.get(str(run_hotspot.id), []),
-        "draft": run_hotspot.draft,
-    } for run_hotspot, hotspot in pairs]
+    hotspots = [
+        {
+            "hotspot_id": str(hotspot.id),
+            "hotspot_raw": hotspot.raw_text,
+            "clue": dict(hotspot.clue or {}),
+            "coverage": dict(run_hotspot.coverage or {}),
+            "candidates": candidates.get(str(run_hotspot.id), []),
+            "draft": run_hotspot.draft,
+        }
+        for run_hotspot, hotspot in pairs
+    ]
     return {
         "run_id": str(run.id),
         "status": run.status,
@@ -309,66 +413,91 @@ def _preview(raw_text: str | None) -> str:
     return value[:HOTSPOT_PREVIEW_CHARS] + "…"
 
 
-@traced_db("db.list_runs", operation="select",
-           tables=("runs", "run_hotspots", "hotspots"))
-async def list_runs(session: AsyncSession, *, limit: int, offset: int) -> dict[str, Any]:
+@traced_db(
+    "db.list_runs", operation="select", tables=("runs", "run_hotspots", "hotspots")
+)
+async def list_runs(
+    session: AsyncSession, *, limit: int, offset: int
+) -> dict[str, Any]:
     """`RunList` 形状：`created_at` 倒序分页的历史运行摘要（平局按 id 倒序，保证幂等）。
 
     `total` 是全部运行条数（分页器用），与当前页条数无关；热点数与首条热点预览在页内
     用两条批量查询补齐，避免逐行 N+1。
     """
     total = (await session.execute(select(func.count()).select_from(Run))).scalar_one()
-    rows = list((await session.execute(
-        select(Run).order_by(Run.created_at.desc(), Run.id.desc())
-        .limit(limit).offset(offset))).scalars())
+    rows = list(
+        (
+            await session.execute(
+                select(Run)
+                .order_by(Run.created_at.desc(), Run.id.desc())
+                .limit(limit)
+                .offset(offset)
+            )
+        ).scalars()
+    )
     run_ids = [run.id for run in rows]
 
     counts: dict[uuid.UUID, int] = {}
     previews: dict[uuid.UUID, str] = {}
     if run_ids:
-        for run_id, count in (await session.execute(
+        for run_id, count in (
+            await session.execute(
                 select(RunHotspot.run_id, func.count())
                 .where(RunHotspot.run_id.in_(run_ids))
-                .group_by(RunHotspot.run_id))).all():
+                .group_by(RunHotspot.run_id)
+            )
+        ).all():
             counts[run_id] = count
-        for run_id, raw_text in (await session.execute(
+        for run_id, raw_text in (
+            await session.execute(
                 select(RunHotspot.run_id, Hotspot.raw_text)
                 .join(Hotspot, Hotspot.id == RunHotspot.hotspot_id)
-                .where(RunHotspot.run_id.in_(run_ids),
-                       RunHotspot.position == 1))).all():
+                .where(RunHotspot.run_id.in_(run_ids), RunHotspot.position == 1)
+            )
+        ).all():
             previews[run_id] = raw_text
 
     return {
-        "items": [{
-            "run_id": str(run.id),
-            "status": run.status,
-            "created_at": _iso(run.created_at),
-            "finished_at": _iso(run.finished_at),
-            "hotspot_count": counts.get(run.id, 0),
-            "hotspot_preview": _preview(previews.get(run.id)),
-            "topk": run.topk,
-            "totals": _totals(run),
-            "error": run.error,
-        } for run in rows],
+        "items": [
+            {
+                "run_id": str(run.id),
+                "status": run.status,
+                "created_at": _iso(run.created_at),
+                "finished_at": _iso(run.finished_at),
+                "hotspot_count": counts.get(run.id, 0),
+                "hotspot_preview": _preview(previews.get(run.id)),
+                "topk": run.topk,
+                "totals": _totals(run),
+                "error": run.error,
+            }
+            for run in rows
+        ],
         "total": total,
     }
 
 
 @traced_db("db.load_material_frames", operation="select", tables=("materials",))
-async def load_material_frames(session: AsyncSession,
-                              material_id: uuid.UUID) -> list[str] | None:
+async def load_material_frames(
+    session: AsyncSession, material_id: uuid.UUID
+) -> list[str] | None:
     """素材登记的关键帧绝对路径列表（取帧接口用）；素材不存在返回 `None`。"""
-    row = await session.execute(select(Material.keyframes).where(Material.id == material_id))
+    row = await session.execute(
+        select(Material.keyframes).where(Material.id == material_id)
+    )
     keyframes = row.scalar_one_or_none()
     if keyframes is None:
         return None
     return list(keyframes)
 
 
-@traced_db("db.load_report_model", operation="select",
-           tables=("runs", "run_hotspots", "hotspots", "run_matches", "materials"))
-async def load_report_model(session: AsyncSession, cfg: AppConfig,
-                            run_id: uuid.UUID) -> dict[str, Any] | None:
+@traced_db(
+    "db.load_report_model",
+    operation="select",
+    tables=("runs", "run_hotspots", "hotspots", "run_matches", "materials"),
+)
+async def load_report_model(
+    session: AsyncSession, cfg: AppConfig, run_id: uuid.UUID
+) -> dict[str, Any] | None:
     """报告 model（`tools/report.py` 的输入形状）；查不到返回 `None`。
 
     报告在库里即时组装（ADR 0011：DB 是权威源），缺口建议现场用规则表重算，
@@ -381,15 +510,19 @@ async def load_report_model(session: AsyncSession, cfg: AppConfig,
     if detail is None:  # pragma: no cover - 与上一行同一行数据，理论上不会发生
         return None
     coverage = await vector_coverage(session, cfg)
-    hotspots = [dict(item, gap_advice=gaps_tool.gap_advice(item.get("coverage") or {}))
-                for item in detail["hotspots"]]
+    hotspots = [
+        dict(item, gap_advice=gaps_tool.gap_advice(item.get("coverage") or {}))
+        for item in detail["hotspots"]
+    ]
     errors = [run.error] if run.status == FAILED and run.error else []
     return build_report_model(
         run_id=str(run.id),
         created_at=_iso(run.created_at) or "",
         materials_count=coverage.total,
-        config={"llm": {"provider": cfg.llm.provider, "model": cfg.llm.model},
-                "materials_dir": cfg.materials_dir()},
+        config={
+            "llm": {"provider": cfg.llm.provider, "model": cfg.llm.model},
+            "materials_dir": cfg.materials_dir(),
+        },
         hotspots=hotspots,
         totals=detail["totals"],
         errors=errors,
@@ -411,16 +544,24 @@ def match_row_values(candidate: dict[str, Any]) -> dict[str, Any]:
     异常：`reasons` 为空或 `rank` 越界即抛 `SchemaError`——"不允许无理由候选"在 Pydantic
           侧的把关；数据库侧另有 `jsonb_array_length(reasons) >= 1` 与 `rank >= 1` 的 CHECK 兜底。
     """
-    reasons = [str(item) for item in (candidate.get("reasons") or []) if str(item).strip()]
+    reasons = [
+        str(item) for item in (candidate.get("reasons") or []) if str(item).strip()
+    ]
     if not reasons:
-        raise SchemaError(f"候选素材 {candidate.get('material_id') or '?'} 缺少 reasons")
+        raise SchemaError(
+            f"候选素材 {candidate.get('material_id') or '?'} 缺少 reasons"
+        )
     rank = int(candidate.get("rank") or 0)
     if rank < 1:
-        raise SchemaError(f"候选素材 {candidate.get('material_id') or '?'} 的 rank 必须 >= 1")
+        raise SchemaError(
+            f"候选素材 {candidate.get('material_id') or '?'} 的 rank 必须 >= 1"
+        )
     return {
         "rank": rank,
         "score": float(candidate.get("score") or 0.0),
-        "recall_sources": [str(item) for item in (candidate.get("recall_sources") or [])],
+        "recall_sources": [
+            str(item) for item in (candidate.get("recall_sources") or [])
+        ],
         "hits": list(candidate.get("hits") or []),
         "missing": list(candidate.get("missing") or []),
         "reasons": reasons,
@@ -430,24 +571,32 @@ def match_row_values(candidate: dict[str, Any]) -> dict[str, Any]:
 
 def _candidate_material_id(candidate: dict[str, Any]) -> uuid.UUID:
     """取候选里的素材 uuid（`material_id` 或 `material.id`），缺失即报错。"""
-    raw = candidate.get("material_id") or (candidate.get("material") or {}).get("id") or ""
+    raw = (
+        candidate.get("material_id")
+        or (candidate.get("material") or {}).get("id")
+        or ""
+    )
     try:
         return uuid.UUID(str(raw))
     except (TypeError, ValueError) as exc:
         raise SchemaError(f"候选素材缺少可解析的 material_id：{raw!r}") from exc
 
 
-async def planned_hotspots(session: AsyncSession,
-                           run_id: uuid.UUID | str) -> list[tuple[int, str]]:
+async def planned_hotspots(
+    session: AsyncSession, run_id: uuid.UUID | str
+) -> list[tuple[int, str]]:
     """按 `position` 读本次运行要分析的热点原文（worker 与写回用例的对齐入口）。
 
     输入：`session`、`run_id`。输出：`[(position, raw_text), ...]`，与 S3.3 建骨架时的顺序一致。
     """
-    rows = (await session.execute(
-        select(RunHotspot.position, Hotspot.raw_text)
-        .join(Hotspot, Hotspot.id == RunHotspot.hotspot_id)
-        .where(RunHotspot.run_id == uuid.UUID(str(run_id)))
-        .order_by(RunHotspot.position))).all()
+    rows = (
+        await session.execute(
+            select(RunHotspot.position, Hotspot.raw_text)
+            .join(Hotspot, Hotspot.id == RunHotspot.hotspot_id)
+            .where(RunHotspot.run_id == uuid.UUID(str(run_id)))
+            .order_by(RunHotspot.position)
+        )
+    ).all()
     return [(int(row.position), str(row.raw_text)) for row in rows]
 
 
@@ -468,8 +617,9 @@ class RunRecorder:
             raise ValueError(f"run_id 不是合法 uuid：{run_id!r}") from exc
 
     async def _run(self) -> Run:
-        run = (await self.session.execute(
-            select(Run).where(Run.id == self.run_id))).scalar_one_or_none()
+        run = (
+            await self.session.execute(select(Run).where(Run.id == self.run_id))
+        ).scalar_one_or_none()
         if run is None:
             raise ValueError(f"run 不存在：{self.run_id}")
         return run
@@ -483,21 +633,51 @@ class RunRecorder:
 
     async def total(self) -> int:
         """本次运行的热点总数（`run_hotspots` 行数）。"""
-        return int((await self.session.execute(
-            select(func.count()).select_from(RunHotspot)
-            .where(RunHotspot.run_id == self.run_id))).scalar_one())
+        return int(
+            (
+                await self.session.execute(
+                    select(func.count())
+                    .select_from(RunHotspot)
+                    .where(RunHotspot.run_id == self.run_id)
+                )
+            ).scalar_one()
+        )
 
     async def topk(self) -> int:
         """本次运行的截断上限（来自提交时的 `topk`）。"""
         return int((await self._run()).topk)
 
-    async def set_stage(self, *, stage: str, status: str, attempt: int = 1,
-                        retries: int = 0, latency_ms: int = 0,
-                        error_category: str = "") -> None:
+    async def set_stage(
+        self,
+        *,
+        stage: str,
+        status: str,
+        attempt: int = 1,
+        retries: int = 0,
+        latency_ms: int = 0,
+        error_category: str = "",
+        source_id: str = "",
+        stage_instance_id: str = "",
+        source_seq: int = 0,
+        progress_revision: int = 0,
+        generation: int = 0,
+    ) -> None:
         """写本次运行的阶段快照（S7.20）；口径与 DB span 全在模块级 `set_run_stage`。"""
-        await set_run_stage(self.session, self.run_id, stage=stage, status=status,
-                            attempt=attempt, retries=retries, latency_ms=latency_ms,
-                            error_category=error_category)
+        await set_run_stage(
+            self.session,
+            self.run_id,
+            stage=stage,
+            status=status,
+            attempt=attempt,
+            retries=retries,
+            latency_ms=latency_ms,
+            error_category=error_category,
+            source_id=source_id,
+            stage_instance_id=stage_instance_id,
+            source_seq=source_seq,
+            progress_revision=progress_revision,
+            generation=generation,
+        )
 
     @traced_db("db.run_recorder.start", operation="update", tables=("runs",))
     async def start(self) -> None:
@@ -510,51 +690,80 @@ class RunRecorder:
 
     async def load_clue(self, raw_text: str) -> dict[str, Any] | None:
         """读该热点已有的线索快照；非空即复用（`{}` 视为没线索，返回 None）。"""
-        clue = (await self.session.execute(
-            select(Hotspot.clue)
-            .join(RunHotspot, RunHotspot.hotspot_id == Hotspot.id)
-            .where(RunHotspot.run_id == self.run_id, Hotspot.raw_text == raw_text)
-            .limit(1))).scalar_one_or_none()
+        clue = (
+            await self.session.execute(
+                select(Hotspot.clue)
+                .join(RunHotspot, RunHotspot.hotspot_id == Hotspot.id)
+                .where(RunHotspot.run_id == self.run_id, Hotspot.raw_text == raw_text)
+                .limit(1)
+            )
+        ).scalar_one_or_none()
         return dict(clue) if clue else None
 
-    @traced_db("db.run_recorder.hotspot_finished", operation="write",
-               tables=("hotspots", "run_hotspots", "run_matches"))
-    async def hotspot_finished(self, position: int, *, clue: dict[str, Any],
-                               coverage: dict[str, Any],
-                               candidates: list[dict[str, Any]],
-                               draft: dict[str, Any] | None, status: str,
-                               error: str = "") -> None:
+    @traced_db(
+        "db.run_recorder.hotspot_finished",
+        operation="write",
+        tables=("hotspots", "run_hotspots", "run_matches"),
+    )
+    async def hotspot_finished(
+        self,
+        position: int,
+        *,
+        clue: dict[str, Any],
+        coverage: dict[str, Any],
+        candidates: list[dict[str, Any]],
+        draft: dict[str, Any] | None,
+        status: str,
+        error: str = "",
+    ) -> None:
         """把一个热点的结果写回：`hotspots.clue` → `run_hotspots` → `run_matches`。
 
         `hotspots.clue` 只在拿到非空线索时才写（失败热点可能还没有线索）；
         `run_matches` 先按 `run_hotspot_id` 删干净再按 rank 插入，保证重跑幂等。
         """
-        run_hotspot = (await self.session.execute(
-            select(RunHotspot).where(RunHotspot.run_id == self.run_id,
-                                     RunHotspot.position == position))).scalar_one_or_none()
+        run_hotspot = (
+            await self.session.execute(
+                select(RunHotspot).where(
+                    RunHotspot.run_id == self.run_id, RunHotspot.position == position
+                )
+            )
+        ).scalar_one_or_none()
         if run_hotspot is None:
             raise ValueError(f"run_hotspots 缺少 position={position} 的行")
         if clue:
-            hotspot = (await self.session.execute(
-                select(Hotspot).where(Hotspot.id == run_hotspot.hotspot_id))).scalar_one()
+            hotspot = (
+                await self.session.execute(
+                    select(Hotspot).where(Hotspot.id == run_hotspot.hotspot_id)
+                )
+            ).scalar_one()
             hotspot.clue = dict(clue)
         run_hotspot.status = status
         run_hotspot.coverage = dict(coverage or {})
         run_hotspot.draft = dict(draft) if draft else None
         run_hotspot.error = error or None
         await self.session.execute(
-            delete(RunMatch).where(RunMatch.run_hotspot_id == run_hotspot.id))
+            delete(RunMatch).where(RunMatch.run_hotspot_id == run_hotspot.id)
+        )
         for candidate in candidates or []:
             values = match_row_values(candidate)
-            self.session.add(RunMatch(run_hotspot_id=run_hotspot.id,
-                                      material_id=_candidate_material_id(candidate),
-                                      **values))
+            self.session.add(
+                RunMatch(
+                    run_hotspot_id=run_hotspot.id,
+                    material_id=_candidate_material_id(candidate),
+                    **values,
+                )
+            )
         await self._commit()
 
     @traced_db("db.run_recorder.finish", operation="update", tables=("runs",))
-    async def finish(self, *, status: str, totals: dict[str, Any],
-                     prompt_versions: dict[str, int],
-                     errors: list[str]) -> None:
+    async def finish(
+        self,
+        *,
+        status: str,
+        totals: dict[str, Any],
+        prompt_versions: dict[str, int],
+        errors: list[str],
+    ) -> None:
         """批次收尾：写 `runs` 的状态、结束时间、LLM 统计与 `prompt_versions`。"""
         run = await self._run()
         run.status = status
@@ -564,21 +773,24 @@ class RunRecorder:
         run.completion_tokens = int(totals.get("completion_tokens") or 0)
         run.cost_cny = Decimal(f"{float(totals.get('cost_cny') or 0.0):.4f}")
         run.latency_ms = int(totals.get("latency_ms") or 0)
-        run.prompt_versions = {str(key): int(value)
-                               for key, value in (prompt_versions or {}).items()}
+        run.prompt_versions = {
+            str(key): int(value) for key, value in (prompt_versions or {}).items()
+        }
         run.error = None if status == SUCCEEDED else ("；".join(errors) or "运行失败")
         await self._commit()
 
 
-async def mark_run_failed(session: AsyncSession, run_id: uuid.UUID | str,
-                          error: str) -> bool:
+async def mark_run_failed(
+    session: AsyncSession, run_id: uuid.UUID | str, error: str
+) -> bool:
     """把运行标成 `failed`（兜底路径：异常逃出 `run_analysis`，S3.4b 的任务层调用）。
 
     只写 `status` / `finished_at` / `error`，**不动**已有的统计与 `prompt_versions`——那些
     可能已被逐热点写回更新过，覆盖成 0 等于丢事实。查不到该 run 时返回 `False`。
     """
-    run = (await session.execute(
-        select(Run).where(Run.id == uuid.UUID(str(run_id))))).scalar_one_or_none()
+    run = (
+        await session.execute(select(Run).where(Run.id == uuid.UUID(str(run_id))))
+    ).scalar_one_or_none()
     if run is None:
         return False
     run.status = FAILED
@@ -599,12 +811,15 @@ def stale_cutoff(now: datetime, threshold_s: int) -> datetime:
 
 def stale_error(threshold_s: int) -> str:
     """陈旧运行的 `error` 文案（对账写回，供 `/api/jobs/{job_id}` 直接展示）。"""
-    return (f"陈旧运行对账：超过 {int(threshold_s)} 秒未收尾"
-            "（worker 崩溃或硬超时），已标记失败")
+    return (
+        f"陈旧运行对账：超过 {int(threshold_s)} 秒未收尾"
+        "（worker 崩溃或硬超时），已标记失败"
+    )
 
 
-async def reconcile_stale_runs(session: AsyncSession, *, threshold_s: int,
-                              now: datetime | None = None) -> list[dict[str, Any]]:
+async def reconcile_stale_runs(
+    session: AsyncSession, *, threshold_s: int, now: datetime | None = None
+) -> list[dict[str, Any]]:
     """把卡住不动的 `running` 行标成 `failed`（S4.1 的陈旧 run 对账）。
 
     为什么需要：worker 被 SIGKILL / 硬超时打断时任务被吞，`runs` 会永远停在 `running`，
@@ -616,9 +831,19 @@ async def reconcile_stale_runs(session: AsyncSession, *, threshold_s: int,
     """
     moment = now or datetime.now(UTC)
     cutoff = stale_cutoff(moment, threshold_s)
-    rows = (await session.execute(
-        select(Run).where(Run.status == RUNNING, Run.started_at.is_not(None),
-                          Run.started_at < cutoff))).scalars().all()
+    rows = (
+        (
+            await session.execute(
+                select(Run).where(
+                    Run.status == RUNNING,
+                    Run.started_at.is_not(None),
+                    Run.started_at < cutoff,
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
     if not rows:
         return []
     detail = stale_error(threshold_s)
@@ -627,8 +852,13 @@ async def reconcile_stale_runs(session: AsyncSession, *, threshold_s: int,
         run.status = FAILED
         run.finished_at = moment
         run.error = detail
-        reconciled.append({"run_id": str(run.id), "job_id": run.job_id,
-                           "started_at": _iso(run.started_at)})
+        reconciled.append(
+            {
+                "run_id": str(run.id),
+                "job_id": run.job_id,
+                "started_at": _iso(run.started_at),
+            }
+        )
     try:
         await session.commit()
     except BaseException:

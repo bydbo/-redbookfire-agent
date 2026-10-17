@@ -1397,3 +1397,37 @@ class TestPartialConsumptionOnFailure:
         assert outcome.payload["cost_cny"] == 0.004
         assert outcome.payload["prompt_tokens"] == 300
         assert outcome.prompt_versions == {chat_tools.CLUE_TASK: 2}
+
+
+class TestUsageStatusAggregation:
+    """E7OBS4-05（E5 / E6）：窗口内的用量来源按事实汇总，缺来源不被 actual 掩盖。"""
+
+    def _caller(self, records: list[dict[str, Any]]) -> Any:
+        caller = SimpleNamespace(records=records)
+        return caller
+
+    def test_missing_source_beside_actual_is_unknown(self) -> None:
+        from xhs_agent.services.chat_tools import _records_usage_status
+
+        caller = self._caller([
+            {"cost_cny": 0.001, "prompt_tokens": 10, "completion_tokens": 5,
+             "usage_status": "actual"},
+            {"cost_cny": 0.0, "prompt_tokens": 0, "completion_tokens": 0,
+             "usage_status": ""},
+        ])
+        assert _records_usage_status(caller, 0) == "unknown"   # 零值也算调用事实
+
+    def test_status_precedence(self) -> None:
+        from xhs_agent.services.chat_tools import _records_usage_status
+
+        def status_of(*values: str) -> str:
+            caller = self._caller([{"usage_status": item} for item in values])
+            return _records_usage_status(caller, 0)
+
+        assert status_of() == ""                                  # 空窗口
+        assert status_of("cached") == "cached"
+        assert status_of("cached", "cached") == "cached"
+        assert status_of("actual", "cached") == "actual"          # 缓存不额外算调用
+        assert status_of("actual", "estimated") == "estimated"    # 不冒充 actual
+        assert status_of("actual", "unknown") == "unknown"
+        assert status_of("estimated", "cached") == "estimated"

@@ -1266,12 +1266,12 @@ async def test_worker_stage_updates_persist_real_status_retries_and_identity(
     }
     assert nodes[("clue", 1, "run-9")]["status"] == "failed"  # 失败尝试可追查
     assert nodes[("clue", 1, "run-9")]["error_category"] == "llm_error"
-    assert nodes[("clue", 2, "run-9")]["status"] == "succeeded"  # 重试成功不抹掉失败
     assert nodes[("report", 1, "run-9")]["latency_ms"] == 7
-    skipped_like = [
-        item for item in snapshot["nodes"] if item["stage"] == "submit_analysis"
-    ]
-    assert skipped_like and skipped_like[0]["status"] == "succeeded"  # 自有阶段照常收尾
+    # E7OBS4-03：不再"切阶段即自动成功"——没有明确终态的阶段不补造节点。
+    # clue attempt=2 只上报过 running，report 到来时不能被追认成功；
+    # submit_analysis 同理（工具只报了 running），保持"未结束 / 未知"。
+    assert ("clue", 2, "run-9") not in nodes
+    assert all(item["stage"] != "submit_analysis" for item in snapshot["nodes"])
 
 
 @pytest.mark.asyncio
@@ -1533,3 +1533,256 @@ async def test_tool_finished_uses_worker_status_for_structured_stages(
         for node in final["nodes"]
     }
     assert nodes[("clue", run_new)] == "skipped"  # skip 不虚构成功
+
+
+# ---------- 9. 部分工具记录可读、可关联（E7OBS4-01 / A1、A2） ----------
+
+
+class ToolCallingProvider(llm.BaseProvider):
+    """第一轮要求调 `run_hotspot_analysis`，之后给正文（这里的用例大多在第一轮就被取消）。"""
+
+    name = "tool-calling"
+
+    def __init__(self, tool: str = "run_hotspot_analysis") -> None:
+        super().__init__(model="scripted-1")
+        self.tool = tool
+        self.rounds = 0
+
+    async def complete(self, call: llm.LLMCall) -> LLMResult:  # pragma: no cover
+        raise AssertionError("对话用例不该走 complete()")
+
+    async def complete_with_tools(
+        self, call: llm.LLMCall, on_delta: Any = None
+    ) -> LLMResult:
+        self.rounds += 1
+        calls = (
+            [
+                {
+                    "id": "call-abc",
+                    "name": self.tool,
+                    "arguments": json.dumps({"hotspot": "某条热点", "topk": 3}),
+                }
+            ]
+            if self.rounds == 1
+            else []
+        )
+        return LLMResult(
+            text="" if calls else "已经跑完了",
+            provider=self.name,
+            model=self.model,
+            prompt_tokens=10,
+            completion_tokens=5,
+            cost_cny=0.001,
+            usage_status="actual",
+            tool_calls=calls,
+        )
+
+
+def _patch_turn_provider(
+    monkeypatch: pytest.MonkeyPatch, provider: llm.BaseProvider
+) -> None:
+    monkeypatch.setattr(
+        chat_turns, "build_turn_provider", lambda _cfg, _client, tracer=None: provider
+    )
+
+
+@pytest.mark.asyncio
+async def test_partial_tool_record_keeps_real_identity_after_cancel(
+    cfg: AppConfig, fake_redis: FakeRedis, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A1：图片成功、提交成功、等待时取消 —— 落库的部分记录保留真实身份且能通过契约校验。
+
+    这里用**真实对话图 + 真实工具执行器**，只把工具处理函数换成"上报两步后挂住"的替身，
+    取消用真实 `Task.cancel()`；供应商等待被完全替身化（不联网、不等待真实超时）。
+    """
+    saved: list[dict[str, Any]] = []
+
+    async def fake_update(
+        _session: Any, message_id: uuid.UUID, **fields: Any
+    ) -> dict[str, Any]:
+        saved.append(fields)
+        return {}
+
+    started = asyncio.Event()
+
+    async def hanging_tool(
+        _ctx: Any, _args: dict[str, Any], *, attachments: Any = None, on_progress: Any = None
+    ) -> ToolOutcome:
+        if on_progress is not None:
+            await on_progress("解析图片", 0, 0)
+            await on_progress("提交分析", 0, 0)
+        started.set()
+        await asyncio.sleep(3600)
+        return ToolOutcome(status="succeeded")  # pragma: no cover - 不会走到
+
+    engine = DummyEngine()
+    _patch_turn_harness(monkeypatch, engine, fake_update, NullTracer())
+    _patch_turn_provider(monkeypatch, ToolCallingProvider())
+    monkeypatch.setitem(chat_tools.HANDLERS, "run_hotspot_analysis", hanging_tool)
+
+    events = TurnEvents(cfg, turn_id="t-partial")
+    await events.open()
+    received: list[dict[str, Any]] = []
+    pump = asyncio.create_task(_collect(events, received))
+    task = start_turn(
+        cfg,
+        events,
+        session_id=uuid.uuid4(),
+        message_id=uuid.uuid4(),
+        history=[],
+        user_text="只发图，跑一下",
+    )
+    try:
+        await asyncio.wait_for(started.wait(), timeout=5)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(task, timeout=5)
+        await _wait_until(lambda: any(item["event"] == "error" for item in received))
+    finally:
+        pump.cancel()
+        await events.aclose()
+
+    final = saved[-1]
+    assert final["status"] == "interrupted"
+    records = final["tool_calls"]
+    assert len(records) == 1
+    record = records[0]
+    # 真实调用身份：调用开始时就登记，不需要等工具结束
+    assert record["tool"] == "run_hotspot_analysis"
+    assert record["call_id"] == "call-abc" and record["attempt"] == 1
+    assert record["args"] == {"hotspot": "某条热点", "topk": 3}   # 不虚构、不丢失参数
+    assert record["status"] == "interrupted"                      # 取消 ≠ 普通失败
+    assert record["run_id"] is None                               # 没提交过：空值，不编 uuid
+    assert [step["stage"] for step in record["steps"]] == ["解析图片", "提交分析"]
+    # 契约：这条记录能通过公开响应模型（旧实现在这里 500）
+    from xhs_agent.api.models import ChatToolCall
+
+    model = ChatToolCall.model_validate(record)
+    assert model.args["hotspot"] == "某条热点"
+    assert model.status == "interrupted"
+
+
+@pytest.mark.asyncio
+async def test_ordinary_tool_exception_keeps_args_and_marks_failed(
+    cfg: AppConfig, fake_redis: FakeRedis, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A2：工具普通异常 —— 参数与身份仍可读，状态 failed，不伪造工具成功。"""
+    saved: list[dict[str, Any]] = []
+
+    async def fake_update(
+        _session: Any, message_id: uuid.UUID, **fields: Any
+    ) -> dict[str, Any]:
+        saved.append(fields)
+        return {}
+
+    async def boom(
+        _ctx: Any, _args: dict[str, Any], *, attachments: Any = None, on_progress: Any = None
+    ) -> ToolOutcome:
+        if on_progress is not None:
+            await on_progress("解析图片", 0, 0)
+        raise RuntimeError("上游炸了")
+
+    engine = DummyEngine()
+    _patch_turn_harness(monkeypatch, engine, fake_update, NullTracer())
+    _patch_turn_provider(monkeypatch, ToolCallingProvider())
+    monkeypatch.setitem(chat_tools.HANDLERS, "run_hotspot_analysis", boom)
+
+    events = TurnEvents(cfg, turn_id="t-boom")
+    await events.open()
+    received: list[dict[str, Any]] = []
+    pump = asyncio.create_task(_collect(events, received))
+    task = start_turn(
+        cfg,
+        events,
+        session_id=uuid.uuid4(),
+        message_id=uuid.uuid4(),
+        history=[],
+        user_text="跑一下",
+    )
+    try:
+        await asyncio.wait_for(task, timeout=10)
+        await _wait_until(lambda: any(item["event"] == "error" for item in received))
+    finally:
+        pump.cancel()
+        await events.aclose()
+
+    final = saved[-1]
+    assert final["status"] == "failed"
+    record = final["tool_calls"][0]
+    assert record["status"] == "failed"
+    assert record["args"] == {"hotspot": "某条热点", "topk": 3}
+    assert record["call_id"] == "call-abc"
+    assert record["run_id"] is None
+    assert final["progress"]["status"] == "failed"   # 阶段如实失败，不伪造成功
+    assert "error" in final
+
+
+@pytest.mark.asyncio
+async def test_persist_adjudicates_before_update_so_late_source_event_cannot_regress(
+    cfg: AppConfig, fake_redis: FakeRedis, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """C1（persist 层）：report/running/seq=5 之后同源 draft/succeeded/seq=3 —— report 仍 running。
+
+    旧实现在合并前就把"上一阶段"推断成 succeeded（并把来源退回 run_id），迟到的旧序号事件
+    因此绕过序号比较；这里钉住"只补历史、不动当前"。
+    """
+    saved: list[dict[str, Any]] = []
+
+    async def fake_update(
+        _session: Any, message_id: uuid.UUID, **fields: Any
+    ) -> dict[str, Any]:
+        saved.append(fields)
+        return {}
+
+    async def scripted(*_args: Any, **kwargs: Any) -> ChatTurn:
+        on_event = kwargs["on_event"]
+        await on_event("tool_progress", {
+            "tool": "run_hotspot_analysis", "stage_key": "report", "stage": "报告",
+            "status": "running", "attempt": 1, "run_id": "77777777-7777-4777-8777-777777777777",
+            "source_id": "worker:run-a:g0", "stage_instance_id": "worker:run-a:g0:report:1",
+            "source_seq": 5,
+        })
+        await on_event("tool_progress", {
+            "tool": "run_hotspot_analysis", "stage_key": "draft", "stage": "撰稿",
+            "status": "succeeded", "attempt": 1, "run_id": "77777777-7777-4777-8777-777777777777",
+            "source_id": "worker:run-a:g0", "stage_instance_id": "worker:run-a:g0:draft:1",
+            "source_seq": 3,
+        })
+        return ChatTurn(reply="跑完了", status="failed", error="模拟失败")
+
+    engine = DummyEngine()
+    _patch_turn_harness(monkeypatch, engine, fake_update, NullTracer())
+    monkeypatch.setattr(chat_turns, "run_turn", scripted)
+
+    events = TurnEvents(cfg, turn_id="t-c1")
+    await events.open()
+    pump = asyncio.create_task(_collect(events, []))
+    task = start_turn(
+        cfg,
+        events,
+        session_id=uuid.uuid4(),
+        message_id=uuid.uuid4(),
+        history=[],
+        user_text="跑一下",
+    )
+    try:
+        await asyncio.wait_for(task, timeout=10)
+    finally:
+        pump.cancel()
+        await events.aclose()
+
+    snapshots = [item["progress"] for item in saved if "progress" in item]
+    after_late = next(
+        item for item in snapshots
+        if any(node["stage"] == "draft" and node["status"] == "succeeded"
+               for node in item["nodes"])
+    )
+    assert (after_late["stage"], after_late["status"]) == ("report", "running")
+    assert after_late["source_id"] == "worker:run-a:g0"
+    assert after_late["source_seq"] == 5                       # 序号不回退
+    assert after_late["run_id"] == "77777777-7777-4777-8777-777777777777"
+    # 没有任何伪造的 report 成功节点
+    assert not any(
+        node["stage"] == "report" and node["status"] == "succeeded"
+        for node in after_late["nodes"]
+    )

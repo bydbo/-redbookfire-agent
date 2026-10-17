@@ -447,6 +447,12 @@ export interface paths {
          *     `stage` / `error_category` / `trace_id`；新增的 `stage` 事件带 `message_id` / `stage` /
          *     `label` / `status` / `attempt` / `run_id` / `job_id` / `last_finished_stage` 等阶段
          *     快照字段。
+         *     **权威快照（E7OBS4-04）**：`stage`、需要更新阶段的 `tool_progress` / `tool_finished`，
+         *     以及成功 / 失败 / 取消的终端事件，另带**合并后的 `progress`**（`StageInfo`）与
+         *     `progress_revision`，事件信封带 `message_id` / `turn_id`。客户端取得 `progress` 后
+         *     **只投影一次**，不得再用原始 `stage_key` 自拼当前阶段；原始 `stage` / `done` / `total`
+         *     仅用于工具过程列表。`progress_revision` 只在同一 `(message_id, turn_id)` 范围内可比，
+         *     无 `progress` 的旧格式事件不能覆盖已有的较新快照。
          *     **断开浏览器只停转发**：这一轮照常跑完并落库（库里能看到 assistant 消息的终态）。
          *     图片只接受 jpg / png / webp（按 magic bytes）；单张上限 `[chat].attachment_max_mb`、
          *     数量上限 `[chat].attachment_max_count`、合计上限 `[chat].attachment_total_max_mb`——
@@ -798,7 +804,7 @@ export interface components {
             /** @description 该工具在本次轮次内的第几次执行（重试 / 多轮递增，默认 1） */
             attempt?: number;
             /** @enum {string} */
-            status: "succeeded" | "failed";
+            status: "succeeded" | "failed" | "interrupted";
             args: {
                 [key: string]: unknown;
             };
@@ -861,6 +867,14 @@ export interface components {
             error_category?: string;
             /** @description 产生该节点的分析运行 id（可选，R3）；对话轮次里同轮多次分析用它区分节点归属，缺省时按旧口径合并 */
             run_id?: string | null;
+            /** @description 产生该节点的明确执行来源标识 */
+            source_id?: string;
+            /** @description 来源内阶段实例标识 */
+            stage_instance_id?: string;
+            /** @description 来源生产端生成的递增顺序号，不能由轮询接收端重新编号 */
+            source_seq?: number;
+            /** @description worker 执行代次（投递重试号）；旧代次的迟到写入只补历史或被存储层拒绝 */
+            generation?: number;
         };
         /**
          * @description 当前阶段快照（S7.20 / S7.21）：应用内事件与可刷新状态是运行状态的事实源，
@@ -886,6 +900,16 @@ export interface components {
             last_finished_stage?: string;
             run_id?: string | null;
             job_id?: string | null;
+            /** @description 当前阶段的来源标识 */
+            source_id?: string;
+            /** @description 当前阶段实例标识 */
+            stage_instance_id?: string;
+            /** @description 当前来源的生产顺序号 */
+            source_seq?: number;
+            /** @description 本轮已接受快照的语义版本；只在同一 (message_id, turn_id) 范围内可比 */
+            progress_revision?: number;
+            /** @description 当前阶段的 worker 执行代次（投递重试号） */
+            generation?: number;
             nodes?: components["schemas"]["StageNode"][];
         };
         ChatSessionDetail: {
