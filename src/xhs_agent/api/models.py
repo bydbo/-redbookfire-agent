@@ -521,6 +521,9 @@ class RecoveryProgress(_Response):
                     "interrupted", "failed"]
     recovery_id: UuidStr | None = None
     reason: str = ""
+    # A01：维护起点（新会话创建时写入；旧会话首次恢复时取历史末条）
+    baseline_created_at: DateTimeStr | None = None
+    baseline_message_id: UuidStr | None = None
     snapshot_last_message_id: UuidStr | None = None
     cursor_message_id: UuidStr | None = None
     scanned_user_messages: int = Field(default=0, ge=0)

@@ -252,3 +252,150 @@ class TestCTX17ObjectRefValidation:
                                    topic_id=TOPIC, version=3)
         active = [fact.value for fact in reset.snapshot.active()]
         assert active == ["全对话不用感叹号"]     # 会话级限制存活，话题项归档
+
+
+# ---------------------------------------------------------------------------
+# 二次验收 A01–A13 的固定回归（需要真库 / HTTP 的部分见 integration）
+# ---------------------------------------------------------------------------
+
+
+class TestA01RecoveryBaseline:
+    """A01：新建会话写入明确维护起点；坏恢复字段不得无声丢弃后假定完整。"""
+
+    def test_new_recovery_is_complete_with_baseline(self) -> None:
+        recovery = rules.new_recovery(
+            baseline_created_at="2026-10-18T00:00:00+00:00",
+            baseline_message_id="m-1",
+        )
+        assert recovery["status"] == "complete"      # 新空会话首轮不要求先恢复
+        assert recovery["baseline_created_at"]
+        assert recovery["baseline_message_id"] == "m-1"
+
+    def test_corrupt_recovery_degrades_to_pending(self) -> None:
+        parsed = rules.recovery_of({"recovery": {"status": "gone", "recovery_id": "r1"}})
+        assert parsed["status"] == "pending"         # 不假定完整
+        assert parsed["recovery_id"] == "r1"         # 原有字段不无声丢弃
+
+    def test_missing_recovery_is_empty(self) -> None:
+        assert rules.recovery_of({}) == {}
+        assert rules.recovery_of({"recovery": {}}) == {}
+
+
+class TestA02EventTypes:
+    """A02：审计事件约束必须放行 select_object / complete_recovery。"""
+
+    def test_model_constraint_allows_new_events(self) -> None:
+        from xhs_agent.db.models import ChatContextEvent
+
+        constraints = [
+            str(item.sqltext) for item in ChatContextEvent.__table__.constraints
+            if str(getattr(item, "name", "")).endswith("event_type_allowed")
+        ]
+        assert constraints, "chat_context_events 必须保留 event_type_allowed 约束"
+        text = constraints[0]
+        assert "select_object" in text and "complete_recovery" in text
+        # 旧合法事件不能丢
+        for legacy in ("delta", "confirm", "reject", "retract", "replace",
+                       "reset_topic", "recovery"):
+            assert legacy in text
+
+
+class TestA05ApplicableFacts:
+    """A05：适用事实按作用域筛选，其他话题 / 其他对象 / 失效项不得混入。"""
+
+    def _snapshot(self) -> ContextSnapshot:
+        snapshot = apply(
+            ContextSnapshot(topic_id=TOPIC),
+            delta([
+                {"op": "add", "kind": "constraint", "value": "全对话不用感叹号",
+                 "evidence": "全对话不用感叹号", "scope": "session"},
+                {"op": "add", "kind": "constraint", "value": "当前话题短句",
+                 "evidence": "当前话题短句"},
+            ]),
+            user_text="全对话不用感叹号，当前话题短句",
+        ).snapshot
+        # 另一个话题的旧事实（reset_topic 前的归档项）
+        old = snapshot.facts[1].model_copy(
+            update={"fact_id": "old", "scope_id": "topic:old", "value": "旧话题要求"}
+        )
+        snapshot.facts.append(old)
+        return snapshot
+
+    def test_only_session_and_current_topic(self) -> None:
+        snapshot = self._snapshot()
+        values = [fact.value for fact in rules.applicable_facts(
+            snapshot, topic_id=TOPIC
+        )]
+        assert values == ["全对话不用感叹号", "当前话题短句"]
+
+    def test_artifact_requires_verified_object(self) -> None:
+        snapshot = self._snapshot()
+        artifact = rules.ContextFact(  # type: ignore[attr-defined]
+            fact_id="af", kind="constraint", value="封面别用红色",
+            scope="artifact", scope_id="draft:r1:1", status="active",
+            evidence="封面别用红色", source_ref={"message_id": "m-1"},
+            created_version=1,
+        )
+        snapshot.facts.append(artifact)
+        assert [f.value for f in rules.applicable_facts(
+            snapshot, topic_id=TOPIC, object_keys=["draft:other:1"]
+        )] == ["全对话不用感叹号", "当前话题短句"]
+        assert "封面别用红色" in [
+            f.value for f in rules.applicable_facts(
+                snapshot, topic_id=TOPIC, object_keys=["draft:r1:1"]
+            )
+        ]
+
+    def test_retracted_facts_excluded(self) -> None:
+        snapshot = self._snapshot()
+        snapshot.facts[0].status = "retracted"
+        values = [fact.value for fact in rules.applicable_facts(
+            snapshot, topic_id=TOPIC
+        )]
+        assert "全对话不用感叹号" not in values
+
+
+class _TextProvider(llm.BaseProvider):
+    name = "text-only"
+
+    async def complete(self, call: llm.LLMCall) -> LLMResult:
+        return LLMResult(text="好的", provider=self.name, model="text-1",
+                         prompt_tokens=1, completion_tokens=1, cost_cny=0.001,
+                         usage_status="actual")
+
+    async def complete_with_tools(self, call: llm.LLMCall,
+                                  on_delta: Any = None) -> LLMResult:
+        return await self.complete(call)
+
+
+class TestA11PromptVersionMerge:
+    """A11：成功轮次的 prompt_versions 必须包含抽取记录，不能只有 supervisor。"""
+
+    @pytest.mark.asyncio
+    async def test_success_path_merges_ledger_versions(self) -> None:
+        from xhs_agent.workflows.chat import run_turn
+
+        class _Chat:
+            max_tool_rounds = 1
+            history_max_messages = 10
+            history_token_budget = 10_000
+
+        class _Cfg:
+            chat = _Chat()
+
+        ledger: dict[str, Any] = {
+            "records": [{"task": "context_extract", "prompt_tokens": 100,
+                         "completion_tokens": 20, "cost_cny": 0.01,
+                         "usage_status": "actual"}],
+            "calls": {}, "tool_calls": [], "components": {},
+            "versions": {"context_extract": 1}, "run_id": "",
+        }
+        turn = await run_turn(
+            _Cfg(), provider=_TextProvider(), history=[], user_text="请开始分析夜跑",
+            run_tool=None, ledger=ledger, stream=False,
+        )
+        assert turn.prompt_versions.get("context_extract") == 1
+        assert "chat_supervisor" in turn.prompt_versions
+        # 抽取的已知消费仍计入合计，且只计一次（合并版本不双计 tokens / 费用）
+        assert (turn.prompt_tokens, turn.completion_tokens) == (101, 21)
+        assert turn.cost_cny == pytest.approx(0.011)

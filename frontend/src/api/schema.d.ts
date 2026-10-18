@@ -1140,6 +1140,8 @@ export interface components {
             status: "complete" | "pending" | "running" | "awaiting_confirmation" | "interrupted" | "failed";
             recovery_id?: string | null;
             reason?: string;
+            baseline_created_at?: string | null;
+            baseline_message_id?: string | null;
             snapshot_last_message_id?: string | null;
             cursor_message_id?: string | null;
             scanned_user_messages?: number;
@@ -2209,6 +2211,15 @@ export interface operations {
         responses: {
             /** @description 动作结果与最新上下文 */
             200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ContextActionResponse"];
+                };
+            };
+            /** @description 恢复页已在处理中（真实 202）：只读取状态等待，不重放付费页 */
+            202: {
                 headers: {
                     [name: string]: unknown;
                 };

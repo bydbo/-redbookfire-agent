@@ -128,7 +128,11 @@ class TestToolSchema:
         by_name = {
             item["function"]["name"]: item["function"]["parameters"] for item in TOOLS
         }
-        assert by_name[TOOL_PARSE_IMAGE]["properties"] == {}  # 只吃本轮附件
+        # A08：解析图片额外接受显式重解析与指定版本；都不是必填（默认用本轮图 + 当前选定版）
+        assert set(by_name[TOOL_PARSE_IMAGE]["properties"]) == {
+            "force_reparse", "clue_version_id"
+        }
+        assert by_name[TOOL_PARSE_IMAGE]["required"] == []
         assert by_name[TOOL_SEARCH_MATERIALS]["required"] == ["hotspot"]
         assert by_name[TOOL_PREVIEW_COVERAGE]["required"] == ["hotspot"]
         # run_id 可省：不传就落到本会话最近一次运行产出的那个（S7.9 起）
@@ -722,7 +726,7 @@ class TestRevisePaths:
         assert outcome.payload["revised"]["body"] == "改后的正文"
         assert outcome.payload["revised"]["material_id"] == "m-1"  # 关联字段按原稿写回
         assert outcome.payload["cost_cny"] > 0
-        assert outcome.prompt_versions == {"copy_revise": 1}
+        assert outcome.prompt_versions == {"copy_revise": 2}
         assert provider.calls == 1
 
     @pytest.mark.asyncio
@@ -740,7 +744,7 @@ class TestRevisePaths:
         assert outcome.payload["refused"] is True
         assert "肖像" in outcome.payload["reason"]
         assert "revised" not in outcome.payload
-        assert outcome.prompt_versions == {"copy_revise": 1}
+        assert outcome.prompt_versions == {"copy_revise": 2}
 
     @pytest.mark.asyncio
     async def test_missing_run_is_reported(

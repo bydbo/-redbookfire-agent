@@ -1,8 +1,8 @@
 # copy_draft · 文案初稿
 
-<!-- prompt-version: v1 -->
+<!-- prompt-version: v2 -->
 <!-- task-id: copy_draft -->
-<!-- requires: hotspot_raw, clue_json, material_json, style -->
+<!-- requires: hotspot_raw, clue_json, material_json, style, constraints_json -->
 
 ## 01 System
 
@@ -18,6 +18,11 @@
 - 热点线索（JSON）：{{clue_json}}
 - 选中素材（JSON）：{{material_json}}
 - 期望风格：{{style}}
+- 本轮适用的事实约束（JSON 数组；可能为空）：{{constraints_json}}
+
+**约束优先**：`constraints_json` 是服务端按作用域筛过的、用户明确表达且有原文证据的要求
+（session 级全程适用；topic 级只对当前话题；artifact 级只对指定产物）。初稿必须同时满足
+其中每一条（例如"不要用感叹号""正文不超过 300 字"），不要自行放宽或删除约束。
 
 写作步骤：
 

@@ -53,6 +53,7 @@ from pathlib import Path
 from typing import Any, Protocol
 
 import httpx
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..agents.clue import TASK_ID as CLUE_TASK
@@ -61,9 +62,11 @@ from ..agents.revise import TASK_ID as REVISE_TASK
 from ..agents.revise import ReviseOutcome
 from ..agents.revise import revise_draft as revise_agent
 from ..config import AppConfig
+from ..core import context_rules
 from ..core import progress as progress_tool
 from ..core.errors import ApiError, BadRequestError, ConflictError
 from ..core.observations import record as record_observation
+from ..db.models import ChatArtifactVersion, ChatMessage
 from ..schemas import TYPE_LABELS, Element, HotspotClue, SchemaError
 from ..services import artifact_versions, context_state, image_cache
 from ..services.chat import latest_run_id, resolve_attachment
@@ -143,7 +146,22 @@ TOOLS: list[dict[str, Any]] = [
                 "evidence 里标了图号）。**只解析图片**：不检索素材、不写文案、不落库、不产生运行"
                 "记录。用户只丢图、想先看看图里是什么热点，或者你想先确认图片内容再决定下一步时用它。"
             ),
-            "parameters": {"type": "object", "properties": {}, "required": []},
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "force_reparse": {
+                        "type": "boolean",
+                        "description": "用户**明确要求重新解析**这张/这组图时传 true：真正再调用一次"
+                        "视觉模型并建立新的原始版本；留空则复用选定版本或有效缓存。",
+                    },
+                    "clue_version_id": {
+                        "type": "string",
+                        "description": "可选：要使用的已选定线索版本 id。只在用户明确指定某一版时传；"
+                        "留空使用当前选定版本。",
+                    },
+                },
+                "required": [],
+            },
         },
     },
     {
@@ -330,6 +348,9 @@ class ToolContext:
     turn_id: str = ""
     # v2 修复（E7CTX-07）：本轮来源用户消息（认领的 source_message_id）；空 = 未提供
     source_message_id: str = ""
+    # A04：随来源用户消息**持久化**的可信操作绑定（服务端校验过）；空 = 本轮没有绑定。
+    # 消费者只读这一份，不采信模型在工具参数里重新生成的绑定。
+    operation_binding: dict[str, Any] | None = None
     # v2 修复（E7CTX-15）：轮次上下文策略——模块只问策略，不自行读配置
     policy: Any = None
 
@@ -523,6 +544,33 @@ async def _clue_for(ctx: ToolContext, text: str) -> ClueRecord:
     return record
 
 
+async def _run_belongs_to_session(ctx: ToolContext, run_id: str) -> bool:
+    """run 是否属于当前会话（A04：跨会话引用一律当作不存在）。
+
+    归属以"会话里真实出现过的消息 run_id"为准（工具结果的 run_id 由 analyses 落消息时写入）；
+    离线 / 无会话上下文（session_id 为空）不做归属校验，保持旧测试路径可用。
+    """
+    if ctx.session is None or ctx.session_id is None:
+        return True
+    try:
+        run_uuid = uuid.UUID(str(run_id))
+    except (TypeError, ValueError):
+        return False
+    count = int(
+        (
+            await ctx.session.execute(
+                select(func.count())
+                .select_from(ChatMessage)
+                .where(
+                    ChatMessage.session_id == ctx.session_id,
+                    ChatMessage.run_id == run_uuid,
+                )
+            )
+        ).scalar_one()
+    )
+    return count > 0
+
+
 async def _resolve_run_id(ctx: ToolContext, raw: str) -> tuple[str, str]:
     """把 `run_id` 参数落成一个真 uuid；**不传就用本会话最近一次运行产出的 id**。
 
@@ -558,23 +606,75 @@ def _image_group(
     return group or list(ctx.recent_attachments or [])
 
 
+def _image_binding(
+    ctx: ToolContext, args: dict[str, Any]
+) -> tuple[bool, str, str]:
+    """解析图片入口的**可信绑定**（A04 / A08）：返回 `(force_reparse, clue_version_id, 冲突原因)`。
+
+    绑定来自来源用户消息（服务端已校验并持久化）；模型参数只能在其未给定时补充，
+    显式冲突（不同版本 / 强制重解析夹带旧版本）一律拒绝，不覆盖用户选择。
+    """
+    binding = dict(ctx.operation_binding or {})
+    operation = str(binding.get("operation") or "")
+    force = bool(args.get("force_reparse") or False)
+    clue = str(args.get("clue_version_id") or "")
+    if operation == "parse_clue_from_image":
+        force = force or bool(binding.get("force_reparse") or False)
+        bound = str(binding.get("clue_version_id") or "")
+        if clue and bound and clue != bound:
+            return force, clue, "artifact_version_mismatch"
+        clue = bound or clue
+    if force and clue:
+        return force, clue, "force_reparse_conflicts_with_version"
+    return force, clue, ""
+
+
+async def _constraints_for(
+    ctx: ToolContext, *, object_key: str = ""
+) -> list[dict[str, Any]]:
+    """本轮**适用事实快照**（A05）：同一份口径交给改稿 / 分析投递与 worker。
+
+    只含 session + 当前话题 + 服务端已验证对象（含本次操作的产物键）的生效事实；
+    失效事实、其他话题与其他对象的约束都不混入。没有会话上下文（离线）时返回空列表。
+    """
+    if ctx.session is None or ctx.session_id is None:
+        return []
+    stored = await context_state.load(ctx.session, ctx.session_id)
+    if stored is None:
+        return []
+    keys = set(context_rules.snapshot_object_keys(stored.snapshot))
+    if object_key:
+        keys.add(object_key)
+    facts = context_rules.applicable_facts(
+        stored.snapshot, topic_id=stored.topic_id, object_keys=keys
+    )
+    return context_rules.constraint_view(facts)
+
+
 async def _image_clue_for(
-    ctx: ToolContext, attachments: list[dict[str, Any]], *, force_reparse: bool = False
+    ctx: ToolContext,
+    attachments: list[dict[str, Any]],
+    *,
+    force_reparse: bool = False,
+    clue_version_id: str = "",
 ) -> ImageClueParse:
     """解析一组图片：选定编辑版 → 轮内 → 持久层 → 真实调用（v2 §2.5）。
 
     四层顺序与口径：
 
-    1. **选定编辑版**（E7CTX-12）：用户编辑 / 选择过的线索版本优先；命中旧视觉缓存不得
-       覆盖编辑版，也不因编辑而无故重跑视觉模型；
-    2. **轮内缓存**（既有安全能力，off 也保留）：命中前同样过附件校验（E7CTX-10）；
-    3. **持久层**（仅 enforce）：命中前校验归属与存在性；`force_reparse` 显式绕过轮内与
-       持久缓存；
-    4. **真实调用**：成功后登记首份原始 clue 版本并写缓存（写失败不阻断本次解析）。
+    1. **选定编辑版**（E7CTX-12 / A08）：显式选定或绑定版本优先于任何缓存；命中旧视觉缓存
+       不得覆盖编辑版，也不因编辑而无故重跑视觉模型。**没有显式选择时不拿对象 head 冒充
+       用户选择**——原始解析的复用走下一层 L1/L2 的完整身份与 TTL；
+    2. **轮内缓存**（既有安全能力，off 也保留）：键是内容身份，命中前同样过附件校验；
+    3. **持久层**（仅 enforce）：命中前校验归属与存在性；`force_reparse` 显式绕过轮内、
+       选定版与持久缓存，真正调用一次并建立**新的原始业务版本**；
+    4. **真实调用**：成功后登记原始 clue 版本并写缓存（写失败不阻断本次解析）。
     """
     policy = ctx.policy
     group = [item for item in attachments if item]
-    key = "|".join(str(item.get("path") or "") for item in group)
+    # 路径键只用于"无法计算内容身份"的离线兜底；生产路径用完整内容身份（见下），
+    # 同路径改写 / 图片顺序变化 / 模型或 prompt 版本变化都不会命中旧结果（A07）。
+    path_key = "|".join(str(item.get("path") or "") for item in group)
     enforce = policy is None or policy.enforce   # 离线路径按旧行为处理
 
     # ---- 附件内容身份（E7CTX-10：L1 命中前也要过校验）----
@@ -592,7 +692,30 @@ async def _image_clue_for(
             logger.warning("附件校验失败（删除 / 越界 / 内容变化）：%s", failures)
             attachments_valid = False
         else:
+            # A07：摘要 / 归属 / 存在性全部通过后才允许命中 L1；此前漏了这一行，
+            # 真实会话的有效图片被当成失效，每轮都新增一次视觉调用。
+            attachments_valid = True
             identity = image_cache.build_identity(ctx.cfg, digests)
+
+    # 轮内键 = 有序内容摘要 + 模型 / 参数 / prompt / schema 身份（A07）；
+    # 没有内容身份（离线 / 校验失败）时才退回路径键。
+    key = image_cache.cache_key(identity) if identity is not None else path_key
+
+    # ---- 选定编辑版优先（A08）：显式选择先于任何缓存 ----
+    group_digest_value = image_cache.group_digest(digests)
+    if identity is not None and not force_reparse and enforce and ctx.session_id is not None:
+        selected = await _selected_clue_parse(
+            ctx, group_digest_value, clue_version_id=clue_version_id
+        )
+        if selected is not None:
+            logger.info("使用用户选定 / 编辑的线索版本（不重跑视觉模型）")
+            ctx.cache.image_clues[key] = (selected, _prompt_version_of(selected))
+            _checkpoint(ctx, "image_parse", cost_cny=0.0, prompt_tokens=0,
+                        completion_tokens=0, usage_status="cached",
+                        cache_level="selected_edit",
+                        version_id=selected.version_id,
+                        prompt_versions=dict(selected.prompt_versions))
+            return selected
 
     cached = ctx.cache.image_clues.get(key) if key else None
     if cached is not None and not force_reparse:
@@ -624,18 +747,6 @@ async def _image_clue_for(
                         completion_tokens=0, usage_status="cached",
                         prompt_versions=dict(cached_result.prompt_versions))
             return cached_result
-
-    # ---- 选定编辑版优先（E7CTX-12）----
-    if identity is not None and not force_reparse and enforce and ctx.session_id is not None:
-        selected = await _selected_clue_parse(ctx, image_cache.group_digest(digests))
-        if selected is not None:
-            logger.info("使用用户选定 / 编辑的线索版本（不重跑视觉模型）")
-            ctx.cache.image_clues[key] = (selected, _prompt_version_of(selected))
-            _checkpoint(ctx, "image_parse", cost_cny=0.0, prompt_tokens=0,
-                        completion_tokens=0, usage_status="cached",
-                        cache_level="selected_edit",
-                        prompt_versions=dict(selected.prompt_versions))
-            return selected
 
     # ---- 持久层（仅 enforce；force_reparse 绕过）----
     lookup = None
@@ -696,26 +807,41 @@ async def _image_clue_for(
     else:
         parsed = await parse_image_clue_multi(ctx.cfg, images, http=ctx.http)
     version = _prompt_version_of(parsed)
+    stored_result: ChatArtifactVersion | None = None
+    if identity is not None and ctx.session_id is not None and enforce:
+        # A08：显式重解析建立**新的**原始业务版本；普通首次解析保持幂等（不重复建版本）。
+        stored_result = await _register_original_clue(
+            ctx, group_digest_value, parsed, force_reparse=force_reparse
+        )
+        parsed = replace(
+            parsed,
+            version_id=str(stored_result.id) if stored_result is not None else "",
+            version_no=int(stored_result.version_no or 0) if stored_result is not None else 0,
+        )
     if key:
         ctx.cache.image_clues[key] = (parsed, version)
     stored: bool | None = None
-    if identity is not None and ctx.session_id is not None and enforce:
-        await _register_original_clue(ctx, image_cache.group_digest(digests), parsed)
-        if policy is None or policy.persistent_cache:
-            stored = await image_cache.store(
-                ctx.session,
-                ctx.cfg,
-                session_id=ctx.session_id,
-                identity=identity,
-                payload={
-                    "clue": parsed.clue.to_dict(),
-                    "raw_text": parsed.raw_text,
-                    "prompt_versions": dict(parsed.prompt_versions),
-                },
-                turn_id=ctx.turn_id,
-                message_id=str((group[0] or {}).get("message_id") or ""),
-                order=len(group),
-            )
+    if (
+        identity is not None
+        and ctx.session_id is not None
+        and enforce
+        and (policy is None or policy.persistent_cache)
+    ):
+        stored = await image_cache.store(
+            ctx.session,
+            ctx.cfg,
+            session_id=ctx.session_id,
+            identity=identity,
+            payload={
+                "clue": parsed.clue.to_dict(),
+                "raw_text": parsed.raw_text,
+                "prompt_versions": dict(parsed.prompt_versions),
+            },
+            turn_id=ctx.turn_id,
+            message_id=str((group[0] or {}).get("message_id") or ""),
+            order=len(group),
+            force_rebuild=force_reparse,
+        )
     _checkpoint(
         ctx,
         "image_parse",
@@ -727,6 +853,7 @@ async def _image_clue_for(
         cache_level=(lookup.level if lookup else "none"),
         cache_store=("stored" if stored else "failed") if stored is not None else "off",
         force_reparse=force_reparse,
+        version_id=parsed.version_id,
     )
     if stored is not None:
         parsed = replace(
@@ -740,24 +867,66 @@ async def _image_clue_for(
 
 
 async def _selected_clue_parse(
-    ctx: ToolContext, group_digest_value: str
+    ctx: ToolContext, group_digest_value: str, *, clue_version_id: str = ""
 ) -> ImageClueParse | None:
-    """读取用户选定 / 编辑的线索版本（E7CTX-12）；没有就返回 None。"""
+    """读取用户**显式选定 / 编辑**的线索版本（E7CTX-12 / A08）；没有显式选择返回 None。
+
+    没有显式选择时**不读对象 head**——head 只能表示"最近一次成功解析"，不代表用户的
+    选择；原始解析复用由调用方走 L1 / 持久缓存的完整身份与 TTL。
+
+    显式版本（`object_refs` 里的选定引用或本轮绑定）必须存在、属于本会话、是同一对象键的
+    成功 clue 版本；无效 / 失踪时明确报错，不回落 head。
+    """
     if ctx.session is None or ctx.session_id is None:
         return None
-    head = await artifact_versions.head(
-        ctx.session, ctx.session_id, f"clue:images:{group_digest_value}"
-    )
-    if head is None or str(head.status) != "succeeded" or not isinstance(head.content, dict):
+    object_key = f"clue:images:{group_digest_value}"
+    chosen = str(clue_version_id or "")
+    if not chosen:
+        stored = await context_state.load(ctx.session, ctx.session_id)
+        if stored is not None:
+            for item in stored.snapshot.object_refs:
+                if str(item.get("object_key") or "") == object_key:
+                    chosen = str(item.get("version_id") or "")
+                    break
+    if not chosen:
         return None
+    try:
+        version_uuid = uuid.UUID(chosen)
+    except (TypeError, ValueError) as exc:
+        raise BadRequestError("选定的线索版本 id 不是合法 UUID") from exc
+    head = await artifact_versions.get_version(ctx.session, ctx.session_id, version_uuid)
+    if (
+        head is None
+        or str(head.object_key) != object_key
+        or str(head.object_type) != "clue"
+        or str(head.status) != "succeeded"
+        or not isinstance(head.content, dict)
+    ):
+        raise ConflictError(
+            "选定的线索版本不存在、已被替换或不属于这组图片，请重新选择",
+            {
+                "reason": "selected_clue_missing",
+                "object_key": object_key,
+                "version_id": chosen,
+                "retryable": False,
+            },
+        )
     raw_text = str(head.content.get("raw_text") or "").strip()
     clue_payload = head.content.get("clue")
     if not raw_text or not isinstance(clue_payload, dict):
-        return None
+        raise ConflictError(
+            "选定的线索版本内容不完整，无法复用，请重新解析或重新编辑",
+            {"reason": "artifact_version_mismatch", "version_id": chosen,
+             "retryable": False},
+        )
     try:
         clue = HotspotClue.from_dict(clue_payload, hotspot_raw=raw_text)
-    except SchemaError:
-        return None
+    except SchemaError as exc:
+        raise ConflictError(
+            f"选定的线索版本不符合契约：{exc}",
+            {"reason": "artifact_version_mismatch", "version_id": chosen,
+             "retryable": False},
+        ) from exc
     await record_observation(
         ctx.session,
         event_type="artifact_consumed",
@@ -773,7 +942,7 @@ async def _selected_clue_parse(
         },
         turn_id=ctx.turn_id,
         call_id=ctx.checkpoint_scope,
-        policy_version="selected_clue_v1",
+        policy_version="selected_clue_v2",
     )
     return ImageClueParse(
         raw_text=raw_text,
@@ -787,33 +956,61 @@ async def _selected_clue_parse(
         usage_status="cached",
         cache_status="hit",
         cache_level="selected_edit",
+        version_id=str(head.id),
+        version_no=int(head.version_no or 0),
     )
 
 
 async def _register_original_clue(
-    ctx: ToolContext, group_digest_value: str, parsed: ImageClueParse
-) -> None:
-    """把图片组的首份成功原始解析登记为该对象的原始 clue 版本（E7CTX-12，幂等）。"""
+    ctx: ToolContext,
+    group_digest_value: str,
+    parsed: ImageClueParse,
+    *,
+    force_reparse: bool = False,
+) -> ChatArtifactVersion | None:
+    """登记图片组的原始 clue 版本（E7CTX-12 / A08）。
+
+    - 首次解析：`ensure_initial` 幂等，已登记时原样返回（不重复建版本）；
+    - 显式重解析：`register_version` 每次建立新的成功版本（新 version_no、base=旧 head），
+      **不修改已选定的 object_refs**——普通后续任务仍消费用户选定的编辑版。
+    """
     if ctx.session is None or ctx.session_id is None:
-        return
+        return None
+    object_key = f"clue:images:{group_digest_value}"
+    content = {
+        "raw_text": parsed.raw_text,
+        "clue": parsed.clue.to_dict(),
+        "edited_fields": [],
+    }
     try:
-        await artifact_versions.ensure_initial(
+        if force_reparse:
+            return await artifact_versions.register_version(
+                ctx.session,
+                session_id=ctx.session_id,
+                object_key_value=object_key,
+                object_type="clue",
+                content=content,
+                source={
+                    "actor": "explicit_reparse",
+                    "turn_id": ctx.turn_id,
+                    "call_id": ctx.checkpoint_scope,
+                },
+                prompt_versions=dict(parsed.prompt_versions),
+            )
+        return await artifact_versions.ensure_initial(
             ctx.session,
             session_id=ctx.session_id,
-            object_key_value=f"clue:images:{group_digest_value}",
+            object_key_value=object_key,
             object_type="clue",
             run_id=None,
             position=None,
-            content={
-                "raw_text": parsed.raw_text,
-                "clue": parsed.clue.to_dict(),
-                "edited_fields": [],
-            },
+            content=content,
             source={"actor": "image_parse_original", "turn_id": ctx.turn_id},
             prompt_versions=dict(parsed.prompt_versions),
         )
     except ApiError as exc:  # 登记失败不阻断解析本身
         logger.warning("原始 clue 版本登记失败（不阻断解析）：%s", exc.message)
+        return None
 
 
 def _prompt_version_of(parsed: ImageClueParse) -> int:
@@ -899,9 +1096,19 @@ async def run_hotspot_analysis(
     image_status = ""
     if group:
         await progress("解析图片")
+        force_reparse, clue_version_id, binding_error = _image_binding(ctx, args)
+        if binding_error:
+            return ToolOutcome(
+                status="failed",
+                steps=steps,
+                payload={"reason": binding_error, "force_reparse": force_reparse,
+                         "clue_version_id": clue_version_id or None},
+                error="这一轮的操作绑定与要求的图片解析不一致，请重新选择后再试",
+            )
         try:
             parsed = await _image_clue_for(
-                ctx, group, force_reparse=bool(args.get("force_reparse"))
+                ctx, group, force_reparse=force_reparse,
+                clue_version_id=clue_version_id,
             )
         except (ApiError, LLMError, EmbeddingError) as exc:
             # R3（OBS-07）：视觉调用可能已发出、用量未知——如实计入未知，不填零
@@ -928,9 +1135,12 @@ async def run_hotspot_analysis(
 
     await progress("提交分析")
     clues: list[dict[str, Any] | None] = [clue]
+    # A05：分析投递把适用约束快照持久化到本次运行的请求数据，worker 撰稿读同一份
+    constraints = await _constraints_for(ctx)
     try:
         submission = await submit_analysis(
-            ctx.session, [text], topk=topk, clues=clues, enqueue=ctx.enqueue
+            ctx.session, [text], topk=topk, clues=clues,
+            context_constraints=constraints, enqueue=ctx.enqueue,
         )
     except ValueError as exc:  # 参数兜底（理论上前面已挡）
         return ToolOutcome(status="failed", steps=steps, error=str(exc))
@@ -1019,8 +1229,19 @@ async def parse_clue_from_image(
     _step(steps, "解析图片")
     if on_progress is not None:
         await on_progress("解析图片", 0, 0)
+    force_reparse, clue_version_id, binding_error = _image_binding(ctx, args)
+    if binding_error:
+        return ToolOutcome(
+            status="failed",
+            steps=steps,
+            payload={"reason": binding_error, "force_reparse": force_reparse,
+                     "clue_version_id": clue_version_id or None},
+            error="这一轮的操作绑定与要求的图片解析不一致，请重新选择后再试",
+        )
     try:
-        parsed = await _image_clue_for(ctx, group)
+        parsed = await _image_clue_for(
+            ctx, group, force_reparse=force_reparse, clue_version_id=clue_version_id
+        )
     except (ApiError, LLMError, EmbeddingError) as exc:
         return ToolOutcome(
             status="failed",
@@ -1037,6 +1258,12 @@ async def parse_clue_from_image(
         "completion_tokens": int(parsed.completion_tokens),
         # R5（E7OBS2-04）：视觉调用的来源口径随结果上卷（actual / estimated / cached）
         "usage_status": str(parsed.usage_status or "estimated"),
+        # A08：明确告知这次用的是哪一版（新解析 / 选定编辑版 / 缓存），前端据此展示与切换
+        "version_id": parsed.version_id or None,
+        "version_no": parsed.version_no or None,
+        "cache_status": parsed.cache_status or None,
+        "cache_level": parsed.cache_level or None,
+        "force_reparse": force_reparse,
     }
     return ToolOutcome(
         status="succeeded",
@@ -1149,6 +1376,14 @@ async def read_run(
     raw, invalid = await _resolve_run_id(ctx, str(args.get("run_id") or ""))
     if invalid:
         return ToolOutcome(status="failed", steps=steps, error=invalid)
+    # A04：直接工具入口同样验证归属——合法 UUID 不能读其他会话的产物
+    if not await _run_belongs_to_session(ctx, raw):
+        return ToolOutcome(
+            status="failed",
+            steps=steps,
+            payload={"reason": "run_not_in_session", "run_id": raw},
+            error="这次运行不属于当前会话，不能读取",
+        )
     _step(steps, "读取运行")
     detail = await load_run(ctx.session, uuid.UUID(raw))
     if detail is None:
@@ -1281,10 +1516,50 @@ async def revise_draft(
             else:
                 await on_progress(stage, done, total, update=update)
 
-    # 不传 run_id 就落到本会话最近一次运行——用户说「把刚才那版改得更口语一点」时才用得上
-    raw_run, invalid_run = await _resolve_run_id(ctx, str(args.get("run_id") or ""))
-    if invalid_run:
-        return ToolOutcome(status="failed", steps=steps, error=invalid_run)
+    # ---- A04：先读**来源用户消息里已持久化的可信绑定**，不从模型参数重新生成 ----
+    binding = dict(ctx.operation_binding or {})
+    bound_revise = str(binding.get("operation") or "") == "revise_draft"
+    bound_run = ""
+    bound_index = 0
+    bound_base = str(binding.get("base_version_id") or "") if bound_revise else ""
+    if bound_revise:
+        bound_object = str(binding.get("object_key") or "")
+        parts = bound_object.split(":")
+        if len(parts) != 3 or parts[0] != "draft" or not parts[1] or not parts[2].isdigit():
+            return ToolOutcome(
+                status="failed",
+                steps=steps,
+                payload={"reason": "artifact_version_mismatch",
+                         "object_key": bound_object or None},
+                error="这一轮绑定的对象不是某条热点的文案，无法改稿；请重新选择",
+            )
+        bound_run, bound_index = parts[1], int(parts[2])
+
+    def _bound_conflict(reason: str, error: str) -> ToolOutcome:
+        return ToolOutcome(
+            status="failed",
+            steps=steps,
+            payload={
+                "reason": reason,
+                "object_key": str(binding.get("object_key") or "") or None,
+                "bound_base_version_id": bound_base or None,
+                "requested_base_version_id": str(args.get("base_version_id") or "") or None,
+            },
+            error=error,
+        )
+
+    raw_arg_run = str(args.get("run_id") or "")
+    if bound_run:
+        if raw_arg_run and raw_arg_run != bound_run:
+            return _bound_conflict(
+                "artifact_version_mismatch",
+                "模型给出的运行与用户这一轮选定的对象不一致，已拒绝（不覆盖用户选择）",
+            )
+        raw_run = bound_run
+    else:
+        raw_run, invalid_run = await _resolve_run_id(ctx, raw_arg_run)
+        if invalid_run:
+            return ToolOutcome(status="failed", steps=steps, error=invalid_run)
     request = str(args.get("request") or "").strip()
     if not request:
         return ToolOutcome(
@@ -1299,7 +1574,14 @@ async def revise_draft(
             error=f"修改要求超过 {MAX_REQUEST_CHARS} 字，请让用户说得再短一点",
         )
     raw_index = args.get("hotspot_index")
-    if raw_index is None or raw_index == "":
+    if bound_index:
+        if raw_index not in (None, "") and str(raw_index) != str(bound_index):
+            return _bound_conflict(
+                "artifact_version_mismatch",
+                "模型给出的热点序号与用户这一轮选定的对象不一致，已拒绝",
+            )
+        index = bound_index
+    elif raw_index is None or raw_index == "":
         index = 1  # 不传就是第一条；0 是非法值，不能顺手当默认
     else:
         try:
@@ -1323,6 +1605,14 @@ async def revise_draft(
             status="failed",
             steps=steps,
             error=f"找不到这次运行（run_id：{raw_run}），请确认 id 是否正确",
+        )
+    # A04：直接工具入口也验证归属——UUID 合法不等于属于本会话，不能读别的会话产物。
+    if not await _run_belongs_to_session(ctx, raw_run):
+        return ToolOutcome(
+            status="failed",
+            steps=steps,
+            payload={"reason": "run_not_in_session", "run_id": raw_run},
+            error="这次运行不属于当前会话，不能改写它的文案",
         )
     if str(detail.get("status")) != "succeeded":
         return ToolOutcome(
@@ -1387,6 +1677,14 @@ async def revise_draft(
 
         base = initial
         raw_base = str(args.get("base_version_id") or "").strip()
+        if bound_base:
+            # A04：用户这一轮明确选定的基础版优先；模型显式给不同版本 → 拒绝，不覆盖选择
+            if raw_base and raw_base != bound_base:
+                return _bound_conflict(
+                    "artifact_version_mismatch",
+                    "模型给出的基础版本与用户这一轮选定的版本不一致，已拒绝",
+                )
+            raw_base = bound_base
         if raw_base:
             try:
                 requested = await artifact_versions.get_version(
@@ -1402,10 +1700,16 @@ async def revise_draft(
                 return ToolOutcome(
                     status="failed",
                     steps=steps,
-                    payload={"object_key": key, "base_version_id": raw_base},
+                    payload={"object_key": key, "base_version_id": raw_base,
+                             "reason": "artifact_version_mismatch"},
                     error="指定的基础版本不属于这条热点的文案（或不是成功版本），请重新选择",
                 )
             base = requested
+        elif bound_revise:
+            # 绑定只给了对象、没指定版本：用该对象最近成功版（服务端已验证的当前选择）
+            head = await artifact_versions.head(session_obj, session_uuid, key)
+            if head is not None:
+                base = head
         else:
             head = await artifact_versions.head(session_obj, session_uuid, key)
             if head is not None:
@@ -1532,6 +1836,8 @@ async def revise_draft(
 
     candidates = item.get("candidates") or []
     material = dict(candidates[0].get("material") or {}) if candidates else None
+    # A05：适用约束快照进入真正的改稿请求（不是只在 supervisor 里提示）
+    constraints = await _constraints_for(ctx, object_key=key)
     await progress("改写文案")
     before = len(ctx.caller.records)
     try:
@@ -1541,6 +1847,7 @@ async def revise_draft(
             draft=dict(base_draft),
             request=request,
             caller=ctx.caller,
+            constraints=constraints,
         )
     except (ApiError, LLMError, SchemaError) as exc:
         if claim is not None:

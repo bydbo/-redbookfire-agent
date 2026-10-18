@@ -23,11 +23,11 @@ import logging
 import uuid
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import UTC, datetime
 from types import SimpleNamespace
 from typing import Any, cast
 
-from sqlalchemy import CursorResult, func, select, update
+from sqlalchemy import CursorResult, func, select, tuple_, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..config import AppConfig
@@ -118,10 +118,12 @@ async def load(session: AsyncSession, session_id: uuid.UUID) -> StoredContext | 
         return None
     snapshot = _parse_snapshot(row)
     raw_state = dict(row.context_state or {})
-    recovery = dict(raw_state.get("recovery") or {})
+    # A01：恢复结构按"显式维护起点"判定——新会话在创建 / 首条用户消息事务里写入
+    # recovery，不能被"有用户消息且无 recovery"的旧口径覆盖；坏字段降级 pending，不假定完整。
+    recovery = context_rules.recovery_of(raw_state)
     if not recovery:
-        # E7CTX-05：区分新空会话与未恢复的旧会话——已有用户历史却没有恢复记录时
-        # 判为 pending，不能因事实列表为空返回"完整但零事实"。
+        # 兼容旧数据：已有用户历史却没有恢复记录 → pending（不能因事实列表为空返回完整）；
+        # 尚无用户消息 → 没有需要恢复的历史，按新会话 complete 处理。
         user_messages = int(
             (
                 await session.execute(
@@ -133,17 +135,18 @@ async def load(session: AsyncSession, session_id: uuid.UUID) -> StoredContext | 
             ).scalar_one()
         )
         recovery = (
-            {"status": "pending", "reason": "legacy_unrecovered"}
+            context_rules.new_recovery(status="pending", reason="legacy_unrecovered")
             if user_messages > 0
-            else {"status": "complete", "reason": "new_session"}
+            else context_rules.new_recovery(reason="new_session")
         )
+    recovery_status = "complete" if str(recovery.get("status")) == "complete" else "partial"
     return StoredContext(
         session_id=session_id,
         state_version=int(row.state_version or 0),
         topic_id=row.topic_id,
         snapshot=snapshot,
         artifact_heads=dict(row.artifact_heads or {}),
-        recovery_status=str(row.recovery_status or "complete"),
+        recovery_status=recovery_status,
         recovery=recovery,
     )
 
@@ -414,6 +417,7 @@ async def perform_action(
         )
     new_version = stored.state_version + 1
     topic_id = stored.topic_id or context_rules.new_topic_id()
+    completed_recovery: dict[str, Any] | None = None
 
     if action == "select_object":
         validated = await _validate_object_ref(
@@ -425,9 +429,10 @@ async def perform_action(
             topic_id=topic_id, version=new_version,
         )
     elif action == "complete_recovery":
-        outcome = await _apply_complete_recovery(
+        outcome, completed_recovery = await _apply_complete_recovery(
             session, stored,
             acknowledge_partial_history=bool(acknowledge_partial_history),
+            recovery_id=recovery_id,
         )
         result = outcome
     else:
@@ -483,6 +488,9 @@ async def perform_action(
               ({"object_ref": object_ref} if object_ref else {}),
         reason=result.reason,
         turn_id="",
+        # A01：完成恢复必须与状态提交同事务写入新恢复结构（含缺口说明与用户核对证据），
+        # 不能只改旧 recovery_status 字段。
+        recovery=completed_recovery,
     )
     if applied.conflict:
         # 提交阶段 CAS 竞争：409（E7CTX-03），不能以 200 包装成普通无操作
@@ -601,6 +609,7 @@ async def _finish_action(
     expected_state_version: int | None = None,
     accounting_message_id: uuid.UUID | None = None,
     recovery_id: uuid.UUID | None = None,
+    commit: bool = True,
 ) -> ChatContextAction:
     row.status = status
     if result is not None:
@@ -614,7 +623,8 @@ async def _finish_action(
     if recovery_id is not None:
         row.recovery_id = recovery_id
     row.updated_at = _utcnow()
-    await session.commit()
+    if commit:
+        await session.commit()
     return row
 
 
@@ -622,6 +632,40 @@ def _utcnow() -> Any:
     from datetime import UTC, datetime
 
     return datetime.now(UTC)
+
+
+def _prompt_asset_version(task_id: str) -> int:
+    """prompt 资产的真实版本号（恢复账目消息用；资产缺失不阻断收尾）。"""
+    try:
+        return int(prompt_tool.load(task_id).version)
+    except Exception:  # noqa: BLE001 - 资产缺失时退回 v1，由账目如实标注
+        return 1
+
+
+async def _persist_recovery(
+    session: AsyncSession, stored: StoredContext, recovery: dict[str, Any]
+) -> None:
+    """只写恢复结构（不推进 `state_version`）：无操作结论 / 分页认领这类非状态变更。
+
+    读取当前快照后整份写回 `recovery` 键，保留并发写入的事实 / 提案；`recovery_status`
+    与恢复结构同事务更新，避免"结构说 pending、旧字段说 complete"。
+    """
+    raw = (
+        await session.execute(
+            select(ChatSession.context_state).where(
+                ChatSession.id == stored.session_id
+            )
+        )
+    ).scalar_one_or_none()
+    body = dict(raw or {})
+    body["recovery"] = dict(recovery)
+    status = "complete" if str(recovery.get("status")) == "complete" else "partial"
+    await session.execute(
+        update(ChatSession)
+        .where(ChatSession.id == stored.session_id)
+        .values(context_state=body, recovery_status=status)
+    )
+    await session.commit()
 
 
 def _action_result_view(
@@ -663,12 +707,17 @@ CLUE_EDITABLE_FIELDS = frozenset({
 async def validate_operation_binding(
     session: AsyncSession, session_id: uuid.UUID, raw: str | None
 ) -> dict[str, Any] | None:
-    """解析并校验 multipart 里的结构化操作绑定（v2 §3.3B）；无绑定时返回 None。
+    """解析并校验 multipart 里的结构化操作绑定（v2 §3.3B / A04）；无绑定时返回 None。
 
-    校验口径：`operation` 取 revise_draft / parse_clue_from_image / run_hotspot_analysis；
-    版本引用必须是 UUID；按操作拒绝不适用组合（改稿不能夹带重解析；force_reparse 不能
-    同时要求读取旧 clue 版本）；`expected_state_version` 与当前版本一致才受理
-    （接收时检查一次；本轮状态增量成功后认领使用服务端接受的新版本）。
+    严格解析（A04）：**拒绝未知字段、错误类型与不适用的组合**——绑定是用户选择的唯一
+    可信来源，不能靠宽松解析"猜"意图：
+    - `operation` ∈ revise_draft / parse_clue_from_image / run_hotspot_analysis；
+    - `force_reparse` 必须是 JSON 布尔；`expected_state_version` 必须是整数；
+    - 版本引用必须是 UUID；
+    - 改稿不能夹带 `force_reparse` / `clue_version_id`；解析图片不能带 `base_version_id`；
+      `force_reparse` 与 `clue_version_id` 互斥（重解析不能同时要求读旧版本）。
+    `expected_state_version` 与当前版本一致才受理（接收时检查一次；本轮状态增量成功后
+    认领使用服务端接受的新版本）。
     """
     if not raw:
         return None
@@ -678,16 +727,37 @@ async def validate_operation_binding(
         raise BadRequestError("operation_binding 不是合法 JSON") from exc
     if not isinstance(body, dict):
         raise BadRequestError("operation_binding 必须是 JSON 对象")
+    allowed = {
+        "operation", "object_key", "base_version_id", "clue_version_id",
+        "expected_state_version", "force_reparse",
+    }
+    unknown = sorted(set(body) - allowed)
+    if unknown:
+        raise BadRequestError(f"operation_binding 含未知字段：{unknown}")
     operation = str(body.get("operation") or "")
     if operation not in ("revise_draft", "parse_clue_from_image", "run_hotspot_analysis"):
         raise BadRequestError(f"不支持的绑定操作：{operation}")
-    force_reparse = bool(body.get("force_reparse") or False)
+    force_raw = body.get("force_reparse", False)
+    if not isinstance(force_raw, bool):
+        raise BadRequestError("force_reparse 必须是布尔值")
+    force_reparse = force_raw
+    for name in ("clue_version_id", "base_version_id", "object_key"):
+        if name in body and not isinstance(body[name], str):
+            raise BadRequestError(f"{name} 必须是字符串")
     clue_version_id = str(body.get("clue_version_id") or "")
     base_version_id = str(body.get("base_version_id") or "")
     object_key = str(body.get("object_key") or "")
     expected = body.get("expected_state_version")
-    if operation == "revise_draft" and force_reparse:
-        raise BadRequestError("改稿绑定不能夹带 force_reparse")
+    if isinstance(expected, bool) or not isinstance(expected, int):
+        raise BadRequestError("绑定必须携带整数 expected_state_version")
+    if operation == "revise_draft":
+        if force_reparse:
+            raise BadRequestError("改稿绑定不能夹带 force_reparse")
+        if clue_version_id:
+            raise BadRequestError("改稿绑定不能携带 clue_version_id")
+    else:
+        if base_version_id:
+            raise BadRequestError(f"{operation} 绑定不能携带 base_version_id")
     if force_reparse and clue_version_id:
         raise BadRequestError("force_reparse 不能同时要求读取旧 clue 版本")
     for name, value in (("base_version_id", base_version_id),
@@ -697,8 +767,6 @@ async def validate_operation_binding(
                 uuid.UUID(value)
             except ValueError as exc:
                 raise BadRequestError(f"{name} 不是合法 UUID") from exc
-    if expected is None:
-        raise BadRequestError("绑定必须携带 expected_state_version")
     stored = await load(session, session_id)
     if stored is None:
         raise NotFoundError(f"会话不存在：{session_id}", {"session_id": str(session_id)})
@@ -708,8 +776,15 @@ async def validate_operation_binding(
             {"reason": "state_version_conflict", "state_version": stored.state_version,
              "retryable": True},
         )
-    if object_key and object_key.startswith("draft:"):
-        await _validate_object_ref(session, session_id, {"object_key": object_key})
+    if object_key:
+        if object_key.startswith("draft:"):
+            await _validate_object_ref(session, session_id, {"object_key": object_key})
+        elif object_key.startswith("clue:"):
+            pass
+        else:
+            raise BadRequestError(f"不支持的对象键：{object_key}")
+    if operation == "revise_draft" and not object_key.startswith("draft:"):
+        raise BadRequestError("改稿绑定必须携带 draft:<run_id>:<position> 对象键")
     binding = {**body, "expected_state_version": int(expected)}
     return binding
 
@@ -818,6 +893,9 @@ async def edit_clue_version(
             },
             usage={},
             expected_state_version=int(expected_state_version),
+            # A02：不自行提交——版本 / head / 选定引用 / state_version / 审计 / 动作终态
+            # 由下面同一个事务一次提交，避免"head 已是 v2、state_version 仍 0"的半提交。
+            commit=False,
         )
     except ConflictError:
         await artifact_versions.finish(session, artifact_claim.row, status="failed",
@@ -842,20 +920,30 @@ async def edit_clue_version(
                     "reason": "clue_edit"}],
         delta={"object_key": object_key, "version_id": str(committed.id)},
         reason="clue_edit", turn_id="",
+        commit=False,
     )
     if applied.conflict:
+        # A02：整批已回滚（版本 / head / 选定引用 / 状态都没有半提交）；
+        # 认领行标失败，下一次显式重试按新 action_id 继续。
+        await _finish_action(
+            session, claim.row, status="failed",
+            error={"reason": "state_version_conflict", "retryable": True},
+        )
         raise ConflictError(
             "状态版本已变化，选定引用未写入",
             {"reason": "state_version_conflict", "state_version": applied.version,
              "retryable": True},
         )
-    final = await load(session, session_id)
-    assert final is not None
     row = await _finish_action(
         session, claim.row, status="succeeded",
         result={"decision": "applied", "version_id": str(committed.id)},
         expected_state_version=int(expected_state_version),
+        commit=False,
     )
+    # 一个事务结束：版本内容、head、选定引用、state_version、审计与动作终态同时可见
+    await session.commit()
+    final = await load(session, session_id)
+    assert final is not None
     view = _action_result_view(
         session_id=session_id, stored=final, action="edit_clue",
         action_id=resolved_action_id, row=row,
@@ -924,20 +1012,28 @@ async def select_clue_version(
                     "reason": "clue_select"}],
         delta={"object_key": str(row.object_key), "version_id": str(row.id)},
         reason="clue_select", turn_id="",
+        commit=False,
     )
     if applied.conflict:
+        await _finish_action(
+            session, claim.row, status="failed",
+            error={"reason": "state_version_conflict", "retryable": True},
+        )
         raise ConflictError(
             "状态版本已变化，请刷新后重试",
             {"reason": "state_version_conflict", "state_version": applied.version,
              "retryable": True},
         )
-    final = await load(session, session_id)
-    assert final is not None
     finished = await _finish_action(
         session, claim.row, status="succeeded",
         result={"decision": "applied", "version_id": str(row.id)},
         expected_state_version=int(expected_state_version),
+        commit=False,
     )
+    # A02：选定引用、状态版本、审计与动作终态同一事务提交
+    await session.commit()
+    final = await load(session, session_id)
+    assert final is not None
     view = _action_result_view(
         session_id=session_id, stored=final, action="select_clue",
         action_id=resolved_action_id, row=finished,
@@ -1010,51 +1106,102 @@ async def _run_recovery_action(
     retry_of: str | None,
     expected_state_version: int,
 ) -> dict[str, Any]:
-    """恢复一页（v2 §3.5）：显式触发、每请求最多 20 条完整用户消息、候选全部待确认。
+    """恢复一页（A03 / v2 §3.5）：显式触发、每页最多 20 条完整用户消息、候选全部待确认。
 
-    - 旧会话首次 recover：锁定历史上界（新增聊天不扩大本次范围）、记录恢复 id；
-    - 预算装不下整页 → 请求不发出、游标保持、报告 overflow；
-    - 候选验证失败 → 该页不推进，记录失败与消费；
-    - 已有 running 认领 / 失败页不自动重试付费调用（retry_of 显式重试除外）。
+    状态语义（A03 第 1 条）：
+
+    - `pending`：还有下一页、当前没有在飞动作；
+    - `running`：当前页已认领（已提交账目消息，模型调用进行中）；
+    - `awaiting_confirmation`：扫描完成，等待用户逐条确认候选 / 显式完成；
+    - `failed` / `interrupted`：失败或真实取消，游标不推进，须显式 `retry_of` 才重试；
+    - `complete`：只由用户在候选清零后显式确认（可带 `acknowledge_partial_history`）。
+
+    分页口径（A03 第 3 条）：`cursor < (created_at,id) <= cutoff` 的稳定元组扫描——同时间戳
+    按 id 不漏项；首次 recover 锁会话并固化上界，之后新增聊天不扩大本次范围；每页最多 20
+    条**完整**用户消息，装不下就保持游标，不裁短原文换放行。
     """
     stored = await load(session, session_id)
     if stored is None:
         raise NotFoundError(f"会话不存在：{session_id}", {"session_id": str(session_id)})
     recovery = dict(stored.recovery or {})
     status = str(recovery.get("status") or "pending")
+    recovery_value = str(recovery.get("recovery_id") or "")
+    now = _utcnow()
 
-    async def _finish(
+    async def _view(
         *, action_status: str, decision: str, reason: str,
         result_extra: dict[str, Any] | None = None,
+        refresh: bool = True,
     ) -> dict[str, Any]:
         row = await _finish_action(
             session, action_row, status=action_status,
-            result={"decision": decision, "reason": reason,
-                    **(result_extra or {})},
-            recovery_id=uuid.UUID(str(recovery.get("recovery_id")))
-            if recovery.get("recovery_id") else None,
+            result={"decision": decision, "reason": reason, **(result_extra or {})},
+            recovery_id=uuid.UUID(recovery_value) if recovery_value else None,
         )
+        current = await load(session, session_id) if refresh else stored
+        assert current is not None
         view = _action_result_view(
-            session_id=session_id, stored=stored, action="recover",
+            session_id=session_id, stored=current, action="recover",
             action_id=action_id, row=row,
         )
         view["reason"] = reason
+        view["recovery_status"] = str(
+            (current.recovery or {}).get("status") or "complete"
+        )
+        view["scanned_user_messages"] = int(
+            (current.recovery or {}).get("scanned_user_messages") or 0
+        )
+        view["total_user_messages"] = int(
+            (current.recovery or {}).get("total_user_messages") or 0
+        )
         return view
 
     if status == "complete":
-        return await _finish(action_status="succeeded", decision="noop",
-                             reason="recovery_complete")
+        return await _view(action_status="succeeded", decision="noop",
+                           reason="recovery_complete")
+    if status == "awaiting_confirmation":
+        # 扫描已完成：再点恢复不重复付费、也不自动完成
+        return await _view(action_status="succeeded", decision="noop",
+                           reason="awaiting_confirmation")
     if status == "running":
-        # 已有 running 认领：不自动重试付费页（§3.5 第 6 条）
-        return await _finish(action_status="interrupted", decision="noop",
-                             reason="recovery_running")
+        # 已有在飞认领：核实它是否真的还活着；失活才标 interrupted，绝不自动重发付费页
+        stale_after = max(1.0, float(cfg.chat.turn_stale_seconds))
+        claim_row = (
+            await session.execute(
+                select(ChatContextAction)
+                .where(
+                    ChatContextAction.session_id == session_id,
+                    ChatContextAction.status == "running",
+                )
+                .order_by(ChatContextAction.created_at.desc())
+                .limit(1)
+            )
+        ).scalar_one_or_none()
+        updated = getattr(claim_row, "updated_at", None) if claim_row else None
+        if updated is not None and updated.tzinfo is None:
+            updated = updated.replace(tzinfo=UTC)
+        alive = updated is not None and (now - updated).total_seconds() < stale_after
+        if not alive:
+            interrupted = {
+                **recovery,
+                "status": "interrupted",
+                "reason": "recovery_claim_stale",
+            }
+            await _persist_recovery(session, stored, interrupted)
+        return await _view(action_status="interrupted", decision="noop",
+                           reason="recovery_running")
     if status in ("failed", "interrupted") and not retry_of:
-        return await _finish(action_status="interrupted", decision="noop",
-                             reason="recovery_retry_required")
+        return await _view(action_status="interrupted", decision="noop",
+                           reason="recovery_retry_required")
 
-    # ---- 初始化或续扫 ----
-    upper_id = recovery.get("snapshot_last_message_id")
-    if not upper_id:
+    # ---- 首次 recover：锁会话、固化上界 (created_at,id) 与总量 ----
+    if not recovery_value:
+        lock = await _lock_session_row(session, session_id)
+        if lock is None:  # pragma: no cover - 刚读过
+            raise NotFoundError(f"会话不存在：{session_id}", {"session_id": str(session_id)})
+        stored = await load(session, session_id)
+        assert stored is not None
+        recovery = dict(stored.recovery or {})
         upper_row = (
             await session.execute(
                 select(ChatMessage)
@@ -1064,98 +1211,87 @@ async def _run_recovery_action(
             )
         ).scalar_one_or_none()
         if upper_row is None:
-            recovery = {**recovery, "status": "complete", "reason": "no_history"}
-            stored.recovery = recovery
-            row = await _finish_action(
-                session, action_row, status="succeeded",
-                result={"decision": "noop", "reason": "no_history"},
-                expected_state_version=int(expected_state_version),
-            )
-            return _action_result_view(
-                session_id=session_id, stored=stored, action="recover",
-                action_id=action_id, row=row,
-            )
-        total = int(
-            (
-                await session.execute(
-                    select(func.count())
-                    .select_from(ChatMessage)
-                    .where(ChatMessage.session_id == session_id,
-                           ChatMessage.role == "user",
-                           ChatMessage.created_at <= upper_row.created_at)
-                )
-            ).scalar_one()
+            no_history = {
+                **context_rules.new_recovery(
+                    status="complete", reason="no_history",
+                    baseline_created_at=str(recovery.get("baseline_created_at") or ""),
+                    baseline_message_id=str(recovery.get("baseline_message_id") or ""),
+                ),
+            }
+            await _persist_recovery(session, stored, no_history)
+            return await _view(action_status="succeeded", decision="noop",
+                               reason="no_history", refresh=True)
+        upper_key = (upper_row.created_at, upper_row.id)
+        total = await _count_user_messages(
+            session, session_id, upper_key[0], upper_key[1]
         )
         recovery = {
+            **recovery,
             "recovery_id": str(uuid.uuid4()),
-            "status": "running",
+            "status": "pending",
             "reason": str(recovery.get("reason") or "legacy_unrecovered"),
-            "snapshot_last_message_id": str(upper_row.id),
             "snapshot_last_created_at": upper_row.created_at.isoformat(),
+            "snapshot_last_message_id": str(upper_row.id),
             "cursor_created_at": None,
             "cursor_message_id": None,
             "scanned_user_messages": 0,
             "total_user_messages": total,
             "pending_proposal_ids": [],
             "accounting_message_id": None,
+            "gaps": list(recovery.get("gaps") or []),
+            "page_action_id": None,
         }
-    elif recovery_id and str(recovery.get("recovery_id") or "") not in ("", str(recovery_id)):
-        return await _finish(action_status="failed", decision="conflict",
-                             reason="recovery_id_mismatch")
+        recovery_value = str(recovery["recovery_id"])
+        stored.recovery = recovery
+        await _persist_recovery(session, stored, recovery)
+    else:
+        if not recovery_id:
+            raise BadRequestError("后续恢复页必须携带 recovery_id")
+        if str(recovery_id) != recovery_value:
+            raise ConflictError(
+                "recovery_id 与当前恢复不一致，请刷新后重试",
+                {"reason": "recovery_id_mismatch", "retryable": False,
+                 "recovery_id": recovery_value},
+            )
 
-    # ---- 取下一页（完整用户消息，禁止截断）----
-    cursor_created_at = recovery.get("cursor_created_at")
-    upper_created_at = recovery.get("snapshot_last_created_at")
-    page_statement = (
-        select(ChatMessage)
-        .where(
-            ChatMessage.session_id == session_id,
-            ChatMessage.role == "user",
-            ChatMessage.created_at
-            <= datetime.fromisoformat(str(upper_created_at)),
-        )
-        .order_by(ChatMessage.created_at.asc(), ChatMessage.id.asc())
-        .limit(RECOVERY_PAGE_SIZE + 1)
+    upper_created = datetime.fromisoformat(str(recovery["snapshot_last_created_at"]))
+    upper_id = uuid.UUID(str(recovery["snapshot_last_message_id"]))
+    cursor_created = recovery.get("cursor_created_at")
+    cursor_id = recovery.get("cursor_message_id")
+    total = int(recovery.get("total_user_messages") or 0)
+    scanned = int(recovery.get("scanned_user_messages") or 0)
+
+    # ---- 没有下一页：进入等待确认（不自动完成、不推进 state_version） ----
+    page_rows = await _recovery_page(
+        session, session_id,
+        upper_created=upper_created, upper_id=upper_id,
+        cursor_created=(
+            datetime.fromisoformat(str(cursor_created)) if cursor_created else None
+        ),
+        cursor_id=uuid.UUID(str(cursor_id)) if cursor_id else None,
     )
-    if cursor_created_at:
-        page_statement = page_statement.where(
-            ChatMessage.created_at > datetime.fromisoformat(str(cursor_created_at))
-        )
-    page_rows = list((await session.execute(page_statement)).scalars().all())
-    page_rows = page_rows[:RECOVERY_PAGE_SIZE]
-
-    if not page_rows:
-        recovery = {**recovery, "status": "awaiting_confirmation"}
-        applied = await _commit(
-            session, stored=stored, snapshot=stored.snapshot,
-            expected_version=stored.state_version,
-            new_version=stored.state_version + 1,
-            topic_id=stored.topic_id or context_rules.new_topic_id(),
-            event_type="recovery", actor="system",
-            source_ref={"action_id": str(action_id), "phase": "scan_done"},
-            decisions=[], delta={}, reason="awaiting_confirmation", turn_id="",
-            recovery=recovery,
-        )
-        row = await _finish_action(
-            session, action_row, status="succeeded",
-            result={"decision": "applied", "reason": "awaiting_confirmation"},
-            expected_state_version=applied.version,
-        )
-        return _action_result_view(
-            session_id=session_id, stored=stored, action="recover",
-            action_id=action_id, row=row,
+    if not page_rows or scanned >= total:
+        done = {
+            **recovery,
+            "status": "awaiting_confirmation",
+            "reason": "scan_done" if not recovery.get("gaps") else "scan_done_partial",
+            "page_action_id": None,
+        }
+        await _persist_recovery(session, stored, done)
+        return await _view(
+            action_status="succeeded", decision="noop",
+            reason="awaiting_confirmation",
+            result_extra={"scanned": scanned, "total": total},
         )
 
-    # ---- 预算检查：装不下整页就不发出（保持游标）----
-    page_text = "\n\n".join(
-        f"[消息 {row.id}] {row.content}" for row in page_rows
-    )
+    # ---- 本页预算：装不下整页就不发出（游标保持、状态保持 pending） ----
+    page_text = "\n\n".join(f"[消息 {row.id}] {row.content}" for row in page_rows)
     rendered = prompt_tool.render(
         RECOVERY_TASK_ID,
         page=_clip_for_prompt(page_text, limit=200_000),
         state=context_rules.render_state(stored.snapshot),
     )
-    decision = budget_tool.decide(
+    budget_decision = budget_tool.decide(
         messages=[
             {"role": "system", "content": rendered.system},
             {"role": "user", "content": rendered.user},
@@ -1167,19 +1303,15 @@ async def _run_recovery_action(
         mode="enforce",
         protected=("恢复页用户原文",),
     )
-    if not decision.allowed:
-        row = await _finish_action(
-            session, action_row, status="failed",
-            error={"reason": "budget_overflow", "retryable": False},
+    if not budget_decision.allowed:
+        return await _view(
+            action_status="failed", decision="noop",
+            reason="required_context_overflow",
+            result_extra={**budget_decision.as_event(), "scanned": scanned,
+                          "total": total},
         )
-        view = _action_result_view(
-            session_id=session_id, stored=stored, action="recover",
-            action_id=action_id, row=row,
-        )
-        view["reason"] = "budget_overflow"
-        return view
 
-    # ---- 账目消息：来源是用户动作，不新增虚假用户原文（§3.5 第 2 条）----
+    # ---- 认领本页：账目消息与 running 状态**先提交**，再调用模型 ----
     accounting = ChatMessage(
         session_id=session_id, role="assistant", status="running",
         content="", turn_id=uuid.uuid4(),
@@ -1187,35 +1319,52 @@ async def _run_recovery_action(
     session.add(accounting)
     await session.flush()
     accounting_id = uuid.UUID(str(accounting.id))
+    claimed = {
+        **recovery,
+        "status": "running",
+        "reason": "page_in_flight",
+        "accounting_message_id": str(accounting_id),
+        "page_action_id": str(action_id),
+    }
+    stored.recovery = claimed
+    await _persist_recovery(session, stored, claimed)
 
+    before_records = len(caller.records)
     try:
         delta, _result = await caller.call(
             RECOVERY_TASK_ID,
             rendered.system,
             rendered.user,
             parse=_parse_delta,
-            context={"recovery_id": str(recovery.get("recovery_id") or "")},
+            context={"recovery_id": recovery_value},
             json_mode=True,
             max_tokens=int(cfg.context.extract_max_tokens),
         )
-    except (LLMError, SchemaError, PromptError) as exc:
-        await update_message(session, accounting_id, status="failed",
-                             error=f"恢复失败：{type(exc).__name__}")
-        row = await _finish_action(
-            session, action_row, status="failed",
-            error={"reason": "recovery_model_failed", "retryable": True},
-            accounting_message_id=accounting_id,
-            recovery_id=uuid.UUID(str(recovery["recovery_id"]))
-            if recovery.get("recovery_id") else None,
+    except (LLMError, SchemaError, PromptError, budget_tool.BudgetError) as exc:
+        records = caller.records[before_records:]
+        tokens = _records_tokens(records)
+        await update_message(
+            session, accounting_id, status="failed",
+            prompt_tokens=tokens[0], completion_tokens=tokens[1],
+            error=f"恢复失败：{type(exc).__name__}",
+            prompt_versions={RECOVERY_TASK_ID: _prompt_asset_version(RECOVERY_TASK_ID)},
         )
-        view = _action_result_view(
-            session_id=session_id, stored=stored, action="recover",
-            action_id=action_id, row=row,
+        failed = {
+            **claimed,
+            "status": "failed",
+            "reason": (
+                "required_context_overflow"
+                if isinstance(exc, budget_tool.BudgetError) else "recovery_model_failed"
+            ),
+        }
+        await _persist_recovery(session, stored, failed)
+        return await _view(
+            action_status="failed", decision="noop",
+            reason=str(failed["reason"]),
+            result_extra={"scanned": scanned, "total": total},
         )
-        view["reason"] = "recovery_model_failed"
-        return view
 
-    # ---- 候选验证：证据必须落在本页某条真实用户消息里 ----
+    # ---- 候选逐条指向真实用户消息；任一不可验证 → 整页不推进（消费照记） ----
     page_bodies = {str(row.id): str(row.content) for row in page_rows}
     proposals: list[dict[str, Any]] = []
     rejected: list[dict[str, Any]] = []
@@ -1233,12 +1382,14 @@ async def _run_recovery_action(
             "kind": op.kind or "goal",
             "value": op.value,
             "scope": "session" if op.scope == "session" else "topic",
-            "scope_id": "" if op.scope == "session" else (stored.topic_id or ""),
+            "scope_id": "" if op.scope == "session" else str(stored.topic_id or ""),
             "reason": "recovered_candidate",
             "evidence": evidence,
-            "conflicts_with": [str(x) for x in (op.target_fact_id and [op.target_fact_id] or [])],
-            "operation": "add" if op.op == "add" else "replace",
-            "replaces_fact_ids": [str(op.target_fact_id)] if op.op == "replace" else [],
+            "conflicts_with": [],
+            "operation": "add",
+            "replaces_fact_ids": [],
+            "source_message_ids": [source],
+            "_source_message_id": source,
         })
     for raw in delta.proposals:
         evidence = str(raw.get("evidence") or "")
@@ -1251,116 +1402,225 @@ async def _run_recovery_action(
             rejected.append({"value": str(raw.get("value") or ""),
                              "reason": "evidence_invalid"})
             continue
-        proposals.append({**raw, "source_message_ids": [source]})
+        proposals.append({**raw, "reason": str(raw.get("reason") or "recovered_candidate"),
+                          "source_message_ids": [source],
+                          "_source_message_id": source})
 
-    if rejected and not proposals:
-        # 整页候选都不可验证：不推进游标，记录失败与消费
+    if rejected:
+        records = caller.records[before_records:]
+        tokens = _records_tokens(records)
         await update_message(
             session, accounting_id, status="failed",
-            prompt_tokens=int(caller.records[-1].get("prompt_tokens") or 0) if caller.records else 0,
-            completion_tokens=int(caller.records[-1].get("completion_tokens") or 0) if caller.records else 0,
-            error="恢复候选全部未通过验证",
+            prompt_tokens=tokens[0], completion_tokens=tokens[1],
+            error="恢复候选未全部通过验证，整页不推进",
+            prompt_versions={RECOVERY_TASK_ID: _prompt_asset_version(RECOVERY_TASK_ID)},
         )
-        row = await _finish_action(
-            session, action_row, status="failed",
-            error={"reason": "recovery_candidates_invalid", "retryable": True},
-            accounting_message_id=accounting_id,
-            recovery_id=uuid.UUID(str(recovery["recovery_id"]))
-            if recovery.get("recovery_id") else None,
+        failed = {
+            **claimed,
+            "status": "failed",
+            "reason": "recovery_candidates_invalid",
+            "rejected": rejected[:20],
+        }
+        await _persist_recovery(session, stored, failed)
+        return await _view(
+            action_status="failed", decision="failed_invalid_candidates",
+            reason="recovery_candidates_invalid",
+            result_extra={"scanned": scanned, "total": total,
+                          "rejected": len(rejected)},
         )
-        view = _action_result_view(
-            session_id=session_id, stored=stored, action="recover",
-            action_id=action_id, row=row,
-        )
-        view["reason"] = "recovery_candidates_invalid"
-        return view
 
-    # ---- 候选全部作为待确认提案落库（确认前不激活）----
-    delta_out = ContextDelta.from_dict({"operations": [], "proposals": proposals})
-    applied = await apply_delta(
-        session, cfg, stored, delta_out,
-        message_id=str(page_rows[0].id),
-        turn_id=str(accounting.turn_id),
-        user_text=page_text,
-        mode="enforce",
-        verify_source=True,
-    )
-    if applied.conflict or applied.applied is False and not applied.pending:
-        await update_message(session, accounting_id, status="failed",
-                             error="恢复候选落库失败")
-        row = await _finish_action(
-            session, action_row, status="failed",
-            error={"reason": applied.reason or "recovery_apply_failed",
-                   "retryable": True},
-            accounting_message_id=accounting_id,
-        )
-        view = _action_result_view(
-            session_id=session_id, stored=stored, action="recover",
-            action_id=action_id, row=row,
-        )
-        view["reason"] = applied.reason or "recovery_apply_failed"
-        return view
-
-    # 给恢复提案打上恢复来源（complete_recovery 时据此检查未确认候选）
+    # ---- 逐条以真实来源应用（纯函数，不在此提交），再一次性提交本页 ----
     latest = await load(session, session_id)
     assert latest is not None
-    snapshot = latest.snapshot
-    recovery_id_value = str(recovery.get("recovery_id") or "")
-    pending_ids: list[str] = []
-    for proposal in snapshot.proposals:
-        if str(proposal.reason or "") == "recovered_candidate":
-            proposal.source_ref = {
-                **proposal.source_ref,
-                "recovery_id": recovery_id_value,
-            }
-            pending_ids.append(proposal.proposal_id)
-    scanned = int(recovery.get("scanned_user_messages") or 0) + len(page_rows)
-    recovery = {
-        **recovery,
-        "status": "awaiting_confirmation"
-        if scanned >= int(recovery.get("total_user_messages") or 0)
-        else "running",
+    snapshot = latest.snapshot.model_copy(deep=True)
+    decisions: list[dict[str, Any]] = []
+    version = int(latest.state_version) + 1
+    for proposal in proposals:
+        source = str(proposal.pop("_source_message_id", "") or "")
+        body = ContextDelta.from_dict(
+            {"operations": [], "proposals": [{k: v for k, v in proposal.items()
+                                              if k != "source_message_ids"}]}
+        )
+        result = context_rules.apply_delta(
+            snapshot, body, user_text=page_bodies.get(source, page_text),
+            message_id=source or str(page_rows[0].id), version=version,
+            topic_id=str(latest.topic_id or context_rules.new_topic_id()),
+        )
+        if result.invalid:
+            rejected.append({"value": proposal.get("value", ""),
+                             "reason": result.invalid_reason or "invalid"})
+            continue
+        snapshot = result.snapshot
+        for item_decision in result.decisions:
+            decisions.append(item_decision)
+        for item in snapshot.proposals:
+            if item.proposal_id and not item.source_ref.get("message_id"):
+                item.source_ref = {"message_id": source or str(page_rows[0].id)}
+            if item.proposal_id and item.source_ref.get("message_id") == (
+                source or str(page_rows[0].id)
+            ):
+                item.source_ref = {**item.source_ref, "recovery_id": recovery_value}
+
+    if rejected:
+        await update_message(
+            session, accounting_id, status="failed",
+            error="恢复候选落库前校验失败，整页不推进",
+            prompt_versions={RECOVERY_TASK_ID: _prompt_asset_version(RECOVERY_TASK_ID)},
+        )
+        failed = {**claimed, "status": "failed",
+                  "reason": "recovery_candidates_invalid",
+                  "rejected": rejected[:20]}
+        await _persist_recovery(session, stored, failed)
+        return await _view(
+            action_status="failed", decision="noop",
+            reason="recovery_candidates_invalid",
+            result_extra={"scanned": scanned, "total": total},
+        )
+
+    scanned_now = scanned + len(page_rows)
+    pending_ids = [
+        item.proposal_id for item in snapshot.proposals
+        if str(item.reason or "") == "recovered_candidate"
+    ]
+    updated_recovery = {
+        **claimed,
+        "status": "awaiting_confirmation" if scanned_now >= total else "pending",
+        "reason": "page_scanned",
         "cursor_created_at": page_rows[-1].created_at.isoformat(),
         "cursor_message_id": str(page_rows[-1].id),
-        "scanned_user_messages": scanned,
+        "scanned_user_messages": scanned_now,
         "pending_proposal_ids": pending_ids,
         "accounting_message_id": str(accounting_id),
+        "page_action_id": None,
     }
-    await _commit(
+    records = caller.records[before_records:]
+    tokens = _records_tokens(records)
+    applied = await _commit(
         session, stored=latest, snapshot=snapshot,
         expected_version=latest.state_version,
         new_version=latest.state_version + 1,
         topic_id=latest.topic_id or context_rules.new_topic_id(),
         event_type="recovery", actor="system",
-        source_ref={"action_id": str(action_id), "phase": "page_scanned"},
-        decisions=applied.decisions,
+        source_ref={"action_id": str(action_id), "phase": "page_scanned",
+                    "recovery_id": recovery_value},
+        decisions=decisions,
         delta={"page_size": len(page_rows), "proposals": len(proposals),
                "rejected": rejected},
         reason="page_scanned", turn_id=str(accounting.turn_id),
-        recovery=recovery,
+        recovery=updated_recovery,
     )
+    if applied.conflict:
+        # CAS 竞争：候选未提交、游标不推进；本页认领标失败，下一次显式重试
+        await update_message(session, accounting_id, status="interrupted",
+                             error="状态版本竞争，本页未提交")
+        await _persist_recovery(
+            session, latest, {**claimed, "status": "interrupted",
+                              "reason": "state_version_conflict"}
+        )
+        return await _view(
+            action_status="failed", decision="conflict",
+            reason="state_version_conflict",
+            result_extra={"scanned": scanned, "total": total},
+        )
     await update_message(
         session, accounting_id, status="succeeded",
         content=f"[恢复] 扫描 {len(page_rows)} 条历史消息，新增 {len(proposals)} 条待确认候选",
-        prompt_tokens=int(caller.records[-1].get("prompt_tokens") or 0) if caller.records else 0,
-        completion_tokens=int(caller.records[-1].get("completion_tokens") or 0) if caller.records else 0,
+        prompt_tokens=tokens[0], completion_tokens=tokens[1],
+        prompt_versions={RECOVERY_TASK_ID: _prompt_asset_version(RECOVERY_TASK_ID)},
     )
     final = await load(session, session_id)
     assert final is not None
     row = await _finish_action(
         session, action_row, status="succeeded",
         result={"decision": "applied", "proposals": len(proposals),
-                "scanned": scanned, "rejected": len(rejected)},
+                "scanned": scanned_now, "rejected": len(rejected),
+                "recovery_status": updated_recovery["status"]},
         expected_state_version=int(expected_state_version),
         accounting_message_id=accounting_id,
-        recovery_id=uuid.UUID(recovery_id_value) if recovery_id_value else None,
+        recovery_id=uuid.UUID(recovery_value),
     )
     view = _action_result_view(
         session_id=session_id, stored=final, action="recover",
         action_id=action_id, row=row,
     )
     view["proposals"] = len(proposals)
+    view["recovery_status"] = str(updated_recovery["status"])
+    view["scanned_user_messages"] = scanned_now
+    view["total_user_messages"] = total
     return view
+
+
+async def _count_user_messages(
+    session: AsyncSession,
+    session_id: uuid.UUID,
+    upper_created: Any,
+    upper_id: uuid.UUID,
+) -> int:
+    """上界（含）之前的完整用户消息数（A03：元组比较，同时间戳不漏不重）。"""
+    return int(
+        (
+            await session.execute(
+                select(func.count())
+                .select_from(ChatMessage)
+                .where(
+                    ChatMessage.session_id == session_id,
+                    ChatMessage.role == "user",
+                    tuple_(ChatMessage.created_at, ChatMessage.id)
+                    <= (upper_created, upper_id),
+                )
+            )
+        ).scalar_one()
+    )
+
+
+async def _recovery_page(
+    session: AsyncSession,
+    session_id: uuid.UUID,
+    *,
+    upper_created: Any,
+    upper_id: uuid.UUID,
+    cursor_created: Any | None,
+    cursor_id: uuid.UUID | None,
+) -> list[ChatMessage]:
+    """取下一页（最多 `RECOVERY_PAGE_SIZE` 条完整用户消息）。
+
+    稳定扫描：`cursor < (created_at,id) <= upper`；新增聊天不会扩大上界。多取的 1 条只用于
+    判断"是否还有下一页"，不进入本页、也不裁短原文。
+    """
+    statement = select(ChatMessage).where(
+        ChatMessage.session_id == session_id,
+        ChatMessage.role == "user",
+        tuple_(ChatMessage.created_at, ChatMessage.id)
+        <= (upper_created, upper_id),
+    )
+    if cursor_created is not None and cursor_id is not None:
+        statement = statement.where(
+            tuple_(ChatMessage.created_at, ChatMessage.id)
+            > (cursor_created, cursor_id)
+        )
+    statement = statement.order_by(
+        ChatMessage.created_at.asc(), ChatMessage.id.asc()
+    ).limit(RECOVERY_PAGE_SIZE + 1)
+    rows = list((await session.execute(statement)).scalars().all())
+    return rows[:RECOVERY_PAGE_SIZE]
+
+
+def _records_tokens(records: list[dict[str, Any]]) -> tuple[int, int]:
+    """本页全部 caller 记录合计 tokens（A03 第 7 条：不只看最后一条）。"""
+    return (
+        sum(int(item.get("prompt_tokens") or 0) for item in records),
+        sum(int(item.get("completion_tokens") or 0) for item in records),
+    )
+
+
+async def _lock_session_row(
+    session: AsyncSession, session_id: uuid.UUID
+) -> ChatSession | None:
+    return (
+        await session.execute(
+            select(ChatSession).where(ChatSession.id == session_id).with_for_update()
+        )
+    ).scalar_one_or_none()
 
 
 async def _apply_complete_recovery(
@@ -1368,14 +1628,33 @@ async def _apply_complete_recovery(
     stored: StoredContext,
     *,
     acknowledge_partial_history: bool,
-) -> context_rules.ActionResult:
-    """完成恢复（v2 §3.5 第 8 条）：候选清零、缺口须显式确认，之后代表"用户已核对"。"""
+    recovery_id: str | None = None,
+) -> tuple[context_rules.ActionResult, dict[str, Any] | None]:
+    """完成恢复（v2 §3.5 第 8 条）：候选清零、缺口须显式确认，之后代表"用户已核对"。
+
+    返回 `(动作结果, 新的恢复结构)`；没有恢复结构要写时第二项为 None（无操作）。
+    """
     recovery = dict(stored.recovery or {})
     if str(recovery.get("status") or "") == "complete":
-        return context_rules.ActionResult(
-            snapshot=stored.snapshot, decision="noop", reason="recovery_complete",
+        return (
+            context_rules.ActionResult(
+                snapshot=stored.snapshot, decision="noop", reason="recovery_complete",
+            ),
+            None,
         )
     recovery_id_value = str(recovery.get("recovery_id") or "")
+    if str(recovery.get("status") or "") in ("pending", "running"):
+        raise ConflictError(
+            "历史还没有扫描完成，请先把剩余页扫描完再完成恢复",
+            {"reason": "recovery_incomplete", "retryable": True,
+             "status": str(recovery.get("status") or "")},
+        )
+    if recovery_id and recovery_id_value and str(recovery_id) != recovery_id_value:
+        raise ConflictError(
+            "recovery_id 与当前恢复不一致，请刷新后重试",
+            {"reason": "recovery_id_mismatch", "retryable": False,
+             "recovery_id": recovery_id_value},
+        )
     pending = [
         p for p in stored.snapshot.proposals
         if not recovery_id_value
@@ -1390,20 +1669,45 @@ async def _apply_complete_recovery(
         )
     scanned = int(recovery.get("scanned_user_messages") or 0)
     total = int(recovery.get("total_user_messages") or 0)
-    has_gap = total == 0 or scanned < total or bool(recovery.get("gaps"))
+    has_gap = (
+        str(recovery.get("status") or "") in ("failed", "interrupted")
+        or total == 0
+        or scanned < total
+        or bool(recovery.get("gaps"))
+    )
     if has_gap and not acknowledge_partial_history:
         raise ConflictError(
             "历史存在未扫描缺口，确认已核对当前要求后才能完成恢复",
             {"reason": "acknowledge_required", "retryable": False,
              "scanned_user_messages": scanned, "total_user_messages": total},
         )
+    gaps = [dict(item) for item in (recovery.get("gaps") or []) if isinstance(item, dict)]
+    if has_gap and acknowledge_partial_history:
+        gaps.append(
+            {
+                "reason": "user_acknowledged_partial",
+                "scanned_user_messages": scanned,
+                "total_user_messages": total,
+            }
+        )
     snapshot = stored.snapshot.model_copy(deep=True)
     snapshot.recovery_status = "complete"
-    return context_rules.ActionResult(
-        snapshot=snapshot,
-        decision="applied",
-        reason="partial_acknowledged" if has_gap else "complete",
-        event_type="complete_recovery",
+    completed = {
+        **recovery,
+        "status": "complete",
+        "reason": "partial_acknowledged" if has_gap else "complete",
+        "gaps": gaps,
+        # 完整只表示"已核对当前要求"，不冒充原始历史全部可恢复
+        "acknowledged_partial_history": bool(has_gap),
+    }
+    return (
+        context_rules.ActionResult(
+            snapshot=snapshot,
+            decision="applied",
+            reason="partial_acknowledged" if has_gap else "complete",
+            event_type="complete_recovery",
+        ),
+        completed,
     )
 
 
@@ -1425,13 +1729,29 @@ async def _commit(
     pending: int = 0,
     blocking: int = 0,
     recovery: dict[str, Any] | None = None,
+    commit: bool = True,
 ) -> ApplyResult:
-    """条件更新快照 + 写审计（同一事务）；失败不留半个状态。"""
+    """条件更新快照 + 写审计（同一事务）；失败不留半个状态。
+
+    A01：`recovery` 缺省**原样继承**已保存的恢复结构——delta / 用户动作 / 话题切换 / 版本
+    选择都不能把恢复进度重置；只有显式恢复动作传入新结构才改变它。旧 `recovery_status`
+    与恢复结构同事务更新，读回时两者一致。
+    """
     snapshot.state_version = new_version
     snapshot.topic_id = topic_id
     context_state_body = snapshot.to_dict()
-    if recovery is not None:
-        context_state_body["recovery"] = recovery
+    effective_recovery = (
+        dict(recovery) if recovery is not None else dict(stored.recovery or {})
+    )
+    if not effective_recovery:
+        # 没有任何覆盖证据时保持 pending（不把"缺字段"当完整）
+        effective_recovery = context_rules.new_recovery(
+            status="pending", reason="recovery_missing"
+        )
+    context_state_body["recovery"] = effective_recovery
+    recovery_status = (
+        "complete" if str(effective_recovery.get("status")) == "complete" else "partial"
+    )
     statement = (
         update(ChatSession)
         .where(ChatSession.id == stored.session_id,
@@ -1440,7 +1760,7 @@ async def _commit(
             state_version=int(new_version),
             topic_id=topic_id,
             context_state=context_state_body,
-            recovery_status=snapshot.recovery_status,
+            recovery_status=recovery_status,
         )
     )
     cursor = cast(CursorResult[Any], await session.execute(statement))
@@ -1472,11 +1792,13 @@ async def _commit(
         )
     )
     try:
-        await session.commit()
+        if commit:
+            await session.commit()
     except Exception:
         await session.rollback()
         raise
-    await _observe_decision(
+    if commit:
+        await _observe_decision(
         session,
         stored=stored,
         event_type=event_type,
@@ -1654,6 +1976,8 @@ def context_view(
         "status": str(recovery.get("status") or "complete"),
         "recovery_id": str(recovery.get("recovery_id") or "") or None,
         "reason": str(recovery.get("reason") or ""),
+        "baseline_created_at": str(recovery.get("baseline_created_at") or "") or None,
+        "baseline_message_id": str(recovery.get("baseline_message_id") or "") or None,
         "snapshot_last_message_id": str(recovery.get("snapshot_last_message_id") or "") or None,
         "cursor_message_id": str(recovery.get("cursor_message_id") or "") or None,
         "scanned_user_messages": int(recovery.get("scanned_user_messages") or 0),
@@ -1684,14 +2008,28 @@ def context_view(
 
 
 def state_prompt(stored: StoredContext) -> str:
-    """装配给 supervisor 的状态段（E7CTX-02：**全部**适用生效事实，不截断；装不下时由
-    完整预算检查明确报 required_context_overflow，不静默丢约束）。"""
-    lines = ["[当前状态] 用户明确表达、且已有原文证据的要求："]
-    for fact in stored.snapshot.active():
+    """装配给 supervisor 的状态段（E7CTX-02 / A05）。
+
+    **只装真正适用的事实**：session 一直适用、topic 只取当前话题、artifact 只取服务端已
+    验证的对象；失效事实排除，未解析对象不能激活产物约束。装不下时由完整预算检查明确报
+    `required_context_overflow`，不静默丢约束、也不混入无关话题 / 其他对象的要求。
+    """
+    applicable = context_rules.applicable_facts(
+        stored.snapshot,
+        topic_id=stored.topic_id,
+        object_keys=context_rules.snapshot_object_keys(stored.snapshot),
+    )
+    lines = ["[当前状态] 用户明确表达、且已有原文证据的要求（只含本轮适用项）："]
+    for fact in applicable:
         scope = "整个会话" if fact.scope == "session" else (
-            f"当前话题（{fact.scope_id}）" if fact.scope == "topic" else f"产物 {fact.scope_id}"
+            f"当前话题（{fact.scope_id}）" if fact.scope == "topic"
+            else f"产物 {fact.scope_id}"
         )
-        lines.append(f"- {fact.kind}：{fact.value}（作用域：{scope}）")
+        source = str(fact.source_ref.get("message_id") or fact.source_ref.get("action_id") or "")
+        lines.append(
+            f"- {fact.kind}：{fact.value}（作用域：{scope}；事实 {fact.fact_id}"
+            f"{'；来源消息 ' + source if source else ''}）"
+        )
     proposals = stored.snapshot.pending()
     if proposals:
         lines.append("[待确认] 以下要求尚未生效，不要按它执行：")

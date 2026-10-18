@@ -647,7 +647,10 @@ async def run_turn(
     # 账目与"部分记录"来自统一投影，保证四条收尾路径口径一致。
     tool_calls = list(final.get("tool_calls") or [])
     projected = ledger_projection.project(ledger)
-    versions = dict(final.get("prompt_versions") or {})
+    # A11：成功路径也必须合并**账本里已完成的调用版本**（抽取 / 恢复等），不能只用图最终
+    # 版本集合——否则抽取记了 tokens / 费用却漏掉 prompt 版本。图里的工具版本后写，覆盖同键。
+    versions = dict(projected["prompt_versions"])
+    versions.update(final.get("prompt_versions") or {})
     versions.setdefault(TASK_ID, rendered.version)
     cost = float(projected["cost_cny"])
     prompt_tokens = int(projected["prompt_tokens"])

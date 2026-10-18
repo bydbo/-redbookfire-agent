@@ -38,6 +38,8 @@ COLUMN_SPECS: dict[str, dict[str, str]] = {
         "latency_ms": "int4", "prompt_versions": "jsonb", "error": "text",
         # S7.20：阶段快照（素材同步 / 向量回填 / 五节点），只记阶段切换
         "stage": "jsonb",
+        # A05：提交时固化的适用事实快照（worker 撰稿读同一份）
+        "context_snapshot": "jsonb",
     },
     "run_hotspots": {
         "id": "uuid", "run_id": "uuid", "hotspot_id": "uuid", "position": "int4",

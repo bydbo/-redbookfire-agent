@@ -304,7 +304,11 @@ def build_graph(
         chosen = candidates[0].get("material") if candidates else None
         async with tracker.stage(NODE_STEPS[3], detail=clue.hotspot_raw):
             before = len(caller.records)
-            outcome = await write_draft(clue, chosen, caller, style=style)
+            outcome = await write_draft(
+                clue, chosen, caller, style=style,
+                # A05：worker 生成阶段使用提交时固化的同一份约束快照
+                constraints=list(state.get("constraints") or []),
+            )
             _record_llm(before)
         update: dict = {
             "draft": outcome.value.to_dict() if outcome.value is not None else None,
@@ -520,6 +524,10 @@ async def _run_analysis(
                 return
             await recorder.set_stage(**payload)
 
+        # A05：提交时固化的适用事实快照；worker 每个热点都带同一份进入撰稿节点
+        constraint_snapshot = (
+            await recorder.constraints() if recorder is not None else []
+        )
         graph = build_graph(
             caller=caller,
             retrieve=retrieve,
@@ -554,6 +562,7 @@ async def _run_analysis(
                 "report_model": model,
                 "prompt_versions": versions,
                 "errors": errors,
+                "constraints": list(constraint_snapshot),
             }
             reused = await recorder.load_clue(raw) if recorder is not None else None
             if reused:

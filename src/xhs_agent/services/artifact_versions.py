@@ -245,6 +245,49 @@ async def ensure_initial(
     return row
 
 
+async def register_version(
+    session: AsyncSession,
+    *,
+    session_id: uuid.UUID,
+    object_key_value: str,
+    object_type: str,
+    content: dict[str, Any],
+    source: dict[str, Any] | None = None,
+    prompt_versions: dict[str, int] | None = None,
+    run_id: str | None = None,
+    position: int | None = None,
+) -> ChatArtifactVersion:
+    """显式重解析：在锁内基于**当前 head** 建立一个新成功版本（A08）。
+
+    与 `ensure_initial` 的区别：后者幂等，已有版本时直接返回，无法表达"用户显式重解析"；
+    这里每次都分配新的 `version_no`，新版本成为对象 head，但**不修改已选定的
+    `object_refs`**——普通后续任务仍消费用户显式选定的编辑版，直到用户再次显式切换。
+    """
+    chat = await _lock_session(session, session_id)
+    head = await _head_row(session, session_id, object_key_value)
+    version_no = (int(head.version_no or 0) if head else 0) + 1
+    row = ChatArtifactVersion(
+        session_id=session_id,
+        object_key=object_key_value,
+        object_type=object_type,
+        run_id=_uuid_or_none(run_id),
+        hotspot_position=position,
+        request_key=f"reparse:{uuid.uuid4().hex}",
+        status="succeeded",
+        version_no=version_no,
+        base_version_id=head.id if head is not None else None,
+        content=dict(content),
+        source={"actor": "explicit_reparse", **dict(source or {})},
+        prompt_versions=dict(prompt_versions or {}),
+        usage={},
+    )
+    session.add(row)
+    await session.flush()
+    _set_head(chat, object_key_value, row)
+    await session.commit()
+    return row
+
+
 async def commit_success(
     session: AsyncSession,
     *,
@@ -253,6 +296,7 @@ async def commit_success(
     prompt_versions: dict[str, int] | None = None,
     usage: dict[str, Any] | None = None,
     expected_state_version: int | None = None,
+    commit: bool = True,
 ) -> ChatArtifactVersion:
     """提交一次成功版本：按**认领时固化**的预期提交，不接受模型给的新预期值（§3.4）。
 
@@ -260,7 +304,9 @@ async def commit_success(
     - 比较**当前 head 与生成前 head**（`expected_head_version_id`）：不一致 → 409，
       已发生的消费保留；选定基础是旧版也允许（旧版分支），只拦"生成期间出现的新版本"；
     - 冲突 / 拒绝 / 失败 / 取消不推进成功版本；
-    - 回滚前先取出错误详情需要的标量，不访问过期 ORM 属性（E7CTX-07）。
+    - 回滚前先取出错误详情需要的标量，不访问过期 ORM 属性（E7CTX-07）；
+    - `commit=False`（A02）：不自行提交，由用例服务把**版本、head、选定引用、state_version、
+      审计与动作终态**放进同一个事务；失败时整批回滚，不留"head 已推进、状态仍 0"的半提交。
     """
     # §3.4：**重新加载认领行**，不信长期 ORM 缓存——回滚 / 其他提交可能已让它过期，
     # 直接读属性会触发同步 IO（MissingGreenlet）；先在绿色线程内 refresh 一次。
@@ -341,7 +387,8 @@ async def commit_success(
     claim_row.error = None
     claim_row.updated_at = _now()
     _set_head(chat, object_key_value, claim_row)
-    await session.commit()
+    if commit:
+        await session.commit()
     await record_observation(
         session,
         event_type="artifact_version_committed",

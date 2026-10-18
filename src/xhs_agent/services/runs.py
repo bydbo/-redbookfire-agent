@@ -88,6 +88,7 @@ async def submit_analysis(
     topk: int = 5,
     request_id: str = "",
     clues: Sequence[Mapping[str, Any] | None] | None = None,
+    context_constraints: Sequence[Mapping[str, Any]] | None = None,
     enqueue: Callable[[str], Awaitable[None]] | None = None,
 ) -> Submission:
     """落库一个待执行的运行：复用/新建 hotspots → 建 runs(queued) → 建 run_hotspots 骨架 → 投递。
@@ -136,6 +137,10 @@ async def submit_analysis(
         status=QUEUED,
         topk=topk,
         request_id=request_id or None,
+        # A05：把本轮适用事实快照随请求固化——worker 撰稿阶段读同一份，不临时猜会话状态
+        context_snapshot={
+            "constraints": [dict(item) for item in (context_constraints or [])]
+        },
     )
     session.add(run)
     await session.flush()
@@ -646,6 +651,14 @@ class RunRecorder:
     async def topk(self) -> int:
         """本次运行的截断上限（来自提交时的 `topk`）。"""
         return int((await self._run()).topk)
+
+    async def constraints(self) -> list[dict[str, Any]]:
+        """提交时固化的适用事实快照（A05）；旧行 / 无快照返回空列表。"""
+        snapshot = dict((await self._run()).context_snapshot or {})
+        items = snapshot.get("constraints")
+        if not isinstance(items, list):
+            return []
+        return [dict(item) for item in items if isinstance(item, dict)]
 
     async def set_stage(
         self,

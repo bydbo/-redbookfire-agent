@@ -300,7 +300,7 @@ class TestReviseDraft:
         assert outcome.payload["refused"] is False
         assert outcome.payload["revised"]["body"] == REVISED_BODY
         assert outcome.payload["revised"]["material_id"] == original["material_id"]
-        assert outcome.prompt_versions == {"copy_revise": 1}
+        assert outcome.prompt_versions == {"copy_revise": 2}
         assert provider.calls == 1
         # 关键：改后文案只在对话里，run 的初稿快照一个字都没动
         db_session.expire_all()
@@ -451,5 +451,5 @@ class TestTurnPromptVersions:
 
         assert turn.status == "succeeded", turn.error
         assert turn.tool_calls[0]["tool"] == "revise_draft"
-        assert turn.prompt_versions == {"chat_supervisor": 3, "copy_revise": 1}
+        assert turn.prompt_versions == {"chat_supervisor": 3, "copy_revise": 2}
         assert provider.tasks == ["copy_revise"]

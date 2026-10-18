@@ -14,8 +14,8 @@ AGENT_TASKS = ("hotspot_clue", "material_select", "copy_draft", "chat_supervisor
 ALL_TASKS = (*AGENT_TASKS, "material_tagging", "image_hotspot_clue")
 PLACEHOLDER_MARKERS = ("待 S3.1 填写", "待填写")
 # 版本号只随内容变更递增（prompt 契约 §三 / §六）——钉住当前值，顺手改正文却忘了升版本会被挡下
-EXPECTED_VERSIONS = {"hotspot_clue": 1, "material_select": 1, "copy_draft": 1,
-                     "chat_supervisor": 3, "copy_revise": 1,
+EXPECTED_VERSIONS = {"hotspot_clue": 1, "material_select": 1, "copy_draft": 2,
+                     "chat_supervisor": 3, "copy_revise": 2,
                      "image_hotspot_clue_multi": 1}
 CONTRACT_PATH = (Path(__file__).resolve().parents[2]
                  / "docs" / "contracts" / "prompt契约.md")

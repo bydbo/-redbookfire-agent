@@ -996,6 +996,12 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/ContextActionResponse'
+        '202':
+          description: 恢复页已在处理中（真实 202）：只读取状态等待，不重放付费页
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ContextActionResponse'
         '400':
           $ref: '#/components/responses/BadRequest'
         '404':
@@ -2550,6 +2556,16 @@ components:
             - type: 'null'
         reason:
           type: string
+        baseline_created_at:
+          oneOf:
+            - type: string
+              format: date-time
+            - type: 'null'
+        baseline_message_id:
+          oneOf:
+            - type: string
+              format: uuid
+            - type: 'null'
         snapshot_last_message_id:
           oneOf:
             - type: string

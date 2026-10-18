@@ -231,7 +231,7 @@ class TestRunAnalysis:
         assert tracer.finished["totals"]["llm_calls"] == 6
         assert tracer.finished["run_id"] == result.run_id
         assert tracer.finished["prompt_versions"] == {"hotspot_clue": 1, "material_select": 1,
-                                                     "copy_draft": 1}
+                                                     "copy_draft": 2}
         assert tracer.flushes == 1
 
     @pytest.mark.asyncio
@@ -243,7 +243,7 @@ class TestRunAnalysis:
                                     caller=StructuredCaller(provider=FakeProvider()))
         assert result.status == "succeeded"
         assert result.prompt_versions == {"hotspot_clue": 1, "material_select": 1,
-                                          "copy_draft": 1}
+                                          "copy_draft": 2}
 
     @pytest.mark.asyncio
     async def test_walks_five_nodes_and_collects_prompt_versions(self, cfg, monkeypatch):
@@ -256,7 +256,7 @@ class TestRunAnalysis:
 
         assert result.status == "succeeded"
         assert result.prompt_versions == {"hotspot_clue": 1, "material_select": 1,
-                                          "copy_draft": 1}
+                                          "copy_draft": 2}
         assert retrieve.calls == ["某明星打羽毛球"]
         assert retrieve.topks == [None]        # 没传 run_id / topk 时不做覆盖
         assert len(result.hotspots) == 1
@@ -303,7 +303,7 @@ class TestRunAnalysis:
         markdown = Path(result.report_paths["markdown"]).read_text(encoding="utf-8")
         assert "热点一" in markdown and "热点二" in markdown
         assert result.prompt_versions == {"hotspot_clue": 1, "material_select": 1,
-                                          "copy_draft": 1}
+                                          "copy_draft": 2}
 
     @pytest.mark.asyncio
     async def test_without_candidates_skips_explain_and_draft(self, cfg, monkeypatch):

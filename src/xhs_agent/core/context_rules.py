@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import re
 import uuid
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -65,6 +66,64 @@ def new_proposal_id() -> str:
 
 def new_topic_id() -> str:
     return f"topic:{uuid.uuid4().hex[:12]}"
+
+
+#: 恢复状态（v2 §3.5）；只有 `complete` 表示"已核对当前要求"，其余一律按未完成处理
+RECOVERY_STATUSES = (
+    "complete",
+    "pending",
+    "running",
+    "awaiting_confirmation",
+    "failed",
+    "interrupted",
+)
+
+
+def new_recovery(
+    *,
+    status: str = "complete",
+    reason: str = "new_session",
+    baseline_created_at: str = "",
+    baseline_message_id: str = "",
+) -> dict[str, Any]:
+    """构造一份完整的恢复结构（A01：新建会话必须持久化维护起点）。
+
+    `baseline_*` 是**维护起点**：状态抽取只对起点之后的消息负责。新会话写入起点即
+    `status=complete`，首轮不要求先恢复；旧数据没有覆盖证据时由调用方另标 `pending`。
+    """
+    return {
+        "status": status if status in RECOVERY_STATUSES else "pending",
+        "reason": str(reason or ""),
+        "recovery_id": None,
+        "baseline_created_at": str(baseline_created_at or ""),
+        "baseline_message_id": str(baseline_message_id or ""),
+        "snapshot_last_created_at": None,
+        "snapshot_last_message_id": None,
+        "cursor_created_at": None,
+        "cursor_message_id": None,
+        "scanned_user_messages": 0,
+        "total_user_messages": 0,
+        "pending_proposal_ids": [],
+        "accounting_message_id": None,
+        "gaps": [],
+    }
+
+
+def recovery_of(raw_state: dict[str, Any] | None) -> dict[str, Any]:
+    """从 `chat_sessions.context_state` 读出恢复结构（A01：坏字段不无声丢弃后假定完整）。
+
+    - 没有 `recovery` 键 → 返回空 dict（由 `load` 按历史覆盖证据判定）；
+    - 有键但 `status` 非法 / 缺失 → 保持原字段并降级为 `pending`（`recovery_corrupt`）。
+    """
+    raw = (raw_state or {}).get("recovery")
+    if not isinstance(raw, dict) or not raw:
+        return {}
+    status = str(raw.get("status") or "")
+    if status not in RECOVERY_STATUSES:
+        return {**raw, "status": "pending",
+                "reason": str(raw.get("reason") or "recovery_corrupt")}
+    return dict(raw)
+
 
 
 def _numeric_limits(value: str) -> dict[str, float]:
@@ -705,6 +764,65 @@ def apply_action(
         return ActionResult(snapshot=working, event_type="replace")
 
     return ActionResult(snapshot=working, decision="noop", reason="invalid_action")
+
+
+# ---------------------------------------------------------------------------
+# 适用事实筛选（A05）
+# ---------------------------------------------------------------------------
+
+
+def applicable_facts(
+    snapshot: ContextSnapshot,
+    *,
+    topic_id: str | None,
+    object_keys: Iterable[str] = (),
+) -> list[ContextFact]:
+    """本轮**真正适用**的生效事实（A05 唯一筛选口径）。
+
+    - `session`：一直适用；
+    - `topic`：只取当前话题（`scope_id == topic_id`）；
+    - `artifact`：只取**服务端已验证的目标对象**（`object_keys`，来自本轮 refs / 选定对象）；
+      未解析对象的约束永远不会以 artifact 作用域生效（抽取阶段已转提案）；
+    - 失效（superseded / retracted）与待确认项一律排除。
+    """
+    keys = {str(item) for item in object_keys if str(item)}
+    current_topic = str(topic_id or "")
+    out: list[ContextFact] = []
+    for fact in snapshot.facts:
+        if fact.status != "active":
+            continue
+        applicable = (
+            fact.scope == "session"
+            or (fact.scope == "topic" and (fact.scope_id or "") == current_topic)
+            or (fact.scope == "artifact" and (fact.scope_id or "") in keys)
+        )
+        if applicable:
+            out.append(fact)
+    return out
+
+
+def constraint_view(facts: Iterable[ContextFact]) -> list[dict[str, Any]]:
+    """适用事实 → 交给各生成消费者的**同一份**约束快照（含身份、值、作用域、来源）。
+
+    只放可追溯的字段；`source_ref` 保留真实消息 / 动作来源，便于用户回看这一条来自哪句话。
+    """
+    return [
+        {
+            "fact_id": fact.fact_id,
+            "kind": fact.kind,
+            "value": fact.value,
+            "scope": fact.scope,
+            "scope_id": fact.scope_id,
+            "source_ref": dict(fact.source_ref),
+        }
+        for fact in facts
+    ]
+
+
+def snapshot_object_keys(snapshot: ContextSnapshot) -> list[str]:
+    """服务端已验证的对象键（本次会话已选定 / 已解析的对象）。"""
+    return [str(item.get("object_key") or "") for item in snapshot.object_refs
+            if str(item.get("object_key") or "")]
 
 
 # ---------------------------------------------------------------------------

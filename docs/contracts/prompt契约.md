@@ -157,6 +157,11 @@ user   消息 = 02 Task（渲染后） + 04 Examples + 05 Output Schema
 
 - 键为 `task_id`、值为整数版本号；未参与本次运行的任务不出现。
 - 该字段是"同一批输入重测"可对比的前提：评测结果必须能追到具体 prompt 版本，否则版本对比无从谈起。
+- **A05（2026-10-18）**：`copy_draft` 与 `copy_revise` 升到 **v2**，新增必需变量
+  `constraints_json`——服务端筛选的适用事实快照（`fact_id` / `kind` / `value` / `scope` /
+  `scope_id` / `source_ref`）。来源分别是 `runs.context_snapshot`（worker 撰稿）与当轮
+  会话状态（对话改稿）；两处必须使用同一筛选口径（session 全程 / 当前 topic / 已验证产物），
+  不得在代码里临时拼另一份。旧调用方必须同时提供该变量，否则按 §四 缺变量报错。
 - 落地路径：列与迁移在 S3.9 完成；**仓储层写入（S3.4a）与 worker 接线（S3.4b）**分别承接——S3.1 已在 state / `RunResult` 里产出该字段，落库由 S3.4a 完成。
 
 ## 六、变更流程与准入门槛

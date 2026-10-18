@@ -23,7 +23,7 @@ from collections.abc import AsyncIterator
 from contextlib import suppress
 from typing import Annotated, Any
 
-from fastapi import APIRouter, Depends, File, Form, Query, UploadFile
+from fastapi import APIRouter, Depends, File, Form, Query, Response, UploadFile
 from fastapi.responses import FileResponse, StreamingResponse
 
 from ...config import AppConfig
@@ -322,13 +322,16 @@ async def get_chat_context(session_id: UuidPath, cfg: ConfigDep,
 
 @router.post("/chat/sessions/{session_id}/context/actions",
              response_model=ContextActionResponse,
-             responses={400: error_response("请求格式或参数不合法"),
+             responses={202: {"model": ContextActionResponse,
+                              "description": "恢复页已在处理中：只读取状态等待，不重放付费页"},
+                        400: error_response("请求格式或参数不合法"),
                         404: error_response("资源不存在"),
                         409: error_response("状态版本冲突（响应带当前版本，可重试）"),
                         422: error_response("字段级校验失败"),
                         503: error_response("依赖不可用（不做降级，直接返回错误）")})
 async def post_chat_context_action(session_id: UuidPath, payload: ContextActionRequest,
-                                   cfg: ConfigDep, session: SessionDep) -> dict[str, Any]:
+                                   cfg: ConfigDep, session: SessionDep,
+                                   response: Response) -> dict[str, Any]:
     """上下文用户动作（v2 §3.3A）：confirm / reject / retract / replace / reset_topic /
     select_object / recover / complete_recovery。
 
@@ -339,12 +342,53 @@ async def post_chat_context_action(session_id: UuidPath, payload: ContextActionR
     chat_id = _uuid(session_id, what="会话")
     caller: StructuredCaller | None = None
     if payload.action == "recover":
+        from ...core import budget as budget_tool
+        from ...core.observations import record as record_observation
         from ...tools.http import build_http_client
+
+        checks = {"n": 0}
+
+        async def before_recover_request(call: Any) -> None:
+            """A06：恢复的真实请求（含结构修复）逐次预算检查，超限不发。"""
+            checks["n"] += 1
+            messages = call.messages or [
+                {"role": "system", "content": call.system},
+                {"role": "user", "content": call.user},
+            ]
+            decision = budget_tool.decide(
+                messages=messages,
+                tools=call.tools,
+                output_reserve=int(call.max_tokens or cfg.context.extract_max_tokens),
+                application_limit=cfg.context.request_token_limit,
+                model_window=cfg.context.model_context_window,
+                mode="enforce",
+                protected=("恢复页用户原文", "现有状态"),
+            )
+            await record_observation(
+                session,
+                event_type="context_assembled",
+                session_id=chat_id,
+                key=f"recover:{payload.action_id or 'new'}:{checks['n']}",
+                payload={
+                    **decision.as_event(),
+                    "effective_mode": "enforce",
+                    "kind": "recover_request",
+                    "request_index": checks["n"],
+                },
+                prompt_version="context_recover:v1",
+                policy_version="context:enforce",
+            )
+            if not decision.allowed:
+                raise budget_tool.BudgetError(
+                    "恢复页的请求超出预算，本次不发出",
+                    reason="required_context_overflow",
+                )
 
         async with build_http_client(cfg.llm.timeout_s) as client:
             caller = StructuredCaller(
                 provider=build_provider(cfg, client=client),
                 max_repairs=int(cfg.context.extract_repair_max),
+                before_request=before_recover_request,
             )
             applied = await context_state.perform_action(
                 session, chat_id,
@@ -379,7 +423,8 @@ async def post_chat_context_action(session_id: UuidPath, payload: ContextActionR
     status = str(applied.get("status") or "succeeded")
     if status == "interrupted" and applied.get("reason") in ("recovery_running",
                                                              "recovery_retry_required"):
-        # 已有 running 认领 / 失败页需显式重试：202 + 当前上下文，不自动重试付费页
+        # 已有在飞认领 / 失败页需显式重试：**真实 202** + 当前上下文，不自动重试付费页
+        response.status_code = 202
         return {
             **applied,
             "decision": "noop",

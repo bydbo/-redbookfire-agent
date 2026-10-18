@@ -123,7 +123,7 @@ class TestWorkflowSmoke:
 
         assert result.status == "succeeded"
         assert result.prompt_versions == {"hotspot_clue": 1, "material_select": 1,
-                                          "copy_draft": 1}
+                                          "copy_draft": 2}
         assert provider.tasks == ["hotspot_clue", "material_select", "copy_draft"]
 
         entry = result.hotspots[0]

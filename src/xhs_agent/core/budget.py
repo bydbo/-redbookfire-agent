@@ -14,8 +14,10 @@ safety = max(512, ceil(input_est × 10%))
 allow = input_est + actual_max_tokens + safety <= effective_limit
 ```
 
-- **估算器**：沿用 `tools/llm.py::estimate_tokens` 的「1.5 字/token」，但本模块不 import
-  `tools`（保持 core 不反向依赖适配器），公式在两处各自实现，由单测钉住一致性；
+- **估算器**：`utf8_bytes_v1`——参与发送的内容规范序列化（JSON / 消息文本）后按 UTF-8
+  字节数估算，再加协议开销与 `max(512, ceil(input_est × 10%))` 安全量；输出预留用该次真实
+  `max_tokens` 另计。没有已验证 tokenizer 时这是保守下界，不宣称准确 tokens，也不改变费用
+  usage 口径；本模块不 import `tools`（保持 core 不反向依赖适配器）；
 - **成组裁剪**：先按 `user` 消息切轮次，再保留预算内的**连续后缀**；遇到最近一个完整组超限就
   停下，**不跳过它去找更早的短消息**；当前问题、有效状态与必需基础版不参与裁剪（调用方作为
   `required` 单独计入，超限即判定不放行）；
@@ -33,7 +35,9 @@ from dataclasses import dataclass, field, replace
 from typing import Any
 
 #: 估算器标识：随每次预算事件落库，便于事后对比估算与实际偏差
-ESTIMATOR = "chars_div_1.5_v1"
+#: A06：没有已验证 tokenizer 时采用 `utf8_bytes_v1`——参与发送的内容规范序列化后按 UTF-8
+#: 字节数估算（中文 3 字节/字），另加协议开销与安全余量；保守、可复现，不宣称是准确 tokens。
+ESTIMATOR = "utf8_bytes_v1"
 #: 协议开销下限（每条消息的角色 / 分隔符等）
 PROTOCOL_OVERHEAD_MIN = 32
 PROTOCOL_OVERHEAD_PER_MESSAGE = 8
@@ -71,8 +75,12 @@ class BudgetError(ValueError):
 
 
 def estimate_tokens(text: str) -> int:
-    """与 `tools/llm.py::estimate_tokens` 同一公式（中文约 1.5 字/token）。"""
-    return max(1, int(len(str(text or "")) / 1.5))
+    """`utf8_bytes_v1`：内容按 UTF-8 字节数估算 tokens（保守，不宣称准确）。
+
+    没有已验证 tokenizer 时，字节数是**不会低估中文**的保守下界：中文约 3 字节/字，
+    比常见 1.5 字/token 的经验值更大，宁可提前判 overflow，也不发出可能超限的请求。
+    """
+    return max(1, len(str(text or "").encode("utf-8")))
 
 
 def estimate_messages(messages: Iterable[dict[str, Any]]) -> int:

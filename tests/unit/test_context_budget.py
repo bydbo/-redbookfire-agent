@@ -21,9 +21,12 @@ def msg(role: str, content: str, **extra: object) -> dict[str, object]:
 
 
 class TestEstimator:
-    def test_matches_llm_estimator(self) -> None:
+    def test_utf8_bytes_is_conservative(self) -> None:
+        # A06：没有已验证 tokenizer 时用 utf8_bytes_v1——UTF-8 字节数是中文的保守下界，
+        # 不会低于「1.5 字/token」的 usage 估算（后者只用于费用口径，不用于放行判断）。
         for text in ("", "abcde", "中" * 150, "混合 mixed 文本" * 7):
-            assert budget.estimate_tokens(text) == llm.estimate_tokens(text)
+            assert budget.estimate_tokens(text) == max(1, len(text.encode("utf-8")))
+            assert budget.estimate_tokens(text) >= llm.estimate_tokens(text)
 
     def test_messages_include_protocol_overhead(self) -> None:
         one = budget.estimate_messages([msg("user", "abc")])

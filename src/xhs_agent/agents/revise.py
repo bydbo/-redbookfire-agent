@@ -53,8 +53,14 @@ def parse_revise(payload: Any, *, material_id: str = "",
 
 async def revise_draft(clue: HotspotClue, material: dict[str, Any] | None,
                        draft: dict[str, Any], request: str,
-                       caller: StructuredCaller) -> AgentOutcome:
-    """按用户要求改写一版已有初稿；越界时返回拒绝结果而不是硬改。"""
+                       caller: StructuredCaller,
+                       constraints: list[dict[str, Any]] | None = None) -> AgentOutcome:
+    """按用户要求改写一版已有初稿；越界时返回拒绝结果而不是硬改。
+
+    `constraints` 是服务端筛选好的**适用事实快照**（A05：session + 当前话题 + 已验证产物）。
+    它必须真正进入这次请求——不能只靠 supervisor 在对话里转述；prompt v2 起 `constraints_json`
+    是必需变量。
+    """
     rendered = prompt_tool.render(
         TASK_ID,
         draft_json=json.dumps(draft, ensure_ascii=False),
@@ -62,6 +68,7 @@ async def revise_draft(clue: HotspotClue, material: dict[str, Any] | None,
         clue_json=json.dumps(clue.to_dict(), ensure_ascii=False),
         material_json=(json.dumps(material, ensure_ascii=False) if material is not None
                        else "null"),
+        constraints_json=json.dumps(list(constraints or []), ensure_ascii=False),
     )
     outcome, result = await caller.call(
         TASK_ID, rendered.system, rendered.user,

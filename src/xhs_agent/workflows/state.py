@@ -22,3 +22,5 @@ class AnalysisState(TypedDict, total=False):
     report_model: dict[str, Any]          # run 级报告 model（跨热点累积）
     report_paths: dict[str, str]          # 报告产物路径
     errors: list[str]                     # 运行级错误（由 run_analysis 维护）
+    # A05：提交时固化的适用事实快照（会话 / 当前话题 / 已验证产物），撰稿节点原样读取
+    constraints: list[dict[str, Any]]

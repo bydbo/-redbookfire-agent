@@ -141,6 +141,10 @@ class Run(Base):
     # S7.20：当前阶段快照（结构见 `core/progress.py` 与数据契约 §3.3）；只记阶段切换
     stage: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False,
                                                   server_default=text("'{}'"))
+    # A05：提交时服务端筛选的适用事实快照（会话 / 话题 / 已验证产物），worker 生成阶段
+    # 读取同一份；空对象表示本次没有可用约束（旧行 / 离线路径）。
+    context_snapshot: Mapped[dict[str, Any]] = mapped_column(
+        JSONB, nullable=False, server_default=text("'{}'"))
     error: Mapped[str | None] = mapped_column(Text, nullable=True)
 
     __table_args__ = (
@@ -320,7 +324,7 @@ class ChatContextEvent(Base):
         CheckConstraint("state_version >= 0", name="state_version_non_negative"),
         CheckConstraint(
             "event_type IN ('delta', 'confirm', 'reject', 'retract', 'replace', "
-            "'reset_topic', 'recovery')",
+            "'reset_topic', 'select_object', 'recovery', 'complete_recovery')",
             name="event_type_allowed",
         ),
         CheckConstraint("actor IN ('extract', 'user', 'system')", name="actor_allowed"),

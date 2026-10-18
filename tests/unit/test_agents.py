@@ -170,7 +170,7 @@ class TestWriteDraft:
         clue = (await extract_clue("热点", caller())).value
         outcome = await write_draft(clue, material().to_dict(), caller())
         draft = outcome.value
-        assert outcome.version == 1
+        assert outcome.version == 2
         assert draft.material_id == MATERIAL_ID
         assert draft.hotspot_key == clue.hotspot_key
         assert draft.body.startswith("最近羽毛球刷屏")

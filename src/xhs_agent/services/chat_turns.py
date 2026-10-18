@@ -35,7 +35,7 @@ from dataclasses import dataclass, field
 from typing import Any, cast
 
 import redis.asyncio as aioredis
-from sqlalchemy import CursorResult, text
+from sqlalchemy import CursorResult, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..config import AppConfig
@@ -59,11 +59,13 @@ from ..core.tracing import (
     capture_content,
     get_tracer,
 )
+from ..db.models import ChatMessage
 from ..db.session import create_engine_from_config, create_session_factory
 from ..schemas import SchemaError
 from ..services import chat_tools, context_state
 from ..services.chat import latest_attachments, update_message
 from ..services.chat_tools import ToolContext, ToolOutcome
+from ..tools import prompt as prompt_tool
 from ..tools.http import build_http_client
 from ..tools.llm import BaseProvider, LLMError, StructuredCaller, build_provider
 from ..tools.prompt import PromptError
@@ -256,6 +258,7 @@ def build_tool_runner(
     ledger: dict[str, Any] | None = None,
     policy: TurnContextPolicy | None = None,
     source_message_id: str = "",
+    operation_binding: dict[str, Any] | None = None,
 ) -> Any:
     """工具执行器：按 `chat_tools.HANDLERS` 分派（S7.7a）——这里也不写具体工具名。
 
@@ -277,6 +280,7 @@ def build_tool_runner(
         turn_id=turn_id,
         policy=policy,
         source_message_id=source_message_id,
+        operation_binding=dict(operation_binding or {}) or None,
     )
     scope_counts: dict[str, int] = {}
 
@@ -502,6 +506,29 @@ async def _context_refs(
     )
 
 
+async def _load_source_binding(
+    session: AsyncSession, message_id: uuid.UUID | None
+) -> dict[str, Any] | None:
+    """读取来源用户消息里持久化的操作绑定（A04：只读一次，不采信模型改写）。"""
+    if message_id is None:
+        return None
+    try:
+        value = (
+            await session.execute(
+                select(ChatMessage.operation_binding).where(
+                    ChatMessage.id == message_id,
+                    ChatMessage.role == "user",
+                )
+            )
+        ).scalar_one_or_none()
+    except Exception:  # noqa: BLE001 - 绑定是可选增强；读取失败按"本轮无绑定"处理
+        logger.warning("读取来源消息绑定失败（按无绑定继续）：%s", message_id, exc_info=True)
+        return None
+    if isinstance(value, dict) and value:
+        return dict(value)
+    return None
+
+
 async def _prepare_context(
     session: AsyncSession,
     cfg: AppConfig,
@@ -565,14 +592,21 @@ async def _prepare_context(
         prep.blocking_reply = _blocking_reply(stored, None)
         return prep
 
-    async def precheck(system: str, user: str, output_reserve: int) -> None:
+    # A06：抽取及其结构修复**每一次真实请求**都要过预算入口——挂在 StructuredCaller 的
+    # before_request 上（而不是只在循环前检查一次）；每次请求各记一条预算事件。
+    extract_checks = {"n": 0}
+    extract_version = _prompt_version(context_state.TASK_ID)
+
+    async def before_extract_request(call: Any) -> None:
+        extract_checks["n"] += 1
+        messages = call.messages or [
+            {"role": "system", "content": call.system},
+            {"role": "user", "content": call.user},
+        ]
         decision = budget_tool.decide(
-            messages=[
-                {"role": "system", "content": system},
-                {"role": "user", "content": user},
-            ],
-            tools=None,
-            output_reserve=output_reserve,
+            messages=messages,
+            tools=call.tools,
+            output_reserve=int(call.max_tokens or cfg.context.extract_max_tokens),
             application_limit=policy.application_limit,
             model_window=policy.model_window,
             mode=policy.mode,
@@ -582,11 +616,11 @@ async def _prepare_context(
             session,
             event_type="context_assembled",
             session_id=session_id,
-            key=f"{turn_id}:extract",
+            key=f"{turn_id}:extract:{extract_checks['n']}",
             payload={**decision.as_event(), "effective_mode": policy.mode,
-                     "kind": "extract"},
+                     "kind": "extract_request", "request_index": extract_checks["n"]},
             turn_id=turn_id,
-            prompt_version="context_extract:v1",
+            prompt_version=f"context_extract:v{extract_version}",
             policy_version=f"context:{policy.mode}",
         )
         if policy.enforce and not decision.allowed:
@@ -598,11 +632,12 @@ async def _prepare_context(
     caller = StructuredCaller(
         provider=provider,
         max_repairs=int(cfg.context.extract_repair_max),
+        before_request=before_extract_request,
     )
     refs = await _context_refs(session, session_id)
     try:
         delta, _result = await context_state.extract(
-            cfg, caller, user_text=user_text, stored=stored, refs=refs, precheck=precheck
+            cfg, caller, user_text=user_text, stored=stored, refs=refs
         )
         applied = await context_state.apply_delta(
             session,
@@ -628,9 +663,15 @@ async def _prepare_context(
     finally:
         # 抽取是一次真实调用：已发生的消费与版本一律计入本轮（失败也不丢）
         ledger.setdefault("records", []).extend(caller.records)
+        extract_version = _prompt_version(context_state.TASK_ID)
         for record in caller.records:
-            ledger.setdefault("versions", {})[str(record.get("task") or "")] = 1
-        prep.versions["context_extract"] = 1
+            task = str(record.get("task") or "")
+            if task:
+                ledger.setdefault("versions", {})[task] = _prompt_version(task)
+        if caller.records:
+            # A11：成功 / 失败 / 取消都要带真实抽取 prompt 版本，不能只有 supervisor
+            ledger["versions"][context_state.TASK_ID] = extract_version
+            prep.versions["context_extract"] = extract_version
 
     # ---- 抽取后的准入判定 ----
     latest = await context_state.load(session, session_id)
@@ -659,6 +700,14 @@ async def _prepare_context(
         return prep
     prep.status = "ready"
     return prep
+
+
+def _prompt_version(task_id: str) -> int:
+    """prompt 资产的真实版本号（A11：未调用任务不写版本，写就必须是真实版本）。"""
+    try:
+        return int(prompt_tool.load(task_id).version)
+    except Exception:  # noqa: BLE001 - 资产缺失不阻断收尾，退回 v1 并由账本如实标注
+        return 1
 
 
 def _blocking_reply(stored: Any, applied: Any) -> str:
@@ -994,6 +1043,11 @@ async def run_turn_task(
                         # 跨轮图片回落（S7.10 / S7.16 按组）：先把本会话最近一组图取出来，工具在
                         # "本轮没带图"时才有得用（用户说「上面那几张图」正是这种情况）
                         recent = await latest_attachments(session, session_id)
+                        # A04：轮次按**来源用户消息 ID**读取一次已持久化的可信绑定，
+                        # 随 ToolContext 传给工具；不从模型参数重新生成。
+                        source_binding = await _load_source_binding(
+                            session, user_message_id or message_id
+                        )
                         runner = build_tool_runner(
                             session,
                             cfg=cfg,
@@ -1010,6 +1064,7 @@ async def run_turn_task(
                             ledger=ledger,
                             policy=turn_policy,
                             source_message_id=str(user_message_id or ""),
+                            operation_binding=source_binding,
                         )
                         # S7.24：历史裁剪**之前**做一次结构化状态抽取（输入是本轮原文而不是
                         # 被裁过的历史）。mode=off 时不抽取，保持旧行为。

@@ -68,6 +68,10 @@ class ImageClueParse:
     # 报告区分"复用"与"真实调用"；命中时 `usage_status=cached` 且用量清零。
     cache_status: str = ""
     cache_level: str = ""
+    # A08：本次结果对应的不可变业务版本（原始解析 / 显式重解析 / 选定编辑版），供工具返回
+    # 给用户"这次用的是哪一版"；缓存命中时同样是真实版本身份，不伪造新版本。
+    version_id: str = ""
+    version_no: int = 0
 
 
 def _cost_cny(cfg: AppConfig, completion: ImageCompletion) -> float:

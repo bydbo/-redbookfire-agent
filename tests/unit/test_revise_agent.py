@@ -89,7 +89,7 @@ class TestReviseAgent:
         assert outcome.value.refused is False
         assert outcome.value.draft.body == "改后的正文"
         assert outcome.value.draft.provider == provider.name       # 记账字段由调用方注入
-        assert outcome.task_id == TASK_ID and outcome.version == 1
+        assert outcome.task_id == TASK_ID and outcome.version == 2
         assert record["task"] == TASK_ID
         assert record["cost_cny"] == pytest.approx(0.004)
 

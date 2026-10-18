@@ -1,8 +1,8 @@
 # copy_revise · 文案改写
 
-<!-- prompt-version: v1 -->
+<!-- prompt-version: v2 -->
 <!-- task-id: copy_revise -->
-<!-- requires: draft_json, user_request, clue_json, material_json -->
+<!-- requires: draft_json, user_request, clue_json, material_json, constraints_json -->
 
 ## 01 System
 
@@ -19,6 +19,11 @@
 - 当前初稿（JSON）：{{draft_json}}
 - 这条热点的线索（JSON）：{{clue_json}}
 - 这位创作者选中的素材（JSON，可能为 null）：{{material_json}}
+- 本轮适用的事实约束（JSON 数组；可能为空）：{{constraints_json}}
+
+**约束优先**：`constraints_json` 是服务端按作用域筛过的、用户明确表达且有原文证据的要求
+（session 级全程适用；topic 级只对当前话题；artifact 级只对指定产物）。改写必须同时满足
+其中每一条；与用户这次的要求冲突时，先按约束收敛，不要自行放宽或删除约束。
 
 改写步骤：
 

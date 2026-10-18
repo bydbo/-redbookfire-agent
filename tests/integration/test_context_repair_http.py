@@ -18,7 +18,7 @@ from typing import Any
 import httpx
 import pytest
 import pytest_asyncio
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
 
 from xhs_agent.api.deps import get_config, get_session
@@ -26,6 +26,7 @@ from xhs_agent.api.main import create_app
 from xhs_agent.config import AppConfig, load_config
 from xhs_agent.core.errors import ConflictError
 from xhs_agent.db import Base
+from xhs_agent.db.models import ChatSession
 from xhs_agent.services import artifact_versions, context_state
 from xhs_agent.services.chat import append_message, create_session
 
@@ -198,6 +199,24 @@ class TestCTX04ConfirmReplaceHttp:
         assert confirm.json()["detail"]["reason"] == "replace_target_changed"
 
 
+class TestA01NewSessionReady:
+    @pytest.mark.asyncio
+    async def test_new_session_first_message_is_ready(
+        self, client: httpx.AsyncClient, db_session: AsyncSession, cfg: AppConfig
+    ) -> None:
+        """A01：新建会话在创建事务里写入维护起点 → 首条消息后仍 complete。"""
+        created = await client.post("/api/chat/sessions")
+        session_id = str(created.json()["session_id"])
+        await append_message(db_session, uuid.UUID(session_id), role="user",
+                             content="以后别提明星姓名")
+        response = await client.get(f"/api/chat/sessions/{session_id}/context")
+        assert response.status_code == 200
+        recovery = response.json()["recovery"]
+        assert recovery["status"] == "complete"          # 缺陷时为 pending/legacy_unrecovered
+        assert recovery["baseline_created_at"]           # 明确维护起点
+        assert response.json()["recovery_status"] == "complete"
+
+
 class TestCTX05LegacySessionPending:
     @pytest.mark.asyncio
     async def test_legacy_session_reports_pending_recovery(
@@ -205,9 +224,16 @@ class TestCTX05LegacySessionPending:
     ) -> None:
         created = await client.post("/api/chat/sessions")
         session_id = str(created.json()["session_id"])
-        # 旧会话：有用户历史、无恢复记录 → pending（缺陷时返回 complete 但零事实）
         await append_message(db_session, uuid.UUID(session_id), role="user",
                              content="以后别提明星姓名")
+        # 真正的旧会话：有用户历史但没有恢复记录（模拟 A01 之前建的行）→ pending
+        await db_session.execute(
+            update(ChatSession)
+            .where(ChatSession.id == uuid.UUID(session_id))
+            .values(context_state={"facts": [], "proposals": [], "object_refs": [],
+                                   "archived": []})
+        )
+        await db_session.commit()
         response = await client.get(f"/api/chat/sessions/{session_id}/context")
         assert response.status_code == 200
         recovery = response.json()["recovery"]

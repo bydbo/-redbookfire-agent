@@ -34,6 +34,7 @@ from sqlalchemy import CursorResult, DateTime, cast, func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..config import PROJECT_ROOT, AppConfig
+from ..core import context_rules
 from ..core import progress as progress_tool
 from ..core.errors import NotFoundError
 from ..db.models import ChatMessage, ChatSession
@@ -194,8 +195,24 @@ def _preview(text: str) -> str:
 
 
 async def create_session(session: AsyncSession, *, title: str = "") -> dict[str, Any]:
-    """建一个会话；标题留空，等首条用户消息落库时自动补（见 `append_message`）。"""
-    row = ChatSession(title=str(title or ""))
+    """建一个会话；标题留空，等首条用户消息落库时自动补（见 `append_message`）。
+
+    A01：创建事务里写入**明确的维护起点与 `recovery.status=complete`**——新空会话首轮
+    不要求用户先恢复；之后普通状态提交默认继承这份恢复结构（见 `context_state._commit`）。
+    """
+    now = datetime.now(UTC)
+    row = ChatSession(
+        title=str(title or ""),
+        context_state={
+            "facts": [],
+            "proposals": [],
+            "object_refs": [],
+            "archived": [],
+            "recovery": context_rules.new_recovery(
+                baseline_created_at=now.isoformat(), reason="new_session"
+            ),
+        },
+    )
     session.add(row)
     await session.commit()
     return _session_view(row)
@@ -381,6 +398,23 @@ async def append_message(
     ).scalar_one_or_none()
     if chat is None:
         return None
+    # A01：旧代码建的会话没有恢复结构——首条用户消息落库时补上维护起点，避免下一轮
+    # `load` 依据"有用户消息且无 recovery"把它误判成未恢复的旧会话。
+    needs_recovery = False
+    if role == "user" and not isinstance(
+        (chat.context_state or {}).get("recovery"), dict
+    ):
+        prior = int(
+            (
+                await session.execute(
+                    select(func.count())
+                    .select_from(ChatMessage)
+                    .where(ChatMessage.session_id == session_id,
+                           ChatMessage.role == "user")
+                )
+            ).scalar_one()
+        )
+        needs_recovery = prior == 0
     row = ChatMessage(
         session_id=session_id,
         role=role,
@@ -403,6 +437,19 @@ async def append_message(
     session.add(row)
     if role == "user" and not (chat.title or "").strip():
         chat.title = derive_title(content)
+    if needs_recovery:
+        await session.flush()
+        state = dict(chat.context_state or {})
+        state.setdefault("facts", [])
+        state.setdefault("proposals", [])
+        state.setdefault("object_refs", [])
+        state.setdefault("archived", [])
+        state["recovery"] = context_rules.new_recovery(
+            baseline_created_at=datetime.now(UTC).isoformat(),
+            baseline_message_id=str(row.id),
+            reason="new_session",
+        )
+        chat.context_state = state
     chat.updated_at = datetime.now(UTC)
     await session.commit()
     return message_view(row)

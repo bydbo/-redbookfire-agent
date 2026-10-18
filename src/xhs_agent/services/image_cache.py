@@ -312,12 +312,15 @@ async def store(
     turn_id: str = "",
     message_id: str = "",
     order: int = 0,
+    force_rebuild: bool = False,
 ) -> bool:
     """写一条成功缓存；唯一冲突时按既有条目状态**条件重建**（E7CTX-11）。
 
     - 无冲突 → 插入新条目（新 generation_id），返回 True；
     - 冲突且既有条目**已到期或结构无效** → 条件更新为新一代（新代次、新创建时间与 TTL），
       返回 True；并发更新比较旧条目身份，不覆盖另一请求刚写入的新结果；
+    - `force_rebuild=True`（显式重解析）→ 即使既有条目仍有效也重建为新 generation，
+      保证"显式解析建立新原始业务版本"在缓存层同样产生新代次；
     - 冲突且既有条目**仍然有效** → 读取既有有效结果路径（返回 False，不算存储错误）；
     - 写失败可以返回本次有效解析（调用方继续用），但**必须**标缓存存储错误。
     """
@@ -364,7 +367,7 @@ async def store(
         expires = existing.expires_at
         expires = expires if expires.tzinfo else expires.replace(tzinfo=UTC)
         valid = expires > now and _payload_valid(dict(existing.payload or {}))
-        if valid:
+        if valid and not force_rebuild:
             # 既有有效条目：读取它，不把并发写入当错误（E7CTX-11）
             await session.commit()
             return False
@@ -391,7 +394,10 @@ async def store(
         new_generation = await _generation_of(session, session_id, key)
         await _observe_invalidation(
             session, session_id, key=key, generation_id=old_generation,
-            reason="expired_rebuilt" if expires <= now else "invalid_rebuilt",
+            reason=(
+                "explicit_reparse" if force_rebuild
+                else ("expired_rebuilt" if expires <= now else "invalid_rebuilt")
+            ),
             turn_id=turn_id,
         )
         await _observe_created(
