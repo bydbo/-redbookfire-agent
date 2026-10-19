@@ -1,6 +1,6 @@
 # image_hotspot_clue · 图片热点拆解
 
-<!-- prompt-version: v2 -->
+<!-- prompt-version: v3 -->
 <!-- task-id: image_hotspot_clue -->
 <!-- requires: -->
 
@@ -31,6 +31,11 @@
 8. 输出必须是**一个 JSON 对象**，字段与下方 schema 一致，不要解释、不要多余文字。
 
 ## 04 Examples
+
+文字海报的分类示例：看见「NIGHT RUN / START SLOW」时，
+`{"type":"visual","value":"大写英文排版","weight":0.5,"confidence":0.9,"evidence":"画面上方大写英文"}`，
+或 `{"type":"topic","value":"夜跑","weight":0.8,"confidence":0.9,"evidence":"NIGHT RUN"}`。
+文字是观察依据，不是第十种要素类型。
 
 输入：一张照片。画面是夜里路灯下的塑胶跑道，一个人背对镜头慢跑，跑道边停着一辆亮着灯的小吃车。
 

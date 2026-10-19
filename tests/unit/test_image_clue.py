@@ -123,7 +123,7 @@ async def test_invalid_vision_schema_keeps_actual_usage_on_failed_tool(tmp_path,
     assert usage["usage_status"] == "actual"
     assert (usage["prompt_tokens"], usage["completion_tokens"]) == (100, 20)
     assert usage["cost_cny"] > 0
-    assert chat_tools._failed_image_versions(info.value) == {"image_hotspot_clue": 2}
+    assert chat_tools._failed_image_versions(info.value) == {"image_hotspot_clue": 3}
 
 
 class TestSniffImageMime:
@@ -160,7 +160,7 @@ class TestParseImageClue:
 
         assert parsed.raw_text == CLUE_PAYLOAD["raw_text"]
         assert parsed.clue.elements[0].value == "夜晚跑道"
-        assert parsed.prompt_versions == {"image_hotspot_clue": 2}
+        assert parsed.prompt_versions == {"image_hotspot_clue": 3}
 
         payload = capture["payload"]
         assert capture["url"].endswith("/chat/completions")
@@ -411,7 +411,7 @@ class TestImageClueEndpoint:
         assert response.status_code == 200, response.text
         body = response.json()
         assert set(body) == {"raw_text", "clue", "prompt_versions"}
-        assert body["prompt_versions"] == {"image_hotspot_clue": 2}
+        assert body["prompt_versions"] == {"image_hotspot_clue": 3}
         assert body["clue"]["elements"][0]["type"] == "scene"
         assert fake.calls == 1
 
