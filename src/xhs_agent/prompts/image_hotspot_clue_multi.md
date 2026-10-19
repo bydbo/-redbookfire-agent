@@ -1,6 +1,6 @@
 # image_hotspot_clue_multi · 多图热点拆解
 
-<!-- prompt-version: v2 -->
+<!-- prompt-version: v3 -->
 <!-- task-id: image_hotspot_clue_multi -->
 <!-- requires: -->
 
@@ -81,6 +81,9 @@
 ```
 
 ## 05 Output Schema
+
+`clue.elements[].type` 只能取 `ip`、`topic`、`scene`、`visual`、`emotion`、`sound`、
+`conflict`、`format`、`audience` 这九个字符串之一。输出前逐项核对；文字只作为依据或归入主题 / 视觉。
 
 只输出一个 JSON 对象，不要解释、不要多余文字。字段口径与单图任务一致（见 `docs/contracts/openapi.yaml`
 的 `HotspotClue`），多图只多两条约束：`clue.elements` 为 **3–8 条**，每条 `evidence` 必须指向具体哪张图。

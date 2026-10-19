@@ -1,6 +1,6 @@
 # image_hotspot_clue · 图片热点拆解
 
-<!-- prompt-version: v3 -->
+<!-- prompt-version: v4 -->
 <!-- task-id: image_hotspot_clue -->
 <!-- requires: -->
 
@@ -74,7 +74,9 @@
 | `raw_text` | string | 热点描述，≤ 500 字；用户会在此基础上编辑 |
 | `clue.why_it_works` | string[] | 1–3 条，说清"为什么能吸引人"，事实与推测分开 |
 | `clue.mechanisms` | object[] | 1–3 条，`{name, explain}` |
-| `clue.elements` | object[] | 3–6 条，`{type, value, weight, confidence, evidence}`；`type` 取九类之一 |
+| `clue.elements` | object[] | 3–6 条，`{type, value, weight, confidence, evidence}`；`type` 只能是 `ip`、`topic`、`scene`、`visual`、`emotion`、`sound`、`conflict`、`format`、`audience` |
 | `clue.match_keywords` | string[] | 2–5 个检索关键词，用于在素材库里找回相关镜头 |
 | `clue.borrow_angles` | string[] | 1–3 条借势角度（怎么用这条图做内容） |
 | `clue.risk_notes` | string[] | 可选；画面容易被误读的地方（例如镜头角度可能让人误判场景） |
+
+输出前最后核对每个 `clue.elements[].type`：严格取上述枚举，画面中的文字按视觉形式或主题归类。

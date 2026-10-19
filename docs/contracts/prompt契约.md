@@ -14,8 +14,8 @@
 | `hotspot_clue` | 热点原文 → 爆点线索 | `agents/clue.py`（S3.1 落地） |
 | `material_select` | 线索 + 候选素材 → 命中解释与建议用法 | `agents/explain.py`（S3.1 落地） |
 | `copy_draft` | 线索 + 选中素材 → 文案初稿 | `agents/draft.py`（S3.1 落地） |
-| `image_hotspot_clue` | 一张图 → 热点描述 + 爆点线索（多模态）；v3 收紧文字的九类枚举归类并补海报示例 | `services/image_clue.py`（S6.6 落地，S7.3 补登记） |
-| `image_hotspot_clue_multi` | **一组图**（1–9 张）→ 一份热点描述 + 一份爆点线索；v2 收紧文字归类 | `services/image_clue.py`（`parse_image_clue_multi`） |
+| `image_hotspot_clue` | 一张图 → 热点描述 + 爆点线索（多模态）；v4 收紧文字的九类枚举归类并补海报示例，输出 schema 明列枚举 | `services/image_clue.py`（S6.6 落地，S7.3 补登记） |
+| `image_hotspot_clue_multi` | **一组图**（1–9 张）→ 一份热点描述 + 一份爆点线索；v3 收紧文字归类，输出 schema 明列九类枚举 | `services/image_clue.py`（`parse_image_clue_multi`） |
 | `chat_supervisor` | 对话层：读用户消息 → 决定直接回答或调工具 → 把结果讲成人话 | `agents/supervisor.py`（S7.3 落地） |
 | `copy_revise` | 已有初稿 + 用户要求 → 改后初稿（要求越界时只回拒绝理由，不给变通写法） | `agents/revise.py`（S7.8 落地） |
 | `context_extract` | 本轮用户原文 + 现有状态 → 有限类型的状态增量（新增 / 撤回 / 显式替换 / 待确认提案） | `services/context_state.py`（S7.24 落地） |
