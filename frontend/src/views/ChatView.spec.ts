@@ -26,6 +26,7 @@ vi.mock('@/api/analysis', () => ({
     ip: 'IP', topic: '主题', scene: '场景', visual: '画面', emotion: '情绪',
     sound: '声音', conflict: '冲突', format: '形式', audience: '人群',
   },
+  ELEMENT_TYPES: ['ip', 'topic', 'scene', 'visual', 'emotion', 'sound', 'conflict', 'format', 'audience'],
 }))
 
 function message(overrides: Partial<ChatMessage> = {}): ChatMessage {

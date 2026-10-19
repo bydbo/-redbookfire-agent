@@ -14,12 +14,15 @@
 | `hotspot_clue` | 热点原文 → 爆点线索 | `agents/clue.py`（S3.1 落地） |
 | `material_select` | 线索 + 候选素材 → 命中解释与建议用法 | `agents/explain.py`（S3.1 落地） |
 | `copy_draft` | 线索 + 选中素材 → 文案初稿 | `agents/draft.py`（S3.1 落地） |
-| `image_hotspot_clue` | 一张图 → 热点描述 + 爆点线索（多模态） | `services/image_clue.py`（S6.6 落地，S7.3 补登记） |
-| `image_hotspot_clue_multi` | **一组图**（1–9 张）→ 一份热点描述 + 一份爆点线索（多模态，S7.15） | `services/image_clue.py`（`parse_image_clue_multi`） |
+| `image_hotspot_clue` | 一张图 → 热点描述 + 爆点线索（多模态）；v2 收紧文字的九类枚举归类 | `services/image_clue.py`（S6.6 落地，S7.3 补登记） |
+| `image_hotspot_clue_multi` | **一组图**（1–9 张）→ 一份热点描述 + 一份爆点线索；v2 收紧文字归类 | `services/image_clue.py`（`parse_image_clue_multi`） |
 | `chat_supervisor` | 对话层：读用户消息 → 决定直接回答或调工具 → 把结果讲成人话 | `agents/supervisor.py`（S7.3 落地） |
 | `copy_revise` | 已有初稿 + 用户要求 → 改后初稿（要求越界时只回拒绝理由，不给变通写法） | `agents/revise.py`（S7.8 落地） |
 | `context_extract` | 本轮用户原文 + 现有状态 → 有限类型的状态增量（新增 / 撤回 / 显式替换 / 待确认提案） | `services/context_state.py`（S7.24 落地） |
 | `context_recover` | 恢复页完整用户消息 + 已恢复候选 → 恢复候选增量（全部待确认，E7CTX-05） | `services/context_state.py`（v2 §3.5 落地） |
+
+`context_recover` v2（2026-10-18）：state 包含累计待确认候选，其 fact_id 映射到服务端
+proposal_id，供后续页显式撤回 / 替换；服务端保持候选待确认，不直接激活恢复事实。
 
 三条硬规则：
 

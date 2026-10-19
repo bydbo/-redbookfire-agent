@@ -23,6 +23,7 @@ prompt 来源：`src/xhs_agent/prompts/material_tagging.md`（五段结构，见
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import json
 import os
@@ -35,9 +36,10 @@ from typing import Any
 import httpx
 
 from ..config import AppConfig
+from ..core import model_attempts
 from ..util import extract_json
 from . import prompt as prompt_tools
-from .llm import resolve_usage
+from .llm import resolve_cache_usage, resolve_usage
 
 TASK_ID = "material_tagging"
 IMAGE_TASK_ID = "image_hotspot_clue"
@@ -109,13 +111,28 @@ def make_describer(cfg: AppConfig) -> Callable[[list[str], str], dict[str, Any] 
             method="POST",
             headers={"Content-Type": "application/json", "Authorization": f"Bearer {api_key}"},
         )
+        handle = model_attempts.begin_sync(model_attempts.metadata(cfg.vision, kind="vision",
+            task=TASK_ID, endpoint=f"{base_url}/chat/completions", prompt_version=rendered.version))
+        terminal: dict[str, Any] = {"status": "failed", "usage_status": "unknown", "error": True,
+                                    "cache_status": "incomplete"}
         try:
             with urllib.request.urlopen(request, timeout=cfg.vision.timeout_s) as response:
                 data = json.loads(response.read().decode("utf-8", errors="replace"))
             text = data["choices"][0]["message"]["content"]
+            incoming, outgoing, source = resolve_usage(data.get("usage"),
+                prompt_text=f"{rendered.system}\n{rendered.user}", completion_text=str(text))
+            hit, miss, cache_status = resolve_cache_usage(data.get("usage"), prompt_tokens=incoming)
+            if cfg.vision.prefix_usage_supported and cache_status == "unsupported":
+                cache_status = "incomplete"
+            terminal = {"status": "succeeded", "prompt_tokens": incoming, "completion_tokens": outgoing,
+                "usage_status": source, "cache_status": cache_status, "cache_hit_tokens": hit,
+                "cache_miss_tokens": miss, "cost_cny": (incoming * cfg.vision.price_in_per_m
+                    + outgoing * cfg.vision.price_out_per_m) / 1_000_000}
             parsed = extract_json(text)
         except (urllib.error.URLError, KeyError, IndexError, ValueError, json.JSONDecodeError):
             return None
+        finally:
+            handle.finish_sync(terminal)
         if not isinstance(parsed, dict):
             return None
         tags = parsed.get("tags") or []
@@ -155,6 +172,9 @@ class ImageCompletion:
     # R3（OBS-06/07）：用量口径（actual = 上游 usage；estimated = 字符估算下界），
     # 与 tools/llm.py 同一词表——轮级用量完整性据此上卷
     usage_status: str = "estimated"
+    cache_hit_tokens: int | None = None
+    cache_miss_tokens: int | None = None
+    cache_status: str = "unsupported"
 
 
 class AsyncImageClient:
@@ -209,6 +229,30 @@ class AsyncImageClient:
             "response_format": {"type": "json_object"},
         }
         headers = {"Authorization": f"Bearer {self.api_key}", "Accept": "application/json"}
+        if self.cfg.thinking_toggle_supported:
+            payload["thinking"] = {"type": "disabled"}
+        handle = await model_attempts.begin(model_attempts.metadata(self.cfg, kind="vision",
+            task=rendered.task_id, endpoint=f"{self.base_url}/chat/completions",
+            prompt_version=rendered.version))
+        terminal: dict[str, Any] = {"status": "failed", "usage_status": "unknown", "error": True,
+                                    "cache_status": "incomplete"}
+        try:
+            result = await self._post_complete(rendered, payload, headers)
+            terminal = {"status": "succeeded", "prompt_tokens": result.prompt_tokens,
+                "completion_tokens": result.completion_tokens, "usage_status": result.usage_status,
+                "cache_status": result.cache_status, "cache_hit_tokens": result.cache_hit_tokens,
+                "cache_miss_tokens": result.cache_miss_tokens,
+                "cost_cny": (result.prompt_tokens * self.cfg.price_in_per_m
+                             + result.completion_tokens * self.cfg.price_out_per_m) / 1_000_000}
+            return result
+        except asyncio.CancelledError:
+            terminal["status"] = "interrupted"
+            raise
+        finally:
+            await handle.finish(terminal)
+
+    async def _post_complete(self, rendered: prompt_tools.RenderedPrompt,
+                             payload: dict[str, Any], headers: dict[str, str]) -> ImageCompletion:
         try:
             response = await self.client.post(f"{self.base_url}/chat/completions", json=payload,
                                               headers=headers, timeout=self.cfg.timeout_s)
@@ -233,9 +277,15 @@ class AsyncImageClient:
             prompt_text=f"{rendered.system}\n{rendered.user}",
             completion_text=str(text),
         )
+        hit, miss, cache_status = resolve_cache_usage(usage, prompt_tokens=prompt_tokens)
+        if self.cfg.prefix_usage_supported and cache_status == "unsupported":
+            cache_status = "incomplete"
+        if cache_status == "complete" and usage_status != "actual":
+            hit, miss, cache_status = None, None, "incomplete"
         return ImageCompletion(text=str(text), prompt_tokens=prompt_tokens,
                                completion_tokens=completion_tokens,
-                               usage_status=usage_status)
+                               usage_status=usage_status, cache_hit_tokens=hit,
+                               cache_miss_tokens=miss, cache_status=cache_status)
 
 
 def build_image_client(cfg: AppConfig, *,

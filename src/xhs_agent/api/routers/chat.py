@@ -342,53 +342,12 @@ async def post_chat_context_action(session_id: UuidPath, payload: ContextActionR
     chat_id = _uuid(session_id, what="会话")
     caller: StructuredCaller | None = None
     if payload.action == "recover":
-        from ...core import budget as budget_tool
-        from ...core.observations import record as record_observation
         from ...tools.http import build_http_client
-
-        checks = {"n": 0}
-
-        async def before_recover_request(call: Any) -> None:
-            """A06：恢复的真实请求（含结构修复）逐次预算检查，超限不发。"""
-            checks["n"] += 1
-            messages = call.messages or [
-                {"role": "system", "content": call.system},
-                {"role": "user", "content": call.user},
-            ]
-            decision = budget_tool.decide(
-                messages=messages,
-                tools=call.tools,
-                output_reserve=int(call.max_tokens or cfg.context.extract_max_tokens),
-                application_limit=cfg.context.request_token_limit,
-                model_window=cfg.context.model_context_window,
-                mode="enforce",
-                protected=("恢复页用户原文", "现有状态"),
-            )
-            await record_observation(
-                session,
-                event_type="context_assembled",
-                session_id=chat_id,
-                key=f"recover:{payload.action_id or 'new'}:{checks['n']}",
-                payload={
-                    **decision.as_event(),
-                    "effective_mode": "enforce",
-                    "kind": "recover_request",
-                    "request_index": checks["n"],
-                },
-                prompt_version="context_recover:v1",
-                policy_version="context:enforce",
-            )
-            if not decision.allowed:
-                raise budget_tool.BudgetError(
-                    "恢复页的请求超出预算，本次不发出",
-                    reason="required_context_overflow",
-                )
 
         async with build_http_client(cfg.llm.timeout_s) as client:
             caller = StructuredCaller(
                 provider=build_provider(cfg, client=client),
                 max_repairs=int(cfg.context.extract_repair_max),
-                before_request=before_recover_request,
             )
             applied = await context_state.perform_action(
                 session, chat_id,
@@ -452,12 +411,15 @@ async def delete_chat_session(session_id: UuidPath, cfg: ConfigDep,
 
 @router.post("/chat/sessions/{session_id}/artifacts/clue-versions",
              response_model=ContextActionResponse,
-             responses={400: error_response("请求格式或参数不合法"),
+             responses={201: {"model": ContextActionResponse,
+                              "description": "新版本已创建、选定并原子提交"},
+                        400: error_response("请求格式或参数不合法"),
                         404: error_response("资源不存在"),
                         409: error_response("状态版本冲突"),
                         503: error_response("依赖不可用（不做降级，直接返回错误）")})
 async def create_clue_version(session_id: UuidPath, payload: ClueVersionRequest,
-                              cfg: ConfigDep, session: SessionDep) -> dict[str, Any]:
+                              cfg: ConfigDep, session: SessionDep,
+                              response: Response) -> dict[str, Any]:
     """保存用户编辑的线索版本（v2 §3.3C）：独立不可变业务版本，成功后设为选定引用。"""
     chat_id = _uuid(session_id, what="会话")
     applied = await context_state.edit_clue_version(
@@ -471,6 +433,7 @@ async def create_clue_version(session_id: UuidPath, payload: ClueVersionRequest,
     )
     stored = await context_state.load(session, chat_id)
     assert stored is not None
+    response.status_code = 200 if applied.get("replay") else 201
     return {**applied, "context": context_state.context_view(cfg, stored)}
 
 

@@ -43,6 +43,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import time
@@ -322,6 +323,7 @@ class ToolCache:
 
     clues: dict[str, ClueRecord] = field(default_factory=dict)
     image_clues: dict[str, tuple[ImageClueParse, int]] = field(default_factory=dict)
+    image_generations: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass
@@ -606,6 +608,51 @@ def _image_group(
     return group or list(ctx.recent_attachments or [])
 
 
+async def _bound_image_group(
+    ctx: ToolContext, args: dict[str, Any], attachments: list[dict[str, Any]] | None,
+) -> list[dict[str, Any]]:
+    """显式旧线索绑定按其图片组取原附件，不能改用最近另一组图片。"""
+    group = _image_group(attachments, ctx)
+    binding = dict(ctx.operation_binding or {})
+    key = str(binding.get("object_key") or "")
+    version_id = str(binding.get("clue_version_id") or args.get("clue_version_id") or "")
+    if ctx.session is None or ctx.session_id is None:
+        return group
+    if version_id:
+        try:
+            version = await artifact_versions.get_version(ctx.session, ctx.session_id, uuid.UUID(version_id))
+        except ValueError as exc:
+            raise BadRequestError("线索版本标识不合法") from exc
+        if version is None or version.object_type != "clue" or version.status != "succeeded":
+            raise ConflictError("选定线索不属于当前会话", {"reason": "artifact_version_mismatch"})
+        if key and key != version.object_key:
+            raise ConflictError("线索版本与对象不一致", {"reason": "artifact_version_mismatch"})
+        key = str(version.object_key)
+    if not key.startswith("clue:images:"):
+        return group
+    target = key.removeprefix("clue:images:")
+
+    def matches(items: list[dict[str, Any]]) -> bool:
+        digests = [str(item.get("sha256") or "") for item in items]
+        return bool(items) and all(digests) and image_cache.group_digest(digests) == target
+
+    if matches(group):
+        return group
+    if attachments:
+        raise ConflictError("本轮图片与绑定的线索不是同一组", {"reason": "artifact_version_mismatch"})
+    rows = (await ctx.session.execute(select(ChatMessage.attachments).where(
+        ChatMessage.session_id == ctx.session_id, ChatMessage.role == "user",
+        func.jsonb_array_length(ChatMessage.attachments) > 0,
+    ).order_by(ChatMessage.created_at.desc(), ChatMessage.id.desc()))).scalars().all()
+    for items in rows:
+        candidate = [dict(item) for item in items if item.get("kind") == "image"]
+        if matches(candidate):
+            return candidate
+    raise ConflictError("这版线索的原图片已不可用，不能替换成另一组图片", {
+        "reason": "artifact_version_mismatch", "retryable": False,
+    })
+
+
 def _image_binding(
     ctx: ToolContext, args: dict[str, Any]
 ) -> tuple[bool, str, str]:
@@ -618,7 +665,7 @@ def _image_binding(
     operation = str(binding.get("operation") or "")
     force = bool(args.get("force_reparse") or False)
     clue = str(args.get("clue_version_id") or "")
-    if operation == "parse_clue_from_image":
+    if operation in ("parse_clue_from_image", "run_hotspot_analysis"):
         force = force or bool(binding.get("force_reparse") or False)
         bound = str(binding.get("clue_version_id") or "")
         if clue and bound and clue != bound:
@@ -639,16 +686,51 @@ async def _constraints_for(
     """
     if ctx.session is None or ctx.session_id is None:
         return []
+    if ctx.policy is not None and not ctx.policy.enforce:
+        return []
     stored = await context_state.load(ctx.session, ctx.session_id)
     if stored is None:
         return []
-    keys = set(context_rules.snapshot_object_keys(stored.snapshot))
-    if object_key:
-        keys.add(object_key)
+    keys = {object_key} if object_key else set()
     facts = context_rules.applicable_facts(
         stored.snapshot, topic_id=stored.topic_id, object_keys=keys
     )
     return context_rules.constraint_view(facts)
+
+
+async def _cache_bypass(ctx: ToolContext, identity: dict[str, Any] | None,
+                        request_id: str, reason: str) -> None:
+    if identity is None or ctx.session is None or ctx.session_id is None:
+        return
+    await record_observation(ctx.session, event_type="cache_lookup_finished",
+        session_id=ctx.session_id, key=request_id, turn_id=ctx.turn_id, call_id=request_id,
+        payload={"outcome": "bypass", "level": "none", "reason": reason,
+                 "cache_key": image_cache.cache_key(identity)})
+
+
+async def _remember_image(ctx: ToolContext, key: str, parsed: ImageClueParse,
+                          identity: dict[str, Any] | None) -> None:
+    ctx.cache.image_clues[key] = (parsed, _prompt_version_of(parsed))
+    generation = str(uuid.uuid4())
+    ctx.cache.image_generations[key] = generation
+    if ctx.session is not None and ctx.session_id is not None and identity is not None:
+        await record_observation(ctx.session, event_type="cache_entry_created",
+            session_id=ctx.session_id, key=f"turn:{generation}", turn_id=ctx.turn_id,
+            model=str(identity.get("model") or ""),
+            prompt_version=f"image_cache:v{identity.get('prompt_version')}",
+            policy_version=str(ctx.policy.mode if ctx.policy else "enforce"),
+            payload={"generation_id": generation, "cache_key": key, "cache_layer": "turn"})
+
+
+async def _consume_image(ctx: ToolContext, parsed: ImageClueParse) -> None:
+    if ctx.session is None or ctx.session_id is None or parsed.cache_status != "hit" \
+            or not parsed.cache_request_id:
+        return
+    await image_cache.consume(ctx.session, session_id=ctx.session_id,
+        lookup_result=image_cache.CacheLookup(
+            outcome="hit", level=parsed.cache_level, key=parsed.cache_key,
+            generation_id=parsed.generation_id, cross_turn=parsed.cross_turn),
+        turn_id=ctx.turn_id, call_id=parsed.cache_request_id)
 
 
 async def _image_clue_for(
@@ -700,16 +782,32 @@ async def _image_clue_for(
     # 轮内键 = 有序内容摘要 + 模型 / 参数 / prompt / schema 身份（A07）；
     # 没有内容身份（离线 / 校验失败）时才退回路径键。
     key = image_cache.cache_key(identity) if identity is not None else path_key
+    cache_request_id = str(uuid.uuid4())
+    persistent = bool(enforce and ctx.policy is not None and ctx.policy.persistent_cache)
+    layer = "turn" if key in ctx.cache.image_clues and not force_reparse else (
+        "persistent" if persistent and not force_reparse else "none")
+    if identity is not None and ctx.session is not None and ctx.session_id is not None:
+        await record_observation(ctx.session, event_type="cache_request_started",
+            session_id=ctx.session_id, key=cache_request_id, turn_id=ctx.turn_id,
+            call_id=cache_request_id, model=str(identity.get("model") or ""),
+            prompt_version=f"image_cache:v{identity.get('prompt_version')}",
+            policy_version=str(ctx.policy.mode if ctx.policy else "enforce"),
+            payload={"cache_key": key, "cache_layer": layer,
+                     "tool_call_id": ctx.checkpoint_scope})
 
     # ---- 选定编辑版优先（A08）：显式选择先于任何缓存 ----
     group_digest_value = image_cache.group_digest(digests)
+    bound_key = str((ctx.operation_binding or {}).get("object_key") or "")
+    if bound_key.startswith("clue:images:") and bound_key != f"clue:images:{group_digest_value}":
+        raise ConflictError("原图片内容已变化，与绑定线索不一致", {
+            "reason": "artifact_version_mismatch", "retryable": False})
     if identity is not None and not force_reparse and enforce and ctx.session_id is not None:
         selected = await _selected_clue_parse(
             ctx, group_digest_value, clue_version_id=clue_version_id
         )
         if selected is not None:
             logger.info("使用用户选定 / 编辑的线索版本（不重跑视觉模型）")
-            ctx.cache.image_clues[key] = (selected, _prompt_version_of(selected))
+            await _cache_bypass(ctx, identity, cache_request_id, "selected_clue")
             _checkpoint(ctx, "image_parse", cost_cny=0.0, prompt_tokens=0,
                         completion_tokens=0, usage_status="cached",
                         cache_level="selected_edit",
@@ -725,14 +823,15 @@ async def _image_clue_for(
         else:
             parsed, _version = cached
             logger.info("图片线索缓存命中：%d 张（不重复计费）", len(group))
-            if ctx.session_id is not None and ctx.cfg.context.image_cache_enabled:
+            if ctx.session_id is not None and ctx.session is not None:
                 await image_cache.record_turn_hit(
                     ctx.session,
                     session_id=ctx.session_id,
                     key=key or str(len(group)),
                     turn_id=ctx.turn_id,
-                    call_id=ctx.checkpoint_scope,
+                    call_id=cache_request_id,
                     images=len(group),
+                    generation_id=ctx.cache.image_generations.get(key, ""),
                 )
             cached_result = replace(
                 parsed,
@@ -742,6 +841,9 @@ async def _image_clue_for(
                 usage_status="cached",
                 cache_status="hit",
                 cache_level="turn",
+                generation_id=ctx.cache.image_generations.get(key, ""),
+                cache_key=key,
+                cache_request_id=cache_request_id,
             )
             _checkpoint(ctx, "image_parse", cost_cny=0.0, prompt_tokens=0,
                         completion_tokens=0, usage_status="cached",
@@ -753,43 +855,24 @@ async def _image_clue_for(
     if identity is not None and not force_reparse and enforce \
             and ctx.session_id is not None and policy is not None \
             and policy.persistent_cache:
-        # E7CTX-13：C（有效逻辑请求）来自受理记录，不由已写出的 H/M/E/B 反推
-        await record_observation(
-            ctx.session,
-            event_type="cache_request_started",
-            session_id=ctx.session_id,
-            key=f"{ctx.turn_id}:{ctx.checkpoint_scope}:persistent",
-            payload={
-                "cache_key": image_cache.cache_key(identity),
-                "images": len(identity.get("image_digests") or []),
-                "cache_layer": "persistent",
-            },
-            turn_id=ctx.turn_id,
-            call_id=ctx.checkpoint_scope,
-            policy_version=str(policy.mode),
-        )
         lookup = await image_cache.lookup(
             ctx.session,
             ctx.cfg,
             session_id=ctx.session_id,
             identity=identity,
             turn_id=ctx.turn_id,
-            call_id=ctx.checkpoint_scope,
+            call_id=cache_request_id,
         )
         if lookup.hit and lookup.payload:
             cached_parsed = _parse_cached_clue(ctx.cfg, lookup.payload)
             if cached_parsed is not None:
                 logger.info("图片解析持久缓存命中：%d 张（跨轮=%s）",
                             len(group), lookup.cross_turn)
-                await image_cache.consume(
-                    ctx.session,
-                    session_id=ctx.session_id,
-                    lookup_result=lookup,
-                    turn_id=ctx.turn_id,
-                    call_id=ctx.checkpoint_scope,
-                )
-                ctx.cache.image_clues[key] = (
-                    cached_parsed, _prompt_version_of(cached_parsed)
+                cached_parsed = replace(cached_parsed, cache_key=key,
+                    generation_id=lookup.generation_id, cache_request_id=cache_request_id,
+                    cross_turn=lookup.cross_turn)
+                await _remember_image(
+                    ctx, key, cached_parsed, identity
                 )
                 _checkpoint(ctx, "image_parse", cost_cny=0.0, prompt_tokens=0,
                             completion_tokens=0, usage_status="cached",
@@ -799,6 +882,10 @@ async def _image_clue_for(
                 return cached_parsed
             logger.warning("图片缓存条目的结构无法解析，按失效处理")
 
+    if lookup is None:
+        await _cache_bypass(ctx, identity, cache_request_id,
+                            "explicit_reparse" if force_reparse else "policy_disabled")
+
     # ---- 真实调用 ----
     images = [await _read_image(ctx, item) for item in group]
     if len(images) == 1:
@@ -806,12 +893,12 @@ async def _image_clue_for(
         parsed = await parse_image_clue(ctx.cfg, data, mime, http=ctx.http)
     else:
         parsed = await parse_image_clue_multi(ctx.cfg, images, http=ctx.http)
-    version = _prompt_version_of(parsed)
     stored_result: ChatArtifactVersion | None = None
     if identity is not None and ctx.session_id is not None and enforce:
         # A08：显式重解析建立**新的**原始业务版本；普通首次解析保持幂等（不重复建版本）。
         stored_result = await _register_original_clue(
-            ctx, group_digest_value, parsed, force_reparse=force_reparse
+            ctx, group_digest_value, parsed, force_reparse=force_reparse,
+            identity=identity,
         )
         parsed = replace(
             parsed,
@@ -819,7 +906,7 @@ async def _image_clue_for(
             version_no=int(stored_result.version_no or 0) if stored_result is not None else 0,
         )
     if key:
-        ctx.cache.image_clues[key] = (parsed, version)
+        await _remember_image(ctx, key, parsed, identity)
     stored: bool | None = None
     if (
         identity is not None
@@ -836,6 +923,8 @@ async def _image_clue_for(
                 "clue": parsed.clue.to_dict(),
                 "raw_text": parsed.raw_text,
                 "prompt_versions": dict(parsed.prompt_versions),
+                "version_id": parsed.version_id,
+                "version_no": parsed.version_no,
             },
             turn_id=ctx.turn_id,
             message_id=str((group[0] or {}).get("message_id") or ""),
@@ -967,12 +1056,12 @@ async def _register_original_clue(
     parsed: ImageClueParse,
     *,
     force_reparse: bool = False,
+    identity: dict[str, Any] | None = None,
 ) -> ChatArtifactVersion | None:
     """登记图片组的原始 clue 版本（E7CTX-12 / A08）。
 
-    - 首次解析：`ensure_initial` 幂等，已登记时原样返回（不重复建版本）；
-    - 显式重解析：`register_version` 每次建立新的成功版本（新 version_no、base=旧 head），
-      **不修改已选定的 object_refs**——普通后续任务仍消费用户选定的编辑版。
+    每次真实新解析建立内容一致的版本，同轮同调用重放保持幂等。
+    不修改已选定的 object_refs——普通后续任务仍消费用户选定的编辑版。
     """
     if ctx.session is None or ctx.session_id is None:
         return None
@@ -983,31 +1072,28 @@ async def _register_original_clue(
         "edited_fields": [],
     }
     try:
-        if force_reparse:
-            return await artifact_versions.register_version(
+        return await artifact_versions.register_version(
                 ctx.session,
                 session_id=ctx.session_id,
                 object_key_value=object_key,
                 object_type="clue",
                 content=content,
                 source={
-                    "actor": "explicit_reparse",
+                    "actor": "explicit_reparse" if force_reparse else "image_parse_original",
                     "turn_id": ctx.turn_id,
                     "call_id": ctx.checkpoint_scope,
+                    "parse_identity": dict(identity or {}),
+                    "message_id": ctx.source_message_id,
                 },
                 prompt_versions=dict(parsed.prompt_versions),
+                request_key_value=artifact_versions.request_key(
+                    ctx.session_id, object_key, turn_id=ctx.turn_id,
+                    call_id=ctx.checkpoint_scope,
+                    request=json.dumps({"identity": identity, "content": content,
+                                        "force_reparse": force_reparse},
+                                       sort_keys=True, ensure_ascii=False),
+                ) if ctx.turn_id and ctx.checkpoint_scope else None,
             )
-        return await artifact_versions.ensure_initial(
-            ctx.session,
-            session_id=ctx.session_id,
-            object_key_value=object_key,
-            object_type="clue",
-            run_id=None,
-            position=None,
-            content=content,
-            source={"actor": "image_parse_original", "turn_id": ctx.turn_id},
-            prompt_versions=dict(parsed.prompt_versions),
-        )
     except ApiError as exc:  # 登记失败不阻断解析本身
         logger.warning("原始 clue 版本登记失败（不阻断解析）：%s", exc.message)
         return None
@@ -1043,6 +1129,8 @@ def _parse_cached_clue(cfg: AppConfig, payload: dict[str, Any]) -> ImageCluePars
         usage_status="cached",
         cache_status="hit",
         cache_level="persistent",
+        version_id=str(payload.get("version_id") or ""),
+        version_no=int(payload.get("version_no") or 0),
     )
 
 
@@ -1091,6 +1179,13 @@ async def run_hotspot_analysis(
     group = [item for item in (attachments or []) if item]
     if not group and not text:
         group = list(ctx.recent_attachments or [])
+    if str((ctx.operation_binding or {}).get("object_key") or "").startswith("clue:images:") \
+            or args.get("clue_version_id"):
+        try:
+            group = await _bound_image_group(ctx, args, attachments)
+        except ApiError as exc:
+            return ToolOutcome(status="failed", steps=steps, error=exc.message,
+                               payload={"reason": "artifact_version_mismatch"})
     image_cost = 0.0
     image_tokens = (0, 0)
     image_status = ""
@@ -1115,7 +1210,8 @@ async def run_hotspot_analysis(
             return ToolOutcome(
                 status="failed",
                 steps=steps,
-                payload={"usage_status": "unknown"},
+                payload=_failed_image_usage(exc),
+                prompt_versions=_failed_image_versions(exc),
                 error=f"图片没能解析出来：{_reason(exc)}",
             )
         versions.update(parsed.prompt_versions)
@@ -1141,11 +1237,16 @@ async def run_hotspot_analysis(
         submission = await submit_analysis(
             ctx.session, [text], topk=topk, clues=clues,
             context_constraints=constraints, enqueue=ctx.enqueue,
+            observation_context={"session_id": str(ctx.session_id or ""),
+                                 "turn_id": ctx.turn_id, "tool_call_id": ctx.checkpoint_scope,
+                                 "policy": str(ctx.policy.mode if ctx.policy else "off")},
         )
     except ValueError as exc:  # 参数兜底（理论上前面已挡）
         return ToolOutcome(status="failed", steps=steps, error=str(exc))
 
     # 提交成功即取得稳定运行引用；等待 worker 的可取消阶段不应阻止它落入轮次账本。
+    if group:
+        await _consume_image(ctx, parsed)
     _checkpoint(
         ctx,
         "submission",
@@ -1208,6 +1309,17 @@ async def run_hotspot_analysis(
     )
 
 
+def _failed_image_usage(exc: Exception) -> dict[str, Any]:
+    detail = exc.detail if isinstance(exc, ApiError) else {}
+    usage = detail.get("usage")
+    return dict(usage) if isinstance(usage, dict) else {"usage_status": "unknown"}
+
+
+def _failed_image_versions(exc: Exception) -> dict[str, int]:
+    detail = exc.detail if isinstance(exc, ApiError) else {}
+    return {str(key): int(value) for key, value in (detail.get("prompt_versions") or {}).items()}
+
+
 async def parse_clue_from_image(
     ctx: ToolContext,
     args: dict[str, Any],
@@ -1217,9 +1329,11 @@ async def parse_clue_from_image(
 ) -> ToolOutcome:
     """「解析图片」工具（S7.7）：只把图片拆成热点描述与要素，不检索、不落库。"""
     steps: list[dict[str, Any]] = []
-    group = _image_group(
-        attachments, ctx
-    )  # 本轮带的优先，本轮没带回落最近一组（S7.16）
+    try:
+        group = await _bound_image_group(ctx, args, attachments)
+    except ApiError as exc:
+        return ToolOutcome(status="failed", steps=steps, error=exc.message,
+                           payload={"reason": "artifact_version_mismatch"})
     if not group:
         return ToolOutcome(
             status="failed",
@@ -1246,7 +1360,8 @@ async def parse_clue_from_image(
         return ToolOutcome(
             status="failed",
             steps=steps,
-            payload={"usage_status": "unknown"},
+            payload=_failed_image_usage(exc),
+            prompt_versions=_failed_image_versions(exc),
             error=f"图片没能解析出来：{_reason(exc)}",
         )
     payload = {
@@ -1265,6 +1380,7 @@ async def parse_clue_from_image(
         "cache_level": parsed.cache_level or None,
         "force_reparse": force_reparse,
     }
+    await _consume_image(ctx, parsed)
     return ToolOutcome(
         status="succeeded",
         steps=steps,
@@ -1777,7 +1893,7 @@ async def revise_draft(
                         "hotspot_index": index,
                         "object_key": key,
                         "refused": False,
-                        "revised": dict(claim.row.content.get("revised") or {}),
+                        "revised": artifact_versions.normalize_draft_content(claim.row.content),
                         "replayed": True,
                         "base_version_id": str(replay_base.id) if replay_base else None,
                         "base_version_no": int(replay_base.version_no or 0)

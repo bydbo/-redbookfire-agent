@@ -1,6 +1,6 @@
 # context_recover · 旧会话恢复抽取
 
-<!-- prompt-version: v1 -->
+<!-- prompt-version: v2 -->
 <!-- task-id: context_recover -->
 <!-- requires: page, state -->
 
@@ -16,7 +16,7 @@
 阅读这一页历史用户消息（每条都带真实消息 ID），对照已恢复的候选，输出状态增量。
 
 - 本页历史用户消息：{{ page }}
-- 已恢复候选 / 现有状态（JSON 数组）：{{ state }}
+- 已恢复候选 / 现有状态（JSON 数组，pending_confirmation 的 fact_id 是候选标识）：{{ state }}
 
 按以下顺序判断：
 

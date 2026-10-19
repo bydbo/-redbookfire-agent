@@ -1,6 +1,6 @@
 # image_hotspot_clue_multi · 多图热点拆解
 
-<!-- prompt-version: v1 -->
+<!-- prompt-version: v2 -->
 <!-- task-id: image_hotspot_clue_multi -->
 <!-- requires: -->
 
@@ -30,7 +30,8 @@
 3. **不猜时间**——不写"昨天""周末""今天"这类画面里没有依据的时间；
 4. **事实与推测分开**——`raw_text` 只写画面可直接看到的内容；推测只能出现在 `clue.borrow_angles` 里；
 5. **要素从九类里取**——`ip` / `topic` / `scene` / `visual` / `emotion` / `sound` / `conflict` /
-   `format` / `audience`；`value` 写画面里能对上的具体内容，不要写抽象词；
+   `format` / `audience`；`value` 写画面里能对上的具体内容，不要写抽象词。画面文字的排版归
+   `visual`，表达的主题归 `topic`，不新增文字类别；
 
 多图合并口径（本任务专有，逐条照做）：
 

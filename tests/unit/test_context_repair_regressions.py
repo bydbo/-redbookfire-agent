@@ -237,6 +237,7 @@ class TestCTX17ObjectRefValidation:
 
     def test_reset_topic_keeps_session_constraints(self) -> None:
         snapshot = ContextSnapshot(topic_id=TOPIC)
+        snapshot.object_refs = [{"object_key": "draft:r1:1", "object_type": "draft"}]
         with_session = apply(
             snapshot,
             delta([{"op": "add", "kind": "constraint", "value": "全对话不用感叹号",
@@ -252,6 +253,7 @@ class TestCTX17ObjectRefValidation:
                                    topic_id=TOPIC, version=3)
         active = [fact.value for fact in reset.snapshot.active()]
         assert active == ["全对话不用感叹号"]     # 会话级限制存活，话题项归档
+        assert reset.snapshot.object_refs == []
 
 
 # ---------------------------------------------------------------------------

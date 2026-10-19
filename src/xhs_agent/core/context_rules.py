@@ -628,6 +628,81 @@ def _mark_status(
 # ---------------------------------------------------------------------------
 
 
+def recover_candidates(
+    snapshot: ContextSnapshot, delta: ContextDelta, *, page_bodies: dict[str, str],
+    recovery_id: str, version: int, topic_id: str,
+) -> tuple[ContextSnapshot, list[dict[str, Any]], list[str]]:
+    """恢复只改变待确认候选；任何无效证据 / 目标都整页拒绝，保留输入不变。"""
+    working = snapshot.model_copy(deep=True)
+    decisions: list[dict[str, Any]] = []
+    errors: list[str] = []
+    items = [op.model_dump() for op in delta.operations] + [
+        {**raw, "op": "add"} for raw in delta.proposals
+    ]
+    for raw in items:
+        evidence = str(raw.get("evidence") or "")
+        source = next((mid for mid, body in page_bodies.items() if evidence_in(body, evidence)), "")
+        if not source:
+            errors.append("evidence_invalid")
+            continue
+        operation = str(raw.get("op") or "add")
+        target_id = str(raw.get("target_fact_id") or "")
+        pending = next((p for p in working.proposals if p.proposal_id == target_id
+                        and p.source_ref.get("recovery_id") == recovery_id), None)
+        active = next((f for f in working.facts if f.fact_id == target_id
+                       and f.status == "active"), None)
+        if operation in ("retract", "replace") and pending is None and active is None:
+            errors.append("target_invalid")
+            continue
+        scope = str(raw.get("scope") or "topic")
+        scope_id = "" if scope == "session" else topic_id
+        kind = str(raw.get("kind") or "goal")
+        value = str(raw.get("value") or "")
+        replaces: list[str] = []
+        source_ids = [source]
+        if pending is not None:
+            kind, scope, scope_id = pending.kind, pending.scope, pending.scope_id
+            source_ids = list(dict.fromkeys([*pending.source_message_ids, source]))
+            working.proposals = [p for p in working.proposals if p.proposal_id != target_id]
+            if operation == "retract":
+                decisions.append({"fact_id": target_id, "decision": "retracted",
+                                  "source_message_id": source, "kind": kind})
+                continue
+            replaces = list(pending.replaces_fact_ids)
+            operation = "replace" if replaces else "add"
+        elif active is not None:
+            kind, scope, scope_id = active.kind, active.scope, active.scope_id
+            replaces = [active.fact_id]
+            if operation == "retract":
+                value = active.value
+        if scope == "artifact":
+            original = pending if pending is not None else active
+            scope_id = str(raw.get("scope_id") or (original.scope_id if original else ""))
+            if scope_id not in snapshot_object_keys(working):
+                errors.append("scope_unresolved")
+                continue
+        if any(p.value == value and p.kind == kind and p.scope == scope
+               and p.scope_id == scope_id and p.operation == operation for p in working.proposals):
+            continue
+        try:
+            proposal = ContextProposal(
+                proposal_id=new_fact_id(), kind=kind, value=value, scope=scope, scope_id=scope_id,
+                operation=operation, replaces_fact_ids=replaces, conflicts_with=replaces,
+                reason="recovered_candidate", evidence=evidence, created_version=version,
+                source_ref={"message_id": source, "recovery_id": recovery_id},
+                source_message_ids=source_ids,
+            )
+        except ValueError:
+            errors.append("candidate_invalid")
+            continue
+        working.proposals.append(proposal)
+        decisions.append({"fact_id": proposal.proposal_id, "kind": proposal.kind,
+                          "decision": "pending_confirmation", "source_message_id": source})
+    if errors:
+        return snapshot.model_copy(deep=True), [], errors
+    return working, decisions, []
+
+
 def apply_action(
     snapshot: ContextSnapshot,
     *,
@@ -652,6 +727,7 @@ def apply_action(
                 working.archived.append(archived)
         kept = [item for item in working.proposals if item.scope != "topic"]
         working.proposals = kept
+        working.object_refs = []
         working.topic_id = new_topic_id()
         return ActionResult(snapshot=working, event_type="reset_topic")
 
@@ -669,7 +745,7 @@ def apply_action(
 
         # ---- 确认替换（E7CTX-04）：原子校验旧项 → 全部置 superseded → 新事实记录替代集合 ----
         replace_ids = list(proposal.replaces_fact_ids) or list(proposal.conflicts_with)
-        if proposal.operation == "replace" and replace_ids:
+        if proposal.operation in ("replace", "retract") and replace_ids:
             targets: list[ContextFact] = []
             for fact_id in replace_ids:
                 old = _find_fact(working, fact_id)
@@ -682,7 +758,12 @@ def apply_action(
                     )
                 targets.append(old)
             for old in targets:
-                _mark_status(working, old, "superseded", version)
+                _mark_status(working, old,
+                             "retracted" if proposal.operation == "retract" else "superseded",
+                             version)
+            if proposal.operation == "retract":
+                working.proposals = [item for item in working.proposals if item.proposal_id != target]
+                return ActionResult(snapshot=working, event_type="confirm")
         if proposal.operation == "select_object":
             # 对象未解析的提案不能只靠确认生效：必须带完整对象引用（服务层再验证归属）
             ref = dict(proposal.target_object_ref or {})
@@ -858,7 +939,8 @@ def proposal_view(proposal: ContextProposal) -> dict[str, Any]:
 
 
 def blocking_proposals(
-    snapshot: ContextSnapshot, *, created_version: int | None = None
+    snapshot: ContextSnapshot, *, created_version: int | None = None,
+    topic_id: str | None = None, object_keys: Iterable[str] | None = None,
 ) -> list[ContextProposal]:
     """会阻断当前任务的提案（冲突 / 歧义 / 作用域未解析）。
 
@@ -866,10 +948,17 @@ def blocking_proposals(
     但仍会在状态面板里显示（用户可随时处理）。
     """
     out = []
+    keys = set(object_keys) if object_keys is not None else None
     for proposal in snapshot.proposals:
         if proposal.reason not in BLOCKING_REASONS:
             continue
         if created_version is not None and proposal.created_version != created_version:
+            continue
+        if topic_id is not None and proposal.scope == "topic" and proposal.scope_id \
+                and proposal.scope_id != topic_id:
+            continue
+        if keys is not None and proposal.scope == "artifact" and proposal.scope_id \
+                and proposal.scope_id not in keys:
             continue
         out.append(proposal)
     return out

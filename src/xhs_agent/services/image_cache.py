@@ -36,6 +36,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from ..config import AppConfig
 from ..core.observations import record as record_observation
 from ..db.models import ChatImageParseCache
+from ..schemas import HotspotClue, SchemaError
 from ..services.chat import resolve_attachment
 from ..services.image_clue import MULTI_TASK_ID
 from ..services.image_clue import TASK_ID as SINGLE_TASK_ID
@@ -44,7 +45,7 @@ from ..tools import prompt as prompt_tool
 logger = logging.getLogger("xhs_agent.image_cache")
 
 #: 缓存身份里的 schema 版本：解析结果结构变化时递增（旧条目自然失配）
-SCHEMA_VERSION = "image_clue_v1"
+SCHEMA_VERSION = "image_clue_v2"
 #: 查询结论（与报告口径一致）
 OUTCOMES = ("hit", "miss", "error", "bypass")
 
@@ -208,7 +209,20 @@ def _payload_valid(payload: dict[str, Any] | None) -> bool:
         return False
     raw_text = str(payload.get("raw_text") or "").strip()
     clue = payload.get("clue")
-    return bool(raw_text) and isinstance(clue, dict) and bool(clue)
+    if not raw_text or len(raw_text) > 500 or not isinstance(clue, dict):
+        return False
+    try:
+        HotspotClue.from_dict(clue, hotspot_raw=raw_text)
+        versions = payload.get("prompt_versions") or {}
+        if not isinstance(versions, dict) or any(type(v) is not int for v in versions.values()):
+            return False
+        if payload.get("version_id"):
+            uuid.UUID(str(payload["version_id"]))
+        if "version_no" in payload and type(payload["version_no"]) is not int:
+            return False
+    except (SchemaError, ValueError, TypeError):
+        return False
+    return True
 
 
 async def lookup(
@@ -433,6 +447,7 @@ async def record_turn_hit(
     turn_id: str = "",
     call_id: str = "",
     images: int = 0,
+    generation_id: str = "",
 ) -> None:
     """轮内缓存命中：只写一条主结果（不再查库，也不重复记 miss）。"""
     await record_observation(
@@ -448,6 +463,8 @@ async def record_turn_hit(
             "cache_key": key,
             "images": int(images),
             "cross_turn": False,
+            "cache_layer": "turn",
+            "generation_id": generation_id,
         },
         turn_id=turn_id,
         call_id=call_id,
@@ -561,6 +578,7 @@ async def _observe(
         payload={
             "outcome": result.outcome,
             "level": result.level,
+            "cache_layer": result.level,
             "reason": result.reason,
             "elapsed_ms": result.elapsed_ms,
             "cache_key": result.key,
@@ -572,6 +590,7 @@ async def _observe(
         },
         turn_id=turn_id,
         call_id=call_id,
+        model=str(result.identity.get("model") or ""),
         prompt_version=f"image_cache:v{result.identity.get('prompt_version')}",
         policy_version=str(cfg.context.mode),
     )
@@ -603,6 +622,7 @@ async def _observe_created(
             "cache_layer": "persistent",
         },
         turn_id=turn_id,
+        model=str(identity.get("model") or ""),
         prompt_version=f"image_cache:v{identity.get('prompt_version')}",
         policy_version=str(cfg.context.mode),
     )

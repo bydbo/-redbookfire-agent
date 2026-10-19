@@ -1076,7 +1076,13 @@ paths:
               $ref: '#/components/schemas/ClueVersionRequest'
       responses:
         '200':
-          description: 动作结果与最新上下文（重放或成功）
+          description: 同动作重放的版本与最新上下文
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ContextActionResponse'
+        '201':
+          description: 新版本已创建、选定并原子提交
           content:
             application/json:
               schema:
@@ -2475,6 +2481,7 @@ components:
           enum:
             - add
             - replace
+            - retract
             - reset_topic
             - select_object
           description: 拟执行操作（v2 §3.3A）；旧提案按 conflicts_with 推导
@@ -2591,6 +2598,17 @@ components:
             - type: string
               format: uuid
             - type: 'null'
+
+        page_action_id:
+          oneOf:
+            - type: string
+              format: uuid
+            - type: 'null'
+        gaps:
+          type: array
+          items:
+            type: object
+            additionalProperties: true
 
     ArtifactHead:
       type: object
@@ -2799,6 +2817,8 @@ components:
             - select_object
             - recover
             - complete_recovery
+            - edit_clue
+            - select_clue
         decision:
           type: string
           enum:
@@ -2809,6 +2829,15 @@ components:
           type: string
         context:
           $ref: '#/components/schemas/ChatContext'
+        version_id:
+          oneOf:
+            - type: string
+              format: uuid
+            - type: 'null'
+        version:
+          oneOf:
+            - $ref: '#/components/schemas/ArtifactVersion'
+            - type: 'null'
         action_id:
           type: string
           format: uuid

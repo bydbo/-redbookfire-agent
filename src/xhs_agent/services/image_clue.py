@@ -72,6 +72,10 @@ class ImageClueParse:
     # 给用户"这次用的是哪一版"；缓存命中时同样是真实版本身份，不伪造新版本。
     version_id: str = ""
     version_no: int = 0
+    cache_key: str = ""
+    generation_id: str = ""
+    cache_request_id: str = ""
+    cross_turn: bool = False
 
 
 def _cost_cny(cfg: AppConfig, completion: ImageCompletion) -> float:
@@ -170,8 +174,25 @@ async def parse_image_clue(
                 ) from exc
             _fill_vision_usage(fields, cfg, completion)
 
-    text = completion.text
-    payload = _parse_payload(text)
+    return _decode_completion(cfg, completion, rendered.task_id, rendered.version)
+
+
+def _decode_completion(cfg: AppConfig, completion: ImageCompletion, task_id: str,
+                       version: int, *, multi: bool = False) -> ImageClueParse:
+    try:
+        return _validated_completion(cfg, completion, task_id, version, multi=multi)
+    except UpstreamError as exc:
+        exc.detail.update(usage={"prompt_tokens": completion.prompt_tokens,
+            "completion_tokens": completion.completion_tokens, "cost_cny": _cost_cny(cfg, completion),
+            "usage_status": str(completion.usage_status or "estimated")},
+            prompt_versions={task_id: version})
+        raise
+
+
+def _validated_completion(cfg: AppConfig, completion: ImageCompletion, task_id: str,
+                          version: int, *, multi: bool) -> ImageClueParse:
+    """严格校验结果；已知消费由调用方沿失败路径保留。"""
+    payload = _parse_payload(completion.text)
     raw_text = str(payload.get("raw_text") or "").strip()
     if not raw_text:
         raise UpstreamError("图片解析失败：模型没有给出热点描述（raw_text 为空）")
@@ -189,10 +210,12 @@ async def parse_image_clue(
     if not clue.elements:
         # 没有要素的"热点"检索不出任何素材，按上游失败处理（不返回半成品）
         raise UpstreamError("图片解析失败：模型没有给出任何爆点要素")
+    if multi:
+        _check_multi_clue(clue)
     return ImageClueParse(
         raw_text=raw_text,
         clue=clue,
-        prompt_versions={rendered.task_id: rendered.version},
+        prompt_versions={task_id: version},
         prompt_tokens=completion.prompt_tokens,
         completion_tokens=completion.completion_tokens,
         cost_cny=_cost_cny(cfg, completion),
@@ -252,31 +275,7 @@ async def parse_image_clue_multi(
                 ) from exc
             _fill_vision_usage(fields, cfg, completion)
 
-    payload = _parse_payload(completion.text)
-    raw_text = str(payload.get("raw_text") or "").strip()
-    if not raw_text:
-        raise UpstreamError("图片解析失败：模型没有给出热点描述（raw_text 为空）")
-    if len(raw_text) > MAX_RAW_TEXT_CHARS:
-        raise UpstreamError(
-            f"图片解析失败：热点描述超过 {MAX_RAW_TEXT_CHARS} 字上限（{len(raw_text)} 字）"
-        )
-    clue_payload = payload.get("clue")
-    if not isinstance(clue_payload, dict):
-        raise UpstreamError("图片解析失败：返回里缺少 clue 对象")
-    try:
-        clue = HotspotClue.from_dict(clue_payload, hotspot_raw=raw_text)
-    except SchemaError as exc:
-        raise UpstreamError(f"图片解析失败：线索结构不合契约（{exc}）") from exc
-    _check_multi_clue(clue)
-    return ImageClueParse(
-        raw_text=raw_text,
-        clue=clue,
-        prompt_versions={rendered.task_id: rendered.version},
-        prompt_tokens=completion.prompt_tokens,
-        completion_tokens=completion.completion_tokens,
-        cost_cny=_cost_cny(cfg, completion),
-        usage_status=str(completion.usage_status or "estimated"),
-    )
+    return _decode_completion(cfg, completion, rendered.task_id, rendered.version, multi=True)
 
 
 def _check_multi_clue(clue: HotspotClue) -> None:

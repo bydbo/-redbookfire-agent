@@ -5,6 +5,7 @@ import {
   NAlert,
   NButton,
   NCard,
+  NCheckbox,
   NCollapse,
   NCollapseItem,
   NEmpty,
@@ -16,6 +17,7 @@ import { computed, nextTick, onMounted, ref, watch } from 'vue'
 
 import type { ChatMessage, ContextFact, ContextProposal } from '@/api/chat'
 import HotspotResult from '@/components/HotspotResult.vue'
+import ChatArtifactPanel from '@/components/ChatArtifactPanel.vue'
 import ImageIntake from '@/components/ImageIntake.vue'
 import { errorCategoryLabel, stageLabel, useChatStore } from '@/stores/chat'
 
@@ -59,6 +61,11 @@ watch(
 
 // 切换（或首次打开）会话：直接跳到底，语义是「看最新的」
 watch(() => store.currentId, () => {
+  contextActionError.value = null
+  contextBusy.value = false
+  acknowledgeGap.value = false
+  draft.value = ''
+  picked.value = []
   void scrollToLatest(true)
 })
 
@@ -80,20 +87,23 @@ function onIntakeError(message: string): void {
 }
 
 async function onRemoveSession(): Promise<void> {
-  contextActionError.value = await store.removeSession()
+  const id = store.currentId
+  const error = await store.removeSession()
+  if (store.currentId === id) contextActionError.value = error
 }
 
 async function submit(): Promise<void> {
+  const id = store.currentId
   const text = draft.value
   const file = picked.value
   draft.value = ''
   picked.value = []
   const invalid = await store.send({ text, files: file })
-  if (invalid !== null) {
+  if (store.currentId === id && invalid !== null) {
     draft.value = text
     picked.value = file
   }
-  intakeError.value = null
+  if (store.currentId === id) intakeError.value = null
 }
 
 function messageText(message: ChatMessage): string {
@@ -166,6 +176,12 @@ const MODE_LABELS: Record<string, string> = {
 
 const contextActionError = ref<string | null>(null)
 const contextBusy = ref(false)
+const acknowledgeGap = ref(false)
+const recoveryLabel = computed(() => {
+  const status = store.context?.recovery?.status
+  return ({ pending: '待扫描', running: '正在扫描', awaiting_confirmation: '等待核对',
+            failed: '本页失败', interrupted: '本页已中断', complete: '已完成' })[status ?? 'pending']
+})
 
 const facts = computed<ContextFact[]>(() => store.context?.facts ?? [])
 const proposals = computed<ContextProposal[]>(() => store.context?.proposals ?? [])
@@ -196,51 +212,38 @@ async function actOnContext(
   action: 'confirm' | 'reject',
   proposalId: string,
 ): Promise<void> {
+  const id = store.currentId
   contextActionError.value = null
   contextBusy.value = true
   try {
-    contextActionError.value = await store.actOnContext(action, proposalId)
+    const error = await store.actOnContext(action, proposalId)
+    if (store.currentId === id) contextActionError.value = error
   } finally {
-    contextBusy.value = false
-  }
-}
-
-function isSelected(head: { object_key: string; version_id: string }): boolean {
-  return store.selectedBase?.objectKey === head.object_key
-    && store.selectedBase.versionId === head.version_id
-}
-
-function selectBase(head: { object_key: string; version_id: string; version_no: number }): void {
-  store.selectedBase = {
-    objectKey: head.object_key,
-    versionId: head.version_id,
-    versionNo: head.version_no,
+    if (store.currentId === id) contextBusy.value = false
   }
 }
 
 async function onStartRecovery(): Promise<void> {
+  const id = store.currentId
   contextActionError.value = null
   contextBusy.value = true
   try {
-    contextActionError.value = await store.startRecovery()
+    const error = await store.startRecovery()
+    if (store.currentId === id) contextActionError.value = error
   } finally {
-    contextBusy.value = false
+    if (store.currentId === id) contextBusy.value = false
   }
 }
 
 async function onCompleteRecovery(): Promise<void> {
+  const id = store.currentId
   contextActionError.value = null
   contextBusy.value = true
   try {
-    const message = await store.completeRecovery(false)
-    if (message !== null && message.includes('核对')) {
-      // 有历史缺口：用户确认后携带显式确认重试
-      contextActionError.value = await store.completeRecovery(true)
-    } else {
-      contextActionError.value = message
-    }
+    const error = await store.completeRecovery(acknowledgeGap.value)
+    if (store.currentId === id) contextActionError.value = error
   } finally {
-    contextBusy.value = false
+    if (store.currentId === id) contextBusy.value = false
   }
 }
 
@@ -284,7 +287,7 @@ function versionTag(call: { version_no?: number | null; base_version_no?: number
       <n-alert v-if="store.error" class="shrink-0" type="error" :title="store.error" />
 
       <!-- 当前目标与限制（S7.24）：折叠面板；刷新、重连后与服务端一致，不被流式正文重置 -->
-      <n-card v-if="store.currentId" size="small" class="shrink-0">
+      <n-card v-if="store.currentId" size="small" class="max-h-[45vh] shrink-0 overflow-y-auto">
         <n-collapse :default-expanded-names="proposals.length > 0 ? ['context'] : []">
           <n-collapse-item name="context">
             <template #header>
@@ -335,6 +338,8 @@ function versionTag(call: { version_no?: number | null; base_version_no?: number
                   <span v-if="fact.evidence" class="text-xs text-ink-muted">
                     · 原文「{{ fact.evidence }}」
                   </span>
+                  <n-button v-if="typeof fact.source_ref?.message_id === 'string'" size="tiny" text
+                            @click="store.showSource(String(fact.source_ref?.message_id))">查看来源</n-button>
                 </li>
               </ul>
 
@@ -352,6 +357,8 @@ function versionTag(call: { version_no?: number | null; base_version_no?: number
                   <span class="text-xs text-ink-muted">
                     {{ proposalReasonLabel(proposal.reason) }}
                   </span>
+                  <n-button v-if="typeof proposal.source_ref?.message_id === 'string'" size="tiny" text
+                            @click="store.showSource(String(proposal.source_ref?.message_id))">查看来源</n-button>
                   <div class="ml-auto flex gap-2">
                     <n-button
                       size="tiny"
@@ -384,7 +391,7 @@ function versionTag(call: { version_no?: number | null; base_version_no?: number
               >
                 <div class="flex flex-wrap items-center gap-2">
                   <n-tag size="tiny" type="warning" :bordered="false">
-                    历史恢复：{{ store.context.recovery.status }}
+                    历史恢复：{{ recoveryLabel }}
                   </n-tag>
                   <span class="text-xs text-ink-muted">
                     已扫描 {{ store.context.recovery.scanned_user_messages }} /
@@ -394,53 +401,38 @@ function versionTag(call: { version_no?: number | null; base_version_no?: number
                     <n-button
                       size="tiny"
                       type="primary"
-                      :disabled="contextBusy"
+                      :disabled="contextBusy || store.context.recovery.status === 'running'
+                        || store.context.recovery.status === 'awaiting_confirmation'"
                       @click="onStartRecovery"
                     >
-                      {{ store.context.recovery.status === 'pending' ? '开始恢复' : '继续恢复下一页' }}
+                      {{ ['failed', 'interrupted'].includes(store.context.recovery.status)
+                        ? '重试本页' : (store.context.recovery.recovery_id ? '扫描下一页' : '开始恢复') }}
                     </n-button>
                     <n-button
                       size="tiny"
-                      :disabled="contextBusy"
+                      :disabled="contextBusy || proposals.length > 0
+                        || store.context.recovery.status === 'running'
+                        || store.context.recovery.status === 'pending'"
                       @click="onCompleteRecovery"
                     >
                       已核对并完成
                     </n-button>
                   </div>
                 </div>
+                <n-button v-if="store.context.recovery.status === 'running'" size="tiny" @click="store.loadContext">
+                  刷新恢复状态
+                </n-button>
+                <n-checkbox v-if="['failed', 'interrupted'].includes(store.context.recovery.status)
+                  || (store.context.recovery.gaps?.length ?? 0) > 0"
+                            v-model:checked="acknowledgeGap">
+                  我已补全当前要求，理解未扫描的历史仍有缺口
+                </n-checkbox>
                 <span class="text-xs text-ink-muted">
                   恢复完成前不会执行分析 / 改稿；候选全部待确认，确认后才生效。
                 </span>
               </div>
 
-              <!-- 版本选择（v2 §3.3B）：选择只绑定下一次改稿，不改变 head -->
-              <div
-                v-if="store.context && store.context.artifact_heads.length > 0"
-                class="flex flex-col gap-2 border-t border-line pt-2"
-              >
-                <span class="text-xs text-ink-muted">文案版本（选择只影响下一次改稿）</span>
-                <div
-                  v-for="head in store.context.artifact_heads"
-                  :key="head.object_key"
-                  class="flex flex-wrap items-center gap-2"
-                >
-                  <span class="text-xs text-ink-strong">{{ head.object_key }}</span>
-                  <n-tag size="tiny" :bordered="false">第 {{ head.version_no }} 版</n-tag>
-                  <n-button
-                    v-if="head.object_key.startsWith('draft:')"
-                    size="tiny"
-                    :type="isSelected(head) ? 'primary' : 'default'"
-                    :disabled="contextBusy"
-                    @click="selectBase(head)"
-                  >
-                    {{ isSelected(head) ? '已选为下次基础' : '以此为基础改稿' }}
-                  </n-button>
-                </div>
-                <span v-if="store.selectedBase" class="text-xs text-ink-muted">
-                  下一次改稿将以第 {{ store.selectedBase.versionNo }} 版为基础
-                  （发送后自动清除绑定）
-                </span>
-              </div>
+              <ChatArtifactPanel :disabled="contextBusy || store.busy" />
             </div>
           </n-collapse-item>
         </n-collapse>

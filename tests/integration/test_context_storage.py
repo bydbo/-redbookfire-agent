@@ -366,13 +366,18 @@ class TestImageCache:
         identity = image_cache.build_identity(cfg, ["a" * 64])
         assert await image_cache.store(
             db_session, cfg, session_id=session_id, identity=identity,
-            payload={"clue": {"raw_text": "描述"}, "raw_text": "描述"}, turn_id="t1",
+            payload={"clue": {"hotspot_raw": "描述", "why_it_works": ["反差"],
+                     "mechanisms": [{"name": "反差"}],
+                     "elements": [{"type": "topic", "value": "夜跑", "weight": 0.9,
+                                   "confidence": 0.9, "evidence": "夜跑"}]},
+                     "raw_text": "描述"}, turn_id="t1",
         )
         hit = await image_cache.lookup(
             db_session, cfg, session_id=session_id, identity=identity, turn_id="t2",
         )
         assert hit.outcome == "hit" and hit.level == "persistent"
-        assert hit.payload == {"clue": {"raw_text": "描述"}, "raw_text": "描述"}
+        assert hit.payload and hit.payload["raw_text"] == "描述"
+        assert hit.payload["clue"]["elements"][0]["value"] == "夜跑"
 
         # 同键重复写入只保留一条
         await image_cache.store(

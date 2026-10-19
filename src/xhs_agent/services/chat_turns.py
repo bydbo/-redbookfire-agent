@@ -40,7 +40,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..config import AppConfig
 from ..core import budget as budget_tool
-from ..core import context_rules
+from ..core import context_rules, model_attempts
 from ..core import ledger as ledger_projection
 from ..core import progress as progress_tool
 from ..core.budget import BudgetDecision, BudgetPolicy
@@ -65,6 +65,7 @@ from ..schemas import SchemaError
 from ..services import chat_tools, context_state
 from ..services.chat import latest_attachments, update_message
 from ..services.chat_tools import ToolContext, ToolOutcome
+from ..services.model_observations import observer as attempt_observer
 from ..tools import prompt as prompt_tool
 from ..tools.http import build_http_client
 from ..tools.llm import BaseProvider, LLMError, StructuredCaller, build_provider
@@ -329,17 +330,50 @@ def build_tool_runner(
         if ledger is not None:
             ledger["active_scope"] = scope
         started = time.monotonic()
+        before_records = len(getattr(context.caller, "records", []))
+
+        def known_tool_usage() -> dict[str, Any]:
+            if context.caller is None:
+                return {}
+            records = list(getattr(context.caller, "records", []))[before_records:]
+            if not records:
+                return {}
+            return {
+                "cost_cny": chat_tools._records_cost(context.caller, before_records),
+                "prompt_tokens": chat_tools._records_tokens(context.caller, before_records)[0],
+                "completion_tokens": chat_tools._records_tokens(context.caller, before_records)[1],
+                "usage_status": chat_tools._records_usage_status(context.caller, before_records),
+                "prompt_versions": {str(row["task"]): _prompt_version(str(row["task"]))
+                                    for row in records if row.get("task")},
+            }
+
         with active.tool(
             name=f"tool.{name}", metadata={"tool": name, "turn_id": turn_id}
         ) as fields:
             try:
-                outcome = await handler(
-                    context, args, attachments=attachments, on_progress=on_progress
-                )
+                bound_operation = str((context.operation_binding or {}).get("operation") or "")
+                bound_tool = {"parse_clue_from_image": chat_tools.TOOL_PARSE_IMAGE,
+                              "run_hotspot_analysis": chat_tools.TOOL_RUN_ANALYSIS,
+                              "revise_draft": chat_tools.TOOL_REVISE_DRAFT}.get(bound_operation)
+                if bound_tool and name in (chat_tools.TOOL_PARSE_IMAGE, chat_tools.TOOL_RUN_ANALYSIS,
+                                           chat_tools.TOOL_REVISE_DRAFT) and name != bound_tool:
+                    outcome = ToolOutcome(status="failed", error="本轮工具与用户明确选择的操作不一致",
+                                          payload={"reason": "operation_binding_mismatch"})
+                else:
+                    outcome = await handler(
+                        context, args, attachments=attachments, on_progress=on_progress
+                    )
             except BaseException as exc:
+                known = known_tool_usage()
+                if known:
+                    record_component({"scope": scope, "component": "tool_llm", "tool": name, **known})
                 fields.level = LEVEL_ERROR
                 fields.status_message = error_category_of(exc)
                 raise
+            known = known_tool_usage()
+            if known and not any(key in outcome.payload for key in ("cost_cny", "prompt_tokens", "completion_tokens")):
+                outcome.payload.update({key: value for key, value in known.items() if key != "prompt_versions"})
+                outcome.prompt_versions.update(known["prompt_versions"])
             fields.metadata["status"] = outcome.status
             fields.metadata["latency_ms"] = int((time.monotonic() - started) * 1000)
             if outcome.status != "succeeded":
@@ -507,7 +541,7 @@ async def _context_refs(
 
 
 async def _load_source_binding(
-    session: AsyncSession, message_id: uuid.UUID | None
+    session: AsyncSession, message_id: uuid.UUID | None, *, session_id: uuid.UUID
 ) -> dict[str, Any] | None:
     """读取来源用户消息里持久化的操作绑定（A04：只读一次，不采信模型改写）。"""
     if message_id is None:
@@ -517,13 +551,16 @@ async def _load_source_binding(
             await session.execute(
                 select(ChatMessage.operation_binding).where(
                     ChatMessage.id == message_id,
+                    ChatMessage.session_id == session_id,
                     ChatMessage.role == "user",
                 )
             )
-        ).scalar_one_or_none()
-    except Exception:  # noqa: BLE001 - 绑定是可选增强；读取失败按"本轮无绑定"处理
-        logger.warning("读取来源消息绑定失败（按无绑定继续）：%s", message_id, exc_info=True)
-        return None
+        ).one_or_none()
+    except Exception as exc:
+        raise DependencyUnavailableError("无法读取本轮操作绑定，请重试") from exc
+    if value is None:
+        raise DependencyUnavailableError("本轮来源用户消息不存在或不属于当前会话")
+    value = value[0]
     if isinstance(value, dict) and value:
         return dict(value)
     return None
@@ -540,6 +577,7 @@ async def _prepare_context(
     turn_id: str,
     ledger: dict[str, Any],
     policy: TurnContextPolicy | None = None,
+    target_object_key: str = "",
 ) -> ContextPrep:
     """历史裁剪前的状态抽取与验证（S7.24；v2 §3.4 状态化准入）。
 
@@ -566,8 +604,6 @@ async def _prepare_context(
         policy=budget_policy,
         turn_policy=policy,
     )
-    if not prep.enabled:
-        return prep
     stored = await context_state.load(session, session_id)
     if stored is None:
         return prep
@@ -586,10 +622,14 @@ async def _prepare_context(
         return prep
 
     # ---- 遗留冲突：每轮检查全部仍适用的未解决冲突（E7CTX-03，不限于本轮新增）----
-    blocking_all = context_rules.blocking_proposals(stored.snapshot)
-    if policy.blocks_on_unresolved and blocking_all:
+    blocking_all = context_rules.blocking_proposals(stored.snapshot, topic_id=stored.topic_id,
+        object_keys=(target_object_key,) if target_object_key else ())
+    if policy.blocks_on_unresolved and blocking_all and not policy.enforce:
         prep.status = "confirmation_required"
         prep.blocking_reply = _blocking_reply(stored, None)
+        return prep
+
+    if not prep.enabled:
         return prep
 
     # A06：抽取及其结构修复**每一次真实请求**都要过预算入口——挂在 StructuredCaller 的
@@ -623,6 +663,7 @@ async def _prepare_context(
             prompt_version=f"context_extract:v{extract_version}",
             policy_version=f"context:{policy.mode}",
         )
+        await session.commit()
         if policy.enforce and not decision.allowed:
             raise budget_tool.BudgetError(
                 "状态抽取的请求超出预算，本轮不发出该请求",
@@ -653,8 +694,9 @@ async def _prepare_context(
     except (LLMError, SchemaError, PromptError, budget_tool.BudgetError) as exc:
         logger.warning("上下文抽取失败（mode=%s）：%s", policy.mode, type(exc).__name__)
         if policy.enforce:
-            prep.status = "invalid"
-            prep.error = (
+            overflow = isinstance(exc, budget_tool.BudgetError)
+            prep.status = "overflow" if overflow else "invalid"
+            prep.error = "这一轮的必需上下文与输出预留超出预算，请缩小范围或调整预算后重试。" if overflow else (
                 "这一轮没能确认上下文状态（抽取或校验失败），为避免按错误的前提继续，"
                 "请重试；如果反复失败，可以把要求写得更具体一些"
             )
@@ -677,7 +719,9 @@ async def _prepare_context(
     latest = await context_state.load(session, session_id)
     if latest is None:
         return prep
-    prep.state_text = context_state.state_prompt(latest)
+    prep.state_text = context_state.state_prompt(
+        latest, object_keys=(target_object_key,) if target_object_key else (),
+    ) if policy.enforce else ""
     if applied.conflict:
         # E7CTX-03：CAS 失败 → 停止依赖本次增量的执行，不悄悄读新快照继续
         prep.status = "conflict"
@@ -693,7 +737,8 @@ async def _prepare_context(
             "我不会按它执行；请把要求再说明清楚一点。"
         )
         return prep
-    blocking_all = context_rules.blocking_proposals(latest.snapshot)
+    blocking_all = context_rules.blocking_proposals(latest.snapshot, topic_id=latest.topic_id,
+        object_keys=(target_object_key,) if target_object_key else ())
     if policy.blocks_on_unresolved and blocking_all:
         prep.status = "confirmation_required"
         prep.blocking_reply = _blocking_reply(latest, applied)
@@ -725,117 +770,6 @@ def _blocking_reply(stored: Any, applied: Any) -> str:
     lines.append("确认后我再继续；也可以直接告诉我新的要求。")
     _ = stored
     return "\n".join(lines)
-
-
-async def _emit_model_attempts(
-    session: AsyncSession,
-    *,
-    session_id: uuid.UUID,
-    turn_id: str,
-    records: list[dict[str, Any]],
-    cfg: AppConfig | None = None,
-) -> None:
-    """按**每次实际传输**写 started + finished 两条观测（E7CTX-14）。
-
-    - 尝试身份 = `turn_id:记录序号:attempt`（结构修复形成新 identity 由 caller 序号区分，
-      传输重试共用 identity、按 attempt 序号区分）；
-    - 每次尝试固化价格快照（币种 / 价格版本 / 单价 / 来源），报告不按当前价格重算历史；
-    - 缺结束事件的尝试（进程崩溃等）没有 finished 行，报告按 incomplete 处理——不补零。
-    """
-    price = {
-        "currency": getattr(cfg.llm, "price_currency", "CNY") if cfg else "CNY",
-        "price_version": getattr(cfg.llm, "price_version", "") if cfg else "",
-        "input_per_m": float(cfg.llm.price_in_per_m) if cfg else None,
-        "output_per_m": float(cfg.llm.price_out_per_m) if cfg else None,
-        "cache_hit_per_m": float(cfg.context.price_cache_hit_per_m)
-        if cfg and cfg.context.price_cache_hit_per_m is not None else None,
-        "cache_miss_per_m": float(cfg.context.price_cache_miss_per_m)
-        if cfg and cfg.context.price_cache_miss_per_m is not None else None,
-        "source_status": "config_estimated",
-    }
-    for index, record in enumerate(records):
-        details = list(record.get("attempts_detail") or [])
-        if not details:
-            # 旧记录 / 无逐次明细：如实标 aggregate，不伪装成逐次传输
-            total = int(record.get("prompt_tokens") or 0) + int(
-                record.get("completion_tokens") or 0
-            )
-            if not total:
-                continue
-            base = {
-                "detail": "aggregate",
-                "task": str(record.get("task") or ""),
-                "prompt_tokens": int(record.get("prompt_tokens") or 0),
-                "completion_tokens": int(record.get("completion_tokens") or 0),
-                "usage_status": str(record.get("usage_status") or ""),
-                "cache_status": str(record.get("cache_status") or ""),
-                "attempts": int(record.get("attempts") or 1),
-                "latency_ms": int(record.get("latency_ms") or 0),
-                "price": dict(price),
-            }
-            await record_observation(
-                session,
-                event_type="model_attempt_started",
-                session_id=session_id,
-                key=f"{turn_id}:{index}:aggregate",
-                payload={**base, "identity": "aggregate"},
-                turn_id=turn_id,
-                model=str(record.get("model") or ""),
-                policy_version="attempt_v2",
-            )
-            await record_observation(
-                session,
-                event_type="model_attempt_finished",
-                session_id=session_id,
-                key=f"{turn_id}:{index}:aggregate",
-                payload=base,
-                turn_id=turn_id,
-                model=str(record.get("model") or ""),
-                policy_version="attempt_v2",
-            )
-            continue
-        for item in details:
-            attempt = int(item.get("attempt") or 1)
-            identity = f"{turn_id}:{index}"
-            body = {
-                "detail": "per_attempt",
-                "identity": identity,
-                "task": str(record.get("task") or ""),
-                "status": str(item.get("status") or ""),
-                "prompt_tokens": int(item.get("prompt_tokens") or 0),
-                "completion_tokens": int(item.get("completion_tokens") or 0),
-                "usage_status": str(item.get("usage_status") or ""),
-                "cache_hit_tokens": item.get("cache_hit_tokens"),
-                "cache_miss_tokens": item.get("cache_miss_tokens"),
-                "cache_status": str(item.get("cache_status") or ""),
-                "ttft_ms": item.get("ttft_ms"),
-                "latency_ms": int(item.get("latency_ms") or 0),
-                "error": bool(item.get("error")),
-                "price": dict(price),
-            }
-            await record_observation(
-                session,
-                event_type="model_attempt_started",
-                session_id=session_id,
-                key=f"{identity}:{attempt}:started",
-                payload={**body, "phase": "started"},
-                turn_id=turn_id,
-                attempt=attempt,
-                model=str(record.get("model") or ""),
-                policy_version="attempt_v2",
-            )
-            await record_observation(
-                session,
-                event_type="model_attempt_finished",
-                session_id=session_id,
-                key=f"{identity}:{attempt}:finished",
-                payload={**body, "phase": "finished"},
-                turn_id=turn_id,
-                attempt=attempt,
-                model=str(record.get("model") or ""),
-                policy_version="attempt_v2",
-            )
-
 
 
 async def run_turn_task(
@@ -882,6 +816,10 @@ async def run_turn_task(
         "versions": {},
         "run_id": "",
     }
+    observation_token = model_attempts.bind(attempt_observer(
+        factory, cfg, session_id=str(session_id), turn_id=events.turn_id,
+        policy=cfg.context.effective_mode(str(session_id)),
+        interrupted_records=ledger["records"]))
     # R5（E7OBS2-05）：轮次时间窗（进入 run_turn 到返回）——trace 上落一份同边界时间戳，
     # 回放脚本据此把落库 latency_ms 与 trace 同口径比对，而不是拿含准备 / 收尾的入口 span
     window: dict[str, str] = {"run_started_at": "", "run_finished_at": ""}
@@ -1046,7 +984,7 @@ async def run_turn_task(
                         # A04：轮次按**来源用户消息 ID**读取一次已持久化的可信绑定，
                         # 随 ToolContext 传给工具；不从模型参数重新生成。
                         source_binding = await _load_source_binding(
-                            session, user_message_id or message_id
+                            session, user_message_id, session_id=session_id
                         )
                         runner = build_tool_runner(
                             session,
@@ -1078,6 +1016,7 @@ async def run_turn_task(
                             turn_id=events.turn_id,
                             ledger=ledger,
                             policy=turn_policy,
+                            target_object_key=str((source_binding or {}).get("object_key") or ""),
                         )
                         budget_calls = {"n": 0}
 
@@ -1096,6 +1035,8 @@ async def run_turn_task(
                                 turn_id=events.turn_id,
                                 policy_version=f"context:{context_prep.mode}",
                             )
+                            # 预算观测带会话外键；发送前结束短事务，不持锁等待模型网络响应。
+                            await session.commit()
 
                         async def on_event(event: str, payload: dict[str, Any]) -> None:
                             body = dict(payload)
@@ -1228,7 +1169,7 @@ async def run_turn_task(
 
                         # R2（OBS-03）：先按轮次结果分流——失败不做 `final_reply`
                         window["run_started_at"] = now_iso()
-                        if context_prep.error and context_prep.status == "invalid" \
+                        if context_prep.error and context_prep.status in ("invalid", "overflow") \
                                 and not context_prep.blocking_reply:
                             # 抽取 / 校验失败：本轮停止依赖新状态的任务，不静默继续
                             turn = ChatTurn(
@@ -1262,13 +1203,6 @@ async def run_turn_task(
                                 budget_policy=context_prep.policy,
                                 on_budget=on_budget,
                             )
-                        await _emit_model_attempts(
-                            session,
-                            session_id=session_id,
-                            turn_id=events.turn_id,
-                            records=list(ledger.get("records") or []),
-                            cfg=cfg,
-                        )
                         window["run_finished_at"] = now_iso()
                         if turn.status == "succeeded":
                             # 收尾阶段（S7.20）：正文已流式回吐，这一步只做写库与终态整理
@@ -1363,6 +1297,7 @@ async def run_turn_task(
         with suppress(asyncio.CancelledError):
             await heartbeat_task
         reset_turn_id(token)
+        model_attempts.reset(observation_token)
         await events.close_publisher()
         await engine.dispose()
 

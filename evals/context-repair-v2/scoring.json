@@ -1,0 +1,11 @@
+{
+  "version": "context-repair-v2", "deterministic_threshold": 1.0,
+  "semantic_constraint_threshold": 0.95, "task_success_threshold": 0.90,
+  "normal_observation_completeness": 0.99, "supported_prefix_success_coverage": 0.95,
+  "state_reads": 200, "cache_reads": 100, "p95_limit_ms": 100,
+  "failed_timeout_empty_in_denominator": true, "semantic_reviewer": "independent_human",
+  "human_score_values": ["pass", "fail", "uncertain"], "uncertain_counts_as_pass": false,
+  "forbidden": ["cross_session_leak", "silent_constraint_loss", "orphan_tool_result", "over_budget_send", "wrong_base_commit", "double_billing"],
+  "prefix_experiment": {"groups": 30, "requests_per_group": 3, "mode": "sequential_same_prefix_same_params"},
+  "execution_budget": {"planning_limit_cny": 200, "current_user_limit_cny": 10, "stop_before_exceeding": true}
+}

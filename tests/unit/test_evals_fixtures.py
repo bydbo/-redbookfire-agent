@@ -78,7 +78,8 @@ class TestManifest:
                   # 与检索评测集 v1 分开管理，见 docs/评测集.md §六与 evals/context-repair-v1/
                   and not path.relative_to(EVALS_DIR).as_posix().startswith(("reports/",
                                                                              "chat/",
-                                                                             "context-repair-v1/"))}
+                                                                             "context-repair-v1/",
+                                                                             "context-repair-v2/"))}
         unexpected = sorted(actual - registered)
         assert not unexpected, f"这些文件没登记进 manifest：{unexpected}"
 

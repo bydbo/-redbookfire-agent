@@ -99,5 +99,5 @@ class TurnContextPolicy:
 
     @property
     def blocks_on_unresolved(self) -> bool:
-        """未解决冲突 / 未完成恢复阻止依赖任务：enforce 生效；shadow 只记录。"""
-        return self.enforce
+        """已有未决状态的保护不随新能力回退而消失。"""
+        return True

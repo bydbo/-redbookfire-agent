@@ -134,6 +134,10 @@ def fake_redis(monkeypatch: pytest.MonkeyPatch) -> FakeRedis:
 @pytest.fixture
 def cfg(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> AppConfig:
     monkeypatch.setenv("REDIS_URL", REDIS_URL)
+    # 本文件只测轮次事件 / 收尾；持久状态与回退保护由真库上下文回归覆盖。
+    async def no_persisted_context(*_args: Any, **_kwargs: Any):
+        return None
+    monkeypatch.setattr(chat_turns.context_state, "load", no_persisted_context)
     return write_config(tmp_path)
 
 
@@ -706,6 +710,40 @@ async def test_tool_runner_opens_tool_span_and_enqueue_uses_it(
     assert outcome.status == "succeeded"
     assert captured["x-xhs-turn-id"] == "turn-9"
     assert format(holder["span_id"], "016x") in str(captured["traceparent"])
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cancel", [False, True])
+async def test_tool_structure_failure_or_cancel_keeps_prior_repair_usage(monkeypatch, cancel):
+    from types import SimpleNamespace
+
+    from xhs_agent.core.ledger import project
+    from xhs_agent.services import chat_tools
+    from xhs_agent.services.chat_tools import ToolOutcome
+
+    caller = SimpleNamespace(records=[])
+    ledger = {"records": [], "calls": {"scope1": {"tool": "fixture", "scope": "scope1", "call_id": "scope1"}}}
+
+    async def tool(ctx, _args, **_kwargs):
+        ctx.caller.records.append({"task": "copy_revise", "cost_cny": 0.01, "prompt_tokens": 100,
+                                   "completion_tokens": 20, "usage_status": "actual"})
+        if cancel:
+            raise asyncio.CancelledError()
+        return ToolOutcome(status="failed", payload={"usage_status": "unknown"}, error="bad schema")
+
+    monkeypatch.setitem(chat_tools.HANDLERS, "fixture", tool)
+    runner = chat_turns.build_tool_runner(None, cfg=AppConfig(), client=None, session_id=uuid.uuid4(),
+        attachments=[], dispatcher=None, caller=caller, ledger=ledger)
+    if cancel:
+        with pytest.raises(asyncio.CancelledError):
+            await runner("fixture", {}, meta={"scope": "scope1"})
+        total = project(ledger)
+        assert total["prompt_tokens"] == 100 and total["cost_cny"] == 0.01
+        assert total["prompt_versions"] == {"copy_revise": 2}
+    else:
+        outcome = await runner("fixture", {}, meta={"scope": "scope1"})
+        assert outcome.payload["prompt_tokens"] == 100 and outcome.payload["cost_cny"] == 0.01
+        assert outcome.prompt_versions == {"copy_revise": 2}
 
 
 # ---------- R2（OBS-03 / 04 / 09）：一个入口、真实失败阶段、取消终态 ----------

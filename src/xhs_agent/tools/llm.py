@@ -23,6 +23,7 @@ import asyncio
 import json
 import math
 import time
+import uuid
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import Any, TypeVar
@@ -30,6 +31,7 @@ from typing import Any, TypeVar
 import httpx
 
 from ..config import LLM_PROVIDERS, AppConfig, LLMConfig
+from ..core import model_attempts
 from ..util import extract_json
 from .http import backoff_seconds
 
@@ -348,6 +350,10 @@ class OpenAICompatibleProvider(BaseProvider):
         if call.stream:
             # 不带 stream_options：不是所有兼容端点都认它；usage 缺失时按字符估算（见 `_result`）
             payload["stream"] = True
+            if self.cfg.stream_usage_supported:
+                payload["stream_options"] = {"include_usage": True}
+        if self.cfg.thinking_toggle_supported:
+            payload["thinking"] = {"type": "disabled"}
         return payload
 
     def _headers(self) -> dict[str, str]:
@@ -369,6 +375,10 @@ class OpenAICompatibleProvider(BaseProvider):
             error=error,
         )
         hit, miss, cache_status = resolve_cache_usage(usage, prompt_tokens=prompt_tokens)
+        if self.cfg.prefix_usage_supported and cache_status == "unsupported":
+            cache_status = "incomplete"
+        if cache_status == "complete" and usage_status != "actual":
+            hit, miss, cache_status = None, None, "incomplete"
         cost = (prompt_tokens / 1_000_000 * self.cfg.price_in_per_m
                 + completion_tokens / 1_000_000 * self.cfg.price_out_per_m)
         return LLMResult(
@@ -413,6 +423,14 @@ class OpenAICompatibleProvider(BaseProvider):
         last_error = ""
         started = time.time()
         attempts: list[dict[str, Any]] = []
+        identity = str(uuid.uuid4())
+        try:
+            from . import prompt as prompt_tool
+            version = int(prompt_tool.load(call.task).version)
+        except (ValueError, OSError, prompt_tool.PromptError):
+            version = None
+        facts = model_attempts.metadata(self.cfg, kind="text", task=call.task,
+                                        endpoint=url, prompt_version=version)
 
         def _attempt_row(*, attempt: int, status: str, usage: dict[str, Any] | None,
                          text: str, error: str, ttft_ms: int | None,
@@ -423,6 +441,10 @@ class OpenAICompatibleProvider(BaseProvider):
             hit, miss, cache_status = resolve_cache_usage(
                 usage, prompt_tokens=prompt_tokens
             )
+            if self.cfg.prefix_usage_supported and cache_status == "unsupported":
+                cache_status = "incomplete"
+            if cache_status == "complete" and usage_status != "actual":
+                hit, miss, cache_status = None, None, "incomplete"
             return {
                 "attempt": attempt,
                 "status": status,
@@ -435,11 +457,15 @@ class OpenAICompatibleProvider(BaseProvider):
                 "ttft_ms": ttft_ms,
                 "latency_ms": int((time.time() - at) * 1000),
                 "error": error,
+                "cost_cny": (prompt_tokens * self.cfg.price_in_per_m
+                             + completion_tokens * self.cfg.price_out_per_m) / 1_000_000,
             }
 
         for attempt in range(1, self.cfg.max_retries + 2):
             sink: dict[str, Any] = {"text": "", "ttft_ms": None}
             attempt_started = time.time()
+            handle = await model_attempts.begin(facts, identity=identity, attempt=attempt)
+            before_count = len(attempts)
             try:
                 if call.stream:
                     text, tool_calls, usage = await self._consume_stream(
@@ -494,6 +520,17 @@ class OpenAICompatibleProvider(BaseProvider):
                     return self._result(call, text=sink["text"], tool_calls=[], usage=None,
                                         attempt=attempt, started=started, error=last_error,
                                         ttft_ms=sink.get("ttft_ms"), attempts_detail=attempts)
+            except asyncio.CancelledError:
+                attempts.append(_attempt_row(attempt=attempt, status="interrupted",
+                    usage=sink.get("usage"), text=sink.get("text", ""),
+                    error="cancelled", ttft_ms=sink.get("ttft_ms"), at=attempt_started))
+                raise
+            finally:
+                terminal = attempts[-1] if len(attempts) > before_count else {
+                    "status": "failed", "usage_status": "unknown", "cache_status": "incomplete",
+                    "error": True,
+                }
+                await handle.finish(terminal)
             if attempt <= self.cfg.max_retries:
                 await asyncio.sleep(backoff_seconds(attempt))
 
@@ -532,6 +569,7 @@ class OpenAICompatibleProvider(BaseProvider):
                 chunk = json.loads(body)
                 if chunk.get("usage"):
                     usage = chunk["usage"]
+                    sink["usage"] = usage
                 choices = chunk.get("choices") or []
                 if not choices:
                     continue

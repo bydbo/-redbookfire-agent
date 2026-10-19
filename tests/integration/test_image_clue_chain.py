@@ -169,7 +169,7 @@ class TestImageClueChain:
         async with httpx.AsyncClient(transport=vision_transport(
                 json.dumps(CLUE_PAYLOAD, ensure_ascii=False))) as http:
             parsed = await parse_image_clue(cfg, PNG, "image/png", http=http)
-        assert parsed.prompt_versions == {"image_hotspot_clue": 1}
+        assert parsed.prompt_versions == {"image_hotspot_clue": 2}
         clue = parsed.clue.to_dict()
         assert clue["hotspot_raw"] == CLUE_PAYLOAD["raw_text"]
 

@@ -9,14 +9,20 @@ import type {
   ChatMessage,
   ChatSessionSummary,
   ContextActionRequest,
+  ArtifactVersion,
+  ChatStreamInput,
 } from '@/api/chat'
 import {
   createChatSession,
+  createClueVersion,
   deleteChatSession,
   getChatContext,
+  getChatArtifact,
   getChatSession,
   listChatSessions,
+  listChatArtifacts,
   postChatContextAction,
+  selectClueVersion,
   streamMessage,
 } from '@/api/chat'
 
@@ -142,6 +148,45 @@ export const useChatStore = defineStore('chat', () => {
   )
   const contextLoading = ref(false)
   const contextError = ref<string | null>(null)
+  const artifactVersions = ref<ArtifactVersion[]>([])
+  const artifactPreview = ref<ArtifactVersion | null>(null)
+  const artifactObjectKey = ref('')
+  const artifactsLoading = ref(false)
+  const artifactsError = ref<string | null>(null)
+  const sourcePreview = ref<ChatMessage | null>(null)
+  const sourceError = ref<string | null>(null)
+  let sessionEpoch = 0
+  let contextRequest = 0
+  let artifactRequest = 0
+  let previewRequest = 0
+  let streamAbort: AbortController | undefined
+
+  function sameSession(id: string, epoch: number): boolean {
+    return currentId.value === id && sessionEpoch === epoch
+  }
+
+  function clearSessionView(): void {
+    sessionEpoch += 1
+    contextRequest += 1
+    artifactRequest += 1
+    previewRequest += 1
+    streamAbort?.abort()
+    streamAbort = undefined
+    sending.value = false
+    context.value = null
+    selectedBase.value = null
+    contextError.value = null
+    contextLoading.value = false
+    artifactVersions.value = []
+    artifactPreview.value = null
+    artifactObjectKey.value = ''
+    artifactsError.value = null
+    artifactsLoading.value = false
+    sourcePreview.value = null
+    sourceError.value = null
+    messages.value = []
+    runs.value = {}
+  }
 
   // 当前阶段（S7.21）：SSE 实时更新 + 刷新后从 message.progress 恢复；已耗时每秒刷新
   const progress = ref<StageView | null>(null)
@@ -366,6 +411,7 @@ export const useChatStore = defineStore('chat', () => {
 
   async function pollOnce(): Promise<void> {
     const sessionId = currentId.value
+    const epoch = sessionEpoch
     if (sessionId === null) {
       stopPolling()
       return
@@ -373,18 +419,20 @@ export const useChatStore = defineStore('chat', () => {
     try {
       const detail = await getChatSession(sessionId)
       // E7OBS4-04：旧请求返回前验证范围——切会话后迟到的响应不能覆盖新会话
-      if (currentId.value !== sessionId) return
+      if (!sameSession(sessionId, epoch)) return
       messages.value = detail.messages
       syncProgressFromMessages(detail.messages)
       if (!hasRunning(detail.messages)) stopPolling()
     } catch {
-      stopPolling()
+      if (sameSession(sessionId, epoch)) stopPolling()
     }
   }
 
   /** 拉取会话上下文（S7.24）：面板、待确认项与恢复缺口都来自它。 */
   async function loadContext(): Promise<void> {
     const sessionId = currentId.value
+    const epoch = sessionEpoch
+    const request = ++contextRequest
     if (sessionId === null) {
       context.value = null
       return
@@ -393,12 +441,12 @@ export const useChatStore = defineStore('chat', () => {
     contextError.value = null
     try {
       const loaded = await getChatContext(sessionId)
-      if (currentId.value !== sessionId) return   // 旧会话响应不覆盖新会话
-      context.value = loaded
+      if (!sameSession(sessionId, epoch) || request !== contextRequest) return
+      if (context.value === null || loaded.state_version >= context.value.state_version) context.value = loaded
     } catch (err) {
-      contextError.value = describeError(err)
+      if (sameSession(sessionId, epoch) && request === contextRequest) contextError.value = describeError(err)
     } finally {
-      contextLoading.value = false
+      if (sameSession(sessionId, epoch) && request === contextRequest) contextLoading.value = false
     }
   }
 
@@ -416,6 +464,7 @@ export const useChatStore = defineStore('chat', () => {
   ): Promise<string | null> {
     const sessionId = currentId.value
     const current = context.value
+    const epoch = sessionEpoch
     if (sessionId === null || current === null) return '上下文还没加载好，请稍后重试'
     try {
       const body: ContextActionRequest = {
@@ -427,9 +476,16 @@ export const useChatStore = defineStore('chat', () => {
       if (value !== undefined && value !== '') body.value = value
       if (extra) Object.assign(body, extra)
       const result = await postChatContextAction(sessionId, body)
-      if (currentId.value === sessionId) context.value = result.context
+      if (!sameSession(sessionId, epoch)) return null
+      if (context.value === null || result.context.state_version >= context.value.state_version) context.value = result.context
+      if (action === 'reset_topic') {
+        selectedBase.value = null
+        artifactPreview.value = null
+      }
+      if (result.status === 'failed') return '这次操作未完成，请核对当前状态后重试'
       return null
     } catch (err) {
+      if (!sameSession(sessionId, epoch)) return null
       if (err instanceof ApiRequestError && err.httpStatus === 409) {
         await loadContext()
         return '状态已变化，已刷新当前版本，请重新操作'
@@ -440,26 +496,143 @@ export const useChatStore = defineStore('chat', () => {
 
   /** 开始 / 继续旧会话恢复（每页一次付费模型调用，不自动重试）。 */
   async function startRecovery(): Promise<string | null> {
-    return actOnContext('recover')
+    const recovery = context.value?.recovery
+    if (recovery?.status === 'running') {
+      await loadContext()
+      return '恢复正在处理，请等待后刷新状态'
+    }
+    return actOnContext('recover', undefined, undefined, {
+      recovery_id: recovery?.recovery_id ?? undefined,
+      retry_of: recovery && ['failed', 'interrupted'].includes(recovery.status)
+        ? recovery.page_action_id ?? undefined : undefined,
+    })
   }
 
   /** 完成恢复：候选清零；有历史缺口时必须显式确认已核对。 */
   async function completeRecovery(acknowledgePartialHistory = false): Promise<string | null> {
     return actOnContext('complete_recovery', undefined, undefined,
-                        { acknowledge_partial_history: acknowledgePartialHistory })
+                        { acknowledge_partial_history: acknowledgePartialHistory,
+                          recovery_id: context.value?.recovery?.recovery_id ?? undefined })
 
+  }
+
+  async function loadArtifacts(objectKey: string): Promise<void> {
+    const id = currentId.value
+    if (id === null) return
+    const epoch = sessionEpoch
+    const request = ++artifactRequest
+    artifactObjectKey.value = objectKey
+    artifactVersions.value = []
+    artifactPreview.value = null
+    artifactsLoading.value = true
+    artifactsError.value = null
+    try {
+      const result = await listChatArtifacts(id, objectKey)
+      if (sameSession(id, epoch) && request === artifactRequest) artifactVersions.value = result.items
+    } catch (err) {
+      if (sameSession(id, epoch) && request === artifactRequest) artifactsError.value = describeError(err)
+    } finally {
+      if (sameSession(id, epoch) && request === artifactRequest) artifactsLoading.value = false
+    }
+  }
+
+  async function previewArtifact(versionId: string): Promise<void> {
+    const id = currentId.value
+    if (id === null) return
+    const epoch = sessionEpoch
+    const request = ++previewRequest
+    artifactPreview.value = null
+    artifactsError.value = null
+    try {
+      const result = await getChatArtifact(id, versionId)
+      if (sameSession(id, epoch) && request === previewRequest) artifactPreview.value = result
+    } catch (err) {
+      if (sameSession(id, epoch) && request === previewRequest) artifactsError.value = describeError(err)
+    }
+  }
+
+  async function chooseClue(versionId: string): Promise<string | null> {
+    const id = currentId.value
+    const current = context.value
+    const epoch = sessionEpoch
+    if (id === null || current === null) return '请先加载当前对话'
+    try {
+      const result = await selectClueVersion(id, versionId, {
+        action_id: crypto.randomUUID(), expected_state_version: current.state_version,
+      })
+      if (sameSession(id, epoch)) context.value = result.context
+      return null
+    } catch (err) {
+      if (!sameSession(id, epoch)) return null
+      if (err instanceof ApiRequestError && err.httpStatus === 409) await loadContext()
+      return describeError(err)
+    }
+  }
+
+  async function saveClue(content: Record<string, unknown>): Promise<string | null> {
+    const id = currentId.value
+    const current = context.value
+    const base = artifactPreview.value
+    const epoch = sessionEpoch
+    if (id === null || current === null || base?.object_type !== 'clue') return '请先选择要编辑的线索版本'
+    const head = current.artifact_heads.find(item => item.object_key === base.object_key)
+    try {
+      const result = await createClueVersion(id, {
+        action_id: crypto.randomUUID(), expected_state_version: current.state_version,
+        expected_head_version_id: head?.version_id ?? null,
+        base_version_id: base.version_id, object_key: base.object_key, content,
+      })
+      if (!sameSession(id, epoch)) return null
+      context.value = result.context
+      await loadArtifacts(base.object_key)
+      if (sameSession(id, epoch) && result.version_id) await previewArtifact(result.version_id)
+      return null
+    } catch (err) {
+      if (!sameSession(id, epoch)) return null
+      if (err instanceof ApiRequestError && err.httpStatus === 409) await loadContext()
+      return describeError(err)
+    }
+  }
+
+  async function reparseClue(): Promise<string | null> {
+    const base = artifactPreview.value
+    const current = context.value
+    if (base?.object_type !== 'clue' || current === null) return '请先选择图片线索'
+    return send({ text: '请重新解析这组图片，生成一份新的原始线索。', operationBinding: JSON.stringify({
+      operation: 'parse_clue_from_image', object_key: base.object_key,
+      force_reparse: true, expected_state_version: current.state_version,
+    }) })
+  }
+
+  async function showSource(messageId: string): Promise<void> {
+    const id = currentId.value
+    if (id === null) return
+    const epoch = sessionEpoch
+    sourcePreview.value = null
+    sourceError.value = null
+    const existing = messages.value.find(item => item.message_id === messageId)
+    if (existing) { sourcePreview.value = existing; return }
+    try {
+      const detail = await getChatSession(id)
+      if (!sameSession(id, epoch)) return
+      sourcePreview.value = detail.messages.find(item => item.message_id === messageId) ?? null
+      if (sourcePreview.value === null) sourceError.value = '这条来源消息已不可用'
+    } catch (err) {
+      if (sameSession(id, epoch)) sourceError.value = describeError(err)
+    }
   }
 
   /** 删除当前会话并清空本地视图（v2 §3.3D）。 */
   async function removeSession(): Promise<string | null> {
     const sessionId = currentId.value
+    const epoch = sessionEpoch
     if (sessionId === null) return '没有可删除的会话'
     try {
       await deleteChatSession(sessionId)
     } catch (err) {
       return describeError(err)
     }
-    reset()
+    if (sameSession(sessionId, epoch)) reset()
     await loadSessions()
     return null
   }
@@ -479,8 +652,12 @@ export const useChatStore = defineStore('chat', () => {
 
   async function newSession(): Promise<string | null> {
     stopPolling()
+    clearSessionView()
+    currentId.value = null
+    const epoch = sessionEpoch
     try {
       const created = await createChatSession()
+      if (sessionEpoch !== epoch) return null
       currentId.value = created.session_id
       messages.value = []
       streamText.value = ''
@@ -492,6 +669,7 @@ export const useChatStore = defineStore('chat', () => {
       await loadSessions()
       return null
     } catch (err) {
+      if (sessionEpoch !== epoch) return null
       error.value = describeError(err)
       return error.value
     }
@@ -508,7 +686,9 @@ export const useChatStore = defineStore('chat', () => {
 
   async function openSession(sessionId: string): Promise<void> {
     stopPolling()
+    clearSessionView()
     currentId.value = sessionId
+    const epoch = sessionEpoch
     messagesLoading.value = true
     error.value = null
     streamText.value = ''
@@ -517,25 +697,27 @@ export const useChatStore = defineStore('chat', () => {
     progressScope.value = { messageId: '', turnId: '' }
     try {
       const detail = await getChatSession(sessionId)
-      if (currentId.value !== sessionId) return   // 期间切了会话：旧响应不覆盖新视图
+      if (!sameSession(sessionId, epoch)) return
       messages.value = detail.messages
       syncProgressFromMessages(detail.messages)
       if (hasRunning(detail.messages)) startPolling()
       void loadContext()
     } catch (err) {
+      if (!sameSession(sessionId, epoch)) return
       messages.value = []
       error.value = describeError(err)
     } finally {
-      messagesLoading.value = false
+      if (sameSession(sessionId, epoch)) messagesLoading.value = false
     }
   }
 
   async function refreshMessages(): Promise<void> {
     const sessionId = currentId.value
+    const epoch = sessionEpoch
     if (sessionId === null) return
     try {
       const detail = await getChatSession(sessionId)
-      if (currentId.value !== sessionId) return   // 旧会话响应不覆盖新会话
+      if (!sameSession(sessionId, epoch)) return
       messages.value = detail.messages
       syncProgressFromMessages(detail.messages)
     } catch {
@@ -616,7 +798,7 @@ export const useChatStore = defineStore('chat', () => {
   }
 
   // 发一条消息（文字与图片至少给一个）。返回 null 表示已受理，否则是要给用户看的提示。
-  async function send(input: { text: string; files?: File[] | null }): Promise<string | null> {
+  async function send(input: ChatStreamInput & { text: string }): Promise<string | null> {
     const text = input.text.trim()
     const files = input.files ?? []
     if (text.length === 0 && files.length === 0) return '请先说点什么，或者丢图进来'
@@ -627,6 +809,7 @@ export const useChatStore = defineStore('chat', () => {
       if (invalid !== null) return invalid
     }
     const sessionId = currentId.value
+    const epoch = sessionEpoch
     if (sessionId === null) return '会话没能建起来，请重试'
 
     sending.value = true
@@ -637,44 +820,50 @@ export const useChatStore = defineStore('chat', () => {
     progressScope.value = { messageId: '', turnId: '' }
     try {
       // v2 §3.3B：选择了基础版本时携带结构化绑定（服务端校验后随用户消息持久保存）
-      const binding = selectedBase.value && context.value !== null
+      const binding = input.operationBinding ?? (selectedBase.value && context.value !== null
         ? JSON.stringify({
             operation: 'revise_draft',
             object_key: selectedBase.value.objectKey,
             base_version_id: selectedBase.value.versionId,
             expected_state_version: context.value.state_version,
           })
-        : undefined
+        : undefined)
+      streamAbort = new AbortController()
       await streamMessage(sessionId, { text, files, operationBinding: binding },
                           (event) => {
-        onStreamEvent(event.event, event.data)
-      })
+        if (sameSession(sessionId, epoch)) onStreamEvent(event.event, event.data)
+      }, streamAbort.signal)
+      if (!sameSession(sessionId, epoch)) return null
       selectedBase.value = null   // 绑定只作用于下一次明确操作
     } catch (err) {
+      if (!sameSession(sessionId, epoch)) return null
       error.value = describeError(err)
     } finally {
-      sending.value = false
-      streamText.value = ''
-      await refreshMessages()
-      await loadContext()
-      await loadSessions()
-      // 这一轮如果产出了 run，顺手把结果卡片的数据取回来
-      const latest = [...messages.value].reverse().find((item) => item.run_id)
-      if (latest?.run_id) void ensureRun(latest.run_id)
+      if (sameSession(sessionId, epoch)) {
+        sending.value = false
+        streamText.value = ''
+        await refreshMessages()
+        if (sameSession(sessionId, epoch)) await loadContext()
+        if (sameSession(sessionId, epoch)) await loadSessions()
+        const latest = sameSession(sessionId, epoch)
+          ? [...messages.value].reverse().find((item) => item.run_id) : undefined
+        if (latest?.run_id) void ensureRun(latest.run_id)
+      }
     }
     return null
   }
 
   // 取一次结果卡片的数据并缓存；409（还没写回）折成 null，不重复请求。
   async function ensureRun(runId: string): Promise<RunDetail | null> {
+    const epoch = sessionEpoch
     const cached = runs.value[runId]
     if (cached !== undefined) return cached
     try {
       const detail = await getRun(runId)
-      runs.value[runId] = detail
+      if (sessionEpoch === epoch) runs.value[runId] = detail
       return detail
     } catch {
-      runs.value[runId] = null
+      if (sessionEpoch === epoch) runs.value[runId] = null
       return null
     }
   }
@@ -682,6 +871,7 @@ export const useChatStore = defineStore('chat', () => {
   function reset(): void {
     stopPolling()
     stopClock()
+    clearSessionView()
     currentId.value = null
     context.value = null
     messages.value = []
@@ -698,6 +888,9 @@ export const useChatStore = defineStore('chat', () => {
     sending, busy, streamText, toolSteps, error, runs,
     progress, stageElapsedMs, stageLongRunning,
     context, contextLoading, contextError, selectedBase,
+    artifactVersions, artifactPreview, artifactObjectKey, artifactsLoading, artifactsError,
+    sourcePreview, sourceError,
+    loadArtifacts, previewArtifact, chooseClue, saveClue, reparseClue, showSource,
     loadSessions, loadContext, actOnContext, startRecovery, completeRecovery,
     removeSession,
     init, newSession, openSession, refreshMessages, send, ensureRun, reset,

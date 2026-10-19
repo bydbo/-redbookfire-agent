@@ -60,7 +60,7 @@ class TestAssets:
     def test_image_hotspot_clue_has_no_placeholders(self, task_id: str):
         """图片热点拆解没有文本变量（图随消息附上），`requires` 因此是空的（S7.15 多图同）。"""
         loaded = prompt_tools.load(task_id)
-        assert loaded.version == 1
+        assert loaded.version == 2
         assert loaded.requires == ()
         assert loaded.placeholders() == set()
 

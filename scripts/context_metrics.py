@@ -156,7 +156,7 @@ class AppCacheMetrics:
             "orphan_lookups": self.orphan_lookups,
             "duplicate_events_ignored": self.duplicate_events,
             "layer": {"turn": turn_hits, "persistent": persistent_hits},
-            "primary_hit_rate": _rate(outcomes["hit"], complete),
+            "primary_hit_rate": _rate(outcomes["hit"], complete - outcomes["bypass"]),
             "normal_hit_rate": _rate(outcomes["hit"], outcomes["hit"] + outcomes["miss"]),
             "hit_consumption_rate": _rate(consumed_hit_requests, hit_requests),
             "hit_consumption_numerator": consumed_hit_requests,
@@ -183,13 +183,17 @@ class PrefixMetrics:
     finished: dict[str, dict[str, Any]] = field(default_factory=dict)
     orphan_finished: int = 0
     prices: dict[str, int] = field(default_factory=dict)
+    admitted: dict[str, dict[str, Any]] = field(default_factory=dict)
 
     def as_dict(self) -> dict[str, Any]:
         attempts = len(self.started)
         finished = len(self.finished)
         without_terminal = max(0, attempts - finished)
         complete = 0
-        unsupported = 0
+        unsupported = sum(1 for key in self.started if (
+            self.admitted.get(key, {}).get("prefix_usage_supported") is False
+            or (self.admitted.get(key, {}).get("prefix_usage_supported") is None
+                and self.finished.get(key, {}).get("cache_status") == "unsupported")))
         successes = 0
         success_supported = 0
         success_complete = 0
@@ -197,22 +201,26 @@ class PrefixMetrics:
         hit_tokens = 0
         hit_requests = 0
         invalid_breakdown = 0
+        prices: dict[str, int] = {}
         for key in self.finished:
             payload = self.finished[key]
             status = str(payload.get("cache_status") or "")
             success = str(payload.get("status") or "") == "succeeded"
             if success:
                 successes += 1
-            if status == "unsupported":
-                unsupported += 1
+            capability = self.admitted.get(key, {}).get("prefix_usage_supported")
+            if capability is False or (capability is None and status == "unsupported"):
                 continue
             if success:
                 # 支持供应商的成功响应 = 完整分项 + 缺分项（后者进未知，不排除分母）
                 success_supported += 1
             if status == "complete":
-                hit = int(payload.get("cache_hit_tokens") or 0)
-                miss = int(payload.get("cache_miss_tokens") or 0)
-                if hit < 0 or miss < 0 or (hit + miss) <= 0:
+                hit = payload.get("cache_hit_tokens")
+                miss = payload.get("cache_miss_tokens")
+                actual = payload.get("prompt_tokens")
+                if not all(type(n) is int and n >= 0 for n in (hit, miss, actual)) \
+                        or actual != hit + miss \
+                        or payload.get("usage_status", "actual") != "actual":
                     invalid_breakdown += 1
                 else:
                     complete += 1
@@ -225,7 +233,7 @@ class PrefixMetrics:
             price_snapshot = payload.get("price")
             if isinstance(price_snapshot, dict):
                 price_key = json.dumps(price_snapshot, ensure_ascii=False, sort_keys=True)
-                self.prices[price_key] = self.prices.get(price_key, 0) + 1
+                prices[price_key] = prices.get(price_key, 0) + 1
         supported = max(0, attempts - unsupported)
         unknown = max(0, supported - complete)
         return {
@@ -247,7 +255,7 @@ class PrefixMetrics:
             "success_responses": successes,
             "unknown_ratio": _rate(unknown, supported),
             "request_hit_rate": _rate(hit_requests, complete),
-            "price_snapshots": self.prices,
+            "price_snapshots": prices,
             "note": "支持供应商缺分项仍计入 supported 分母；缺终态按 incomplete/unknown 计入"
                     "全部尝试分母，不补零；成功响应覆盖与全部尝试覆盖分别报告",
         }
@@ -293,20 +301,24 @@ def analyze(
     app = AppCacheMetrics()
     prefix = PrefixMetrics()
     seen: set[str] = set()
-
+    unique: list[Observation] = []
+    filters = {"model": model, "prompt": prompt, "policy": policy,
+               "cache_layer": cache_layer, "experiment_arm": experiment_arm}
     for row in sorted(rows, key=lambda item: item.created_at):
         if row.event_id in seen:
             app.duplicate_events += 1
             continue
         seen.add(row.event_id)
-        if not _match_filters(row, model=model, prompt=prompt, policy=policy,
-                              cache_layer=cache_layer, experiment_arm=experiment_arm):
-            continue
+        unique.append(row)
+    all_requests = {row.request_key for row in unique if row.event_type == "cache_request_started"}
+    admitted_requests = {row.request_key for row in unique if row.event_type == "cache_request_started"
+                         and since <= row.created_at < until and _match_filters(row, **filters)}
+    for row in unique:
         event_type = row.event_type
         payload = dict(row.payload or {})
 
         if event_type == "cache_request_started":
-            if not (since <= row.created_at < until):
+            if row.request_key not in admitted_requests:
                 continue
             request = app.requests.get(row.request_key)
             if request is None:
@@ -320,6 +332,11 @@ def analyze(
                 continue
             request = app.requests.get(row.request_key)
             if request is None:
+                if row.request_key not in all_requests and since <= row.created_at < until \
+                        and _match_filters(row, **filters):
+                    app.orphan_lookups += 1
+                continue
+            if row.created_at < request.started_at:
                 app.orphan_lookups += 1
                 continue
             outcome = str(payload.get("outcome") or "")
@@ -333,11 +350,13 @@ def analyze(
 
         if event_type == "cache_entry_created":
             generation = str(payload.get("generation_id") or "")
-            if generation and since <= row.created_at < until:
+            if generation and since <= row.created_at < until and _match_filters(row, **filters):
                 app.created.setdefault(generation, row.created_at)
             continue
 
         if event_type == "cache_entry_invalidated":
+            if not (since <= row.created_at < until) or not _match_filters(row, **filters):
+                continue
             reason = str(payload.get("reason") or "unknown")
             app.invalidation_reasons[reason] = app.invalidation_reasons.get(reason, 0) + 1
             continue
@@ -346,22 +365,34 @@ def analyze(
             generation = str(payload.get("generation_id") or "")
             used_for = str(payload.get("used_for") or "")
             # 只认真实缓存消费；选定编辑版（used_for=selected_clue）不算缓存命中
-            if not generation or used_for != "image_clue":
+            if used_for != "image_clue":
                 continue
             if row.created_at >= until:
                 continue
-            app.consumed.setdefault(generation, []).append(row.created_at)
+            if generation:
+                app.consumed.setdefault(generation, []).append(row.created_at)
             request = app.requests.get(row.request_key)
-            if request is not None:
+            if request is not None and row.created_at >= request.started_at:
                 request.consumed_at.append(row.created_at)
             continue
 
     # ---- 前缀尝试：第二遍按 logical_call_id + attempt 关联 ----
-    for row in sorted(rows, key=lambda item: item.created_at):
-        if row.event_type not in ("model_attempt_started", "model_attempt_finished"):
+    all_attempts: set[str] = set()
+    for row in unique:
+        if row.event_type != "model_attempt_started":
             continue
-        if not _match_filters(row, model=model, prompt=prompt, policy=policy,
-                              cache_layer=cache_layer, experiment_arm=experiment_arm):
+        payload = dict(row.payload or {})
+        identity = str(payload.get("identity") or "")
+        if not identity or identity == "aggregate":
+            continue
+        attempt = row.attempt or payload.get("attempt") or 1
+        key = f"{row.session_id}:{identity}:{attempt}"
+        all_attempts.add(key)
+        if since <= row.created_at < until and _match_filters(row, **filters):
+            prefix.started.setdefault(key, row.created_at)
+            prefix.admitted.setdefault(key, payload)
+    for row in unique:
+        if row.event_type not in ("model_attempt_started", "model_attempt_finished"):
             continue
         payload = dict(row.payload or {})
         identity = str(payload.get("identity") or "")
@@ -369,14 +400,17 @@ def analyze(
             continue
         attempt = int(row.attempt or payload.get("attempt") or 1)
         key = f"{row.session_id}:{identity}:{attempt}"
-        if row.event_type == "model_attempt_started":
-            if since <= row.created_at < until:
-                prefix.started.setdefault(key, row.created_at)
-        else:
+        if row.event_type == "model_attempt_finished":
             if row.created_at >= until:
                 continue
             if key not in prefix.started:
+                if key not in all_attempts and since <= row.created_at < until \
+                        and _match_filters(row, **filters):
+                    prefix.orphan_finished += 1
+                continue
+            if row.created_at < prefix.started[key]:
                 prefix.orphan_finished += 1
+                continue
             prefix.finished[key] = payload
     return app, prefix
 
@@ -447,7 +481,7 @@ def _render_markdown(report: dict[str, Any]) -> str:
         f"- C（受理请求）= {app['C']}；H/M/E/B = {app['H']} / {app['M']} / "
         f"{app['E']} / {app['B']}；未完成 = {app['incomplete_requests']}"
     )
-    lines.append(f"- 主自动命中率 H/(H+M+E+B) = {app['primary_hit_rate']}")
+    lines.append(f"- 主自动命中率 H/(H+M+E) = {app['primary_hit_rate']}")
     lines.append(f"- 辅助正常命中率 H/(H+M) = {app['normal_hit_rate']}")
     lines.append(
         f"- 命中消费率（请求级）= {app['hit_consumption_rate']}"

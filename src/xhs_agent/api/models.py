@@ -494,7 +494,7 @@ class ContextProposal(_Response):
     source_ref: dict[str, Any] = Field(default_factory=dict)
     conflicts_with: list[str] = Field(default_factory=list)
     created_version: int = Field(default=0, ge=0)
-    operation: Literal["add", "replace", "reset_topic", "select_object"] = "add"
+    operation: Literal["add", "replace", "retract", "reset_topic", "select_object"] = "add"
     replaces_fact_ids: list[str] = Field(default_factory=list)
     target_object_ref: dict[str, Any] = Field(default_factory=dict)
     source_message_ids: list[str] = Field(default_factory=list)
@@ -530,6 +530,8 @@ class RecoveryProgress(_Response):
     total_user_messages: int = Field(default=0, ge=0)
     pending_proposal_ids: list[str] = Field(default_factory=list)
     accounting_message_id: UuidStr | None = None
+    page_action_id: UuidStr | None = None
+    gaps: list[dict[str, Any]] = Field(default_factory=list)
 
 
 class ArtifactHead(_Response):
@@ -579,7 +581,8 @@ class ContextActionResponse(_Response):
 
     session_id: UuidStr
     state_version: int = Field(ge=0)
-    action: ContextAction
+    action: Literal["confirm", "reject", "retract", "replace", "reset_topic",
+                    "select_object", "recover", "complete_recovery", "edit_clue", "select_clue"]
     decision: Literal["applied", "noop", "conflict"]
     context: ChatContext
     reason: str = ""
@@ -587,6 +590,8 @@ class ContextActionResponse(_Response):
     accounting_message_id: UuidStr | None = None
     replay: bool = False
     status: Literal["pending", "running", "succeeded", "failed", "interrupted"] = "succeeded"
+    version_id: UuidStr | None = None
+    version: ArtifactVersion | None = None
 
 
 class ArtifactVersion(_Response):

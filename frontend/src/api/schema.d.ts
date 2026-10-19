@@ -1110,7 +1110,7 @@ export interface components {
              * @description 拟执行操作（v2 §3.3A）；旧提案按 conflicts_with 推导
              * @enum {string}
              */
-            operation?: "add" | "replace" | "reset_topic" | "select_object";
+            operation?: "add" | "replace" | "retract" | "reset_topic" | "select_object";
             /** @description 确认 replace 时要替代的旧事实（E7CTX-04） */
             replaces_fact_ids?: string[];
             /** @description select_object 提案的目标对象（确认前由服务端验证归属） */
@@ -1148,6 +1148,10 @@ export interface components {
             total_user_messages?: number;
             pending_proposal_ids?: string[];
             accounting_message_id?: string | null;
+            page_action_id?: string | null;
+            gaps?: {
+                [key: string]: unknown;
+            }[];
         };
         /** @description 一个产物对象当前指向的成功版本（S7.25）。 */
         ArtifactHead: {
@@ -1226,11 +1230,13 @@ export interface components {
             session_id: string;
             state_version: number;
             /** @enum {string} */
-            action: "confirm" | "reject" | "retract" | "replace" | "reset_topic" | "select_object" | "recover" | "complete_recovery";
+            action: "confirm" | "reject" | "retract" | "replace" | "reset_topic" | "select_object" | "recover" | "complete_recovery" | "edit_clue" | "select_clue";
             /** @enum {string} */
             decision: "applied" | "noop" | "conflict";
             reason?: string;
             context: components["schemas"]["ChatContext"];
+            version_id?: string | null;
+            version?: components["schemas"]["ArtifactVersion"] | null;
             /** Format: uuid */
             action_id?: string;
             accounting_message_id?: string | null;
@@ -2289,8 +2295,17 @@ export interface operations {
             };
         };
         responses: {
-            /** @description 动作结果与最新上下文（重放或成功） */
+            /** @description 同动作重放的版本与最新上下文 */
             200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ContextActionResponse"];
+                };
+            };
+            /** @description 新版本已创建、选定并原子提交 */
+            201: {
                 headers: {
                     [name: string]: unknown;
                 };

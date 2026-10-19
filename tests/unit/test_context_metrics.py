@@ -74,6 +74,7 @@ def fixed_events(metrics):
              payload={"identity": "call-b"}),
         _row(metrics, event_id="a-end", event_type="model_attempt_finished", offset=12,
              payload={"identity": "call-a", "status": "succeeded",
+                      "prompt_tokens": 100, "usage_status": "actual",
                       "cache_status": "complete", "cache_hit_tokens": 60,
                       "cache_miss_tokens": 40}),
     ]
@@ -81,6 +82,71 @@ def fixed_events(metrics):
 
 
 class TestFixedEventRecompute:
+    def test_filters_select_admission_then_keep_terminal(self, metrics) -> None:
+        rows = [
+            _row(metrics, event_id="r", event_type="cache_request_started", offset=0,
+                 payload={"cache_layer": "persistent"}),
+            _row(metrics, event_id="h", event_type="cache_lookup_finished", offset=1,
+                 payload={"outcome": "hit", "level": "persistent"}),
+            _row(metrics, event_id="u", event_type="artifact_consumed", offset=2,
+                 payload={"generation_id": "g", "used_for": "image_clue"}),
+        ]
+        app, _ = metrics.analyze(rows, since=SINCE, until=UNTIL, cache_layer="persistent")
+        report = app.as_dict()
+        assert (report["C"], report["H"], report["incomplete_requests"]) == (1, 1, 0)
+        assert report["hit_consumption_rate"] == 1.0
+
+    def test_bypass_is_excluded_from_primary_denominator(self, metrics) -> None:
+        rows = [
+            _row(metrics, event_id="r1", event_type="cache_request_started", offset=0),
+            _row(metrics, event_id="h", event_type="cache_lookup_finished", offset=1,
+                 payload={"outcome": "hit"}),
+            _row(metrics, event_id="r2", event_type="cache_request_started", offset=2, call_id="c2"),
+            _row(metrics, event_id="b", event_type="cache_lookup_finished", offset=3, call_id="c2",
+                 payload={"outcome": "bypass"}),
+        ]
+        app, _ = metrics.analyze(rows, since=SINCE, until=UNTIL)
+        assert app.as_dict()["primary_hit_rate"] == 1.0
+        assert app.as_dict()["bypass_rate"] == 0.5
+
+    @pytest.mark.parametrize("usage", [
+        {"prompt_tokens": 100, "cache_hit_tokens": 100, "cache_miss_tokens": 100},
+        {"prompt_tokens": 100, "cache_hit_tokens": None, "cache_miss_tokens": 100},
+        {"prompt_tokens": 100, "cache_hit_tokens": -1, "cache_miss_tokens": 101},
+        {"prompt_tokens": 100, "cache_hit_tokens": 1.5, "cache_miss_tokens": 98.5},
+        {"prompt_tokens": 100, "cache_hit_tokens": "60", "cache_miss_tokens": 40},
+    ])
+    def test_invalid_breakdown_cannot_pass_strict(self, metrics, usage) -> None:
+        rows = [
+            _row(metrics, event_id="a", event_type="model_attempt_started", offset=0,
+                 payload={"identity": "i", "prefix_usage_supported": True}),
+            _row(metrics, event_id="b", event_type="model_attempt_finished", offset=1,
+                 payload={"identity": "i", "status": "succeeded", "cache_status": "complete", **usage}),
+        ]
+        app, prefix = metrics.analyze(rows, since=SINCE, until=UNTIL)
+        report = prefix.as_dict()
+        assert report["K"] == 0 and report["invalid_breakdown"] == 1
+        assert any("非法分项" in s for s in metrics._strict_gates({"app_cache": app.as_dict(),
+                                                                    "prefix_cache": report}))
+
+    def test_zero_actual_usage_is_complete(self, metrics) -> None:
+        rows = [
+            _row(metrics, event_id="a", event_type="model_attempt_started", offset=0,
+                 payload={"identity": "i", "prefix_usage_supported": True}),
+            _row(metrics, event_id="b", event_type="model_attempt_finished", offset=1,
+                 payload={"identity": "i", "status": "succeeded", "cache_status": "complete",
+                          "prompt_tokens": 0, "cache_hit_tokens": 0, "cache_miss_tokens": 0}),
+        ]
+        _, prefix = metrics.analyze(rows, since=SINCE, until=UNTIL)
+        assert prefix.as_dict()["K"] == 1
+        assert prefix.as_dict()["token_hit_rate"] == "N/A"
+
+    def test_duplicate_attempt_terminal_is_deduplicated(self, metrics) -> None:
+        rows = fixed_events(metrics)
+        rows += [rows[-1], rows[-1]]
+        _, prefix = metrics.analyze(rows, since=SINCE, until=UNTIL)
+        assert prefix.as_dict()["attempts_finished"] == 1
+
     def test_request_level_rates(self, metrics) -> None:
         app, prefix = metrics.analyze(fixed_events(metrics), since=SINCE, until=UNTIL)
         report = app.as_dict()

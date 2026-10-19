@@ -25,6 +25,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+import uuid
 from contextvars import Token
 from typing import Any
 
@@ -33,6 +34,7 @@ from sqlalchemy.exc import InterfaceError, OperationalError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..config import AppConfig
+from ..core import model_attempts
 from ..core.logging import bind_run_id, bind_turn_id, reset_run_id, reset_turn_id
 from ..core.progress import TURN_ID_HEADER
 from ..core.progress import error_category as error_category_of
@@ -43,8 +45,10 @@ from ..core.tracing import (
     get_tracer,
     use_trace_carrier,
 )
+from ..db.models import Run
 from ..db.session import create_engine_from_config, create_session_factory
 from ..services.materials import backfill_embeddings, sync_materials
+from ..services.model_observations import observer as attempt_observer
 from ..services.runs import load_job, mark_run_failed, planned_hotspots, set_run_stage
 from ..workflows import run_analysis
 
@@ -210,6 +214,7 @@ async def _run_job(
     engine = create_engine_from_config(cfg)
     token: Token[str] | None = None
     turn_token: Token[str] | None = None
+    observation_token = None
     try:
         factory = create_session_factory(engine)
         async with factory() as session:
@@ -227,6 +232,13 @@ async def _run_job(
                 return str(job["status"])
 
             token = bind_run_id(job["run_id"])
+            run = await session.get(Run, uuid.UUID(job["run_id"]))
+            observation = dict((run.context_snapshot if run else {}).get("observation") or {})
+            if observation.get("session_id"):
+                observation_token = model_attempts.bind(attempt_observer(
+                    factory, cfg, session_id=observation["session_id"],
+                    turn_id=observation.get("turn_id", turn_id), run_id=job["run_id"],
+                    policy=observation.get("policy", "")))
             if turn_id:
                 turn_token = bind_turn_id(turn_id)
             if sync_index:
@@ -257,6 +269,8 @@ async def _run_job(
             )
             return result.status
     finally:
+        if observation_token is not None:
+            model_attempts.reset(observation_token)
         if turn_token is not None:
             reset_turn_id(turn_token)
         if token is not None:

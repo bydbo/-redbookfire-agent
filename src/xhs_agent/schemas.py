@@ -916,8 +916,8 @@ class ContextProposal(BaseModel):
     @classmethod
     def _norm_operation(cls, value: Any) -> str:
         text = _clean_str(value) or "add"
-        if text not in ("add", "replace", "reset_topic", "select_object"):
-            raise ValueError("operation 只能是 add / replace / reset_topic / select_object")
+        if text not in ("add", "replace", "retract", "reset_topic", "select_object"):
+            raise ValueError("operation 只能是 add / replace / retract / reset_topic / select_object")
         return text
 
     @field_validator("source_ref", mode="before")

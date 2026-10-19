@@ -1,0 +1,11 @@
+{
+  "version": "context-repair-v2",
+  "frozen_at": "2026-10-18",
+  "files": {
+    "cases.json": "e9f2e1b2421b412fc260407308c47466f7738fe634b6e47cd23f83b4d86d4ec9",
+    "fixtures/camping.svg": "620cd5232565b91637e9eb32a18c042b8e3ac602399950902df63ff38eb26388",
+    "fixtures/night-run.svg": "0f8e4f84e0ae59ccda5e6eaa860eb1ab7392e92f07f60824583c971a5b45d6ac",
+    "protocol.md": "d1af8031bb3f9676e9c72bddffbd11eab56e05af433cace857860d8d1280858d",
+    "scoring.json": "2c88416420bbcdd4c530459ca09cc5619e87e6e99d638f9e9a25f12871e6de6a"
+  }
+}

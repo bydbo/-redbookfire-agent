@@ -68,7 +68,10 @@ def _partial_record(
     draft: dict[str, Any], items: list[dict[str, Any]], open_status: str
 ) -> dict[str, Any]:
     """未完成工具调用的部分记录：真实调用身份 + 组件已知账目，状态如实。"""
-    cost, prompt, completion = _facts_total(items)
+    # runner 已经收齐工具总账时取总账；取消发生在交回图之前也不能再把组件重复相加。
+    aggregate = [item for item in items if item.get("aggregate") is True]
+    accounting = aggregate[-1:] if aggregate else items
+    cost, prompt, completion = _facts_total(accounting)
     run_id = _uuid_or_none(
         draft.get("run_id")
         or next((item.get("run_id") for item in items if item.get("run_id")), "")
@@ -85,7 +88,7 @@ def _partial_record(
         "cost_cny": cost,
         "prompt_tokens": prompt,
         "completion_tokens": completion,
-        "usage_status": _facts_usage_status(items),
+        "usage_status": _facts_usage_status(accounting),
         "latency_ms": max(0, int(draft.get("latency_ms") or 0)),
         "error": "",
         "steps": [

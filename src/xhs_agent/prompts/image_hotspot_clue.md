@@ -1,6 +1,6 @@
 # image_hotspot_clue · 图片热点拆解
 
-<!-- prompt-version: v1 -->
+<!-- prompt-version: v2 -->
 <!-- task-id: image_hotspot_clue -->
 <!-- requires: -->
 
@@ -25,7 +25,7 @@
 2. **不猜地点**——不写具体城市、店名、门牌、活动名称；
 3. **不猜时间**——不写"昨天""周末""今天"这类画面里没有依据的时间；
 4. **事实与推测分开**——`raw_text` 只写画面可直接看到的内容；推测只能出现在 `clue.borrow_angles`（借势角度）里；
-5. **要素从九类里取**——`ip` / `topic` / `scene` / `visual` / `emotion` / `sound` / `conflict` / `format` / `audience`；`value` 写画面里能对上的具体内容，不要写抽象词；
+5. **要素从九类里取**——`ip` / `topic` / `scene` / `visual` / `emotion` / `sound` / `conflict` / `format` / `audience`；`value` 写画面里能对上的具体内容，不要写抽象词。画面文字的排版归 `visual`，文字表达的主题归 `topic`；`text`、`object`、`person` 都不是合法 type，禁止新增类型。输出前逐项核对 type 必须是上列九个字符串之一；
 6. **要素 3–6 个**，按重要性递减排列；`weight` 给 0–1 的权重（越能解释"这条图为什么吸引人"越高，拿不准不要给 1.0）；
 7. `raw_text` 不超过 500 字，用陈述句；**不要加话题标签、不要加 emoji、不要写成问句**；
 8. 输出必须是**一个 JSON 对象**，字段与下方 schema 一致，不要解释、不要多余文字。

@@ -103,6 +103,29 @@ def error_transport(status: int, text: str = "") -> httpx.MockTransport:
     return httpx.MockTransport(handler)
 
 
+@pytest.mark.asyncio
+async def test_invalid_vision_schema_keeps_actual_usage_on_failed_tool(tmp_path, monkeypatch):
+    from xhs_agent.services import chat_tools
+    from xhs_agent.services.image_clue import parse_image_clue
+
+    cfg = build_config(tmp_path, monkeypatch)
+    invalid = {"raw_text": "夜跑", "clue": {**CLUE_PAYLOAD["clue"],
+               "elements": [{"type": "text", "value": "错误类型"}]}}
+
+    def transport(_request):
+        return httpx.Response(200, json={"choices": [{"message": {"content": json.dumps(invalid)}}],
+            "usage": {"prompt_tokens": 100, "completion_tokens": 20}})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(transport)) as client:
+        with pytest.raises(UpstreamError) as info:
+            await parse_image_clue(cfg, PNG, "image/png", http=client)
+    usage = chat_tools._failed_image_usage(info.value)
+    assert usage["usage_status"] == "actual"
+    assert (usage["prompt_tokens"], usage["completion_tokens"]) == (100, 20)
+    assert usage["cost_cny"] > 0
+    assert chat_tools._failed_image_versions(info.value) == {"image_hotspot_clue": 2}
+
+
 class TestSniffImageMime:
     @pytest.mark.parametrize(
         ("data", "mime"),
@@ -137,7 +160,7 @@ class TestParseImageClue:
 
         assert parsed.raw_text == CLUE_PAYLOAD["raw_text"]
         assert parsed.clue.elements[0].value == "夜晚跑道"
-        assert parsed.prompt_versions == {"image_hotspot_clue": 1}
+        assert parsed.prompt_versions == {"image_hotspot_clue": 2}
 
         payload = capture["payload"]
         assert capture["url"].endswith("/chat/completions")
@@ -267,7 +290,7 @@ class TestParseImageClueMulti:
 
         assert parsed.raw_text == MULTI_CLUE_PAYLOAD["raw_text"]
         assert parsed.clue.elements[0].value == "球拍特写"
-        assert parsed.prompt_versions == {"image_hotspot_clue_multi": 1}
+        assert parsed.prompt_versions == {"image_hotspot_clue_multi": 2}
         assert parsed.prompt_tokens > 0 and parsed.cost_cny >= 0
 
         payload = capture["payload"]
@@ -388,7 +411,7 @@ class TestImageClueEndpoint:
         assert response.status_code == 200, response.text
         body = response.json()
         assert set(body) == {"raw_text", "clue", "prompt_versions"}
-        assert body["prompt_versions"] == {"image_hotspot_clue": 1}
+        assert body["prompt_versions"] == {"image_hotspot_clue": 2}
         assert body["clue"]["elements"][0]["type"] == "scene"
         assert fake.calls == 1
 

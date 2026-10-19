@@ -256,6 +256,7 @@ async def register_version(
     prompt_versions: dict[str, int] | None = None,
     run_id: str | None = None,
     position: int | None = None,
+    request_key_value: str | None = None,
 ) -> ChatArtifactVersion:
     """显式重解析：在锁内基于**当前 head** 建立一个新成功版本（A08）。
 
@@ -264,6 +265,13 @@ async def register_version(
     `object_refs`**——普通后续任务仍消费用户显式选定的编辑版，直到用户再次显式切换。
     """
     chat = await _lock_session(session, session_id)
+    if request_key_value:
+        existing = (await session.execute(select(ChatArtifactVersion).where(
+            ChatArtifactVersion.session_id == session_id,
+            ChatArtifactVersion.request_key == request_key_value,
+        ))).scalar_one_or_none()
+        if existing is not None:
+            return existing
     head = await _head_row(session, session_id, object_key_value)
     version_no = (int(head.version_no or 0) if head else 0) + 1
     row = ChatArtifactVersion(
@@ -272,7 +280,7 @@ async def register_version(
         object_type=object_type,
         run_id=_uuid_or_none(run_id),
         hotspot_position=position,
-        request_key=f"reparse:{uuid.uuid4().hex}",
+        request_key=request_key_value or f"parse:{uuid.uuid4().hex}",
         status="succeeded",
         version_no=version_no,
         base_version_id=head.id if head is not None else None,
