@@ -79,6 +79,20 @@ class TestParseRevise:
         with pytest.raises(SchemaError):
             parse_revise(payload)
 
+    def test_rejects_model_rebinding_the_material(self) -> None:
+        """S6.11b：素材身份由基础文案决定，模型不能把改稿绑到另一个素材。"""
+        with pytest.raises(SchemaError, match="material_id"):
+            parse_revise(
+                {"refused": False,
+                 "draft": {"material_id": "m-other", "body": "改后的正文"}},
+                material_id="m-1", hotspot_key="夜跑球鞋开箱")
+
+    def test_accepts_matching_material_id(self) -> None:
+        outcome = parse_revise(
+            {"refused": False, "draft": {"material_id": "m-1", "body": "改后的正文"}},
+            material_id="m-1")
+        assert outcome.draft is not None and outcome.draft.material_id == "m-1"
+
 
 class TestReviseAgent:
     @pytest.mark.asyncio

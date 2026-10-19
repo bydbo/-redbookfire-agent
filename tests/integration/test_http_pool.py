@@ -79,8 +79,14 @@ class CountingApp:
 
 
 @pytest_asyncio.fixture
-async def counting_server() -> AsyncIterator[tuple[str, CountingApp]]:
-    """起一个进程内 uvicorn，产出 (base_url, app)；用例结束关服。"""
+async def counting_server(monkeypatch: pytest.MonkeyPatch) -> AsyncIterator[tuple[str, CountingApp]]:
+    """起一个进程内 uvicorn，产出 (base_url, app)；用例结束关服。
+
+    loopback 必须绕过宿主机代理：测试要证明的是**本进程到本进程**的连接复用，
+    被系统代理拦截时 httpx 会拿到 502（环境问题，不是连接池结论）。
+    """
+    monkeypatch.setenv("NO_PROXY", "127.0.0.1,localhost")
+    monkeypatch.setenv("no_proxy", "127.0.0.1,localhost")
     app = CountingApp()
     port = _free_port()
     server = uvicorn.Server(uvicorn.Config(app, host="127.0.0.1", port=port,

@@ -53,11 +53,13 @@ from ..tools.embedding import (
     material_embedding_text,
 )
 from ..tools.http import build_http_client
+from ..tools.material_paths import is_link, material_key, resolve_material, validate_key
+from .material_identity import current_material, lock_material_index
 
 
 @dataclass
 class SyncPlan:
-    """增量计划：四类素材的绝对路径清单（已排序，便于断言与复现）。"""
+    """增量计划：四类素材根相对键（排序）；文件操作时单独解析本机路径。"""
 
     added: list[str] = field(default_factory=list)
     updated: list[str] = field(default_factory=list)
@@ -84,22 +86,6 @@ class SyncReport:
                 f"未变 {self.unchanged}、删除 {self.deleted}（视觉打标 {self.vision_used} 条）")
 
 
-def _path_key(path: str) -> str:
-    """路径比较键：绝对化 + `normcase`。
-
-    Windows 的路径比较大小写不敏感，而字符串 `startswith` / 字典键是敏感的：统一走
-    `normcase` 再比，避免同一路径只因盘符大小写不同就被当成两条素材（会写出重复行）。
-    """
-    return os.path.normcase(os.path.abspath(path))
-
-
-def _is_under(path: str, root: str) -> bool:
-    """`path` 是否位于 `root` 之下（`root` 自身不算）。"""
-    key_path = _path_key(path)
-    key_root = _path_key(root)
-    return key_path != key_root and key_path.startswith(key_root + os.sep)
-
-
 T = TypeVar("T")
 
 
@@ -120,11 +106,15 @@ def plan_sync(disk_entries: list[str], db_rows: Sequence[_SyncRow],
     磁盘扫描为空时**不删任何行**（避免目录读不到时误清索引）。
     输出：`SyncPlan`（added / updated / unchanged / deleted，均为绝对路径并按字典序排序）。
     """
-    # 键用 normcase 后的路径比较；值保留原始绝对路径，供落库与报错使用
-    disk_map = {_path_key(p): (os.path.abspath(p), materials_tool.fingerprint(p))
+    disk_map = {material_key(p, materials_dir): (material_key(p, materials_dir),
+                                               materials_tool.fingerprint(p))
                 for p in disk_entries}
-    db_map = {_path_key(row.path): (os.path.abspath(row.path), row.fingerprint)
-              for row in db_rows if _is_under(row.path, materials_dir)}
+    db_map = {validate_key(row.path): (row.path, row.fingerprint) for row in db_rows}
+    keys: dict[str, str] = {}
+    for key in [*disk_map, *db_map]:
+        previous = keys.setdefault(key.casefold(), key)
+        if previous != key:
+            raise ValueError("素材键存在大小写歧义，拒绝同步")
 
     added, updated, unchanged = [], [], []
     for key in sorted(disk_map, key=lambda item: disk_map[item][0]):
@@ -144,16 +134,23 @@ def plan_sync(disk_entries: list[str], db_rows: Sequence[_SyncRow],
 
 
 def _relative_keyframes(keyframes: list[str]) -> list[str]:
-    """把关键帧路径统一存成「相对工程根 + 正斜杠」，跨机器可读。"""
+    """把关键帧路径统一存成「相对工程根 + 正斜杠」，跨机器可读。
+
+    索引目录不在工程根下时（临时目录 / 其他盘）**保留绝对路径**：不写 `../` 逃逸路径，
+    也不把工程根相对规则套到素材根上。
+    """
     out = []
     for path in keyframes:
         rel = path
         if os.path.isabs(path):
             try:
-                rel = os.path.relpath(path, PROJECT_ROOT)
+                candidate = os.path.relpath(path, PROJECT_ROOT)
             except ValueError:
-                # 关键帧目录与工程根不在同一个盘符（少见）：退回绝对路径，保证仍能定位文件
-                rel = path
+                # 关键帧目录与工程根不在同一个盘符：保留绝对路径
+                candidate = path
+            if not os.path.isabs(candidate) and not candidate.startswith(".." + os.sep) \
+                    and candidate != "..":
+                rel = candidate
         out.append(rel.replace(os.sep, "/"))
     return out
 
@@ -163,7 +160,7 @@ def _row_values(material: Material, keyframes: list[str]) -> dict[str, Any]:
     mtime = (datetime.fromtimestamp(material.mtime, tz=UTC)
              if material.mtime else None)
     return {
-        "path": material.path,
+        "path": validate_key(material.path),
         "type": material.type,
         "title": material.title,
         "description": material.description,
@@ -232,17 +229,12 @@ MATERIALS_PAGE_MAX = 100
 
 def relative_dir(path: str, materials_dir: str) -> str:
     """素材相对 `materials_dir` 的父目录（正斜杠；直接放在根目录下时为 `""`）。"""
-    rel = os.path.relpath(os.path.abspath(path), os.path.abspath(materials_dir))
-    parent = os.path.dirname(rel)
-    if parent in ("", "."):
-        return ""
-    return parent.replace(os.sep, "/")
+    return validate_key(path).rpartition("/")[0]
 
 
 def _relative_path_expr(materials_dir: str) -> Any:
     """SQL 里取「相对 materials_dir 的路径」（含文件名）。"""
-    prefix = os.path.abspath(materials_dir).rstrip(os.sep) + os.sep
-    return func.substr(MaterialRow.path, len(prefix) + 1)
+    return MaterialRow.path
 
 
 def _escape_like(value: str) -> str:
@@ -260,10 +252,10 @@ def _keyword_clause(keyword: str) -> Any:
 def _dir_clause(materials_dir: str, dir_value: str) -> Any:
     """`dir` 筛选：空串 = 只看直接放在根目录下的素材，非空 = 该目录前缀（含子目录）。"""
     rel = _relative_path_expr(materials_dir)
-    normalized = dir_value.strip().strip("/").replace("/", os.sep)
+    normalized = dir_value.strip().strip("/")
     if not normalized:
-        return func.strpos(rel, os.sep) == 0
-    return func.substr(rel, 1, len(normalized) + 1) == normalized + os.sep
+        return func.strpos(rel, "/") == 0
+    return func.substr(rel, 1, len(normalized) + 1) == normalized + "/"
 
 
 def _filter_clauses(materials_dir: str, *, q: str | None, type: str | None,
@@ -335,9 +327,9 @@ async def list_materials(session: AsyncSession, cfg: AppConfig, *, q: str | None
     rows = (await session.execute(items_stmt)).scalars().all()
 
     rel = _relative_path_expr(materials_dir)
-    direct_dir = func.split_part(rel, os.sep, 1)
+    direct_dir = func.split_part(rel, "/", 1)
     dirs_stmt = select(direct_dir.label("path"), func.count().label("count")).where(
-        func.strpos(rel, os.sep) > 0)
+        func.strpos(rel, "/") > 0)
     if base_clauses:
         dirs_stmt = dirs_stmt.where(*base_clauses)
     dirs_stmt = dirs_stmt.group_by(direct_dir).order_by(direct_dir)
@@ -351,8 +343,7 @@ async def list_materials(session: AsyncSession, cfg: AppConfig, *, q: str | None
 async def load_material(session: AsyncSession, cfg: AppConfig,
                         material_id: uuid.UUID) -> dict[str, Any] | None:
     """单个素材的详情（列表项字段 + 爆点要素 `elements`）；不存在返回 None。"""
-    row = (await session.execute(
-        select(MaterialRow).where(MaterialRow.id == material_id))).scalar_one_or_none()
+    row = await current_material(session, material_id)
     if row is None:
         return None
     view = material_item_view(row, cfg.materials_dir())
@@ -406,9 +397,18 @@ def render_sidecar(*, title: str, tags: Sequence[str], description: str) -> str:
 
 
 def write_sidecar(media_path: str, *, title: str, tags: Sequence[str],
-                  description: str) -> str:
-    """把人工确认过的三个字段写进 `<素材文件名>.txt`（UTF-8 + LF），返回写到的路径。"""
+                  description: str, root: str | None = None) -> str:
+    """把人工确认过的三个字段写进 `<素材文件名>.txt`（UTF-8 + LF），返回写到的路径。
+
+    `root` 给了就按素材根重新解析旁车目标（拒绝根以下链接与越界），不能只信任调用方
+    传入的媒体绝对路径——旁车本身也可能是指向别处的符号链接。
+    """
     target = sidecar_target(media_path)
+    if root is not None:
+        key = validate_key(material_key(media_path, root))
+        target = resolve_material(root, f"{key}.txt")
+    elif is_link(target):
+        raise ValueError("旁车文件不能是符号链接或 junction")
     with open(target, "w", encoding="utf-8", newline="\n") as handle:
         handle.write(render_sidecar(title=title, tags=tags, description=description))
     return target
@@ -435,8 +435,7 @@ async def update_material(session: AsyncSession, cfg: AppConfig, material_id: uu
         if problem is not None:
             raise BadRequestError(problem, {"tags": cleaned_tags})
 
-    row = (await session.execute(
-        select(MaterialRow).where(MaterialRow.id == material_id))).scalar_one_or_none()
+    row = await current_material(session, material_id)
     if row is None:
         return None
 
@@ -447,9 +446,16 @@ async def update_material(session: AsyncSession, cfg: AppConfig, material_id: uu
         row.title or "", list(row.tags or []), row.description or "")
 
     if changed:
-        if os.path.isfile(row.path):
-            await asyncio.to_thread(write_sidecar, row.path, title=new_title,
-                                    tags=new_tags, description=new_description)
+        media_path = resolve_under(cfg.materials_dir(), row.path)
+        if os.path.isfile(media_path):
+            try:
+                await asyncio.to_thread(
+                    write_sidecar, media_path, title=new_title, tags=new_tags,
+                    description=new_description, root=cfg.materials_dir())
+            except (ValueError, OSError) as exc:
+                raise BadRequestError(
+                    "旁车文件不合法：不能是链接或越出素材根",
+                    {"path": row.path}) from exc
         row.title, row.tags, row.description = new_title, new_tags, new_description
         row.source = "sidecar"
         await session.commit()
@@ -476,15 +482,10 @@ def trash_root(cfg: AppConfig) -> str:
 
 def resolve_under(root: str, relative: str) -> str:
     """把相对路径解析成 `root` 之下的绝对路径；空路径 / 绝对路径 / 越界一律 400。"""
-    raw = (relative or "").strip()
-    text = raw.replace("\\", "/").strip("/")
-    if not text or text in {".", ".."} or os.path.isabs(raw):
-        raise BadRequestError("路径不合法：必须是相对路径", {"path": relative})
-    root_abs = os.path.realpath(root)
-    target = os.path.realpath(os.path.join(root_abs, *text.split("/")))
-    if not target.startswith(root_abs + os.sep):
-        raise BadRequestError("路径不合法：越出了所在目录", {"path": relative})
-    return target
+    try:
+        return resolve_material(root, relative)
+    except (ValueError, OSError) as exc:
+        raise BadRequestError("路径不合法：必须位于允许目录内且不能包含链接") from exc
 
 
 def unique_path(target: str) -> str:
@@ -499,9 +500,17 @@ def unique_path(target: str) -> str:
 
 
 def companion_paths(media_path: str) -> list[str]:
-    """媒体文件旁的说明文件（`<素材>.txt|.md|.json`）：跟着素材一起进出回收站。"""
-    return [media_path + suffix for suffix in COMPANION_SUFFIXES
-            if os.path.isfile(media_path + suffix)]
+    """媒体文件旁的说明文件（`<素材>.txt|.md|.json`）：跟着素材一起进出回收站。
+
+    根以下的链接 / junction 明确失败（不能借旁车把操作引到素材根之外）。
+    """
+    companions = [media_path + suffix for suffix in COMPANION_SUFFIXES
+                  if os.path.isfile(media_path + suffix)]
+    for path in companions:
+        if is_link(path):
+            raise BadRequestError(
+                "旁车文件不能是符号链接或 junction", {"path": os.path.basename(path)})
+    return companions
 
 
 def _move_file(source: str, target: str) -> None:
@@ -536,20 +545,15 @@ async def trash_material(session: AsyncSession, cfg: AppConfig,
     - 删除 `materials` 行会通过外键 CASCADE 清掉 `run_matches`——**历史候选不再回来**，
       这是「恢复 = 重新入库（新 uuid）」的代价。
     """
-    row = (await session.execute(
-        select(MaterialRow).where(MaterialRow.id == material_id))).scalar_one_or_none()
+    row = await current_material(session, material_id)
     if row is None:
         return None
 
-    materials_dir = os.path.abspath(cfg.materials_dir())
-    media_path = os.path.abspath(row.path)
-    relative = os.path.relpath(media_path, materials_dir)
-    if relative.startswith(".."):
-        raise BadRequestError("素材不在素材根目录下，拒绝移入回收站",
-                              {"path": row.path})
+    media_path = resolve_under(cfg.materials_dir(), row.path)
+    relative = row.path
 
     root = trash_root(cfg)
-    destination = unique_path(os.path.join(root, relative))
+    destination = unique_path(resolve_under(root, relative))
     file_missing = not os.path.isfile(media_path)
     if not file_missing:
         await asyncio.to_thread(_move_bundle, media_path, destination,
@@ -695,6 +699,12 @@ async def save_upload(cfg: AppConfig, upload: _Upload, *,
     limit_bytes = int(cfg.upload.max_size_gb * 1024 ** 3)
     target_dir = upload_dir(cfg, now=now)
     await asyncio.to_thread(os.makedirs, target_dir, exist_ok=True)
+    # 月份目录本身可能是预先放好的链接：落盘前按素材根重新解析，链接 / 越界明确失败
+    month = os.path.basename(target_dir.rstrip("/\\"))
+    try:
+        resolve_material(cfg.materials_dir(), month)
+    except (ValueError, OSError) as exc:
+        raise BadRequestError("上传目录不合法：不能是链接或越出素材根") from exc
     temp = os.path.join(target_dir, f"{INCOMING_PREFIX}{uuid.uuid4().hex}.part")
     total = 0
     try:
@@ -739,6 +749,7 @@ async def sync_materials(session: AsyncSession, cfg: AppConfig, *,
             "把素材放进 data/materials/，或在 config/config.toml 的 [paths].materials_dir "
             "指向真实目录；同步不会因为目录读不到就清空索引")
 
+    await lock_material_index(session)
     keyframes_dir = os.path.join(cfg.index_dir(), "keyframes")
     disk_files = materials_tool.scan_materials(materials_dir)
 
@@ -753,7 +764,7 @@ async def sync_materials(session: AsyncSession, cfg: AppConfig, *,
     if touched:
         changed = (await session.execute(
             select(MaterialRow).where(MaterialRow.path.in_(touched)))).scalars().all()
-        rows_by_path = {os.path.abspath(row.path): row for row in changed}
+        rows_by_path = {row.path: row for row in changed}
 
     report = SyncReport(scanned=len(disk_files), unchanged=len(plan.unchanged),
                         deleted=len(plan.deleted))
@@ -762,12 +773,13 @@ async def sync_materials(session: AsyncSession, cfg: AppConfig, *,
         # build_material 是同步函数（读文件 + 可能调多模态打标，单条可达数秒）：放线程里跑，
         # 避免在 Celery worker 的 async 上下文里阻塞事件循环（E3 审查建议 1）
         material = await asyncio.to_thread(
-            materials_tool.build_material, path, materials_dir, keyframes_dir,
+            materials_tool.build_material, resolve_material(materials_dir, path),
+            materials_dir, keyframes_dir,
             vision=allow_vision)
         if allow_vision is not None and material.source == "vision":
             report.vision_used += 1
         values = _row_values(material, _relative_keyframes(material.keyframes))
-        existing = rows_by_path.get(os.path.abspath(path))
+        existing = rows_by_path.get(path)
         if existing is None:
             # 幂等插入：并发同步撞上同一路径时改写而不是报错（见 `_insert_row`）
             await session.execute(_insert_row(values))
@@ -781,7 +793,7 @@ async def sync_materials(session: AsyncSession, cfg: AppConfig, *,
             report.updated += 1
 
     for path in plan.deleted:
-        row = rows_by_path.get(os.path.abspath(path))
+        row = rows_by_path.get(path)
         if row is not None:
             await session.delete(row)
 

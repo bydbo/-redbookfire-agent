@@ -111,7 +111,7 @@ class TestWorkflowSmoke:
     async def test_runs_five_nodes_against_real_retrieval(self, db_session: AsyncSession,
                                                           tmp_path: Path) -> None:
         # 通道 A 的文本是 title || description（不含 tags），所以关键词要写进标题/描述
-        material_id = await seed(db_session, path="D:/pack/球场热身.mp4", title="羽毛球球场热身",
+        material_id = await seed(db_session, path="球场热身.mp4", title="羽毛球球场热身",
                                  description="户外球场挥拍", tags=["羽毛球", "运动"],
                                  embedding=E0)
         cfg = write_config(tmp_path)

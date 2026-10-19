@@ -74,7 +74,7 @@ def client(db_engine: AsyncEngine, cfg: AppConfig,
 async def _add_material(db_engine: AsyncEngine, keyframes: list[str]) -> uuid.UUID:
     factory = async_sessionmaker(db_engine, expire_on_commit=False)
     async with factory() as session:
-        material = Material(path="D:/materials/挥拍.mp4", type="video", title="挥拍",
+        material = Material(path="挥拍.mp4", type="video", title="挥拍",
                             description="", tags=[], elements=[], source="sidecar",
                             width=1080, height=1920, size_bytes=1024,
                             keyframes=keyframes)

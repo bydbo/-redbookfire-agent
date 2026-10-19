@@ -21,6 +21,7 @@ import os
 from ..schemas import Element, Material
 from ..util import now_iso, read_json, read_text
 from . import lexicon, media
+from .material_paths import is_link, material_key
 
 SIDECAR_EXT = {".txt", ".md", ".json"}
 _TAG_KEYS = ("tags", "tag", "标签")
@@ -33,8 +34,17 @@ def scan_materials(materials_dir: str, recursive: bool = True) -> list:
     if not os.path.isdir(materials_dir):
         return []
     found = []
+    folded: dict[str, str] = {}
     walker = os.walk(materials_dir) if recursive else [(materials_dir, [], os.listdir(materials_dir))]
     for root, dirs, files in walker:
+        for name in dirs + files:
+            path = os.path.join(root, name)
+            if is_link(path):
+                raise ValueError("素材目录包含符号链接或 junction；扫描已中止，不执行删除")
+            key = material_key(path, materials_dir)
+            previous = folded.setdefault(key.casefold(), key)
+            if previous != key:
+                raise ValueError("素材目录存在大小写冲突；扫描已中止，不执行删除")
         dirs[:] = [d for d in dirs if not d.startswith(".") and not d.startswith("_")]
         for name in sorted(files):
             if name.startswith(".") or name.startswith("~"):
@@ -133,7 +143,7 @@ def build_material(file_path: str, materials_dir: str, keyframes_dir: str, *,
     输出：`Material`（未入库；`indexed_at` 取当前时间，`fingerprint` = 文件 mtime+size）。
     依赖：ffmpeg / ffprobe 缺失时只跳过抽帧与探测（能力裁剪），不报错。
     """
-    rel = os.path.relpath(file_path, materials_dir)
+    rel = material_key(file_path, materials_dir)
     material_id = Material.make_id(rel)
     fp = fingerprint(file_path)
     stat = os.stat(file_path)
@@ -168,7 +178,7 @@ def build_material(file_path: str, materials_dir: str, keyframes_dir: str, *,
 
     return Material(
         id=material_id,
-        path=file_path,
+        path=rel,
         type=kind if kind != "other" else "video",
         title=title,
         description=description,

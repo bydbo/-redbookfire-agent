@@ -45,7 +45,6 @@ from ..db.models import (
     ChatContextEvent,
     ChatMessage,
     ChatSession,
-    Material,
     RunHotspot,
 )
 from ..schemas import (
@@ -58,6 +57,7 @@ from ..schemas import (
 from ..tools import prompt as prompt_tool
 from ..tools.llm import LLMResult, StructuredCaller
 from ..util import now_iso
+from .material_identity import current_material
 from .model_observations import observer as attempt_observer
 
 logger = logging.getLogger("xhs_agent.context_state")
@@ -1221,9 +1221,10 @@ async def _validate_object_ref(
             material_id = uuid.UUID(str(ref["material_id"]))
         except ValueError as exc:
             raise BadRequestError("material_id 不是合法素材标识") from exc
-        if await session.get(Material, material_id) is None:
+        material = await current_material(session, material_id)
+        if material is None:
             raise NotFoundError("素材不存在", {"reason": "material_missing"})
-        validated["material_id"] = str(material_id)
+        validated["material_id"] = str(material.id)
     if object_key.startswith("draft:"):
         parts = object_key.split(":")
         if len(parts) != 3:

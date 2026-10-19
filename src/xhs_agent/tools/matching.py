@@ -12,7 +12,6 @@
 
 from __future__ import annotations
 
-import os
 import time
 from dataclasses import dataclass
 
@@ -180,10 +179,15 @@ def explain_candidates(clue: HotspotClue, candidates: list) -> None:
 
 
 def dedupe_by_path(materials: list) -> list:
-    """同一素材被重复扫描时只保留一条（按绝对路径小写去重，保持首次出现的顺序）。"""
+    """同一素材被重复收集时只保留一条（按**规范素材键**去重，保持首次出现顺序）。
+
+    不按 CWD 解析绝对路径：素材身份是数据库键（素材根相对、大小写敏感），跨工作目录必须
+    稳定。大小写不同的两个键不是同一素材——歧义由索引 / 迁移计划明确拒绝，不能在这里
+    静默合并。
+    """
     seen, out = set(), []
     for material in materials:
-        key = os.path.abspath(material.path).lower()
+        key = str(material.path)
         if key in seen:
             continue
         seen.add(key)

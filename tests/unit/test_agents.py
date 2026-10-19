@@ -68,7 +68,7 @@ def caller(**kwargs) -> StructuredCaller:
 
 
 def material() -> Material:
-    return Material(id=MATERIAL_ID, path="D:/materials/球场热身.mp4", title="球场热身",
+    return Material(id=MATERIAL_ID, path="球场热身.mp4", title="球场热身",
                     tags=["羽毛球"], width=1080, height=1920, duration_s=15)
 
 
@@ -165,6 +165,20 @@ class TestExplainCandidates:
 
 
 class TestWriteDraft:
+    @pytest.mark.asyncio
+    async def test_rejects_model_rebinding_the_material(self):
+        """S6.11b：初稿的素材身份以服务端选中素材为准，模型改 ID 直接失败。"""
+        class RebindingProvider(FakeProvider):
+            async def complete(self, call):
+                payload = {**DRAFT_PAYLOAD, "material_id": "m_other"}
+                return LLMResult(text=json.dumps(payload, ensure_ascii=False),
+                                 provider=self.name, model=self.model)
+
+        clue = (await extract_clue("热点", caller())).value
+        with pytest.raises(LLMError):
+            await write_draft(clue, material().to_dict(),
+                              StructuredCaller(provider=RebindingProvider()))
+
     @pytest.mark.asyncio
     async def test_returns_draft_with_inputs_attached(self):
         clue = (await extract_clue("热点", caller())).value

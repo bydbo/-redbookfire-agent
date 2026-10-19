@@ -24,9 +24,9 @@ class TestPlanSync:
         (root / "b.mp4").write_bytes(b"bbb")
         (root / "c.mp4").write_bytes(b"ccc")
         rows = [
-            _row(str(root / "a.mp4"), tool.fingerprint(str(root / "a.mp4"))),
-            _row(str(root / "c.mp4"), "stale-fingerprint"),
-            _row(str(root / "gone.mp4"), "whatever"),
+            _row("a.mp4", tool.fingerprint(str(root / "a.mp4"))),
+            _row("c.mp4", "stale-fingerprint"),
+            _row("gone.mp4", "whatever"),
         ]
         disk = [str(root / "a.mp4"), str(root / "b.mp4"), str(root / "c.mp4")]
         plan = service.plan_sync(disk, rows, str(root))
@@ -41,24 +41,22 @@ class TestPlanSync:
         root.mkdir()
         (root / "a.mp4").write_bytes(b"aaa")
         plan = service.plan_sync([str(root / "a.mp4")],
-                                 [_row(str(root / "a.mp4"), "")], str(root))
-        assert plan.updated == [os.path.abspath(str(root / "a.mp4"))]
+                                 [_row("a.mp4", "")], str(root))
+        assert plan.updated == ["a.mp4"]
         assert plan.unchanged == []
 
-    def test_rows_outside_scan_dir_are_never_deleted(self, tmp_path):
+    def test_legacy_absolute_rows_block_sync_without_deletion(self, tmp_path):
         root = tmp_path / "m"
         root.mkdir()
         (root / "a.mp4").write_bytes(b"aaa")
         outside = tmp_path / "other" / "x.mp4"
-        plan = service.plan_sync([str(root / "a.mp4")],
-                                 [_row(str(outside), "fp")], str(root))
-        assert plan.deleted == []
-        assert plan.added == [os.path.abspath(str(root / "a.mp4"))]
+        with pytest.raises(ValueError):
+            service.plan_sync([str(root / "a.mp4")], [_row(str(outside), "fp")], str(root))
 
     def test_empty_scan_does_not_delete_anything(self, tmp_path):
         root = tmp_path / "m"
         root.mkdir()
-        plan = service.plan_sync([], [_row(str(root / "a.mp4"), "fp")], str(root))
+        plan = service.plan_sync([], [_row("a.mp4", "fp")], str(root))
         assert (plan.added, plan.updated, plan.unchanged, plan.deleted) == ([], [], [], [])
 
     def test_outputs_are_sorted(self, tmp_path):
@@ -67,8 +65,7 @@ class TestPlanSync:
         (root / "b.mp4").write_bytes(b"b")
         (root / "a.mp4").write_bytes(b"a")
         plan = service.plan_sync([str(root / "b.mp4"), str(root / "a.mp4")], [], str(root))
-        assert plan.added == [os.path.abspath(str(root / "a.mp4")),
-                              os.path.abspath(str(root / "b.mp4"))]
+        assert plan.added == ["a.mp4", "b.mp4"]
 
 
 def _cfg(materials_dir: str, index_dir: str):

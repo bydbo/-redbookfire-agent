@@ -171,7 +171,7 @@ class TestIncrementalChanges:
         target = pack / "宠物猫.png"
         await db_session.execute(text(
             "UPDATE materials SET embedding = array_fill(0.0::real, ARRAY[1024])::vector, "
-            "embedding_model = 'fake-model' WHERE path = :p"), {"p": str(target)})
+            "embedding_model = 'fake-model' WHERE path = :p"), {"p": "宠物猫.png"})
         await db_session.commit()
 
         target.write_bytes(_png(640, 640) + b"changed")  # size 变 → fingerprint 变
@@ -179,7 +179,7 @@ class TestIncrementalChanges:
         assert (report.updated, report.unchanged, report.added) == (1, 2, 0)
 
         row = (await db_session.execute(
-            select(MaterialRow).where(MaterialRow.path == str(target)))).scalar_one()
+            select(MaterialRow).where(MaterialRow.path == "宠物猫.png"))).scalar_one()
         assert row.embedding is None
         assert row.embedding_model is None
 
@@ -195,7 +195,7 @@ class TestIncrementalChanges:
         assert (await db_session.execute(
             select(func.count()).select_from(MaterialRow))).scalar_one() == 2
         gone = (await db_session.execute(select(MaterialRow).where(
-            MaterialRow.path == str(pack / "晨跑-公园.png")))).scalar_one_or_none()
+            MaterialRow.path == "晨跑-公园.png"))).scalar_one_or_none()
         assert gone is None
 
     async def test_sidecar_only_edit_counts_as_unchanged(

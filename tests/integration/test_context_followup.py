@@ -403,14 +403,17 @@ async def test_recovery_second_page_sees_and_replaces_first_candidate(db_session
 async def test_bound_v1_with_v2_head_reaches_real_revise_input_and_replays(
     db_session: AsyncSession, cfg: AppConfig,
 ):
-    from xhs_agent.db.models import Hotspot, Run, RunHotspot
+    from xhs_agent.db.models import Hotspot, Material, Run, RunHotspot
 
     db = db_session
     sid = uuid.UUID((await create_session(db))["session_id"])
     run, hotspot = Run(job_id=str(uuid.uuid4()), status="succeeded"), Hotspot(raw_text="夜跑", clue=clue().to_dict())
-    db.add_all([run, hotspot])
+    material = Material(path="夜跑/夜跑.mp4", type="video", title="夜跑素材",
+                        description="公园夜跑", elements=[], source="sidecar")
+    db.add_all([run, hotspot, material])
     await db.flush()
-    original = {"titles": [{"text": "夜跑", "style": "建议"}], "body": "D0 初稿",
+    original = {"material_id": str(material.id),
+                "titles": [{"text": "夜跑", "style": "建议"}], "body": "D0 初稿",
                 "tags": ["夜跑"], "cover_text": "开始", "first_3s": "慢慢走", "shot_list": [], "compliance_notes": []}
     db.add(RunHotspot(run_id=run.id, hotspot_id=hotspot.id, position=1, status="succeeded", draft=original))
     hotspot.clue = clue().to_dict()
@@ -619,7 +622,7 @@ async def test_worker_receives_scoped_constraints_and_persists_transport_events(
         for i, (value, scope, scope_id) in enumerate([
             ("不要使用感叹号", "session", ""), ("正文保持简短", "topic", chat.topic_id or ""),
             ("不得混入OTHER", "artifact", "draft:other:1")]) ]}
-    material = Material(path="D:/fixture/night-run.mp4", type="video", title="夜跑",
+    material = Material(path="night-run.mp4", type="video", title="夜跑",
                         description="公园夜跑", elements=[], source="sidecar")
     db.add(material)
     await db.commit()

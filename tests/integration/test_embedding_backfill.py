@@ -104,8 +104,9 @@ async def _rows(session: AsyncSession) -> list[MaterialRow]:
 
 
 async def _row_for(session: AsyncSession, path: Path) -> MaterialRow:
+    """按素材根相对键读取行（`path` 只用来定位临时素材包里的文件名）。"""
     return (await session.execute(
-        select(MaterialRow).where(MaterialRow.path == str(path)))).scalar_one()
+        select(MaterialRow).where(MaterialRow.path == path.name))).scalar_one()
 
 
 class TestBackfill:

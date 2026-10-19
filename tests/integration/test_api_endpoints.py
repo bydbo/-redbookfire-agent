@@ -104,7 +104,7 @@ async def _finish_run(db_engine: AsyncEngine, run_id: str) -> str:
     """模拟 worker 写回：线索 + 覆盖度 + 文稿 + 候选 + runs 统计（S3.4a 的活，这里只为验证接口）。"""
     factory = async_sessionmaker(db_engine, expire_on_commit=False)
     async with factory() as session:
-        material = Material(path="D:/materials/球场-挥拍.mp4", type="video", title="球场热身",
+        material = Material(path="球场-挥拍.mp4", type="video", title="球场热身",
                             description="户外球场挥拍", tags=["羽毛球"], elements=[],
                             source="sidecar", width=1080, height=1920, size_bytes=2048)
         session.add(material)

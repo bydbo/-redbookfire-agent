@@ -138,7 +138,7 @@ async def seed_material(session: AsyncSession, *, path: str, title: str,
 async def seed_library(session: AsyncSession, count: int = 3) -> list[str]:
     titles = [("羽毛球球场热身", "户外球场挥拍"), ("羽毛球反手教学", "慢动作分解"),
               ("羽毛球夜间灯光场", "城市夜拍")]
-    return [await seed_material(session, path=f"D:/pack/court-{index}.mp4", title=title,
+    return [await seed_material(session, path=f"court-{index}.mp4", title=title,
                                 description=description)
             for index, (title, description) in enumerate(titles[:count])]
 

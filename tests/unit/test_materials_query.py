@@ -46,11 +46,11 @@ def client(tmp_path: Path) -> Iterator[TestClient]:
 class TestRelativeDir:
     def test_root_file_has_empty_dir(self, tmp_path: Path) -> None:
         root = str(tmp_path / "materials")
-        assert relative_dir(str(tmp_path / "materials" / "a.mp4"), root) == ""
+        assert relative_dir("a.mp4", root) == ""
 
     def test_nested_dirs_use_forward_slashes(self, tmp_path: Path) -> None:
         root = str(tmp_path / "materials")
-        path = str(tmp_path / "materials" / "运动" / "夜里" / "a.mp4")
+        path = "运动/夜里/a.mp4"
         assert relative_dir(path, root) == "运动/夜里"
 
 

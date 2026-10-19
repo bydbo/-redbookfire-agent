@@ -134,7 +134,7 @@ async def seed(session: AsyncSession, cfg: AppConfig) -> dict[str, str]:
     created: dict[str, MaterialRow] = {}
     for rel, kind, title, tags, source, minutes in SEED:
         row = MaterialRow(
-            path=str(Path(cfg.materials_dir()) / rel), type=kind, title=title,
+            path=rel, type=kind, title=title,
             description=f"{title} 的描述", tags=list(tags), source=source,
             elements=[{"type": "topic", "value": title, "weight": 0.8,
                        "confidence": 0.7, "evidence": "旁车"}] if rel == "运动/挥拍.mp4" else [],
@@ -463,9 +463,9 @@ class TestRestoreAndPurge:
         report = await run_index(task_cfg, embedder=FakeEmbedder())
 
         assert report["added"] == 1 and report["scanned"] >= 1
-        path = str(Path(cfg.materials_dir()) / "运动" / "挥拍.mp4")
+        # 恢复 = 重新入库：路径是素材根相对键，UUID 是新的
         rows = (await db_session.execute(
-            select(MaterialRow).where(MaterialRow.path == path))).scalars().all()
+            select(MaterialRow).where(MaterialRow.path == "运动/挥拍.mp4"))).scalars().all()
         assert len(rows) == 1
         assert str(rows[0].id) != ids["运动/挥拍.mp4"]
 

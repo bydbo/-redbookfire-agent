@@ -52,6 +52,7 @@ from .config import (
     load_config,
 )
 from .db.session import database_url
+from .tools.material_paths import validate_key
 
 # 当前阶段：S2.1 起进入 P2（DATABASE_URL 必填）；S3.4b 落地 Celery 队列后进入 P3
 # （REDIS_URL 变为必填）。
@@ -333,7 +334,7 @@ async def run_startup_checks(cfg: AppConfig) -> PreflightReport:
         if problem is not None:
             report.problems.append(problem)
             return report
-        for check in (check_extensions, check_migration):
+        for check in (check_extensions, check_migration, check_material_identity):
             problem = await check(engine)
             if problem is not None:
                 report.problems.append(problem)
@@ -349,6 +350,31 @@ async def run_startup_checks(cfg: AppConfig) -> PreflightReport:
     if problem is not None:
         report.problems.append(problem)
     return report
+
+
+async def check_material_identity(engine: AsyncEngine) -> Problem | None:
+    """身份非法阻断启动；媒体是否暂时存在不决定数据库身份是否有效。"""
+    async with engine.connect() as connection:
+        paths = (await connection.execute(text("SELECT path FROM materials"))).scalars()
+        folded: dict[str, str] = {}
+        try:
+            for path in paths:
+                validate_key(path)
+                if folded.setdefault(path.casefold(), path) != path:
+                    raise ValueError("素材键大小写歧义")
+            invalid_alias = (await connection.execute(text(
+                "SELECT EXISTS(SELECT 1 FROM material_id_aliases a "
+                "LEFT JOIN material_id_aliases b ON a.canonical_id=b.old_id "
+                "LEFT JOIN materials m ON a.old_id=m.id "
+                "WHERE a.old_id=a.canonical_id OR b.old_id IS NOT NULL OR m.id IS NOT NULL)"
+            ))).scalar()
+            if invalid_alias:
+                raise ValueError("素材别名链、环或活动 ID 冲突")
+        except ValueError:
+            return Problem("E_MATERIAL_IDENTITY", "materials", "素材身份数据不符合规范",
+                           "停止写入，按 E6 迁移说明执行 plan / apply / verify；不自动删除数据",
+                           step=5, kind="dependency")
+    return None
 
 
 def report_lines(report: PreflightReport, *, include_warnings: bool = True) -> list[str]:

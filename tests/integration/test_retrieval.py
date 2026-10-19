@@ -125,8 +125,8 @@ async def seed_miss(session: AsyncSession, path: str, **overrides) -> str:
 class TestRecallChannels:
     async def test_literal_channel_recalls_text_match(self, db_session: AsyncSession,
                                                       tmp_path: Path) -> None:
-        hit = await seed_hit(db_session, "D:/m/a.mp4")
-        await seed_miss(db_session, "D:/m/b.mp4", embedding=E1)
+        hit = await seed_hit(db_session, "m/a.mp4")
+        await seed_miss(db_session, "m/b.mp4", embedding=E1)
         outcome = await retrieve_candidates(db_session, write_config(tmp_path),
                                             clue_with([("topic", "羽毛球")],
                                                       keywords=["羽毛球", "球场"]),
@@ -138,7 +138,7 @@ class TestRecallChannels:
 
     async def test_vector_channel_recalls_semantic_match(self, db_session: AsyncSession,
                                                          tmp_path: Path) -> None:
-        conv = await seed_miss(db_session, "D:/m/c.mp4", embedding=E0)
+        conv = await seed_miss(db_session, "m/c.mp4", embedding=E0)
         outcome = await retrieve_candidates(db_session, write_config(tmp_path),
                                             clue_with([("topic", "羽毛球")]), embedder=FakeEmbedder())
         assert [c.material_id for c in outcome.candidates] == [conv]
@@ -148,7 +148,7 @@ class TestRecallChannels:
 
     async def test_both_channels_are_recorded(self, db_session: AsyncSession,
                                               tmp_path: Path) -> None:
-        both = await seed_hit(db_session, "D:/m/d.mp4", embedding=E0)
+        both = await seed_hit(db_session, "m/d.mp4", embedding=E0)
         outcome = await retrieve_candidates(db_session, write_config(tmp_path),
                                             clue_with([("topic", "羽毛球")],
                                                       keywords=["羽毛球", "球场"]),
@@ -164,7 +164,7 @@ class TestRecallChannels:
         负例与正例成对出现。旧实现用对称的 `similarity()`，短关键词对长文案的相似度天然只有
         0.03–0.14，**正例也会恒为 0**（字面通道等于失效）；该缺陷与修复见 ADR 0010。
         """
-        await seed_hit(db_session, "D:/m/a.mp4")
+        await seed_hit(db_session, "m/a.mp4")
 
         absent = clue_with([("topic", "露营")], keywords=["帐篷", "天幕"])
         none_hit = await retrieve_candidates(
@@ -180,7 +180,7 @@ class TestRecallChannels:
     async def test_recall_limit_truncates_channel(self, db_session: AsyncSession,
                                                   tmp_path: Path) -> None:
         for index in range(3):
-            await seed_hit(db_session, f"D:/m/n{index}.mp4")
+            await seed_hit(db_session, f"m/n{index}.mp4")
         cfg = write_config(tmp_path, retrieval={"recall_limit": 1},
                            embedding={"enabled": False})
         outcome = await retrieve_candidates(db_session, cfg, clue_with([("topic", "羽毛球")],
@@ -191,7 +191,7 @@ class TestRecallChannels:
 
     async def test_max_cosine_distance_gates_vector_channel(self, db_session: AsyncSession,
                                                             tmp_path: Path) -> None:
-        await seed_miss(db_session, "D:/m/c.mp4", embedding=E1)  # 与查询向量正交 → 距离 1.0
+        await seed_miss(db_session, "m/c.mp4", embedding=E1)  # 与查询向量正交 → 距离 1.0
         clue = clue_with([("topic", "羽毛球")])
         blocked = await retrieve_candidates(
             db_session, write_config(tmp_path, retrieval={"max_cosine_distance": 0.35}),
@@ -204,8 +204,8 @@ class TestRecallChannels:
 
     async def test_embedding_model_mismatch_is_excluded_from_vector_channel(
             self, db_session: AsyncSession, tmp_path: Path) -> None:
-        current = await seed_miss(db_session, "D:/m/new.mp4", embedding=E0)
-        await seed_miss(db_session, "D:/m/old.mp4", embedding=E0, model="old-model")
+        current = await seed_miss(db_session, "m/new.mp4", embedding=E0)
+        await seed_miss(db_session, "m/old.mp4", embedding=E0, model="old-model")
         outcome = await retrieve_candidates(db_session, write_config(tmp_path),
                                             clue_with([("topic", "羽毛球")]),
                                             embedder=FakeEmbedder())
@@ -217,8 +217,8 @@ class TestRecallChannels:
 class TestFusionAndRanking:
     async def test_rrf_boosts_material_recalled_by_both_channels(self, db_session: AsyncSession,
                                                                  tmp_path: Path) -> None:
-        text_only = await seed_hit(db_session, "D:/m/p1.mp4")
-        both = await seed_hit(db_session, "D:/m/p2.mp4", embedding=E0)
+        text_only = await seed_hit(db_session, "m/p1.mp4")
+        both = await seed_hit(db_session, "m/p2.mp4", embedding=E0)
         clue = clue_with([("topic", "羽毛球")], keywords=["羽毛球", "球场"])
         outcome = await retrieve_candidates(db_session, write_config(tmp_path), clue,
                                             embedder=FakeEmbedder())
@@ -234,7 +234,7 @@ class TestFusionAndRanking:
     async def test_topk_and_min_score_come_from_match_section(self, db_session: AsyncSession,
                                                               tmp_path: Path) -> None:
         for index in range(3):
-            await seed_hit(db_session, f"D:/m/n{index}.mp4")
+            await seed_hit(db_session, f"m/n{index}.mp4")
         clue = clue_with([("topic", "羽毛球")], keywords=["羽毛球", "球场"])
         topk_cfg = write_config(tmp_path, match={"topk": 2}, embedding={"enabled": False})
         outcome = await retrieve_candidates(db_session, topk_cfg, clue)
@@ -247,7 +247,7 @@ class TestFusionAndRanking:
     async def test_hit_threshold_changes_coverage(self, db_session: AsyncSession,
                                                   tmp_path: Path) -> None:
         # 要素「羽毛球运动」对素材文案「羽毛球 咖啡手冲」的相似度 = 0.25（bigram Jaccard）
-        await seed(db_session, path="D:/m/c.mp4", title="咖啡手冲", tags=["羽毛球"],
+        await seed(db_session, path="m/c.mp4", title="咖啡手冲", tags=["羽毛球"],
                    embedding=E0)
         clue = clue_with([("topic", "羽毛球运动")])
         loose = await retrieve_candidates(
@@ -264,7 +264,7 @@ class TestFusionAndRanking:
 
     async def test_scores_are_rounded_and_stable(self, db_session: AsyncSession,
                                                 tmp_path: Path) -> None:
-        await seed_hit(db_session, "D:/m/a.mp4", embedding=E0)
+        await seed_hit(db_session, "m/a.mp4", embedding=E0)
         clue = clue_with([("topic", "羽毛球")], keywords=["羽毛球", "球场"])
         cfg = write_config(tmp_path)
         first = await retrieve_candidates(db_session, cfg, clue, embedder=FakeEmbedder())
@@ -277,9 +277,9 @@ class TestFusionAndRanking:
 class TestVectorCoverageAndFailures:
     async def test_coverage_counts_current_model_vectors_only(self, db_session: AsyncSession,
                                                               tmp_path: Path) -> None:
-        await seed_miss(db_session, "D:/m/a.mp4", embedding=E0)
-        await seed_miss(db_session, "D:/m/b.mp4", embedding=E0, model="old-model")
-        await seed_miss(db_session, "D:/m/c.mp4")
+        await seed_miss(db_session, "m/a.mp4", embedding=E0)
+        await seed_miss(db_session, "m/b.mp4", embedding=E0, model="old-model")
+        await seed_miss(db_session, "m/c.mp4")
         outcome = await retrieve_candidates(db_session, write_config(tmp_path),
                                             clue_with([("topic", "羽毛球")]),
                                             embedder=FakeEmbedder())
@@ -290,8 +290,8 @@ class TestVectorCoverageAndFailures:
 
     async def test_disabled_embedding_runs_literal_only(self, db_session: AsyncSession,
                                                        tmp_path: Path) -> None:
-        hit = await seed_hit(db_session, "D:/m/a.mp4")
-        await seed_miss(db_session, "D:/m/c.mp4", embedding=E0)
+        hit = await seed_hit(db_session, "m/a.mp4")
+        await seed_miss(db_session, "m/c.mp4", embedding=E0)
         failure = FailingEmbedder()
         outcome = await retrieve_candidates(
             db_session, write_config(tmp_path, embedding={"enabled": False}),
@@ -305,7 +305,7 @@ class TestVectorCoverageAndFailures:
 
     async def test_query_embedding_failure_raises(self, db_session: AsyncSession,
                                                  tmp_path: Path) -> None:
-        await seed_miss(db_session, "D:/m/c.mp4", embedding=E0)
+        await seed_miss(db_session, "m/c.mp4", embedding=E0)
         with pytest.raises(EmbeddingError):
             await retrieve_candidates(db_session, write_config(tmp_path),
                                       clue_with([("topic", "羽毛球")]),

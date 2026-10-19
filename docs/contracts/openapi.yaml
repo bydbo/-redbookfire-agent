@@ -1662,6 +1662,7 @@ components:
           format: uuid
         path:
           type: string
+          description: 相对配置素材根目录的正斜杠路径
         type:
           type: string
           enum:
@@ -1713,7 +1714,7 @@ components:
           format: uuid
         path:
           type: string
-          description: 素材绝对路径
+          description: 相对配置素材根目录的正斜杠路径（不含绝对根和穿越段）
         type:
           type: string
           enum:
@@ -1781,7 +1782,7 @@ components:
           format: uuid
         path:
           type: string
-          description: 素材绝对路径
+          description: 相对配置素材根目录的正斜杠路径（不含绝对根和穿越段）
         type:
           type: string
           enum:

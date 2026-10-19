@@ -774,6 +774,7 @@ export interface components {
         MaterialSummary: {
             /** Format: uuid */
             id: string;
+            /** @description 相对配置素材根目录的正斜杠路径 */
             path: string;
             /** @enum {string} */
             type: "video" | "image";
@@ -790,7 +791,7 @@ export interface components {
         MaterialItem: {
             /** Format: uuid */
             id: string;
-            /** @description 素材绝对路径 */
+            /** @description 相对配置素材根目录的正斜杠路径（不含绝对根和穿越段） */
             path: string;
             /** @enum {string} */
             type: "video" | "image";
@@ -814,7 +815,7 @@ export interface components {
         MaterialDetail: {
             /** Format: uuid */
             id: string;
-            /** @description 素材绝对路径 */
+            /** @description 相对配置素材根目录的正斜杠路径（不含绝对根和穿越段） */
             path: string;
             /** @enum {string} */
             type: "video" | "image";

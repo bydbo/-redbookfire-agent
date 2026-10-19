@@ -64,7 +64,8 @@ def stub_dependency_checks(monkeypatch) -> None:
     async def _no_problem_async(*_args, **_kwargs):
         return None
 
-    for name in ("check_database", "check_extensions", "check_migration", "check_redis"):
+    for name in ("check_database", "check_extensions", "check_migration",
+                 "check_material_identity", "check_redis"):
         monkeypatch.setattr(probe_module, name, _no_problem_async)
     # check_frontend 是同步函数（纯判断），单独 stub
     monkeypatch.setattr(probe_module, "check_frontend", lambda *_a, **_k: None)

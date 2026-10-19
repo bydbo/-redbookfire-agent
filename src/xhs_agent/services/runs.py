@@ -36,6 +36,7 @@ from ..core.tracing import traced_db
 from ..db.models import Hotspot, Material, Run, RunHotspot, RunMatch
 from ..schemas import SchemaError
 from ..tools import gaps as gaps_tool
+from .material_identity import current_material
 from .reporting import build_report_model
 from .retrieval import vector_coverage
 
@@ -489,13 +490,10 @@ async def load_material_frames(
     session: AsyncSession, material_id: uuid.UUID
 ) -> list[str] | None:
     """素材登记的关键帧绝对路径列表（取帧接口用）；素材不存在返回 `None`。"""
-    row = await session.execute(
-        select(Material.keyframes).where(Material.id == material_id)
-    )
-    keyframes = row.scalar_one_or_none()
-    if keyframes is None:
+    row = await current_material(session, material_id)
+    if row is None:
         return None
-    return list(keyframes)
+    return list(row.keyframes or [])
 
 
 @traced_db(

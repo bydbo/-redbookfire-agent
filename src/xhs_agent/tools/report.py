@@ -24,6 +24,7 @@ from __future__ import annotations
 import html
 import os
 
+from ..config import PROJECT_ROOT
 from ..schemas import TYPE_LABELS
 
 
@@ -31,7 +32,7 @@ def _rel(base_dir: str, path: str) -> str:
     if not path:
         return ""
     try:
-        rel = os.path.relpath(path, base_dir)
+        rel = os.path.relpath(os.path.join(PROJECT_ROOT, path), base_dir)
     except ValueError:
         return path
     return rel.replace("\\", "/")

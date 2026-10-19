@@ -39,11 +39,25 @@ async def write_draft(clue: HotspotClue, material: dict[str, Any] | None,
         style=style or DEFAULT_STYLE,
         constraints_json=json.dumps(list(constraints or []), ensure_ascii=False),
     )
+    chosen_material_id = str(material.get("id") or "")
+
+    def _parse_draft(payload: Any) -> Draft:
+        """素材身份以服务端选中的素材为准；模型返回不同 ID 直接拒绝。"""
+        if isinstance(payload, dict):
+            returned = str(payload.get("material_id") or "").strip()
+            if chosen_material_id and returned and returned != chosen_material_id:
+                from ..schemas import SchemaError
+
+                raise SchemaError("copy_draft 返回的 material_id 与被分析素材不一致，拒绝改绑")
+        return Draft.from_dict(
+            {**payload, "material_id": chosen_material_id}
+            if isinstance(payload, dict) else payload,
+            material_id=chosen_material_id,
+            hotspot_key=clue.hotspot_key,
+        )
+
     draft, result = await caller.call(
-        TASK_ID, rendered.system, rendered.user,
-        parse=lambda payload: Draft.from_dict(
-            payload, material_id=str(material.get("id") or ""),
-            hotspot_key=clue.hotspot_key),
+        TASK_ID, rendered.system, rendered.user, parse=_parse_draft,
     )
     draft = draft.model_copy(update={"provider": result.provider, "model": result.model})
     return AgentOutcome(value=draft, task_id=TASK_ID, version=rendered.version)

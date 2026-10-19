@@ -45,7 +45,14 @@ def parse_revise(payload: Any, *, material_id: str = "",
     raw = payload.get("draft")
     if not isinstance(raw, dict):
         raise SchemaError("copy_revise 没有拒绝时必须在 draft 里给出改后的初稿")
-    draft = Draft.from_dict(raw, material_id=material_id, hotspot_key=hotspot_key)
+    # 素材身份由服务端基础文案决定：模型给出不同 material_id 时拒绝，不能静默改绑
+    returned_material = str(raw.get("material_id") or "").strip()
+    if material_id and returned_material and returned_material != material_id:
+        raise SchemaError("copy_revise 返回的 material_id 与基础文案素材不一致，拒绝改绑")
+    draft = Draft.from_dict(
+        {**raw, "material_id": material_id or returned_material},
+        material_id=material_id, hotspot_key=hotspot_key,
+    )
     if not draft.body.strip():
         raise SchemaError("copy_revise 给回的初稿缺少正文（body）")
     return ReviseOutcome(refused=False, draft=draft)

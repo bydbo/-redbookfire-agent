@@ -104,6 +104,18 @@ COLUMN_SPECS: dict[str, dict[str, str]] = {
         "call_id": "text", "attempt": "int4", "model": "text", "prompt_version": "text",
         "policy_version": "text", "payload": "jsonb", "created_at": "timestamptz",
     },
+    # E6 主题三（S6.10–S6.13）：迁移批次 / 原记录归档 / 旧 ID 别名
+    "material_identity_batches": {
+        "id": "uuid", "rule_version": "int4", "plan_digest": "text", "plan": "jsonb",
+        "counts": "jsonb", "status": "text", "created_at": "timestamptz",
+    },
+    "material_identity_archive": {
+        "batch_id": "uuid", "entity_type": "text", "original_key": "text",
+        "record": "jsonb", "digest": "text", "provenance": "text",
+    },
+    "material_id_aliases": {
+        "old_id": "uuid", "canonical_id": "uuid", "batch_id": "uuid",
+    },
 }
 
 NULLABLE_COLUMNS: dict[str, set[str]] = {
@@ -124,6 +136,9 @@ NULLABLE_COLUMNS: dict[str, set[str]] = {
     "chat_image_parse_cache": set(),
     "context_observations": {"turn_id", "call_id", "attempt", "model",
                              "prompt_version", "policy_version"},
+    "material_identity_batches": set(),
+    "material_identity_archive": set(),
+    "material_id_aliases": set(),
 }
 
 # 数据契约 §4.1 的 16 条索引（唯一约束在 PG 里也是索引）
@@ -147,6 +162,9 @@ EXPECTED_INDEXES = {
     "ix_chat_context_actions_session_created_at",
     "ix_context_observations_session_created_at",
     "ix_context_observations_type_created_at",
+    # E6 主题三：批次计划摘要唯一、别名目标索引
+    "uq_material_identity_batches_plan_digest",
+    "ix_material_id_aliases_canonical_id",
 }
 
 
@@ -161,7 +179,7 @@ async def seed_minimal(conn) -> dict[str, object]:
     """插入一条最小可用链路，返回主键，供约束/级联用例复用。"""
     ids: dict[str, object] = {}
     ids["material"] = (await conn.execute(text(
-        "INSERT INTO materials (path) VALUES ('D:/materials/seed.mp4') RETURNING id"))).scalar_one()
+        "INSERT INTO materials (path) VALUES ('运动/seed.mp4') RETURNING id"))).scalar_one()
     ids["hotspot"] = (await conn.execute(text(
         "INSERT INTO hotspots (raw_text, clue) VALUES ('seed', '{}'::jsonb) RETURNING id"
     ))).scalar_one()
@@ -217,7 +235,7 @@ class TestStructure:
     async def test_defaults_are_applied_by_database(self, db_engine: AsyncEngine) -> None:
         async with db_engine.begin() as conn:
             row = (await conn.execute(text(
-                "INSERT INTO materials (path) VALUES ('D:/materials/defaults.mp4') "
+                "INSERT INTO materials (path) VALUES ('默认/defaults.mp4') "
                 "RETURNING type, source, title, description, tags, elements, width, height, "
                 "has_audio, size_bytes, duration_s, indexed_at"))).one()
         assert row.type == "video"
@@ -264,6 +282,18 @@ class TestConstraints:
         ("material width 非负", "INSERT INTO materials (path, width) VALUES ('p3', -1)"),
         ("material height 非负", "INSERT INTO materials (path, height) VALUES ('p4', -1)"),
         ("material size_bytes 非负", "INSERT INTO materials (path, size_bytes) VALUES ('p5', -1)"),
+        # E6 主题三：规范素材键 CHECK（数据库层阻止旧格式回流）
+        ("material path 空", "INSERT INTO materials (path) VALUES ('')"),
+        ("material path 绝对", "INSERT INTO materials (path) VALUES ('/abs.mp4')"),
+        ("material path 盘符", "INSERT INTO materials (path) VALUES ('D:/m.mp4')"),
+        ("material path 反斜杠", "INSERT INTO materials (path) VALUES ('a\\b.mp4')"),
+        ("material path 穿越段", "INSERT INTO materials (path) VALUES ('a/../b.mp4')"),
+        ("material path 双斜杠", "INSERT INTO materials (path) VALUES ('a//b.mp4')"),
+        ("material path 尾斜杠", "INSERT INTO materials (path) VALUES ('a/b.mp4/')"),
+        ("material path 控制字符", "INSERT INTO materials (path) VALUES ('a' || chr(1) || '.mp4')"),
+        ("material path DEL", "INSERT INTO materials (path) VALUES ('a' || chr(127) || '.mp4')"),
+        ("material path 首空格", "INSERT INTO materials (path) VALUES (' a.mp4')"),
+        ("material path 尾空格", "INSERT INTO materials (path) VALUES ('a.mp4 ')"),
         ("run status 枚举", "INSERT INTO runs (job_id, status) VALUES ('j1', 'xx')"),
         ("run cost_cny 非负", "INSERT INTO runs (job_id, cost_cny) VALUES ('j2', -1)"),
         # 对话四例用 CTE 现造会话，保证失败的**只能是 CHECK**（而不是外键）
@@ -288,6 +318,27 @@ class TestConstraints:
         with pytest.raises(IntegrityError):
             async with db_engine.begin() as conn:
                 await conn.execute(text(statement))
+
+    async def test_identity_tables_constraints(self, db_engine: AsyncEngine) -> None:
+        batch_id = "00000000-0000-0000-0000-0000000000b1"
+        async with db_engine.begin() as conn:
+            await conn.execute(text(
+                "INSERT INTO material_identity_batches "
+                "(id, rule_version, plan_digest, plan, counts, status) "
+                "VALUES (:id, 2, 'digest', '{}'::jsonb, '{}'::jsonb, 'applied')"),
+                {"id": batch_id})
+        with pytest.raises(IntegrityError):     # old_id 不能等于 canonical_id
+            async with db_engine.begin() as conn:
+                await conn.execute(text(
+                    "INSERT INTO material_id_aliases (old_id, canonical_id, batch_id) "
+                    "VALUES (:id, :id, :batch)"), {"id": batch_id, "batch": batch_id})
+        with pytest.raises(IntegrityError):     # provenance 只能是 migration_capture
+            async with db_engine.begin() as conn:
+                await conn.execute(text(
+                    "INSERT INTO material_identity_archive "
+                    "(batch_id, entity_type, original_key, record, digest, provenance) "
+                    "VALUES (:batch, 'materials', 'k', '{}'::jsonb, 'd', 'runtime_snapshot')"),
+                    {"batch": batch_id})
 
     async def test_run_table_constraints_reject(self, db_engine: AsyncEngine) -> None:
         async with db_engine.begin() as conn:
@@ -326,7 +377,7 @@ class TestConstraints:
                 "VALUES (:rh, :m, 1, 0.5, '[{\"why\": \"x\"}]')"),
                 {"rh": ids["run_hotspot"], "m": ids["material"]})
         duplicates = [
-            ("INSERT INTO materials (path) VALUES ('D:/materials/seed.mp4')", None),
+            ("INSERT INTO materials (path) VALUES ('运动/seed.mp4')", None),
             ("INSERT INTO runs (job_id) VALUES ('job-seed')", None),
             ("INSERT INTO run_hotspots (run_id, hotspot_id, position) VALUES (:r, :h, 1)",
              {"r": ids["run"], "h": ids["hotspot"]}),
@@ -381,7 +432,7 @@ class TestVector:
         async with db_engine.begin() as conn:
             row = (await conn.execute(text(
                 "INSERT INTO materials (path, embedding, embedding_model) "
-                "VALUES ('D:/materials/vector.mp4', CAST(:v AS vector), 'text-embedding-v3') "
+                "VALUES ('向量/vector.mp4', CAST(:v AS vector), 'text-embedding-v3') "
                 "RETURNING embedding"), {"v": vector})).one()
         assert row.embedding is not None
 
@@ -398,12 +449,12 @@ class TestVector:
 class TestSession:
     async def test_commit_is_visible_and_rollback_is_not(self, db_session: AsyncSession,
                                                          db_engine: AsyncEngine) -> None:
-        await db_session.execute(text("INSERT INTO materials (path) VALUES ('D:/m/committed.mp4')"))
+        await db_session.execute(text("INSERT INTO materials (path) VALUES ('提交/committed.mp4')"))
         await db_session.commit()
-        await db_session.execute(text("INSERT INTO materials (path) VALUES ('D:/m/rolled.mp4')"))
+        await db_session.execute(text("INSERT INTO materials (path) VALUES ('回滚/rolled.mp4')"))
         await db_session.rollback()
 
         async with db_engine.connect() as conn:
             paths = set((await conn.execute(text("SELECT path FROM materials"))).scalars())
-        assert "D:/m/committed.mp4" in paths
-        assert "D:/m/rolled.mp4" not in paths
+        assert "提交/committed.mp4" in paths
+        assert "回滚/rolled.mp4" not in paths

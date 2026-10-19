@@ -83,6 +83,10 @@ class Material(Base):
     indexed_at: Mapped[datetime] = _created_at()
 
     __table_args__ = (
+        CheckConstraint(
+            "path <> '' AND path !~ '(^/|:|\\\\|(^|/)[.]{1,2}(/|$)|//|/$|[[:cntrl:]]"
+            "|(^|/)[[:space:]]|[[:space:]]($|/)|\\x7f)'",
+            name="path_canonical"),
         CheckConstraint("type IN ('video', 'image')", name="type_allowed"),
         CheckConstraint("source IN ('sidecar', 'vision', 'filename', 'legacy')",
                         name="source_allowed"),
@@ -101,6 +105,51 @@ class Material(Base):
               postgresql_ops={"embedding": "vector_cosine_ops"}),
         Index("ix_materials_indexed_at", "indexed_at"),
     )
+
+
+class MaterialIdentityBatch(Base):
+    """身份迁移的已提交批次；完整计划用于核验和 E8 交接。"""
+
+    __tablename__ = "material_identity_batches"
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True)
+    rule_version: Mapped[int] = mapped_column(Integer, nullable=False)
+    plan_digest: Mapped[str] = mapped_column(Text, nullable=False, unique=True)
+    plan: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)
+    counts: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)
+    status: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[datetime] = _created_at()
+    __table_args__ = (CheckConstraint("status = 'applied'", name="status_allowed"),)
+
+
+class MaterialIdentityArchive(Base):
+    """迁移时原记录，不能冒充运行时快照。"""
+
+    __tablename__ = "material_identity_archive"
+    batch_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("material_identity_batches.id", ondelete="RESTRICT"),
+        primary_key=True)
+    entity_type: Mapped[str] = mapped_column(Text, primary_key=True)
+    original_key: Mapped[str] = mapped_column(Text, primary_key=True)
+    record: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)
+    digest: Mapped[str] = mapped_column(Text, nullable=False)
+    provenance: Mapped[str] = mapped_column(Text, nullable=False,
+                                           server_default=text("'migration_capture'"))
+    __table_args__ = (
+        CheckConstraint("provenance = 'migration_capture'", name="provenance_allowed"),)
+
+
+class MaterialIdAlias(Base):
+    """旧 UUID → 规范 UUID；不与当前素材建立外键，删除后仍保留身份记录。"""
+
+    __tablename__ = "material_id_aliases"
+    old_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True)
+    canonical_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    batch_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("material_identity_batches.id", ondelete="RESTRICT"),
+        nullable=False)
+    __table_args__ = (
+        CheckConstraint("old_id <> canonical_id", name="different_ids"),
+        Index("ix_material_id_aliases_canonical_id", "canonical_id"),)
 
 
 class Hotspot(Base):

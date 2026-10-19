@@ -114,7 +114,7 @@ async def get_material_keyframe(material_id: UuidPath, index: int,
                             {"material_id": material_id, "index": index})
     root = Path(cfg.index_dir(), "keyframes").resolve()
     try:
-        target = Path(frames[index]).resolve()
+        target = Path(PROJECT_ROOT, frames[index]).resolve()
     except OSError as exc:  # 非法路径字符等
         raise NotFoundError(f"关键帧不存在：{material_id}[{index}]",
                             {"material_id": material_id, "index": index}) from exc

@@ -24,7 +24,15 @@ from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
 
 from xhs_agent.config import AppConfig, load_config
 from xhs_agent.db import Base
-from xhs_agent.db.models import Hotspot, Material, Run, RunHotspot, RunMatch
+from xhs_agent.db.models import (
+    Hotspot,
+    Material,
+    MaterialIdAlias,
+    MaterialIdentityBatch,
+    Run,
+    RunHotspot,
+    RunMatch,
+)
 from xhs_agent.services.chat import append_message, create_session
 from xhs_agent.services.chat_tools import (
     ToolContext,
@@ -83,9 +91,11 @@ class CountingProvider(llm.BaseProvider):
         super().__init__(model="counting-1")
         self.payload = payload or CLUE_PAYLOAD
         self.calls = 0
+        self.requests: list[llm.LLMCall] = []
 
     async def complete(self, call: llm.LLMCall) -> LLMResult:
         self.calls += 1
+        self.requests.append(call)
         return LLMResult(text=json.dumps(self.payload, ensure_ascii=False),
                          provider=self.name, model=self.model,
                          prompt_tokens=100, completion_tokens=50, cost_cny=0.003)
@@ -191,7 +201,7 @@ async def seed_finished_run(session: AsyncSession, *, hotspot: str = "夜跑球�
     }
     run_hotspot.status = "succeeded"
     run_hotspot.coverage = {"ratio": 1.0, "covered": [], "gaps": []}
-    material = Material(path="D:/materials/夜跑球鞋.mp4", type="video", title="夜里的球鞋",
+    material = Material(path="夜跑球鞋.mp4", type="video", title="夜里的球鞋",
                         description="夜里跑步的球鞋特写", tags=["夜跑"], elements=[],
                         source="sidecar", width=1080, height=1920, size_bytes=2048)
     session.add(material)
@@ -215,7 +225,7 @@ class TestSearchMaterials:
     async def test_returns_candidates_and_reuses_the_clue(
             self, context: ToolContext, db_session: AsyncSession,
             provider: CountingProvider) -> None:
-        await seed_material(db_session, path="D:/materials/羽毛球-新手练习.mp4",
+        await seed_material(db_session, path="羽毛球-新手练习.mp4",
                             title=MATERIAL_TITLE, description=MATERIAL_DESCRIPTION,
                             tags=MATERIAL_TAGS)
         await db_session.commit()
@@ -244,7 +254,7 @@ class TestPreviewElementCoverage:
     async def test_reports_coverage_and_gap_advice_without_touching_runs(
             self, context: ToolContext, db_session: AsyncSession,
             provider: CountingProvider) -> None:
-        await seed_material(db_session, path="D:/materials/羽毛球-新手练习.mp4",
+        await seed_material(db_session, path="羽毛球-新手练习.mp4",
                             title=MATERIAL_TITLE, description=MATERIAL_DESCRIPTION,
                             tags=MATERIAL_TAGS)
         await db_session.commit()
@@ -271,7 +281,7 @@ class TestPreviewElementCoverage:
         cfg = write_config(tmp_path, embedding_enabled=True)
         ctx = ToolContext(cfg=cfg, session=db_session,
                           caller=StructuredCaller(provider=provider))
-        await seed_material(db_session, path="D:/materials/羽毛球-新手练习.mp4",
+        await seed_material(db_session, path="羽毛球-新手练习.mp4",
                             title=MATERIAL_TITLE, description=MATERIAL_DESCRIPTION,
                             tags=MATERIAL_TAGS)
         await db_session.commit()
@@ -309,6 +319,37 @@ class TestReviseDraft:
         )).scalar_one()
         assert stored["body"] == original["body"]
         assert stored["titles"] == original["titles"]
+
+    async def test_old_material_id_resolves_alias_before_model_call(
+            self, db_session: AsyncSession, cfg: AppConfig) -> None:
+        """S6.11b：基础文案持有旧 UUID 时，改稿按别名解析到规范素材，模型看到规范 ID。"""
+        run_id, original = await seed_finished_run(db_session)
+        canonical = uuid.UUID(original["material_id"])
+        old_id = uuid.uuid4()
+        batch_id = uuid.uuid4()
+        db_session.add(MaterialIdentityBatch(
+            id=batch_id, rule_version=2, plan_digest=str(batch_id),
+            plan={}, counts={}, status="applied"))
+        await db_session.flush()
+        db_session.add(MaterialIdAlias(old_id=old_id, canonical_id=canonical,
+                                       batch_id=batch_id))
+        run_hotspot = (await db_session.execute(
+            select(RunHotspot).where(RunHotspot.run_id == uuid.UUID(run_id))
+        )).scalar_one()
+        run_hotspot.draft = {**run_hotspot.draft, "material_id": str(old_id)}
+        await db_session.commit()
+
+        provider = CountingProvider(REVISED_PAYLOAD)
+        ctx = ToolContext(cfg=cfg, session=db_session,
+                          caller=StructuredCaller(provider=provider))
+        outcome = await revise_draft(ctx, {"run_id": run_id, "request": "改成避坑向"})
+
+        assert outcome.status == "succeeded", outcome.error
+        assert provider.calls == 1
+        prompt = provider.requests[0].user
+        assert str(canonical) in prompt
+        assert str(old_id) not in prompt
+        assert outcome.payload["revised"]["material_id"] == str(canonical)
 
     async def test_refusal_keeps_the_snapshot_and_reports_the_reason(
             self, db_session: AsyncSession, cfg: AppConfig) -> None:
@@ -410,7 +451,7 @@ class TestTurnPromptVersions:
 
     async def test_read_only_turn_records_both_versions(self, db_session: AsyncSession,
                                                         cfg: AppConfig) -> None:
-        await seed_material(db_session, path="D:/materials/羽毛球-新手练习.mp4",
+        await seed_material(db_session, path="羽毛球-新手练习.mp4",
                             title=MATERIAL_TITLE, description=MATERIAL_DESCRIPTION,
                             tags=MATERIAL_TAGS)
         await db_session.commit()

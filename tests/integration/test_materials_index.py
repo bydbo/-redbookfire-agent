@@ -232,14 +232,14 @@ class TestConcurrentIndexing:
 
         assert all(report["scanned"] >= 1 for report in reports)
         rows = (await db_session.execute(
-            select(MaterialRow).where(MaterialRow.path == str(touch)))).scalars().all()
+            select(MaterialRow).where(MaterialRow.path == "运动/并发新片.mp4"))).scalars().all()
         assert len(rows) == 1                       # 只入库一次
         assert sum(report["added"] for report in reports) == 1   # 第二个任务看到"没变化"
 
     async def test_unlocked_runs_still_do_not_crash(self, task_cfg: AppConfig,
                                                     db_session: AsyncSession,
                                                     cfg: AppConfig) -> None:
-        """即使绕过锁（分析与索引同时做新鲜度同步），幂等插入也不该报唯一键冲突。"""
+        """所有索引入口共用服务层事务锁：并发的第二次同步看到"没变化"，不撞唯一键。"""
         touch = Path(cfg.materials_dir()) / "运动" / "无锁并发.mp4"
         touch.parent.mkdir(parents=True, exist_ok=True)
         touch.write_bytes(b"fake-video")
@@ -249,7 +249,8 @@ class TestConcurrentIndexing:
             run_index(task_cfg, embedder=FakeEmbedder()),
         )
 
-        assert all(report["added"] >= 1 for report in reports)
+        assert all(report["scanned"] >= 1 for report in reports)
+        assert sum(report["added"] for report in reports) == 1
         rows = (await db_session.execute(
-            select(MaterialRow).where(MaterialRow.path == str(touch)))).scalars().all()
+            select(MaterialRow).where(MaterialRow.path == "运动/无锁并发.mp4"))).scalars().all()
         assert len(rows) == 1

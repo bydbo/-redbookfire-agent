@@ -27,7 +27,7 @@ from alembic import command
 pytestmark = pytest.mark.integration
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
-REVISION = "0011"
+REVISION = "0013"
 
 
 @pytest.fixture
@@ -126,6 +126,69 @@ class TestUpgrade:
         await _alembic(command.upgrade, alembic_config, "head")
         assert {"turn_id", "trace_id", "progress"} <= await _columns(db_engine,
                                                                      "chat_messages")
+
+    @pytest.mark.asyncio
+    async def test_material_identity_structure_round_trip(self, alembic_config: Config,
+                                                          db_engine: AsyncEngine) -> None:
+        """E6：0012 建批次 / 归档 / 别名，0013 加规范路径 CHECK；空库可回退并再次升级。"""
+        await _alembic(command.upgrade, alembic_config, "head")
+        assert {"material_identity_batches", "material_identity_archive",
+                "material_id_aliases"} <= await _tables(db_engine)
+        assert {"record", "digest", "provenance"} <= await _columns(
+            db_engine, "material_identity_archive")
+        async with db_engine.connect() as conn:
+            constraint = (await conn.execute(text(
+                "SELECT pg_get_constraintdef(oid) FROM pg_constraint "
+                "WHERE conname = 'ck_materials_path_canonical'"))).scalar_one_or_none()
+        assert constraint is not None and "[[:cntrl:]]" in constraint
+        await _alembic(command.downgrade, alembic_config, "0011")
+        assert not ({"material_identity_batches", "material_identity_archive",
+                     "material_id_aliases"} & await _tables(db_engine))
+        await _alembic(command.upgrade, alembic_config, "head")
+        assert {"material_identity_batches", "material_identity_archive",
+                "material_id_aliases"} <= await _tables(db_engine)
+
+    @pytest.mark.asyncio
+    async def test_constraint_gate_blocks_legacy_material_rows(
+        self, alembic_config: Config, db_engine: AsyncEngine
+    ) -> None:
+        """E6：0013 之前必须先完成 plan/apply/verify；旧格式行必须阻断升级。"""
+        await _alembic(command.upgrade, alembic_config, "0012")
+        async with db_engine.begin() as conn:
+            await conn.execute(text(
+                "INSERT INTO materials (path) VALUES ('D:/old/materials/legacy.mp4')"))
+        with pytest.raises(RuntimeError):
+            await _alembic(command.upgrade, alembic_config, "head")
+        async with db_engine.connect() as conn:
+            version = (await conn.execute(text(
+                "SELECT version_num FROM alembic_version"))).scalar_one()
+        assert version == "0012"
+        async with db_engine.begin() as conn:
+            await conn.execute(text("DELETE FROM materials"))
+        await _alembic(command.upgrade, alembic_config, "head")
+        async with db_engine.connect() as conn:
+            version = (await conn.execute(text(
+                "SELECT version_num FROM alembic_version"))).scalar_one()
+        assert version == REVISION
+
+    @pytest.mark.asyncio
+    async def test_downgrade_refuses_after_identity_batch(
+        self, alembic_config: Config, db_engine: AsyncEngine
+    ) -> None:
+        """E6：已应用身份批次后拒绝回退 schema，不能把归档当作可丢弃数据。"""
+        await _alembic(command.upgrade, alembic_config, "head")
+        async with db_engine.begin() as conn:
+            await conn.execute(text(
+                "INSERT INTO material_identity_batches "
+                "(id, rule_version, plan_digest, plan, counts, status) "
+                "VALUES ('00000000-0000-0000-0000-0000000000a1', 2, 'd', "
+                "'{}'::jsonb, '{}'::jsonb, 'applied')"))
+        with pytest.raises(RuntimeError):
+            await _alembic(command.downgrade, alembic_config, "0012")
+        async with db_engine.connect() as conn:
+            version = (await conn.execute(text(
+                "SELECT version_num FROM alembic_version"))).scalar_one()
+        assert version == REVISION
 
 
 class TestDowngrade:

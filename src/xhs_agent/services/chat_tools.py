@@ -82,6 +82,8 @@ from ..tools.embedding import EmbeddingError
 from ..tools.gaps import gap_advice
 from ..tools.llm import LLMError, StructuredCaller
 from ..tools.vision import sniff_image_mime
+from .material_identity import current_material
+from .materials import row_to_material
 
 TOOL_RUN_ANALYSIS = "run_hotspot_analysis"
 TOOL_PARSE_IMAGE = "parse_image_clue"
@@ -1950,8 +1952,29 @@ async def revise_draft(
                 status="failed", steps=steps, error="改写失败：请求认领没有落库，请稍后重试"
             )
 
-    candidates = item.get("candidates") or []
-    material = dict(candidates[0].get("material") or {}) if candidates else None
+    # 基础版本的素材才是此次改稿对象；不能默默改用第一候选。
+    material = None
+    raw_material = str(base_draft.get("material_id") or "")
+    try:
+        if ctx.session is not None:
+            selected = await current_material(ctx.session, uuid.UUID(raw_material))
+            if selected is not None:
+                material = row_to_material(selected).to_dict()
+        else:
+            # 固定样本 / 无数据库调用方只允许精确匹配，不猜别名。
+            matches = [candidate for candidate in item.get("candidates", [])
+                       if str(candidate.get("material_id")
+                              or candidate.get("material", {}).get("id")) == raw_material]
+            if raw_material and len(matches) == 1:
+                material = dict(matches[0].get("material") or {})
+        if material is None:
+            raise ValueError("基础文案关联的素材不存在或无法唯一确定")
+    except (ValueError, ApiError) as exc:
+        if claim is not None:
+            await artifact_versions.finish(ctx.session, claim.row, status="failed", error=str(exc))
+        return ToolOutcome(status="failed", steps=steps, error="改写失败：基础文案素材引用失效",
+                           payload={"reason": "material_reference_missing"})
+    base_draft = {**base_draft, "material_id": str(material["id"])}
     # A05：适用约束快照进入真正的改稿请求（不是只在 supervisor 里提示）
     constraints = await _constraints_for(ctx, object_key=key)
     await progress("改写文案")

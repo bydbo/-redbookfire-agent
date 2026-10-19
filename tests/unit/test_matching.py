@@ -125,13 +125,14 @@ class TestExplainAndDedupe:
         assert candidate.reasons == ["模型给的理由"]
         assert candidate.usage == "放开头 3 秒"
 
-    def test_dedupe_keeps_first_and_ignores_case(self, make_material):
+    def test_dedupe_uses_canonical_key_and_keeps_first(self, make_material):
         kept = matching.dedupe_by_path([
-            make_material(material_id="a", path="D:/M/clip.mp4"),
-            make_material(material_id="b", path="d:/m/CLIP.mp4"),
-            make_material(material_id="c", path="D:/M/other.mp4"),
+            make_material(material_id="a", path="运动/clip.mp4"),
+            make_material(material_id="b", path="运动/clip.mp4"),
+            make_material(material_id="c", path="运动/Clip.mp4"),   # 大小写不同 = 不同键
+            make_material(material_id="d", path="运动/other.mp4"),
         ])
-        assert [material.id for material in kept] == ["a", "c"]
+        assert [material.id for material in kept] == ["a", "c", "d"]
 
 
 class TestDeterminism:
