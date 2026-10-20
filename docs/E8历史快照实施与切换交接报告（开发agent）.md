@@ -38,6 +38,7 @@
 | 覆盖率 | 单测 66.61%（低于既有 78% 单测门槛，基线同样不达标）；单测 + 集成合并 **86.54%**，达到 78% |
 | 浏览器全栈 | 真实 FastAPI + Postgres + Redis + 前端 dist + Edge；**2/2 检查、exit 0**：[result.json](../../runs/_e8/browser-20261020T121247Z/result.json)、[候选截图](../../runs/_e8/browser-20261020T121247Z/run-candidates.png)、[报告 Markdown](../../runs/_e8/browser-20261020T121247Z/report.md) |
 | 迁移 CLI | 空库 plan → apply → verify 通过；篡改计划拒绝（`test_e8_snapshot_cli`） |
+| Compose / 镜像 | `docker compose config --quiet` 通过；`docker build -t xhs-agent:ci .` 成功（`sha256:8676…`） |
 | 迁移恢复演练 | 含快照库 `pg_dump` → 另一容器 `pg_restore` → 批次与素材快照核验通过 |
 | 性能 | 10 runs / 20 hotspots / 100 matches / 30 materials：plan 0.196s、apply 0.692s、verify 0.309s；`load_run` 0.141s、3 条查询、详情 16 KB、快照 86.6 KB：[performance.json](../../runs/_e8/performance.json) |
 

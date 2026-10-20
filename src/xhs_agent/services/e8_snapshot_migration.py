@@ -518,13 +518,25 @@ async def verify_snapshot(session: AsyncSession, batch_id: uuid.UUID, *,
         row = (await session.execute(text(
             "SELECT execution_snapshot::text AS s, evidence_meta::text AS e "
             "FROM runs WHERE id=:id"), {"id": target["id"]})).mappings().one_or_none()
-        if row is None or json.loads(row["e"]) != target["evidence_meta"]:
+        if (row is None or json.loads(row["s"]) != target["execution_snapshot"]
+                or json.loads(row["e"]) != target["evidence_meta"]):
             raise ValueError("runs 快照核验失败")
     for target in plan["targets"]["run_hotspots"]:
         row = (await session.execute(text(
-            "SELECT evidence_meta::text AS e FROM run_hotspots WHERE id=:id"),
-            {"id": target["id"]})).scalar_one_or_none()
-        if row is None or json.loads(row) != target["evidence_meta"]:
+            "SELECT raw_text, clue::text AS clue, gap_advice::text AS gap, "
+            "retrieval_meta::text AS retrieval, evidence_meta::text AS evidence "
+            "FROM run_hotspots WHERE id=:id"), {"id": target["id"]})).mappings().one_or_none()
+        if row is None:
+            raise ValueError("run_hotspots 快照核验失败")
+        expected = target
+        actual = {
+            "raw_text": row["raw_text"],
+            "clue": json.loads(row["clue"]) if row["clue"] is not None else None,
+            "gap_advice": json.loads(row["gap"]) if row["gap"] is not None else None,
+            "retrieval_meta": json.loads(row["retrieval"]),
+            "evidence_meta": json.loads(row["evidence"]),
+        }
+        if actual != {key: expected[key] for key in actual}:
             raise ValueError("run_hotspots 快照核验失败")
     for target in plan["targets"]["run_matches"]:
         row = (await session.execute(text(
@@ -532,8 +544,8 @@ async def verify_snapshot(session: AsyncSession, batch_id: uuid.UUID, *,
             "WHERE run_hotspot_id=:rh AND material_id=:mid"),
             {"rh": target["run_hotspot_id"], "mid": target["material_id"]})).scalar_one_or_none()
         expected = target["material_snapshot"]
-        actual = json.loads(row) if row is not None else None
-        if actual != expected:
+        actual_snapshot = json.loads(row) if row is not None else None
+        if actual_snapshot != expected:
             raise ValueError("run_matches 素材快照核验失败")
     for target in plan["targets"]["artifacts"]:
         row = (await session.execute(text(
@@ -541,6 +553,14 @@ async def verify_snapshot(session: AsyncSession, batch_id: uuid.UUID, *,
             {"id": target["id"]})).scalar_one_or_none()
         if row is None or json.loads(row) != target["evidence_snapshot"]:
             raise ValueError("chat_artifact_versions 证据核验失败")
+    actual_counts = (await session.execute(text(
+        "SELECT (SELECT count(*) FROM runs) AS runs, "
+        "(SELECT count(*) FROM run_hotspots) AS run_hotspots, "
+        "(SELECT count(*) FROM run_matches) AS run_matches, "
+        "(SELECT count(*) FROM chat_artifact_versions) AS artifacts"))).mappings().one()
+    for key in ("runs", "run_hotspots", "run_matches", "artifacts"):
+        if int(actual_counts[key]) != int(plan["counts"][key]):
+            raise ValueError(f"E8 快照计数核验失败：{key}")
     batch.status = "verified"
     batch.verification = {"counts": dict(batch.counts), "verified": True}
     batch.verified_at = datetime.now(UTC)
