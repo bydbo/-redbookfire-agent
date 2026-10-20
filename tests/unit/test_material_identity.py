@@ -142,7 +142,7 @@ def test_existing_alias_repoints_and_is_archived():
     data = _data()
     old = "00000000-0000-0000-0000-0000000000aa"
     data["material_id_aliases"] = [
-        {"old_id": old, "canonical_id": data["materials"][0]["id"]},
+        {"old_id": old, "canonical_id": data["materials"][0]["id"], "batch_id": "prior-batch"},
     ]
     result = plan(data)
     assert result["issues"] == []
@@ -158,8 +158,8 @@ def test_alias_cycle_is_blocking():
     data = _data()
     old = "00000000-0000-0000-0000-0000000000aa"
     data["material_id_aliases"] = [
-        {"old_id": old, "canonical_id": data["materials"][0]["id"]},
-        {"old_id": data["materials"][0]["id"], "canonical_id": old},
+        {"old_id": old, "canonical_id": data["materials"][0]["id"], "batch_id": "prior-batch"},
+        {"old_id": data["materials"][0]["id"], "canonical_id": old, "batch_id": "prior-batch"},
     ]
     assert any("链或环" in item["reason"] for item in plan(data)["issues"])
 

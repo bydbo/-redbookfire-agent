@@ -559,13 +559,12 @@ def companion_paths(media_path: str) -> list[str]:
 
     根以下的链接 / junction 明确失败（不能借旁车把操作引到素材根之外）。
     """
-    companions = [media_path + suffix for suffix in COMPANION_SUFFIXES
-                  if os.path.isfile(media_path + suffix)]
-    for path in companions:
+    candidates = [media_path + suffix for suffix in COMPANION_SUFFIXES]
+    for path in candidates:
         if is_link(path):
             raise BadRequestError(
                 "旁车文件不能是符号链接或 junction", {"path": os.path.basename(path)})
-    return companions
+    return [path for path in candidates if os.path.isfile(path)]
 
 
 def _record_fs_failure(cfg: AppConfig, payload: dict[str, Any]) -> str:
@@ -626,6 +625,22 @@ def _move_group(
     validate: Callable[[str], Any],
 ) -> list[tuple[str, str]]:
     """按顺序移动整组；任一步失败即逆序补偿，补偿失败抛人工核对错误。"""
+    # 在第一次修改前留下完整意图。中断后可对照源、目标和数据库定位残留；
+    # 这个记录不是提交凭证，不据此自动重放文件操作。
+    for _source, target in pairs:
+        validate(target)
+        if os.path.lexists(target):
+            raise FileExistsError(target)
+    journal_dir = os.path.join(cfg.runs_dir(), "_material_identity", "fs_operations")
+    os.makedirs(journal_dir, exist_ok=True)
+    operation_id = str(uuid.uuid4())
+    with open(os.path.join(journal_dir, operation_id + ".json"), "x", encoding="utf-8") as handle:
+        json.dump({"operation_id": operation_id, "action": action,
+                   "at": datetime.now(UTC).isoformat(), "evidence": "intent_only",
+                   "planned": [{"source": source, "target": target} for source, target in pairs]},
+                  handle, ensure_ascii=False)
+        handle.flush()
+        os.fsync(handle.fileno())
     moved: list[tuple[str, str]] = []
     try:
         for source, target in pairs:
@@ -673,6 +688,7 @@ async def trash_material(session: AsyncSession, cfg: AppConfig,
         return None
 
     relative = row.path
+    _trash_base(cfg)  # 缺失文件也先验证回收站边界，避免非法根时只删数据库。
     media_path = _materials_item(cfg, relative)
     file_missing = not os.path.isfile(media_path)
     trashed = relative.replace(os.sep, "/")
@@ -709,12 +725,14 @@ async def trash_material(session: AsyncSession, cfg: AppConfig,
         await session.delete(row)
         await session.commit()
     except BaseException:
-        await session.rollback()
-        if moved:
-            failures = _rollback(moved)
-            if failures:
-                raise _manual_review(cfg, action="trash_db_commit", pairs=moved,
-                                     moved=moved, failures=failures) from None
+        try:
+            await session.rollback()
+        finally:
+            if moved:
+                failures = _rollback(moved)
+                if failures:
+                    raise _manual_review(cfg, action="trash_db_commit", pairs=moved,
+                                         moved=moved, failures=failures) from None
         raise
     return {"material_id": material_id_str, "path": relative.replace(os.sep, "/"),
             "trashed_path": trashed, "file_missing": file_missing}

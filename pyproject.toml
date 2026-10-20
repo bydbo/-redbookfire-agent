@@ -64,17 +64,18 @@ asyncio_default_test_loop_scope = "session"
 
 # 覆盖率（S1.5）：`uv run pytest --cov` 即可出报告。
 # source 用包名而不是目录清单，后续新增 models/、db/、api/ 等会自动纳入统计。
-# 按 backlog 不设 fail_under（门槛留到 CI，见 S4.5）；show_missing 直接给未覆盖行号。
+# CI 使用 scripts/check_coverage.py 保存单测、集成分项并执行联合门槛。
 [tool.coverage.run]
 source = ["xhs_agent"]
 branch = true
 
 [tool.coverage.report]
+# 旧版本恢复演练会动态加载历史源码；质量门仅衡量本检出 src/xhs_agent。
+include = ["src/xhs_agent/*"]
 show_missing = true
 skip_covered = true
-# 覆盖率门槛（S4.5 起进 CI）：当前单测覆盖 81%，留 3 个点余量避免小重构踩线。
-# 只在带 --cov 的跑法下生效（CI 的 test job）；本地 `uv run pytest` 与 pre-commit 钩子不带
-# --cov，所以提交仍然是快的。改这个数字时同步 tests/unit/test_ci_workflow.py 的断言。
+# 单测与真实数据库集成测试联合覆盖率门槛；两套测试必须成功，保留分项报告。
+# 本地 pytest / pre-commit 默认不测覆盖率。修改数字须同步 CI 守卫测试。
 fail_under = 78
 
 # 代码质量门（S1.3）：规则集显式写死，避免 ruff 默认集随版本漂移。

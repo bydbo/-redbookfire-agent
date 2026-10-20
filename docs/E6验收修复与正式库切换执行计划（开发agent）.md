@@ -177,8 +177,7 @@
 工程根：
 uv run ruff check .
 uv run mypy
-uv run pytest --cov
-uv run pytest -m integration
+uv run python scripts/check_coverage.py
 uv run python scripts/check_openapi.py
 uv run alembic heads
 git diff --check
@@ -191,7 +190,7 @@ pnpm run build
 pnpm run check:api
 ```
 
-覆盖率执行当前配置的 78% 门槛，不下调。生成类型纳入本批后检查一致性；涉及 Compose 或镜像时补配置校验和构建验证。
+覆盖率按 2026-10-20 用户确认的口径：单测与真实容器集成均通过，保存分项报告，再对联合覆盖率执行当前配置的 78% 门槛。跨容器用例先构建 `xhs-agent:ci`（或通过 `E6_TEST_IMAGE` 指定候选镜像）。生成类型纳入本批后检查一致性；涉及 Compose 或镜像时补配置校验和构建验证。
 
 证据保存在被忽略的 `runs/_material_identity/` 下，包含命令、时间、提交、schema／规则版本、结果、截图及摘要索引。明确区分通过、失败、未执行与跳过；凭据和真实内容不进入提交。
 

@@ -361,7 +361,58 @@ async def test_second_batch_repoints_alias_and_both_batches_verify(identity_db):
         assert (await verify_migration(
             session, uuid.UUID(first["batch_id"]), exact=False))["status"] == "verified"
         assert (await current_material(session, ids["a"])).id == newer
+        # 仅篡改来源批次，不改 old/target；最新精确核验也必须拒绝。
+        await session.execute(text("UPDATE material_id_aliases SET batch_id=:batch WHERE old_id=:id"),
+                              {"batch": uuid.UUID(second["batch_id"]), "id": ids["a"]})
+        await session.commit()
+    async with factory() as session:
+        with pytest.raises(ValueError, match="来源批次"):
+            await verify_migration(session, uuid.UUID(second["batch_id"]))
     await asyncio.to_thread(command.upgrade, config, "head")
+
+
+async def test_audit_rejects_forged_repoint_without_later_batch(identity_db):
+    factory, _, ids = identity_db
+    plan = await make_plan(factory)
+    async with factory() as session:
+        await apply_migration(session, plan)
+    async with factory() as session:
+        await session.execute(text("DELETE FROM materials WHERE id=:id"), {"id": ids["b"]})
+        await session.execute(text("UPDATE material_id_aliases SET canonical_id=:id"),
+                              {"id": ids["single"]})
+        await session.execute(text("INSERT INTO material_id_aliases(old_id,canonical_id,batch_id) "
+            "VALUES(:old,:target,:batch)"), {"old": ids["b"], "target": ids["single"],
+                                             "batch": uuid.UUID(plan["batch_id"])})
+        await session.commit()
+    async with factory() as session:
+        with pytest.raises(ValueError, match="归档证据"):
+            await verify_migration(session, uuid.UUID(plan["batch_id"]), exact=False)
+
+
+async def test_legacy_v2_batch_created_by_old_implementation_can_verify(identity_db, tmp_path):
+    import importlib.util
+
+    factory, _, _ = identity_db
+    old = subprocess.run(["git", "show", "f12c110:src/xhs_agent/services/material_identity_migration.py"],
+                         cwd=PROJECT_ROOT, capture_output=True, check=True)
+    path = tmp_path / "legacy.py"
+    path.write_bytes(old.stdout)
+    spec = importlib.util.spec_from_file_location("xhs_agent.services._legacy_e6", path)
+    assert spec and spec.loader
+    legacy = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(legacy)
+    async with factory() as session:
+        await session.execute(text("UPDATE run_matches SET hits=CAST(:value AS jsonb)"),
+                              {"value": '[{"nested":{"fraction":0.123456789}}]'})
+        await session.commit()
+    async with factory() as session:
+        plan = await legacy.plan_migration(session, ROOTS, code_version="legacy-fixture")
+    async with factory() as session:
+        await legacy.apply_migration(session, plan)
+    async with factory() as session:
+        result = await verify_migration(session, uuid.UUID(plan["batch_id"]))
+        assert result["status"] == "verified" and result["rule_version"] == 2
+        assert result["limitations"]
 
 
 async def test_old_id_reaches_detail_edit_keyframes_and_trash(identity_db, tmp_path):

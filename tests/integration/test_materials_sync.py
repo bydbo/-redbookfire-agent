@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import os
 import struct
 import subprocess
@@ -278,6 +279,75 @@ class TestIncrementalChanges:
 
 
 class TestOpsCommand:
+    async def test_cli_worker_and_analysis_wait_for_same_database_lock(
+            self, db_engine, db_session, tmp_path, postgres_dsn, redis_url, monkeypatch):
+        from sqlalchemy.ext.asyncio import async_sessionmaker
+
+        from xhs_agent.config import load_config
+        from xhs_agent.core.tracing import NullTracer
+        from xhs_agent.db.models import Run
+        from xhs_agent.services.material_identity import (
+            MATERIAL_INDEX_LOCK,
+            lock_material_index,
+        )
+        from xhs_agent.tasks.analysis import _sync_index_with_stages
+        from xhs_agent.tasks.indexing import run_locked
+        from xhs_agent.tools.embedding import EmbeddingResult
+
+        class FixedEmbedder:
+            async def embed(self, texts):
+                return EmbeddingResult(vectors=[[1.0] + [0.0] * 1023 for _ in texts],
+                                       model="fixed", prompt_tokens=len(texts), attempts=1)
+
+        embedder = FixedEmbedder()
+
+        root = _make_pack(tmp_path)
+        config = tmp_path / "config.toml"
+        config.write_text(f'[paths]\nmaterials_dir="{root.as_posix()}"\n'
+            f'index_dir="{(tmp_path / "index").as_posix()}"\n'
+            '[embedding]\nenabled=true\nmodel="fixed"\n[vision]\nenabled=false\n', encoding="utf-8")
+        monkeypatch.setenv("DATABASE_URL", postgres_dsn)
+        monkeypatch.setenv("REDIS_URL", redis_url)
+        cfg = load_config(str(config))
+        run = Run(job_id="concurrent-index-fixture", status="running")
+        db_session.add(run)
+        await db_session.commit()
+        factory = async_sessionmaker(db_engine, expire_on_commit=False)
+
+        async def analysis():
+            async with factory() as session:
+                await _sync_index_with_stages(session, cfg, run_id=str(run.id), vision=None,
+                                              embedder=embedder, tracer=NullTracer(), retries=0)
+
+        async with factory() as blocker:
+            await lock_material_index(blocker)
+            env = {**os.environ, "XHS_CONFIG_PATH": str(config), "PYTHONIOENCODING": "utf-8"}
+            tasks = [asyncio.create_task(run_locked(cfg, embedder=embedder)), asyncio.create_task(analysis()),
+                     asyncio.create_task(asyncio.to_thread(subprocess.run,
+                         [sys.executable, "scripts/index_materials.py"], cwd=str(PROJECT_ROOT),
+                         env=env, capture_output=True, text=True, encoding="utf-8", errors="replace"))]
+            try:
+                async with factory() as observer:
+                    for _ in range(150):
+                        waiting = (await observer.execute(text("SELECT count(*) FROM pg_locks "
+                            "WHERE locktype='advisory' AND objid=:key AND NOT granted"),
+                            {"key": MATERIAL_INDEX_LOCK})).scalar_one()
+                        if waiting == 3:
+                            break
+                        await asyncio.sleep(0.1)
+                    assert waiting == 3, "CLI、worker、分析同步必须同时被同一数据库锁阻塞"
+            finally:
+                await blocker.rollback()
+            worker_result, _, cli_result = await asyncio.wait_for(asyncio.gather(*tasks), 30)
+        assert cli_result.returncode == 0, cli_result.stderr
+        assert worker_result["added"] in (0, 3)
+        async with factory() as session:
+            rows = (await session.execute(text("SELECT id,path,indexed_at FROM materials"))).all()
+            assert len(rows) == 3 and len({row.path for row in rows}) == 3
+            result = await sync_materials(session, cfg)
+            assert result.unchanged == 3 and result.added == result.updated == result.deleted == 0
+            assert (await session.execute(text("SELECT id,path,indexed_at FROM materials"))).all() == rows
+
     async def test_cli_smoke(self, db_session: AsyncSession, tmp_path: Path,
                              postgres_dsn: str) -> None:
         pack = _make_pack(tmp_path)

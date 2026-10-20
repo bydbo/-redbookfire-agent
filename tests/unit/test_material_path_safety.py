@@ -5,6 +5,7 @@ Windows 上普通用户可能无法创建符号链接；创建失败时跳过该
 
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 from datetime import datetime
@@ -73,6 +74,35 @@ class _Upload:
 
 
 class TestSidecarSafety:
+    def test_dangling_companion_is_rejected(self, tmp_path: Path) -> None:
+        media = tmp_path / "a.mp4"
+        media.write_bytes(b"x")
+        _symlink(tmp_path / "missing", Path(str(media) + ".txt"))
+        with pytest.raises(BadRequestError):
+            companion_paths(str(media))
+        assert media.read_bytes() == b"x"
+
+    def test_move_intent_survives_interruption(self, tmp_path, monkeypatch):
+        from xhs_agent.services.materials import _move_group
+
+        cfg = make_config(tmp_path)
+        source = Path(cfg.materials_dir()) / "sample.mp4"
+        source.write_bytes(b"media")
+        target = Path(cfg.materials_dir()) / "_trash" / "sample.mp4"
+
+        def interrupted(*args):
+            raise KeyboardInterrupt
+
+        monkeypatch.setattr(os, "replace", interrupted)
+        with pytest.raises(KeyboardInterrupt):
+            _move_group(cfg, action="trash", pairs=[(str(source), str(target))],
+                        validate=lambda path: None)
+        records = list((Path(cfg.runs_dir()) / "_material_identity/fs_operations").glob("*.json"))
+        assert len(records) == 1
+        record = json.loads(records[0].read_text(encoding="utf-8"))
+        assert record["planned"] == [{"source": str(source), "target": str(target)}]
+        assert record["evidence"] == "intent_only" and source.read_bytes() == b"media"
+
     def test_sidecar_symlink_is_rejected(self, tmp_path: Path) -> None:
         cfg = make_config(tmp_path)
         root = Path(cfg.materials_dir())
@@ -101,6 +131,24 @@ class TestSidecarSafety:
 
 class TestTrashBoundary:
     """R01：`_trash` 自身或子层指向素材根之外时，所有入口拒绝且零改动。"""
+
+    @pytest.mark.asyncio
+    async def test_missing_media_still_rejects_linked_trash(self, tmp_path, monkeypatch):
+        import uuid
+        from types import SimpleNamespace
+        from unittest.mock import AsyncMock
+
+        from xhs_agent.services import materials
+
+        cfg, outside = self._setup(tmp_path)
+        row = SimpleNamespace(id=uuid.uuid4(), path="missing.mp4")
+        monkeypatch.setattr(materials, "current_material", AsyncMock(return_value=row))
+        session = SimpleNamespace(delete=AsyncMock(), commit=AsyncMock())
+        with pytest.raises(BadRequestError):
+            await materials.trash_material(session, cfg, row.id)
+        session.delete.assert_not_called()
+        session.commit.assert_not_called()
+        assert (outside / "sentinel.txt").read_text(encoding="utf-8") == "sentinel"
 
     def _setup(self, tmp_path: Path) -> tuple[AppConfig, Path]:
         cfg = make_config(tmp_path)

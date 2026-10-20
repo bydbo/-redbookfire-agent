@@ -22,11 +22,14 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from alembic import command
+from xhs_agent.config import load_config
+from xhs_agent.services import materials as material_service
 from xhs_agent.services.material_identity_migration import (
     apply_migration,
     plan_migration,
     verify_migration,
 )
+from xhs_agent.tools import materials as material_tools
 from xhs_agent.tools.materials import scan_materials
 
 pytestmark = [pytest.mark.integration, pytest.mark.asyncio]
@@ -92,7 +95,7 @@ async def perf_db(db_engine, postgres_dsn, monkeypatch):
 
 
 async def test_record_plan_apply_verify_and_scan_cost(
-    perf_db, tmp_path: Path
+    perf_db, tmp_path: Path, monkeypatch
 ) -> None:
     factory = perf_db
     tracemalloc.start()
@@ -123,6 +126,23 @@ async def test_record_plan_apply_verify_and_scan_cost(
     found = scan_materials(str(scan_root))
     scan_s = time.perf_counter() - started
     assert len(found) == MATERIAL_PAIRS + UNIQUE_MATERIALS
+    # 实际索引与未变重索引；探测/抽帧固定，隔离文件不访问模型。
+    config = tmp_path / "index.toml"
+    config.write_text(f'[paths]\nmaterials_dir="{scan_root.as_posix()}"\n'
+        f'index_dir="{(tmp_path / "index").as_posix()}"\n', encoding="utf-8")
+    cfg = load_config(str(config))
+    monkeypatch.setattr(material_service, "PROJECT_ROOT", str(tmp_path))
+    monkeypatch.setattr(material_tools.media, "probe", lambda path: {})
+    monkeypatch.setattr(material_tools.media, "extract_keyframes", lambda *args, **kwargs: [])
+    async with factory() as session:
+        started = time.perf_counter()
+        indexed = await material_service.sync_materials(session, cfg)
+        index_s = time.perf_counter() - started
+        started = time.perf_counter()
+        unchanged = await material_service.sync_materials(session, cfg)
+        reindex_s = time.perf_counter() - started
+    assert indexed.added == 200 and unchanged.unchanged == 200
+    assert unchanged.added == unchanged.updated == unchanged.deleted == 0
 
     payload = {
         "recorded_at": datetime.now(UTC).isoformat(),
@@ -138,6 +158,7 @@ async def test_record_plan_apply_verify_and_scan_cost(
         },
         "seconds": {"plan": round(plan_s, 3), "apply": round(apply_s, 3),
                     "verify": round(verify_s, 3), "scan": round(scan_s, 3),
+                    "index": round(index_s, 3), "unchanged_reindex": round(reindex_s, 3),
                     "process_cpu": round(time.process_time() - process_started, 3)},
         "python_heap_peak_bytes": tracemalloc.get_traced_memory()[1],
         "counts": plan["counts"],

@@ -24,7 +24,7 @@ from sqlalchemy.pool import NullPool
 from testcontainers.community.postgres import PostgresContainer
 
 from alembic import command
-from xhs_agent.services.material_identity_migration import apply_migration
+from xhs_agent.services.material_identity_migration import apply_migration, snapshot
 
 pytestmark = [pytest.mark.integration, pytest.mark.asyncio]
 
@@ -47,7 +47,7 @@ async def identity_db(db_engine, postgres_dsn, monkeypatch):
     monkeypatch.setenv("DATABASE_URL", postgres_dsn)
     config = Config(str(PROJECT_ROOT / "alembic.ini"))
     await asyncio.to_thread(command.upgrade, config, "0012")
-    ids = {name: uuid.uuid4() for name in ("a", "b", "single", "h", "r", "rh")}
+    ids = {name: uuid.uuid4() for name in ("a", "b", "single", "h", "r", "rh", "chat", "version")}
     async with db_engine.begin() as conn:
         for name, path, source in [
             ("a", "/app/data/materials/运动/a.mp4", "filename"),
@@ -74,6 +74,19 @@ async def identity_db(db_engine, postgres_dsn, monkeypatch):
                 "VALUES(:rh,:m,:rank,:score,'[\"原始理由\"]')"),
                 {"rh": ids["rh"], "m": ids[material], "rank": rank,
                  "score": Decimal(score)})
+        await conn.execute(text("UPDATE run_hotspots SET draft=CAST(:draft AS jsonb)"),
+                           {"draft": '{"title":"旧稿","body":"保留正文","tags":["历史"]}'})
+        await conn.execute(text("INSERT INTO chat_sessions(id,context_state) "
+            "VALUES(:id,CAST(:state AS jsonb))"), {"id": ids["chat"],
+                "state": json.dumps({"facts": [{"value": "保留约束"}],
+                                     "object_refs": [{"material_id": str(ids["a"])}]})})
+        await conn.execute(text("INSERT INTO chat_messages(session_id,role,content) "
+            "VALUES(:id,'user','保留旧消息')"), {"id": ids["chat"]})
+        await conn.execute(text("INSERT INTO chat_artifact_versions "
+            "(id,session_id,object_key,object_type,request_key,status,version_no,content) "
+            "VALUES(:id,:session,'draft:fixture','draft','restore-fixture','succeeded',1,"
+            "CAST(:content AS jsonb))"), {"id": ids["version"], "session": ids["chat"],
+                "content": '{"title":"历史版本","body":"保留版本正文"}'})
     return async_sessionmaker(db_engine, expire_on_commit=False), config, ids
 
 
@@ -82,6 +95,8 @@ async def test_backup_migrate_restore_and_read_with_old_code(
 ):
     factory, _, ids = identity_db
     dump_host = tmp_path / "pre-migration.dump"
+    async with factory() as session:
+        original_snapshot = await snapshot(session)
 
     # 1) 迁移前备份（0012，绝对路径 + 候选）
     dumped = postgres_container.exec([
@@ -109,6 +124,8 @@ async def test_backup_migrate_restore_and_read_with_old_code(
 
         engine = create_async_engine(dsn, poolclass=NullPool)
         try:
+            async with async_sessionmaker(engine)() as session:
+                assert await snapshot(session) == original_snapshot
             async with engine.connect() as connection:
                 version = (await connection.execute(text(
                     "SELECT version_num FROM alembic_version"))).scalar_one()
@@ -134,6 +151,11 @@ async def test_backup_migrate_restore_and_read_with_old_code(
                 "from sqlalchemy import text\n"
                 "from xhs_agent.db.session import create_engine_from_config\n"
                 "from xhs_agent.config import load_config\n"
+                "from sqlalchemy.ext.asyncio import async_sessionmaker\n"
+                "from xhs_agent.services.runs import load_run, load_report_model\n"
+                "from xhs_agent.services.chat import load_session\n"
+                "from xhs_agent.services.artifact_versions import get_version\n"
+                "import uuid\n"
                 "async def main():\n"
                 "    cfg = load_config()\n"
                 "    engine = create_engine_from_config(cfg)\n"
@@ -142,6 +164,16 @@ async def test_backup_migrate_restore_and_read_with_old_code(
                 "            'SELECT path FROM materials ORDER BY path'))).scalars().all()\n"
                 "        matches = (await conn.execute(text(\n"
                 "            'SELECT count(*) FROM run_matches'))).scalar_one()\n"
+                "    async with async_sessionmaker(engine)() as session:\n"
+                f"        run = await load_run(session, uuid.UUID('{ids['r']}'))\n"
+                f"        report = await load_report_model(session, cfg, uuid.UUID('{ids['r']}'))\n"
+                f"        chat = await load_session(session, uuid.UUID('{ids['chat']}'))\n"
+                f"        version = await get_version(session, uuid.UUID('{ids['chat']}'), "
+                f"uuid.UUID('{ids['version']}'))\n"
+                "        assert len(run['hotspots'][0]['candidates']) == 3\n"
+                "        assert run['hotspots'][0]['draft']['body'] == '保留正文'\n"
+                "        assert report and chat['messages'][0]['content'] == '保留旧消息'\n"
+                "        assert version.content['body'] == '保留版本正文'\n"
                 "    await engine.dispose()\n"
                 "    print(json.dumps({'paths': rows, 'matches': matches}))\n"
                 "asyncio.run(main())\n", encoding="utf-8")

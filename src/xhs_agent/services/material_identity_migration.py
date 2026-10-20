@@ -352,7 +352,9 @@ def build_plan(data: dict[str, list[dict[str, Any]]], *, identity: dict[str, str
                               "digest": digest(row)} for row in data["materials"]],
         "groups": material_groups, "aliases": aliases,
         "alias_records": sorted(
-            ({"old_id": str(old), "canonical_id": str(target)}
+            ({"old_id": str(old), "canonical_id": str(target),
+              "batch_id": next((str(row["batch_id"]) for row in data["material_id_aliases"]
+                                if str(row["old_id"]) == str(old)), "this_batch")}
              for old, target in aliases.items()),
             key=encoded,
         ),
@@ -467,12 +469,22 @@ def _verify_plan_integrity(batch: MaterialIdentityBatch) -> None:
         raise ValueError("迁移批次缺少计划")
     unsigned = {key: value for key, value in plan.items()
                 if key not in {"plan_digest", "batch_id"}}
-    if digest(unsigned) != plan.get("plan_digest"):
+    version = int(batch.rule_version)
+    if version not in (*LEGACY_RULE_VERSIONS, RULE_VERSION):
+        raise ValueError("不支持的迁移规则版本")
+    plan_digest = legacy_digest(unsigned) if version in LEGACY_RULE_VERSIONS else digest(unsigned)
+    if plan_digest != plan.get("plan_digest"):
         raise ValueError("迁移计划摘要不一致（计划内容被修改）")
     if str(plan.get("plan_digest")) != str(batch.plan_digest):
         raise ValueError("批次计划摘要与计划内容不一致")
     if int(plan.get("rule_version") or 0) != int(batch.rule_version):
         raise ValueError("批次规则版本与计划不一致")
+    if str(batch.id) != str(plan.get("batch_id")) or batch.id != uuid.uuid5(
+            uuid.NAMESPACE_URL, plan_digest):
+        raise ValueError("批次 ID 与计划摘要不一致")
+    if batch.counts != {**plan.get("counts", {}),
+                        "archived": len(plan.get("archive_manifest") or [])}:
+        raise ValueError("批次计数与计划不一致")
     manifest = plan.get("archive_manifest")
     if not isinstance(manifest, list) or _count(batch.counts, "archived") != len(manifest):
         raise ValueError("批次归档计数与计划清单不一致")
@@ -555,16 +567,37 @@ async def verify_migration(session: AsyncSession, batch_id: uuid.UUID, *,
                 f"缺 {len(missing)}、多 {len(extra)}、目标不符 {len(wrong)}"
                 + (f"（额外：{extra[:5]}）" if extra else "")
             )
+        if rule_version >= 3:
+            if any("batch_id" not in row for row in batch.plan.get("alias_records", [])):
+                raise ValueError("旧 v3 批次缺少别名来源期望，无法精确核验；请用 audit-only 核对归档，"
+                                 "未执行的旧计划必须重新生成")
+            expected_records = [{**row, "batch_id": str(batch.id) if row["batch_id"] == "this_batch"
+                                 else row["batch_id"]} for row in batch.plan["alias_records"]]
+            if sorted(data["material_id_aliases"], key=encoded) != sorted(expected_records, key=encoded):
+                raise ValueError("素材别名来源批次与迁移计划不一致")
     else:
-        # 历史批次：后续批次可以把目标再合并（A→B 之后 B→C，旧别名重指向 A→C）
-        for old, target in planned.items():
-            current = aliases.get(old)
-            if current is None:
-                raise ValueError("素材别名与迁移计划不一致（缺项）")
-            if current != target:
-                follow = aliases.get(target)
-                if follow is None or follow != current:
-                    raise ValueError("素材别名与迁移计划不一致（目标不符）")
+        # 重放后续批次对旧别名的合法修改；当前 A→C、B→C 本身不是迁移证据。
+        expected_aliases = dict(planned)
+        later_batches = (await session.execute(select(MaterialIdentityBatch).where(
+            MaterialIdentityBatch.created_at > batch.created_at).order_by(
+                MaterialIdentityBatch.created_at, MaterialIdentityBatch.id))).scalars().all()
+        for later_batch in later_batches:
+            _verify_plan_integrity(later_batch)
+            await _verify_archive(session, later_batch)
+            archived_aliases = (await session.execute(select(MaterialIdentityArchive).where(
+                MaterialIdentityArchive.batch_id == later_batch.id,
+                MaterialIdentityArchive.entity_type == "material_id_aliases"))).scalars().all()
+            previous = {str(row.record["old_id"]): str(row.record["canonical_id"])
+                        for row in archived_aliases}
+            next_aliases = later_batch.plan["aliases"]
+            for old, target in list(expected_aliases.items()):
+                next_target = next_aliases.get(old)
+                if next_target != target:
+                    if previous.get(old) != target or not next_target:
+                        raise ValueError("历史别名重指向缺少后续批次归档证据")
+                    expected_aliases[old] = str(next_target)
+        if any(aliases.get(old) != target for old, target in expected_aliases.items()):
+            raise ValueError("素材别名与有归档证据的迁移计划不一致")
 
     if exact:
         if rule_version >= 3:

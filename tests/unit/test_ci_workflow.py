@@ -22,7 +22,7 @@ PYPROJECT = PROJECT_ROOT / "pyproject.toml"
 PYTHON_JOBS = {
     "lint": "uv run ruff check .",
     "typecheck": "uv run mypy",
-    "test": "uv run pytest -q --cov --cov-report=term-missing",
+    "test": "uv run python scripts/check_coverage.py",
 }
 UV_VERSION = "0.12.7"
 PYTHON_VERSION = "3.12"
@@ -36,7 +36,13 @@ PNPM_VERSION = "11.25.0"
 
 def load_workflow() -> dict[str, Any]:
     """解析 workflow；注意 YAML 1.1 会把裸 `on` 解析成布尔 True。"""
-    data = yaml.safe_load(WORKFLOW.read_text(encoding="utf-8"))
+    class UniqueKeysLoader(yaml.SafeLoader):
+        def construct_mapping(self, node, deep=False):
+            keys = [self.construct_object(key, deep=deep) for key, _value in node.value]
+            assert len(keys) == len(set(keys)), "CI YAML 包含重复映射键"
+            return super().construct_mapping(node, deep=deep)
+
+    data = yaml.load(WORKFLOW.read_text(encoding="utf-8"), Loader=UniqueKeysLoader)
     assert isinstance(data, dict)
     if "on" not in data and True in data:
         data["on"] = data[True]
@@ -102,7 +108,7 @@ class TestJobs:
 
     def test_test_job_runs_integration_suite(self):
         commands = job_commands(load_workflow()["jobs"]["test"])
-        assert "uv run pytest -m integration -q" in commands
+        assert "uv run python scripts/check_coverage.py" in commands
 
     def test_image_job_validates_compose_and_builds(self):
         job = load_workflow()["jobs"]["image"]
@@ -157,8 +163,8 @@ class TestSafety:
                 assert ref.split("@", 1)[1] not in {"main", "master", "latest"}, ref
 
     def test_coverage_gate_matches_pyproject(self):
-        """门槛数字与 CI 的跑法必须成对：CI 用 --cov，pyproject 给 fail_under。"""
+        """门槛数字与 CI 的联合覆盖率入口保持一致。"""
         with PYPROJECT.open("rb") as fh:
             config = tomllib.load(fh)
         assert config["tool"]["coverage"]["report"]["fail_under"] == COVERAGE_GATE
-        assert any("--cov" in command for command in job_commands(load_workflow()["jobs"]["test"]))
+        assert PYTHON_JOBS["test"] in job_commands(load_workflow()["jobs"]["test"])

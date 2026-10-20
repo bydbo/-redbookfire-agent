@@ -163,8 +163,8 @@ E7 第六批已完成上下文、版本、图片复用和观测的工程修复�
 # ============ CI 跑什么（S4.5）：推 main 自动跑，本地可逐条复现 ============
 #   lint        uv run ruff check .
 #   typecheck   uv run mypy
-#   test        uv run pytest -q --cov --cov-report=term-missing   # 覆盖率门槛 78%
-#               uv run pytest -m integration -q                    # 真容器（runner 自带 Docker）
+#   test        uv run python scripts/check_coverage.py   # 单测 + 集成联合覆盖率 >=78%
+#               # 联合入口已包含真实容器集成测试（runner 自带 Docker）
 #   image       docker compose config --quiet && docker build -t xhs-agent:ci .
 # test job 里还包含契约一致性校验（tests/unit/test_openapi_contract.py →
 #   scripts/check_openapi.py），本地可单独跑：uv run python scripts/check_openapi.py
@@ -435,8 +435,9 @@ uv run mypy
 # 全量单元测试
 uv run pytest
 
-# 覆盖率（门槛 78%，只在带 --cov 的跑法下生效；加 --cov-report=html 可生成逐行报告）
-uv run pytest --cov
+# 联合覆盖率（需 Docker；单测与集成均通过后执行 78% 门槛）
+# 分项与联合报告：runs/_coverage/{unit,integration,combined}.json
+uv run python scripts/check_coverage.py
 
 # 提交前钩子：装一次即可，之后每次 commit 自动跑上面三条
 uv run pre-commit install

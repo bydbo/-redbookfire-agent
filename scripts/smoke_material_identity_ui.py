@@ -15,6 +15,7 @@ import sys
 import tempfile
 import threading
 import time
+import uuid
 from datetime import UTC, datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -58,7 +59,9 @@ def wait_http(url: str, timeout: float = 30.0, process: subprocess.Popen | None 
 
 async def seed(dsn: str, materials_dir: Path) -> dict[str, str]:
     """插入 5 条素材：正常 / 待恢复 / 缺失 / 批量缺失 / 正常图片。"""
-    from xhs_agent.db.models import Material
+    from decimal import Decimal
+
+    from xhs_agent.db.models import Hotspot, Material, Run, RunHotspot, RunMatch
 
     engine = create_async_engine(dsn, poolclass=NullPool)
     ids: dict[str, str] = {}
@@ -71,6 +74,11 @@ async def seed(dsn: str, materials_dir: Path) -> dict[str, str]:
                 ("缺失片", "运动/缺失.mp4", False),
                 ("批量缺失", "美食/批量缺失.jpg", False),
                 ("正常图", "美食/正常.png", True),
+                ("全缺失甲", "缺失/甲.mp4", False),
+                ("全缺失乙", "缺失/乙.mp4", False),
+                ("混合正常", "混合/正常.mp4", True),
+                ("混合缺失", "混合/缺失.mp4", False),
+                ("混合失败", "blocked/error.mp4", True),
             ):
                 target = materials_dir / rel
                 target.parent.mkdir(parents=True, exist_ok=True)
@@ -83,7 +91,29 @@ async def seed(dsn: str, materials_dir: Path) -> dict[str, str]:
                 session.add(row)
                 await session.flush()
                 ids[key] = str(row.id)
+            run = Run(job_id="e6-browser-history", status="succeeded")
+            hotspot = Hotspot(raw_text="E6 历史报告", clue={"hotspot_raw": "E6 历史报告",
+                "elements": [], "mechanisms": [], "why_it_works": [], "borrow_angles": []})
+            session.add_all([run, hotspot])
+            await session.flush()
+            rh = RunHotspot(run_id=run.id, hotspot_id=hotspot.id, position=1,
+                status="succeeded", coverage={"ratio": 0, "covered": [], "gaps": []},
+                draft={"titles": [{"text": "E6 固定历史稿", "style": "固定"}],
+                       "body": "历史正文保持可读", "tags": []})
+            session.add(rh)
+            await session.flush()
+            session.add(RunMatch(run_hotspot_id=rh.id, material_id=uuid.UUID(ids["待恢复"]),
+                                rank=1, score=Decimal("0.8"), reasons=["固定测试依据"]))
+            ids["run_id"] = str(run.id)
             await session.commit()
+        blocked = materials_dir / "blocked"
+        outside = materials_dir.parent / "outside"
+        blocked.rename(outside)
+        try:
+            blocked.symlink_to(outside, target_is_directory=True)
+        except OSError:
+            subprocess.run(["cmd", "/c", "mklink", "/J", str(blocked), str(outside)],
+                           capture_output=True, check=True)
     finally:
         await engine.dispose()
     return ids
@@ -178,6 +208,54 @@ async function confirmPop(page) {
     // R06/R07：单条缺失 —— 确认文案 + 结果提示
     const card = (title) => page.locator('.n-card').filter({
       has: page.getByText(title, { exact: true }) }).first()
+    const initial = await (await page.request.get(`${origin}/api/materials?limit=100`)).json()
+    const oldId = initial.items.find(item => item.title === '待恢复').id
+    const oldRunResponse = await page.request.get(`${origin}/api/runs/${process.env.SMOKE_RUN_ID}`)
+    assert.equal(oldRunResponse.status(), 200, await oldRunResponse.text())
+    const oldRun = await oldRunResponse.json()
+    assert.equal(oldRun.hotspots[0].candidates.length, 1)
+    await card('正常片').getByRole('button', { name: '编辑', exact: true }).click()
+    await page.getByPlaceholder('素材标题').fill('编辑后素材')
+    await page.getByPlaceholder('一句话说明这条素材能怎么用').fill('本地旁车编辑证据')
+    await page.getByRole('button', { name: '保存', exact: true }).click()
+    await waitText(page, '编辑后素材')
+    await page.reload({ waitUntil: 'networkidle' })
+    await page.getByPlaceholder('搜索标题或标签').fill('编辑后素材')
+    await page.getByRole('button', { name: '搜索', exact: true }).click()
+    await waitText(page, '编辑后素材')
+    assert.equal(await page.getByRole('button', { name: '详情', exact: true }).count(), 1)
+    const sidecar = await fs.readFile(path.join(process.env.SMOKE_MATERIALS, '运动', '正常.mp4.txt'), 'utf8')
+    assert.match(sidecar, /编辑后素材/)
+    checks.push('编辑旁车、刷新后搜索筛选保持一致')
+    await page.getByRole('button', { name: '重置', exact: true }).click()
+    await waitText(page, '缺失片')
+    const batch = async (titles) => {
+      for (const title of titles) await card(title).locator('.n-checkbox').click()
+      await page.getByRole('button', { name: '批量删除' }).click()
+      await waitText(page, '确认删除选中的')
+      await confirmPop(page)
+    }
+    await batch(['全缺失甲', '全缺失乙'])
+    await waitText(page, '原文件缺失 2 条')
+    assert.match(await text(page), /已移入回收站 0 条/)
+    checks.push('R07 全部缺失：0 条移入、2 条仅移除索引')
+    await batch(['混合正常', '混合缺失', '混合失败'])
+    await waitText(page, '失败 1 条（可重试）')
+    assert.match(await text(page), /已移入回收站 1 条/)
+    assert.match(await text(page), /原文件缺失 1 条/)
+    assert.equal(await card('混合失败').count(), 1)
+    await shot(page, '09-mixed-delete-failure')
+    const blocked = path.join(process.env.SMOKE_MATERIALS, 'blocked')
+    await fs.rmdir(blocked) // 只移除本脚本创建的 junction；外部非空目录保持完整。
+    await fs.mkdir(blocked)
+    const outside = path.join(process.env.SMOKE_MATERIALS, '..', 'outside', 'error.mp4')
+    await fs.copyFile(outside, path.join(blocked, 'error.mp4'))
+    await page.getByRole('button', { name: '重试失败项（1）' }).click()
+    await waitText(page, '已移入回收站 1 条')
+    await page.waitForFunction(() => !document.body.innerText.includes('重试失败项'))
+    assert.match(await text(page), /已移入回收站 1 条/)
+    assert.equal((await fs.readFile(outside)).length, 64)
+    checks.push('R07 混合结果：移入1、缺失1、失败1；修复临时链接后仅重试失败项成功')
     await card('缺失片').getByRole('button', { name: '删除' }).click()
     await waitText(page, '文件可从回收站恢复')
     assert.match(await page.locator('.n-popconfirm').last().innerText(),
@@ -202,11 +280,29 @@ async function confirmPop(page) {
     // 回收站恢复：真实 Celery 索引任务 → 新素材身份提示
     await page.getByRole('button', { name: '回收站' }).click()
     await waitText(page, '待恢复.mp4')
-    await page.getByRole('button', { name: '恢复', exact: true }).first().click()
+    await page.getByText('运动/待恢复.mp4', { exact: true }).locator('../../..').getByRole('button', { name: '恢复', exact: true }).click()
     await waitText(page, '已作为新素材入库，历史关联未恢复', 60000)
     checks.push('R06 恢复成功提示新素材身份，历史关联未恢复')
     await shot(page, '05-restored')
     await page.keyboard.press('Escape')
+
+    const restoredList = await (await page.request.get(`${origin}/api/materials?limit=100`)).json()
+    const restored = restoredList.items.find(item => item.path.endsWith('待恢复.mp4'))
+    assert.ok(restored && restored.id !== oldId, '恢复必须生成新 UUID')
+    assert.equal((await page.request.get(`${origin}/api/materials/${oldId}`)).status(), 404)
+    const afterRun = await (await page.request.get(`${origin}/api/runs/${process.env.SMOKE_RUN_ID}`)).json()
+    assert.equal(afterRun.hotspots[0].candidates.length, 0)
+    assert.deepEqual(afterRun.hotspots[0].draft, oldRun.hotspots[0].draft)
+    await page.goto(`${origin}/runs/${process.env.SMOKE_RUN_ID}`, { waitUntil: 'networkidle' })
+    await waitText(page, '历史正文保持可读')
+    const reportPage = await browser.newPage()
+    const reportResponse = await reportPage.goto(`${origin}/api/runs/${process.env.SMOKE_RUN_ID}/report?format=html`)
+    assert.equal(reportResponse.status(), 200)
+    await waitText(reportPage, '历史正文保持可读')
+    await shot(reportPage, '08-history-report')
+    await reportPage.close()
+    checks.push('恢复新 UUID、旧 ID 失效，旧候选不复活，历史草稿及 HTML 报告可读')
+    await page.goto(`${origin}/materials`, { waitUntil: 'networkidle' })
 
     // 详情删除入口：同一文案语义
     await page.getByRole('button', { name: '详情' }).first().click()
@@ -306,16 +402,24 @@ def main() -> int:
             "XHS_CONFIG_PATH": str(config),
             "PYTHONIOENCODING": "utf-8",
             "DASHSCOPE_API_KEY": "stub-key",
+            "DEEPSEEK_API_KEY": "",
+            "LANGFUSE_PUBLIC_KEY": "",
+            "LANGFUSE_SECRET_KEY": "",
+            "LANGFUSE_HOST": "",
+            "LANGFUSE_BASE_URL": "",
+            "LANGFUSE_CAPTURE_CONTENT": "",
         }
-        env.pop("DEEPSEEK_API_KEY", None)
+        for name in ("LANGFUSE_PUBLIC_KEY", "LANGFUSE_SECRET_KEY", "LANGFUSE_HOST",
+                     "LANGFUSE_BASE_URL", "LANGFUSE_CAPTURE_CONTENT"):
+            os.environ[name] = ""
         os.environ["DATABASE_URL"] = dsn
         os.environ["XHS_CONFIG_PATH"] = str(config)
         subprocess.run([sys.executable, "-m", "alembic", "upgrade", "head"],
                        cwd=str(PROJECT_ROOT), env=env, check=True,
-                       capture_output=True, text=True)
+                       capture_output=True, text=True, encoding="utf-8", errors="replace")
         import asyncio
 
-        asyncio.run(seed(dsn, materials_dir))
+        fixture_ids = asyncio.run(seed(dsn, materials_dir))
 
         port = free_port()
         launch = temp / "api_launcher.py"
@@ -344,6 +448,8 @@ def main() -> int:
             "SMOKE_EDGE": edge,
             "SMOKE_ORIGIN": f"http://127.0.0.1:{port}",
             "SMOKE_OUTPUT": str(output),
+            "SMOKE_RUN_ID": fixture_ids["run_id"],
+            "SMOKE_MATERIALS": str(materials_dir),
         }
         run = subprocess.run(["node", str(script)], env=node_env, capture_output=True,
                              text=True, encoding="utf-8", errors="replace", timeout=180)

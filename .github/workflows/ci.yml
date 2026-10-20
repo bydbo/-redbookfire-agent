@@ -51,6 +51,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7.0.1
+        with:
+          fetch-depth: 0  # 恢复演练需要检出固定的旧实现
       - uses: astral-sh/setup-uv@v10.2.0
         with:
           version: "0.12.7"
@@ -58,10 +60,10 @@ jobs:
           enable-cache: true
           cache-dependency-glob: "uv.lock"
       - run: uv sync
-      # 单测 + 覆盖率门槛（fail_under 写在 pyproject 的 [tool.coverage.report] 里）
-      - run: uv run pytest -q --cov --cov-report=term-missing
-      # 集成用例：GitHub runner 自带 Docker，testcontainers 直接起真 Postgres / Redis
-      - run: uv run pytest -m integration -q
+      # 两套测试均须成功；保存分项报告后，对联合覆盖率执行配置中的 78% 门槛。
+      # GitHub runner 自带 Docker，集成测试使用真实 Postgres / Redis。
+      - run: docker build -t xhs-agent:ci .
+      - run: uv run python scripts/check_coverage.py
 
   image:
     name: image（Dockerfile + compose 静态校验）
