@@ -5,6 +5,7 @@ Windows 上普通用户可能无法创建符号链接；创建失败时跳过该
 
 from __future__ import annotations
 
+import os
 import subprocess
 from datetime import datetime
 from pathlib import Path
@@ -12,10 +13,15 @@ from pathlib import Path
 import pytest
 
 from xhs_agent.config import AppConfig, load_config
-from xhs_agent.core.errors import BadRequestError
+from xhs_agent.core.errors import BadRequestError, ConflictError
 from xhs_agent.services.materials import (
+    _choose_group_target,
     companion_paths,
+    list_trash,
+    purge_trash,
+    restore_from_trash,
     save_upload,
+    trash_root,
     write_sidecar,
 )
 
@@ -91,6 +97,124 @@ class TestSidecarSafety:
         _symlink(outside, Path(str(media) + ".md"))
         with pytest.raises(BadRequestError):
             companion_paths(str(media))
+
+
+class TestTrashBoundary:
+    """R01：`_trash` 自身或子层指向素材根之外时，所有入口拒绝且零改动。"""
+
+    def _setup(self, tmp_path: Path) -> tuple[AppConfig, Path]:
+        cfg = make_config(tmp_path)
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        (outside / "sentinel.txt").write_text("sentinel", encoding="utf-8")
+        (outside / "外部素材.mp4").write_bytes(b"outside")
+        _dir_link(outside, Path(trash_root(cfg)))
+        return cfg, outside
+
+    def test_list_trash_rejects_linked_root(self, tmp_path: Path) -> None:
+        cfg, outside = self._setup(tmp_path)
+        with pytest.raises(BadRequestError):
+            list_trash(cfg)
+        assert (outside / "sentinel.txt").read_text(encoding="utf-8") == "sentinel"
+        assert (outside / "外部素材.mp4").read_bytes() == b"outside"
+
+    def test_purge_trash_rejects_linked_root(self, tmp_path: Path) -> None:
+        cfg, outside = self._setup(tmp_path)
+        with pytest.raises(BadRequestError):
+            purge_trash(cfg, all_files=True)
+        assert (outside / "sentinel.txt").exists()
+        assert (outside / "外部素材.mp4").exists()
+
+    def test_restore_rejects_linked_root(self, tmp_path: Path) -> None:
+        cfg, outside = self._setup(tmp_path)
+        with pytest.raises(BadRequestError):
+            restore_from_trash(cfg, "外部素材.mp4")
+        assert (outside / "外部素材.mp4").exists()
+
+
+class TestFileGroup:
+    def test_group_target_avoids_companion_conflict(self, tmp_path: Path) -> None:
+        base = tmp_path / "a.mp4"
+        (tmp_path / "a.mp4.txt").write_text("existing", encoding="utf-8")
+        assert _choose_group_target(str(base), ["", ".txt"]) == str(tmp_path / "a-2.mp4")
+
+    def test_restore_media_conflict_keeps_both_sides(self, tmp_path: Path) -> None:
+        cfg = make_config(tmp_path)
+        root = Path(cfg.materials_dir())
+        _put_trash(cfg, "运动/a.mp4", b"trashed")
+        _put_trash(cfg, "运动/a.mp4.txt", b"trashed-sidecar")
+        target = root / "运动"
+        target.mkdir(parents=True)
+        (target / "a.mp4").write_bytes(b"existing")
+        with pytest.raises(ConflictError):
+            restore_from_trash(cfg, "运动/a.mp4")
+        assert (target / "a.mp4").read_bytes() == b"existing"
+        assert (Path(trash_root(cfg)) / "运动" / "a.mp4").read_bytes() == b"trashed"
+        assert (Path(trash_root(cfg)) / "运动" / "a.mp4.txt").read_bytes() == b"trashed-sidecar"
+
+    def test_restore_companion_only_conflict_keeps_both_sides(self, tmp_path: Path) -> None:
+        cfg = make_config(tmp_path)
+        root = Path(cfg.materials_dir())
+        _put_trash(cfg, "运动/a.mp4", b"trashed")
+        _put_trash(cfg, "运动/a.mp4.txt", b"trashed-sidecar")
+        target = root / "运动"
+        target.mkdir(parents=True)
+        (target / "a.mp4.txt").write_bytes(b"existing-sidecar")
+        with pytest.raises(ConflictError):
+            restore_from_trash(cfg, "运动/a.mp4")
+        assert (target / "a.mp4.txt").read_bytes() == b"existing-sidecar"
+        assert not (target / "a.mp4").exists()
+        assert (Path(trash_root(cfg)) / "运动" / "a.mp4").exists()
+
+    def test_move_failure_compensates(self, tmp_path: Path, monkeypatch) -> None:
+        cfg = make_config(tmp_path)
+        _put_trash(cfg, "运动/a.mp4", b"trashed")
+        _put_trash(cfg, "运动/a.mp4.txt", b"trashed-sidecar")
+        calls = {"n": 0}
+        real_replace = os.replace
+
+        def flaky(source, target):
+            calls["n"] += 1
+            if calls["n"] == 2:
+                raise OSError("模拟第二个文件移动失败")
+            real_replace(source, target)
+
+        monkeypatch.setattr(os, "replace", flaky)
+        with pytest.raises(ConflictError) as excinfo:
+            restore_from_trash(cfg, "运动/a.mp4")
+        assert excinfo.value.detail["reason"] == "file_group_move_failed"
+        assert (Path(trash_root(cfg)) / "运动" / "a.mp4").read_bytes() == b"trashed"
+        assert (Path(trash_root(cfg)) / "运动" / "a.mp4.txt").read_bytes() == b"trashed-sidecar"
+        assert not (Path(cfg.materials_dir()) / "运动" / "a.mp4").exists()
+
+    def test_compensation_failure_requires_manual_review(self, tmp_path: Path,
+                                                        monkeypatch) -> None:
+        cfg = make_config(tmp_path)
+        _put_trash(cfg, "运动/a.mp4", b"trashed")
+        _put_trash(cfg, "运动/a.mp4.txt", b"trashed-sidecar")
+        calls = {"n": 0}
+        real_replace = os.replace
+
+        def flaky(source, target):
+            calls["n"] += 1
+            # 第 2 次移动失败；第 3 次是补偿（移回），也失败
+            if calls["n"] >= 2:
+                raise OSError("模拟移动与补偿都失败")
+            real_replace(source, target)
+
+        monkeypatch.setattr(os, "replace", flaky)
+        with pytest.raises(ConflictError) as excinfo:
+            restore_from_trash(cfg, "运动/a.mp4")
+        assert excinfo.value.detail["manual_review_required"] is True
+        log = Path(str(excinfo.value.detail["log"]))
+        assert log.is_file()
+        assert "manual_review_required" in log.read_text(encoding="utf-8")
+
+
+def _put_trash(cfg: AppConfig, relative: str, data: bytes) -> None:
+    target = Path(trash_root(cfg)) / relative
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_bytes(data)
 
 
 class TestUploadSafety:

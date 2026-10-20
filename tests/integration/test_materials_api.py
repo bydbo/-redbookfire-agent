@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import os
+import subprocess
 import uuid
 from collections.abc import AsyncIterator, Iterator
 from datetime import UTC, datetime, timedelta
@@ -24,6 +25,7 @@ from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 from xhs_agent.api.deps import CeleryDispatcher, get_config, get_dispatcher, get_session
 from xhs_agent.api.main import create_app
 from xhs_agent.config import AppConfig, EnvView, load_config
+from xhs_agent.core.errors import BadRequestError
 from xhs_agent.db import Base
 from xhs_agent.db.models import Hotspot, Run, RunHotspot, RunMatch
 from xhs_agent.db.models import Material as MaterialRow
@@ -423,10 +425,78 @@ class TestTrash:
 
         assert result is not None and result["trashed_path"] == "运动/挥拍-2.mp4"
 
+    async def test_companion_only_collision_numbers_the_whole_group(
+            self, db_session: AsyncSession, cfg: AppConfig) -> None:
+        """R03：回收站只有同名旁车时，整组改用 `-2`，不能覆盖或只移动一半。"""
+        media = touch("运动/挥拍.mp4", cfg)
+        Path(media + ".txt").write_text("标题: 源旁车\n", encoding="utf-8")
+        put_trash_file(cfg, "运动/挥拍.mp4.txt", b"existing-sidecar")
+        ids = await seed(db_session, cfg)
+
+        result = await trash_material(db_session, cfg, uuid.UUID(ids["运动/挥拍.mp4"]))
+
+        assert result is not None and result["trashed_path"] == "运动/挥拍-2.mp4"
+        trashed = Path(trash_root(cfg)) / "运动"
+        assert (trashed / "挥拍-2.mp4").is_file()
+        assert (trashed / "挥拍-2.mp4.txt").read_text(encoding="utf-8") == "标题: 源旁车\n"
+        assert (trashed / "挥拍.mp4.txt").read_bytes() == b"existing-sidecar"
+
+    async def test_db_commit_failure_moves_files_back(
+            self, db_session: AsyncSession, cfg: AppConfig,
+            monkeypatch: pytest.MonkeyPatch) -> None:
+        """R03：数据库提交失败时移回文件；不能出现"文件已进回收站、行还在"。"""
+        media = touch("运动/挥拍.mp4", cfg)
+        sidecar = Path(media + ".txt")
+        sidecar.write_text("标题: 原样\n", encoding="utf-8")
+        ids = await seed(db_session, cfg)
+
+        async def fail_commit(self) -> None:
+            raise RuntimeError("模拟数据库提交失败")
+
+        monkeypatch.setattr(AsyncSession, "commit", fail_commit)
+        with pytest.raises(RuntimeError):
+            await trash_material(db_session, cfg, uuid.UUID(ids["运动/挥拍.mp4"]))
+        monkeypatch.undo()
+
+        assert Path(media).is_file()
+        assert sidecar.read_text(encoding="utf-8") == "标题: 原样\n"
+        assert not (Path(trash_root(cfg)) / "运动" / "挥拍.mp4").exists()
+        row = await db_session.get(MaterialRow, uuid.UUID(ids["运动/挥拍.mp4"]))
+        assert row is not None
+
     async def test_unknown_id_returns_none(self, db_session: AsyncSession,
                                           cfg: AppConfig) -> None:
         await seed(db_session, cfg)
         assert await trash_material(db_session, cfg, uuid.uuid4()) is None
+
+    async def test_linked_trash_root_rejected_without_changes(
+            self, db_session: AsyncSession, cfg: AppConfig, tmp_path: Path) -> None:
+        """R01：`_trash` 是外部链接时，素材移入失败且文件 / 行 / 外部文件都不变。"""
+        media = touch("运动/挥拍.mp4", cfg)
+        ids = await seed(db_session, cfg)
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        (outside / "sentinel.txt").write_text("sentinel", encoding="utf-8")
+        _dir_link(outside, Path(trash_root(cfg)))
+
+        with pytest.raises(BadRequestError):
+            await trash_material(db_session, cfg, uuid.UUID(ids["运动/挥拍.mp4"]))
+
+        assert Path(media).is_file()
+        assert (outside / "sentinel.txt").read_text(encoding="utf-8") == "sentinel"
+        row = await db_session.get(MaterialRow, uuid.UUID(ids["运动/挥拍.mp4"]))
+        assert row is not None
+
+
+def _dir_link(target: Path, link: Path) -> None:
+    try:
+        link.symlink_to(target, target_is_directory=True)
+        return
+    except (OSError, NotImplementedError):
+        pass
+    if subprocess.run(["cmd", "/c", "mklink", "/J", str(link), str(target)],
+                      capture_output=True).returncode != 0:
+        pytest.skip("当前环境不能创建目录链接，跳过回收站链接用例")
 
 
 def put_trash_file(cfg: AppConfig, relative: str, data: bytes = b"old") -> str:

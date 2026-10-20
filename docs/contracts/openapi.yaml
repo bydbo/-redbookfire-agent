@@ -511,6 +511,12 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/TrashList'
+        '400':
+          description: 回收站目录或子路径包含符号链接 / junction，或路径越界
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
         '503':
           $ref: '#/components/responses/DependencyUnavailable'
 
@@ -544,7 +550,9 @@ paths:
         '404':
           $ref: '#/components/responses/NotFound'
         '409':
-          description: 目标位置已有同名文件
+          description: |
+            目标位置已有同名文件（媒体或任一将写入的旁车）。整组不移动，双方原文件保留；
+            `reason=restore_target_exists`，`conflicts` 列出冲突的相对路径。
           content:
             application/json:
               schema:
@@ -686,6 +694,14 @@ paths:
           $ref: '#/components/responses/BadRequest'
         '404':
           $ref: '#/components/responses/NotFound'
+        '409':
+          description: |
+            文件组移动冲突或无法自动补偿。`reason=trash_target_exists` 表示目标已存在；
+            `reason=manual_review_required` 表示已保留操作记录、需要人工核对，不能当成功。
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
         '503':
           $ref: '#/components/responses/DependencyUnavailable'
 

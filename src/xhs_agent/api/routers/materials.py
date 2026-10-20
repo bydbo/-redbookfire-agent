@@ -87,7 +87,8 @@ async def list_materials_endpoint(
 
 
 @router.get("/materials/trash", response_model=TrashList,
-            responses={503: error_response("依赖不可用（不做降级，直接返回错误）")})
+            responses={400: error_response("回收站路径包含链接或越界"),
+                       503: error_response("依赖不可用（不做降级，直接返回错误）")})
 async def list_trash_endpoint(cfg: ConfigDep) -> dict[str, Any]:
     """列回收站里的媒体文件（S6.3）；旁车跟着媒体走，不单独列出。
 
@@ -203,6 +204,7 @@ async def update_material_endpoint(material_id: UuidPath, payload: UpdateMateria
 @router.post("/materials/{material_id}/trash", response_model=MaterialTrashResult,
              responses={400: error_response("请求格式或参数不合法"),
                         404: error_response("资源不存在"),
+                        409: error_response("文件组移动冲突或需要人工核对"),
                         503: error_response("依赖不可用（不做降级，直接返回错误）")})
 async def trash_material_endpoint(material_id: UuidPath, cfg: ConfigDep,
                                   session: SessionDep) -> dict[str, Any]:

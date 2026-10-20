@@ -22,6 +22,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import uuid
 from collections.abc import Callable, Sequence
@@ -472,16 +473,51 @@ COMPANION_SUFFIXES = (".txt", ".md", ".json")
 
 
 def trash_root(cfg: AppConfig) -> str:
-    """回收站根目录：`<materials_dir>/_trash`。
+    """回收站根目录的**声明位置**（不解析链接）。
 
-    `tools.materials.scan_materials` 跳过 `_` 开头的目录，所以「移进回收站」天然等于出库，
-    「移回去」天然等于重新入库——不需要额外元数据。
+    文件操作一律走 `_trash_base` / `_trash_item`：`_trash` 自身或任意子层是链接时明确失败，
+    不能先把 `_trash` 解析到外部目录、再把外部目录当成合法根。
     """
     return os.path.join(cfg.materials_dir(), TRASH_DIR_NAME)
 
 
+def _trash_base(cfg: AppConfig) -> str:
+    """从可信素材根解析 `_trash`；`_trash` 自身是链接 / 越界即失败。"""
+    try:
+        return resolve_material(cfg.materials_dir(), TRASH_DIR_NAME)
+    except (ValueError, OSError) as exc:
+        raise BadRequestError(
+            "回收站目录不合法：不能是链接或越出素材根", {"path": TRASH_DIR_NAME}
+        ) from exc
+
+
+def _trash_item(cfg: AppConfig, relative: str) -> str:
+    """把回收站相对路径解析成绝对路径；`_trash` 及每一层都按素材根重新校验。"""
+    try:
+        validate_key(relative)
+        return resolve_material(cfg.materials_dir(), f"{TRASH_DIR_NAME}/{relative}")
+    except (ValueError, OSError) as exc:
+        raise BadRequestError(
+            "回收站路径不合法：必须位于回收站内且不能包含链接",
+            {"path": relative},
+        ) from exc
+
+
+def _materials_item(cfg: AppConfig, relative: str) -> str:
+    try:
+        return resolve_material(cfg.materials_dir(), relative)
+    except (ValueError, OSError) as exc:
+        raise BadRequestError(
+            "路径不合法：必须位于素材根内且不能包含链接", {"path": relative}
+        ) from exc
+
+
 def resolve_under(root: str, relative: str) -> str:
-    """把相对路径解析成 `root` 之下的绝对路径；空路径 / 绝对路径 / 越界一律 400。"""
+    """把相对路径解析成 `root` 之下的绝对路径；空路径 / 绝对路径 / 越界一律 400。
+
+    注意：`root` 必须是**可信根**（配置素材根）。回收站操作请用 `_trash_item`，
+    不能把 `_trash` 自己当 root。
+    """
     try:
         return resolve_material(root, relative)
     except (ValueError, OSError) as exc:
@@ -495,6 +531,25 @@ def unique_path(target: str) -> str:
     stem, ext = os.path.splitext(target)
     index = 2
     while os.path.exists(f"{stem}-{index}{ext}"):
+        index += 1
+    return f"{stem}-{index}{ext}"
+
+
+def _suffixes(source: str, companions: Sequence[str]) -> list[str]:
+    return [""] + [path[len(source):] for path in companions]
+
+
+def _choose_group_target(base_target: str, suffixes: Sequence[str]) -> str:
+    """为**整个文件组**选一个无冲突名称（不能只检查媒体文件）。"""
+
+    def free(candidate: str) -> bool:
+        return all(not os.path.lexists(candidate + suffix) for suffix in suffixes)
+
+    if free(base_target):
+        return base_target
+    stem, ext = os.path.splitext(base_target)
+    index = 2
+    while not free(f"{stem}-{index}{ext}"):
         index += 1
     return f"{stem}-{index}{ext}"
 
@@ -513,22 +568,89 @@ def companion_paths(media_path: str) -> list[str]:
     return companions
 
 
-def _move_file(source: str, target: str) -> None:
-    os.makedirs(os.path.dirname(target), exist_ok=True)
-    os.replace(source, target)
+def _record_fs_failure(cfg: AppConfig, payload: dict[str, Any]) -> str:
+    """把无法自动补偿的文件操作记录到忽略目录；返回日志路径。"""
+    directory = os.path.join(cfg.runs_dir(), "_material_identity")
+    path = os.path.join(directory, "fs_failures.jsonl")
+    try:
+        os.makedirs(directory, exist_ok=True)
+        with open(path, "a", encoding="utf-8") as handle:
+            handle.write(json.dumps({"at": datetime.now(UTC).isoformat(), **payload},
+                                    ensure_ascii=False) + "\n")
+    except OSError:  # pragma: no cover - 日志写失败不掩盖原始错误
+        pass
+    return path
 
 
-def _move_bundle(source: str, target: str, companions: Sequence[str]) -> None:
-    """移动媒体文件及其旁车（旁车名字跟着媒体走：`A.mp4` → `A-2.mp4` 时 `.txt` 同名）。"""
-    _move_file(source, target)
-    for path in companions:
-        _move_file(path, target + path[len(source):])
+def _manual_review(cfg: AppConfig, *, action: str,
+                   pairs: Sequence[tuple[str, str]],
+                   moved: Sequence[tuple[str, str]],
+                   failures: Sequence[str]) -> ConflictError:
+    log_path = _record_fs_failure(cfg, {
+        "action": action,
+        "planned": [{"source": source, "target": target} for source, target in pairs],
+        "moved": [{"source": source, "target": target} for source, target in moved],
+        "compensation_failures": list(failures),
+        "manual_review_required": True,
+    })
+    return ConflictError(
+        "文件组操作失败且无法自动恢复原状；已保留操作记录，需要人工核对后再重试",
+        {"reason": "manual_review_required", "manual_review_required": True,
+         "log": log_path},
+    )
+
+
+def _rollback(moved: Sequence[tuple[str, str]]) -> list[str]:
+    """逆序把已移动的文件移回；返回无法恢复的描述。"""
+    failures: list[str] = []
+    for source, target in reversed(list(moved)):
+        try:
+            if os.path.lexists(source):
+                failures.append(f"原位置已被占用：{source}")
+                continue
+            if not os.path.lexists(target):
+                failures.append(f"目标已不存在：{target}")
+                continue
+            os.makedirs(os.path.dirname(source), exist_ok=True)
+            os.replace(target, source)
+        except OSError as exc:
+            failures.append(f"{source}: {exc}")
+    return failures
+
+
+def _move_group(
+    cfg: AppConfig,
+    *,
+    action: str,
+    pairs: Sequence[tuple[str, str]],
+    validate: Callable[[str], Any],
+) -> list[tuple[str, str]]:
+    """按顺序移动整组；任一步失败即逆序补偿，补偿失败抛人工核对错误。"""
+    moved: list[tuple[str, str]] = []
+    try:
+        for source, target in pairs:
+            validate(target)
+            os.makedirs(os.path.dirname(target), exist_ok=True)
+            validate(target)
+            if os.path.lexists(target):
+                raise FileExistsError(target)
+            os.replace(source, target)
+            moved.append((source, target))
+    except BaseException:
+        failures = _rollback(moved)
+        if failures:
+            raise _manual_review(cfg, action=action, pairs=pairs, moved=moved,
+                                 failures=failures) from None
+        raise
+    return moved
 
 
 def _remove_empty_dirs(root: str) -> None:
-    """清掉回收站里的空目录（自底向上）；root 自身保留。"""
+    """清掉回收站里的空目录（自底向上）；root 自身保留；不跟随链接。"""
     for dirpath, _dirnames, _filenames in os.walk(root, topdown=False):
         if os.path.realpath(dirpath) == os.path.realpath(root):
+            continue
+        if is_link(dirpath):
             continue
         with suppress(OSError):        # 非空目录 / 权限问题：留着即可，不算错误
             os.rmdir(dirpath)
@@ -541,7 +663,8 @@ async def trash_material(session: AsyncSession, cfg: AppConfig,
     口径：
 
     - 文件不在磁盘上时**仍然删行**（`file_missing=true`），不留删不掉的僵尸行；
-    - 回收站里已有同名文件时自动加序号（与上传同一套规则），不覆盖、不报错；
+    - 媒体与旁车作为一个文件组：整组选无冲突名称、先预检再移动、失败逆序补偿；
+    - 数据库提交失败时把已移动文件移回；补偿失败明确返回人工核对并记录；
     - 删除 `materials` 行会通过外键 CASCADE 清掉 `run_matches`——**历史候选不再回来**，
       这是「恢复 = 重新入库（新 uuid）」的代价。
     """
@@ -549,46 +672,98 @@ async def trash_material(session: AsyncSession, cfg: AppConfig,
     if row is None:
         return None
 
-    media_path = resolve_under(cfg.materials_dir(), row.path)
     relative = row.path
-
-    root = trash_root(cfg)
-    destination = unique_path(resolve_under(root, relative))
+    media_path = _materials_item(cfg, relative)
     file_missing = not os.path.isfile(media_path)
+    trashed = relative.replace(os.sep, "/")
+    moved: list[tuple[str, str]] = []
     if not file_missing:
-        await asyncio.to_thread(_move_bundle, media_path, destination,
-                                companion_paths(media_path))
+        companions = companion_paths(media_path)
+        sources = [media_path, *companions]
+        base_target = _trash_item(cfg, relative)
+        target = _choose_group_target(base_target, _suffixes(media_path, companions))
+        pairs = [(source, target + source[len(media_path):]) for source in sources]
+        root = _trash_base(cfg)
+        trashed = os.path.relpath(target, root).replace(os.sep, "/")
+        try:
+            moved = _move_group(
+                cfg, action="trash", pairs=pairs,
+                validate=lambda path: _trash_item(
+                    cfg, os.path.relpath(path, root).replace(os.sep, "/")
+                ),
+            )
+        except FileExistsError as exc:
+            raise ConflictError(
+                f"回收站目标已存在：{relative}",
+                {"reason": "trash_target_exists", "path": relative, "target": str(exc)},
+            ) from exc
+        except OSError as exc:
+            raise ConflictError(
+                "文件组移动失败，已恢复原状",
+                {"reason": "file_group_move_failed", "path": relative,
+                 "retryable": True},
+            ) from exc
 
-    trashed = os.path.relpath(destination, root).replace(os.sep, "/")
     material_id_str = str(row.id)
-    await session.delete(row)
-    await session.commit()
+    try:
+        await session.delete(row)
+        await session.commit()
+    except BaseException:
+        await session.rollback()
+        if moved:
+            failures = _rollback(moved)
+            if failures:
+                raise _manual_review(cfg, action="trash_db_commit", pairs=moved,
+                                     moved=moved, failures=failures) from None
+        raise
     return {"material_id": material_id_str, "path": relative.replace(os.sep, "/"),
             "trashed_path": trashed, "file_missing": file_missing}
 
 
 def list_trash(cfg: AppConfig) -> dict[str, Any]:
     """列出回收站里的**媒体**文件（旁车跟着媒体走，不单独列出），按相对路径排序。"""
-    root = trash_root(cfg)
+    root = _trash_base(cfg)
     items: list[dict[str, Any]] = []
-    if os.path.isdir(root):
-        for dirpath, dirnames, filenames in os.walk(root):
-            dirnames[:] = [name for name in dirnames if not name.startswith(".")]
-            for name in sorted(filenames):
-                if name.startswith("."):
-                    continue
-                path = os.path.join(dirpath, name)
-                kind = media_tool.kind_of(path)
-                if kind == "other":
-                    continue
+    if not os.path.isdir(root):
+        return {"items": [], "total": 0}
+
+    def onerror(exc: OSError) -> None:
+        raise BadRequestError(
+            f"回收站目录无法读取：{type(exc).__name__}",
+            {"path": TRASH_DIR_NAME},
+        ) from exc
+
+    def checked(path: str) -> str:
+        rel = os.path.relpath(path, root).replace(os.sep, "/")
+        _trash_item(cfg, rel)
+        if is_link(path):
+            raise BadRequestError(
+                "回收站包含符号链接或 junction，已中止列举", {"path": rel})
+        return rel
+
+    for dirpath, dirnames, filenames in os.walk(root, onerror=onerror):
+        for name in dirnames + filenames:
+            checked(os.path.join(dirpath, name))
+        dirnames[:] = [name for name in dirnames if not name.startswith(".")]
+        for name in sorted(filenames):
+            if name.startswith("."):
+                continue
+            path = os.path.join(dirpath, name)
+            rel = checked(path)
+            kind = media_tool.kind_of(path)
+            if kind == "other":
+                continue
+            try:
                 stat = os.stat(path)
-                items.append({
-                    "path": os.path.relpath(path, root).replace(os.sep, "/"),
-                    "name": name,
-                    "type": kind,
-                    "size_bytes": int(stat.st_size),
-                    "mtime": datetime.fromtimestamp(stat.st_mtime, tz=UTC).isoformat(),
-                })
+            except OSError:  # pragma: no cover - 并发删除的窄窗口
+                continue
+            items.append({
+                "path": rel,
+                "name": name,
+                "type": kind,
+                "size_bytes": int(stat.st_size),
+                "mtime": datetime.fromtimestamp(stat.st_mtime, tz=UTC).isoformat(),
+            })
     items.sort(key=lambda item: item["path"])
     return {"items": items, "total": len(items)}
 
@@ -598,16 +773,43 @@ def restore_from_trash(cfg: AppConfig, relative: str) -> str:
 
     恢复 = **重新入库**：调用方随后触发一次索引任务，拿到的是新 uuid、重新打标——
     `run_matches` 已在移入回收站时被级联清掉，不会回来。
-    目标位置已有同名文件时抛 `ConflictError`（409），不覆盖。
+    媒体或任一将写入的旁车目标已存在时，整组返回 409，保留双方原文件。
     """
-    root = trash_root(cfg)
-    source = resolve_under(root, relative)
+    source = _trash_item(cfg, relative)
     if not os.path.isfile(source):
         raise NotFoundError(f"回收站里没有这个文件：{relative}", {"path": relative})
-    target = resolve_under(cfg.materials_dir(), relative)
-    if os.path.exists(target):
-        raise ConflictError(f"目标位置已有同名文件：{relative}", {"path": relative})
-    _move_bundle(source, target, companion_paths(source))
+    companions = companion_paths(source)
+    sources = [source, *companions]
+    target = _materials_item(cfg, relative)
+    pairs = [(item, target + item[len(source):]) for item in sources]
+    conflicts = [
+        os.path.relpath(dst, cfg.materials_dir()).replace(os.sep, "/")
+        for _src, dst in pairs if os.path.lexists(dst)
+    ]
+    if conflicts:
+        raise ConflictError(
+            "目标位置已有同名文件，恢复未执行",
+            {"reason": "restore_target_exists", "path": relative,
+             "conflicts": conflicts},
+        )
+    try:
+        _move_group(
+            cfg, action="restore", pairs=pairs,
+            validate=lambda path: _materials_item(
+                cfg, os.path.relpath(path, cfg.materials_dir()).replace(os.sep, "/")
+            ),
+        )
+    except FileExistsError as exc:  # 并发抢占：预检后、移动前
+        raise ConflictError(
+            "目标位置已有同名文件，恢复未执行",
+            {"reason": "restore_target_exists", "path": relative,
+             "target": str(exc)},
+        ) from exc
+    except OSError as exc:
+        raise ConflictError(
+            "文件组移动失败，已恢复原状",
+            {"reason": "file_group_move_failed", "path": relative, "retryable": True},
+        ) from exc
     return target
 
 
@@ -615,22 +817,43 @@ def purge_trash(cfg: AppConfig, *, paths: Sequence[str] | None = None,
                 all_files: bool = False) -> dict[str, Any]:
     """真删回收站里的文件（S6.3）：`paths` 给具体条目（连同旁车），`all_files` 清空整个回收站。
 
-    先整体校验再删：任何一条路径不在回收站里就抛 404，不做部分删除（避免"删了一半"的中间态）。
+    先整体预检（含链接 / 越界）再删：任何一条非法或不存在都不做部分删除。
     """
-    root = trash_root(cfg)
+    root = _trash_base(cfg)
     if not os.path.isdir(root):
         return {"deleted": [], "count": 0}
 
+    def onerror(exc: OSError) -> None:
+        raise BadRequestError(
+            f"回收站目录无法读取：{type(exc).__name__}", {"path": TRASH_DIR_NAME}
+        ) from exc
+
+    targets: list[str] = []
     if all_files:
-        targets = [os.path.join(dirpath, name)
-                   for dirpath, _dirnames, filenames in os.walk(root) for name in filenames]
+        for dirpath, dirnames, filenames in os.walk(root, onerror=onerror):
+            for name in dirnames + filenames:
+                path = os.path.join(dirpath, name)
+                rel = os.path.relpath(path, root).replace(os.sep, "/")
+                _trash_item(cfg, rel)
+                if is_link(path):
+                    raise BadRequestError(
+                        "回收站包含符号链接或 junction，清空已中止", {"path": rel})
+            for name in filenames:
+                targets.append(os.path.join(dirpath, name))
     else:
-        targets = []
         for relative in paths or []:
-            source = resolve_under(root, relative)
+            source = _trash_item(cfg, relative)
             if not os.path.isfile(source):
-                raise NotFoundError(f"回收站里没有这个文件：{relative}", {"path": relative})
-            targets.extend([source, *companion_paths(source)])
+                raise NotFoundError(f"回收站里没有这个文件：{relative}",
+                                    {"path": relative})
+            group = [source, *companion_paths(source)]
+            for path in group:
+                rel = os.path.relpath(path, root).replace(os.sep, "/")
+                _trash_item(cfg, rel)
+                if is_link(path):
+                    raise BadRequestError(
+                        "回收站文件不能是符号链接或 junction", {"path": rel})
+            targets.extend(group)
 
     deleted: list[str] = []
     for target in dict.fromkeys(targets):          # 去重：all 模式下不会重复，单条模式可能

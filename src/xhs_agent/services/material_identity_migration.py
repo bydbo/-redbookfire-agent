@@ -2,7 +2,12 @@
 
 输入为隔离会话及显式根映射。计划确定性生成，不读取密钥、不调用模型、不移动文件。
 apply 在写锁下重建计划并比对摘要，归档后合并；所有异常整体回滚。
-归档采用 PostgreSQL 原生 JSON 表示，Decimal / vector 额外转成文本以保证可回填。
+
+规则 v3（R04）：
+- 快照以 **PostgreSQL JSON 文本**为源，用 `Decimal` 解析所有非整数数值，禁止默认 float；
+- 计划摘要 / 归档清单 / 期望记录使用同一个无损 JSON 编码（Decimal 输出为数字字面量）；
+- 归档与候选重写直接用 JSON 文本绑定回 JSONB，不经过 Python float 或整行 ORM 重建；
+- 旧规则（v2）批次保留按旧口径的核验能力，但结果明确标注旧规则的无损性限制。
 """
 
 from __future__ import annotations
@@ -11,12 +16,13 @@ import hashlib
 import json
 import uuid
 from collections import defaultdict
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from datetime import datetime
 from decimal import Decimal
 from typing import Any
 
 from sqlalchemy import delete, func, select, text, update
+from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..db.models import (
@@ -29,7 +35,10 @@ from ..db.models import (
 from ..tools.material_paths import historical_key, validate_key
 from .material_identity import lock_material_index
 
-RULE_VERSION = 2
+#: 当前规则版本；旧计划（低版本）必须重新生成
+RULE_VERSION = 3
+#: 旧规则（v2）批次仍可按旧口径核验，但输出会标注精度限制
+LEGACY_RULE_VERSIONS = (2,)
 TABLES = (
     "materials", "run_matches", "run_hotspots", "runs", "hotspots", "chat_sessions",
     "chat_messages", "chat_context_events", "chat_artifact_versions", "chat_context_actions",
@@ -39,12 +48,73 @@ PROTECTED = TABLES[2:-1]
 
 
 def encoded(value: Any) -> str:
-    return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
-                      allow_nan=False)
+    """确定性无损 JSON 编码：`Decimal` 输出为**数字字面量**，不经过 float。
+
+    只接受 JSON 原生类型与 `Decimal`、`int`；出现 `float` 直接失败——默认 JSON 解码
+    会把高精度 numeric 变成二进制浮点，是 R04 要杜绝的损失路径。
+    """
+    if value is None:
+        return "null"
+    if value is True:
+        return "true"
+    if value is False:
+        return "false"
+    if isinstance(value, int):
+        return str(value)
+    if isinstance(value, Decimal):
+        if not value.is_finite():
+            raise ValueError("JSON 编码拒绝非有限数值")
+        # 固定点表示，避免 `1E+3` / `1E-7` 经 JSONB 归一化后文本不一致
+        return format(value, "f")
+    if isinstance(value, float):
+        raise ValueError("JSON 编码拒绝 float（请用 Decimal 解析数值）")
+    if isinstance(value, str):
+        return json.dumps(value, ensure_ascii=False)
+    if isinstance(value, (list, tuple)):
+        return "[" + ",".join(encoded(item) for item in value) + "]"
+    if isinstance(value, dict):
+        items = sorted(((str(key), item) for key, item in value.items()),
+                       key=lambda pair: pair[0])
+        return "{" + ",".join(
+            json.dumps(key, ensure_ascii=False) + ":" + encoded(item)
+            for key, item in items
+        ) + "}"
+    raise TypeError(f"无法无损编码的类型：{type(value).__name__}")
 
 
 def digest(value: Any) -> str:
     return hashlib.sha256(encoded(value).encode("utf-8")).hexdigest()
+
+
+def digest_rows(rows: Iterable[dict[str, Any]]) -> str:
+    """一组记录的摘要：先按无损文本排序，再对连接后的文本取 SHA-256。"""
+    texts = sorted(encoded(row) for row in rows)
+    return hashlib.sha256("\n".join(texts).encode("utf-8")).hexdigest()
+
+
+def legacy_encoded(value: Any) -> str:
+    """旧规则（v2）的编码：默认 `json.dumps`（数值经 float 表示）。"""
+
+    def _plain(item: Any) -> Any:
+        if isinstance(item, Decimal):
+            return float(item)
+        if isinstance(item, dict):
+            return {str(key): _plain(child) for key, child in item.items()}
+        if isinstance(item, (list, tuple)):
+            return [_plain(child) for child in item]
+        return item
+
+    return json.dumps(_plain(value), ensure_ascii=False, sort_keys=True,
+                      separators=(",", ":"), allow_nan=False)
+
+
+def legacy_digest(value: Any) -> str:
+    return hashlib.sha256(legacy_encoded(value).encode("utf-8")).hexdigest()
+
+
+def legacy_digest_rows(rows: Iterable[dict[str, Any]]) -> str:
+    texts = sorted(legacy_encoded(row) for row in rows)
+    return hashlib.sha256("\n".join(texts).encode("utf-8")).hexdigest()
 
 
 def original_key(table: str, record: dict[str, Any]) -> str:
@@ -56,13 +126,10 @@ def original_key(table: str, record: dict[str, Any]) -> str:
 def decode_record(table: str, record: dict[str, Any]) -> dict[str, Any]:
     """把归档里的 JSON 表示还原成可回填的 Python / ORM 值（字段级无损约定）。
 
-    `snapshot` 对 PostgreSQL 无法直接 JSON 化的类型做了**显式文本编码**：
-    `materials.embedding`（vector → "[0.1,0.2]"）、`materials.duration_s` / `run_matches.score`
-    （numeric/Decimal → 十进制字符串）。这里提供严格逆变换；未知表原样返回，
-    任何无法解析的值直接失败（不静默吞精度）。
+    `snapshot` 只对 PostgreSQL 无法直接 JSON 化的类型做显式文本编码：
+    `materials.embedding`（vector → "[0.1,0.2]"）。其余 numeric 以 JSON 数字保存，
+    归档读取时不再经过默认 float；未知表原样返回，无法解析的值直接失败。
     """
-    from decimal import Decimal
-
     value = dict(record)
     if table == "materials":
         embedding = value.get("embedding")
@@ -107,11 +174,10 @@ def _manifest(rows: list[tuple[str, dict[str, Any]]]) -> list[dict[str, str]]:
 async def database_identity(session: AsyncSession) -> dict[str, str]:
     """数据库身份（不含 DSN / 密码）。
 
-    系统标识来自 `pg_control_system()`，需要 `pg_monitor` 及以上权限；部署账号权限不足时
-    **不阻断**计划，但显式记录 `cluster_source=unavailable`，由审查者确认同一集群。
+    系统标识来自 `pg_control_system()`，需要 `pg_monitor` 及以上权限。**仅**把权限不足
+    （`42501`）识别为 `cluster_source=unavailable`；其他数据库错误原样上抛，不能笼统当成
+    权限问题。计划可在低权限下生成，但会标记 `executable=false`。
     """
-    from sqlalchemy.exc import DBAPIError
-
     base = (await session.execute(text(
         "SELECT current_database() AS name, oid::text AS oid "
         "FROM pg_database WHERE datname = current_database()"))).mappings().one()
@@ -121,14 +187,56 @@ async def database_identity(session: AsyncSession) -> dict[str, str]:
         async with session.begin_nested():
             cluster = str((await session.execute(text(
                 "SELECT system_identifier::text FROM pg_control_system()"))).scalar_one())
-    except DBAPIError:
-        # savepoint 回滚后事务仍可用；权限不足是部署事实，不是数据错误
+    except DBAPIError as exc:
+        original = getattr(exc, "orig", None)
+        sqlstate = str(getattr(original, "sqlstate", "")
+                       or getattr(original, "pgcode", "") or "")
+        if sqlstate != "42501":
+            raise
         source = "unavailable"
     return {"name": str(base["name"]), "oid": str(base["oid"]),
             "cluster": cluster, "cluster_source": source}
 
 
+def identity_executable(identity: dict[str, str]) -> bool:
+    """集群身份可读才允许 apply；低权限预检可以生成计划，但不可执行。"""
+    return (str(identity.get("cluster_source") or "") == "pg_control_system"
+            and bool(str(identity.get("cluster") or "")))
+
+
+def require_cluster_identity(identity: dict[str, str], *, stage: str) -> None:
+    if not identity_executable(identity):
+        raise ValueError(
+            f"{stage}无法读取数据库集群身份（需要 pg_monitor 或同等权限）："
+            "禁止 apply 写入；请由具备权限的操作者配置最小权限后重新生成计划"
+        )
+
+
 async def snapshot(session: AsyncSession) -> dict[str, list[dict[str, Any]]]:
+    """无损快照：JSON 文本 + `Decimal` 解析，禁止默认 float。
+
+    唯一需要显式文本化的是 `materials.embedding`（pgvector 类型无法直接 JSON 化）；
+    其余 numeric（含嵌套 JSON 中的数字）以 JSON 数字保存，Python 侧用 Decimal 保留精度。
+    """
+    result: dict[str, list[dict[str, Any]]] = {}
+    for table in TABLES:
+        expression = "to_jsonb(t)"
+        if table == "materials":
+            expression += " || jsonb_build_object('embedding', t.embedding::text)"
+        # table 仅来自本模块固定白名单，不接受用户提供 SQL 标识符。
+        rows = (await session.execute(
+            text(f"SELECT ({expression})::text AS record FROM {table} t")
+        )).scalars()
+        parsed = [json.loads(raw, parse_float=Decimal) for raw in rows]
+        result[table] = sorted(parsed, key=encoded)
+    return result
+
+
+async def legacy_snapshot(session: AsyncSession) -> dict[str, list[dict[str, Any]]]:
+    """旧规则（v2）快照：默认 float 解码，duration_s / score 取文本。
+
+    只用于核验规则 v2 的历史批次；新计划与新批次一律使用 `snapshot`。
+    """
     result: dict[str, list[dict[str, Any]]] = {}
     for table in TABLES:
         expression = "to_jsonb(t)"
@@ -137,9 +245,11 @@ async def snapshot(session: AsyncSession) -> dict[str, list[dict[str, Any]]]:
                            "'duration_s', t.duration_s::text)")
         elif table == "run_matches":
             expression += " || jsonb_build_object('score', t.score::text)"
-        # table 仅来自本模块固定白名单，不接受用户提供 SQL 标识符。
-        rows = (await session.execute(text(f"SELECT {expression} FROM {table} t"))).scalars()
-        result[table] = sorted([dict(row) for row in rows], key=encoded)
+        rows = (await session.execute(
+            text(f"SELECT ({expression})::text AS record FROM {table} t")
+        )).scalars()
+        parsed = [json.loads(raw) for raw in rows]
+        result[table] = sorted(parsed, key=legacy_encoded)
     return result
 
 
@@ -212,7 +322,7 @@ def build_plan(data: dict[str, list[dict[str, Any]]], *, identity: dict[str, str
         if hotspot in affected:
             decisions.append({"run_hotspot_id": hotspot, "canonical_id": target,
                               "original_material_id": winner["material_id"],
-                              "rank": winner["rank"], "score": winner["score"],
+                              "rank": winner["rank"], "score": str(winner["score"]),
                               "members": sorted(row["material_id"] for row in rows)})
     # 旧 JSON 引用盘点：受保护历史表里出现的素材 UUID（不批量改写，只作为预检证据）
     material_ids = sorted(str(row["id"]) for row in data["materials"])
@@ -236,23 +346,30 @@ def build_plan(data: dict[str, list[dict[str, Any]]], *, identity: dict[str, str
         "rule_version": RULE_VERSION, "database": identity, "schema_revision": revision,
         "code_version": code_version, "mappings": sorted(mappings, key=encoded),
         "relative_basis": relative_basis, "source_digest": digest(data),
-        "source_tables": {table: {"count": len(rows), "digest": digest(rows)}
+        "source_tables": {table: {"count": len(rows), "digest": digest_rows(rows)}
                           for table, rows in data.items()},
         "source_materials": [{"id": row["id"], "path": row["path"],
                               "digest": digest(row)} for row in data["materials"]],
-        "groups": material_groups, "aliases": aliases, "affected_hotspots": affected,
+        "groups": material_groups, "aliases": aliases,
+        "alias_records": sorted(
+            ({"old_id": str(old), "canonical_id": str(target)}
+             for old, target in aliases.items()),
+            key=encoded,
+        ),
+        "affected_hotspots": affected,
         "alias_updates": sorted(alias_updates, key=encoded),
         "candidate_decisions": decisions, "issues": sorted(issues, key=encoded),
         # 预检证据：旧 JSON 引用 / 关键帧定位 / 关联运行（逐类盘点，不只整表摘要）
         "references": sorted(references, key=encoded),
         "keyframe_references": sorted(keyframe_refs, key=encoded),
         "affected_runs": affected_runs,
-        "expected": {"materials": digest(sorted(expected_materials, key=encoded)),
-                     "run_matches": digest(sorted(expected_matches, key=encoded))},
-        # 逐行期望值：核验失败时可定位到具体行；也是 E8 交接的候选 / 素材快照
+        # 逐行期望值用**无损 JSON 文本**保存：计划本身保持 JSON 可序列化，
+        # 核验时与实际行的无损文本逐条比较，不经过 float。
+        "expected": {"materials": digest_rows(expected_materials),
+                     "run_matches": digest_rows(expected_matches)},
         "expected_records": {
-            "materials": sorted(expected_materials, key=encoded),
-            "run_matches": sorted(expected_matches, key=encoded),
+            "materials": sorted(encoded(row) for row in expected_materials),
+            "run_matches": sorted(encoded(row) for row in expected_matches),
         },
         "counts": {"materials_before": len(data["materials"]),
                    "materials_after": len(expected_materials),
@@ -261,6 +378,8 @@ def build_plan(data: dict[str, list[dict[str, Any]]], *, identity: dict[str, str
                    "old_reference_rows": len(references),
                    "keyframe_materials": len(keyframe_refs),
                    "affected_runs": len(affected_runs)},
+        # R08：集群身份可读才可执行；低权限只读预检仍然允许生成计划
+        "executable": identity_executable(identity),
     }
     # 归档清单锚定到计划来源：实体集合、原主键与原始摘要都写进计划；
     # apply 归档后逐条比对，缺项 / 多项 / 改内容（即使重算自带摘要）都能被发现。
@@ -280,34 +399,120 @@ async def plan_migration(session: AsyncSession, mappings: list[dict[str, str]], 
                       revision=revision, code_version=code_version)
 
 
+def _count(mapping: dict[str, Any], key: str) -> int:
+    """计数缺失时返回 -1；0 是合法计数，不能用 `or` 吞掉。"""
+    if key not in mapping or mapping[key] is None:
+        return -1
+    return int(mapping[key])
+
+
 async def _verify_archive(session: AsyncSession, batch: MaterialIdentityBatch) -> int:
-    rows = (await session.execute(select(MaterialIdentityArchive).where(
-        MaterialIdentityArchive.batch_id == batch.id))).scalars().all()
-    if len(rows) != batch.counts.get("archived"):
-        raise ValueError("迁移归档条数不一致")
+    """核验归档：条数、计划清单、逐条摘要与 provenance。
+
+    规则 v3 直接从 JSONB 文本按 Decimal 解析，避免 ORM 默认 float 解码；
+    规则 v2 批次按旧口径（float / 文本）核验，并在结果中标注精度限制。
+    """
     expected = batch.plan.get("archive_manifest")
     if not isinstance(expected, list):
         raise ValueError("迁移计划缺少归档清单，无法证明原始完整性")
-    actual = sorted(
-        ({"entity_type": str(row.entity_type),
-          "original_key": str(row.original_key), "digest": str(row.digest)}
-         for row in rows),
-        key=encoded,
-    )
-    if actual != expected:
+    expected_keys = [(str(item.get("entity_type")), str(item.get("original_key")))
+                     for item in expected]
+    if len(set(expected_keys)) != len(expected_keys):
+        raise ValueError("迁移归档清单包含重复的实体主键")
+    if _count(batch.counts, "archived") != len(expected):
+        raise ValueError("迁移归档条数与计划清单不一致")
+
+    modern = int(batch.rule_version) >= 3
+    if modern:
+        rows = (await session.execute(text(
+            "SELECT entity_type, original_key, record::text AS record, digest, provenance "
+            "FROM material_identity_archive WHERE batch_id = :batch"),
+            {"batch": batch.id})).mappings().all()
+        if len(rows) != len(expected):
+            raise ValueError("迁移归档条数不一致")
+        actual: list[dict[str, str]] = []
+        for row in rows:
+            if str(row["provenance"]) != "migration_capture":
+                raise ValueError("迁移归档 provenance 非法")
+            record = json.loads(row["record"], parse_float=Decimal)
+            if digest(record) != str(row["digest"]):
+                raise ValueError("迁移归档校验失败（内容与摘要不一致）")
+            actual.append({"entity_type": str(row["entity_type"]),
+                           "original_key": str(row["original_key"]),
+                           "digest": str(row["digest"])})
+    else:
+        rows_orm = (await session.execute(select(MaterialIdentityArchive).where(
+            MaterialIdentityArchive.batch_id == batch.id))).scalars().all()
+        if len(rows_orm) != len(expected):
+            raise ValueError("迁移归档条数不一致")
+        actual_legacy: list[dict[str, str]] = []
+        for orm_row in rows_orm:
+            if orm_row.provenance != "migration_capture":
+                raise ValueError("迁移归档 provenance 非法")
+            if legacy_digest(orm_row.record) != orm_row.digest:
+                raise ValueError("迁移归档校验失败（旧规则）")
+            actual_legacy.append({"entity_type": str(orm_row.entity_type),
+                                  "original_key": str(orm_row.original_key),
+                                  "digest": str(orm_row.digest)})
+        actual = actual_legacy
+    if sorted(actual, key=encoded) != sorted(expected, key=encoded):
         raise ValueError("迁移归档与计划清单不一致（缺项 / 多项 / 内容被改）")
-    for row in rows:
-        if row.provenance != "migration_capture" or digest(row.record) != row.digest:
-            raise ValueError("迁移归档校验失败")
-    return len(rows)
+    return len(actual)
+
+
+def _verify_plan_integrity(batch: MaterialIdentityBatch) -> None:
+    """核验批次内的计划摘要与计数，不信任批次里保存的计数。"""
+    plan = batch.plan
+    if not isinstance(plan, dict):
+        raise ValueError("迁移批次缺少计划")
+    unsigned = {key: value for key, value in plan.items()
+                if key not in {"plan_digest", "batch_id"}}
+    if digest(unsigned) != plan.get("plan_digest"):
+        raise ValueError("迁移计划摘要不一致（计划内容被修改）")
+    if str(plan.get("plan_digest")) != str(batch.plan_digest):
+        raise ValueError("批次计划摘要与计划内容不一致")
+    if int(plan.get("rule_version") or 0) != int(batch.rule_version):
+        raise ValueError("批次规则版本与计划不一致")
+    manifest = plan.get("archive_manifest")
+    if not isinstance(manifest, list) or _count(batch.counts, "archived") != len(manifest):
+        raise ValueError("批次归档计数与计划清单不一致")
+    aliases_after = _count(plan.get("counts") or {}, "aliases_after")
+    if aliases_after != len(plan.get("aliases") or {}):
+        raise ValueError("计划别名计数与别名集合不一致")
+    if int(plan.get("rule_version") or 0) < 3:
+        # 旧规则计划没有无损逐行期望；仍允许按其旧摘要核验，结果会标注限制
+        return
+    records = plan.get("expected_records")
+    if not isinstance(records, dict):
+        raise ValueError("迁移计划缺少逐行期望记录")
+    materials_after = _count(plan.get("counts") or {}, "materials_after")
+    matches_after = _count(plan.get("counts") or {}, "matches_after")
+    if materials_after != len(records.get("materials") or []):
+        raise ValueError("计划素材计数与逐行期望不一致")
+    if matches_after != len(records.get("run_matches") or []):
+        raise ValueError("计划候选计数与逐行期望不一致")
 
 
 async def verify_migration(session: AsyncSession, batch_id: uuid.UUID, *,
                            exact: bool = True) -> dict[str, Any]:
+    """核验一个迁移批次。
+
+    - `exact=True`：只允许最新批次；比较**完整别名集合**、逐行期望记录与受保护历史表，
+      并核验计划摘要 / 归档清单 / 计数；
+    - `exact=False`（audit-only）：有限核验（归档、别名单向解析、链环、路径），
+      不声明"当前数据与旧计划完全一致"。
+    """
     batch = await session.get(MaterialIdentityBatch, batch_id)
     if batch is None:
         raise ValueError("迁移批次不存在")
+    _verify_plan_integrity(batch)
     archived = await _verify_archive(session, batch)
+    rule_version = int(batch.rule_version)
+    limitations: list[str] = []
+    if rule_version < 3:
+        limitations.append(
+            "该批次使用旧规则（v2）生成：归档与摘要按旧口径，不满足规则 v3 的无损保证；"
+            "如需最新口径请重新 plan/apply 到新批次")
     if exact:
         later = int(
             (
@@ -321,60 +526,108 @@ async def verify_migration(session: AsyncSession, batch_id: uuid.UUID, *,
         if later:
             raise ValueError(
                 "该批次之后还有迁移批次：精确核验只适用于最新批次；"
-                "历史批次请使用 --audit-only（归档与别名仍会核验）"
+                "历史批次请使用 --audit-only（归档、别名与路径仍会核验）"
             )
-    data = await snapshot(session)
+
+    data = await snapshot(session) if rule_version >= 3 else await legacy_snapshot(session)
     for row in data["materials"]:
         validate_key(row["path"])
-    aliases = {row["old_id"]: row["canonical_id"] for row in data["material_id_aliases"]}
-    if any(value in aliases for value in aliases.values()):
+    material_ids = {str(row["id"]) for row in data["materials"]}
+    aliases = {str(row["old_id"]): str(row["canonical_id"])
+               for row in data["material_id_aliases"]}
+    if any(old == canonical for old, canonical in aliases.items()):
+        raise ValueError("素材别名含自环")
+    if any(canonical in aliases for canonical in aliases.values()):
         raise ValueError("素材别名含链或环")
-    # 批次核验只锚定本批次写入的映射：后续批次可以把目标再合并（A→B 之后 B→C，
-    # 旧别名行会被重指向为 A→C），因此要求"本批 target 现在解析到 current"而不是全局相等。
-    for old, target in batch.plan["aliases"].items():
-        current = aliases.get(old)
-        if current is None:
-            raise ValueError("素材别名与迁移计划不一致")
-        if str(current) != str(target):
-            follow = aliases.get(str(target))
-            if follow is None or str(follow) != str(current):
-                raise ValueError("素材别名与迁移计划不一致")
+    conflicts = sorted(set(aliases) & material_ids)
+    if conflicts:
+        raise ValueError(f"素材别名与活动素材 ID 冲突：{conflicts[:5]}")
+
+    planned = {str(old): str(target) for old, target in batch.plan["aliases"].items()}
     if exact:
-        for table, expected in batch.plan["expected"].items():
-            if digest(data[table]) != expected:
-                raise ValueError(f"迁移后 {table} 与计划不一致；恢复业务后的变化需单独核对")
+        if aliases != planned:
+            missing = sorted(set(planned) - set(aliases))
+            extra = sorted(set(aliases) - set(planned))
+            wrong = sorted(old for old in set(aliases) & set(planned)
+                           if aliases[old] != planned[old])
+            raise ValueError(
+                "素材别名与迁移计划不一致："
+                f"缺 {len(missing)}、多 {len(extra)}、目标不符 {len(wrong)}"
+                + (f"（额外：{extra[:5]}）" if extra else "")
+            )
+    else:
+        # 历史批次：后续批次可以把目标再合并（A→B 之后 B→C，旧别名重指向 A→C）
+        for old, target in planned.items():
+            current = aliases.get(old)
+            if current is None:
+                raise ValueError("素材别名与迁移计划不一致（缺项）")
+            if current != target:
+                follow = aliases.get(target)
+                if follow is None or follow != current:
+                    raise ValueError("素材别名与迁移计划不一致（目标不符）")
+
+    if exact:
+        if rule_version >= 3:
+            for table, expected_texts in batch.plan["expected_records"].items():
+                actual_texts = sorted(encoded(row) for row in data[table])
+                if actual_texts != list(expected_texts):
+                    raise ValueError(
+                        f"迁移后 {table} 与计划逐行期望不一致；恢复业务后的变化需单独核对")
+        else:
+            for table, expected_digest in batch.plan["expected"].items():
+                if legacy_digest(data[table]) != expected_digest:
+                    raise ValueError(
+                        f"迁移后 {table} 与旧计划不一致（旧规则口径）")
         for table in PROTECTED:
-            if digest(data[table]) != batch.plan["source_tables"][table]["digest"]:
+            current = digest_rows(data[table]) if rule_version >= 3 \
+                else legacy_digest(data[table])
+            if current != batch.plan["source_tables"][table]["digest"]:
                 raise ValueError(f"受保护历史表 {table} 被修改")
     return {"batch_id": str(batch.id), "status": "verified", "exact": exact,
-            "archived": archived, **batch.counts}
+            "rule_version": rule_version, "archived": archived,
+            "limitations": limitations, **batch.counts}
 
 
 async def apply_migration(session: AsyncSession, plan: dict[str, Any], *,
                           fault: Callable[[str], None] | None = None,
                           code_version: str | None = None) -> dict[str, Any]:
-    """专用新会话执行；已有批次只读返回，不重新核写业务数据。"""
+    """专用新会话执行；已有批次只读返回，不重新核写业务数据。
+
+    R08：计划和目标库都必须有**可读取的集群身份**；低权限计划（`executable=false`）或
+    目标库读不到身份时，在任何写入之前失败，不提供绕过参数。
+    """
     unsigned = {key: value for key, value in plan.items() if key not in {"plan_digest", "batch_id"}}
     if digest(unsigned) != plan.get("plan_digest") or plan.get("rule_version") != RULE_VERSION:
-        raise ValueError("计划被修改或规则版本不兼容")
+        raise ValueError("计划被修改或规则版本不兼容；旧规则计划必须重新生成")
     batch_id = uuid.UUID(str(plan["batch_id"]))
     if batch_id != uuid.uuid5(uuid.NAMESPACE_URL, plan["plan_digest"]):
         raise ValueError("批次 ID 与计划摘要不一致")
     if plan["issues"]:
         raise ValueError("存在未解决身份问题，禁止应用")
+    if not plan.get("executable"):
+        raise ValueError(
+            "计划生成时无法读取数据库集群身份（executable=false），禁止 apply；"
+            "请由具备 pg_monitor 或同等权限的操作者重新生成计划")
+    require_cluster_identity(plan["database"], stage="计划")
+
     async with session.begin():
+        # 目标库身份必须在锁、归档或任何写入之前验证
+        current_identity = await database_identity(session)
+        require_cluster_identity(current_identity, stage="目标库")
+        if current_identity != plan["database"]:
+            raise ValueError("计划不属于当前数据库（名称 / OID / 集群标识不一致）")
+        # 停写仍是运维前提；表锁同时阻止遗留写入口绕过 advisory lock。
         await lock_material_index(session)
-        if await database_identity(session) != plan["database"]:
-            raise ValueError("计划不属于当前数据库")
+        await session.execute(text("LOCK TABLE " + ", ".join(TABLES) + " IN EXCLUSIVE MODE"))
+        # 拿到锁后再查一次：并发 apply 的后来者应读回已提交批次，而不是拿迁移后数据重建失败
         existing = await session.get(MaterialIdentityBatch, batch_id)
         if existing is not None:
+            _verify_plan_integrity(existing)
             await _verify_archive(session, existing)
             return {"batch_id": str(batch_id), "status": "already_applied", **existing.counts}
-        # 停写仍是运维前提；表锁同时阻止遗留写入口绕过 advisory lock。
-        await session.execute(text("LOCK TABLE " + ", ".join(TABLES) + " IN EXCLUSIVE MODE"))
         data = await snapshot(session)
         revision = str((await session.execute(text("SELECT version_num FROM alembic_version"))).scalar_one())
-        rebuilt = build_plan(data, identity=plan["database"], mappings=plan["mappings"],
+        rebuilt = build_plan(data, identity=current_identity, mappings=plan["mappings"],
                              relative_basis=plan["relative_basis"], revision=revision,
                              # 用**当前实现版本**重建，才能发现"计划来自另一份未提交实现"
                              code_version=code_version or plan["code_version"])
@@ -388,8 +641,14 @@ async def apply_migration(session: AsyncSession, plan: dict[str, Any], *,
                                          counts=counts, status="applied"))
         await session.flush()
         for table, record in archives:
-            session.add(MaterialIdentityArchive(batch_id=batch_id, entity_type=table,
-                        original_key=original_key(table, record), record=record, digest=digest(record)))
+            await session.execute(text(
+                "INSERT INTO material_identity_archive "
+                "(batch_id, entity_type, original_key, record, digest, provenance) "
+                "VALUES (:batch, :entity, :key, CAST(:record AS jsonb), :digest, "
+                "'migration_capture')"),
+                {"batch": batch_id, "entity": table,
+                 "key": original_key(table, record), "record": encoded(record),
+                 "digest": digest(record)})
         await session.flush()
         # 先证明"归档完整且与计划清单一致"，再开始任何破坏性改写
         batch_row = await session.get(MaterialIdentityBatch, batch_id)
@@ -404,6 +663,7 @@ async def apply_migration(session: AsyncSession, plan: dict[str, Any], *,
         for choice in plan["candidate_decisions"]:
             record = dict(originals[f"{choice['run_hotspot_id']}:{choice['original_material_id']}"])
             record["material_id"] = choice["canonical_id"]
+            # 无损：直接绑定规范 JSON 文本，不经默认 float 或整行 ORM 重建
             await session.execute(text("INSERT INTO run_matches SELECT * FROM "
                 "jsonb_populate_record(NULL::run_matches, CAST(:record AS jsonb))"),
                 {"record": encoded(record)})

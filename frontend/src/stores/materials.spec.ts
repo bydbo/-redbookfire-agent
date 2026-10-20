@@ -140,6 +140,85 @@ describe('useMaterialsStore', () => {
     expect(listMaterials).toHaveBeenCalledTimes(2)      // 初次加载 + 删除后刷新
   })
 
+  it('单条删除：原文件缺失时只移除索引，提示进入回收站为零', async () => {
+    const store = useMaterialsStore()
+    await store.load()
+    vi.mocked(trashMaterial).mockResolvedValueOnce({
+      material_id: 'a', path: 'a', trashed_path: 'a', file_missing: true,
+    })
+
+    expect(await store.trashOne('a')).toBe(true)
+    expect(store.actionMessage).toContain('原文件缺失')
+    expect(store.actionMessage).toContain('没有文件进入回收站')
+    expect(store.actionMessage).toContain('恢复后会作为新素材入库')
+
+    await store.load()                                  // 刷新列表不吞掉本次结果
+    expect(store.actionMessage).toContain('原文件缺失')
+  })
+
+  it('批量删除：分别统计移入 / 缺失 / 失败，并保留失败重试入口', async () => {
+    vi.mocked(listMaterials).mockResolvedValue(listing(['a', 'b', 'c']))
+    const store = useMaterialsStore()
+    await store.load()
+    store.selectAllOnPage()
+    vi.mocked(trashMaterial)
+      .mockResolvedValueOnce({ material_id: 'a', path: 'a', trashed_path: 'a', file_missing: false })
+      .mockResolvedValueOnce({ material_id: 'b', path: 'b', trashed_path: 'b', file_missing: true })
+      .mockRejectedValueOnce(new ApiRequestError('目标已存在', 'trash_target_exists', 409))
+
+    const failed = await store.trashSelected()
+
+    expect(failed).toBe(1)
+    expect(store.actionMessage).toContain('已移入回收站 1 条')
+    expect(store.actionMessage).toContain('原文件缺失 1 条')
+    expect(store.actionMessage).toContain('失败 1 条')
+    expect(store.deleteRetryIds).toEqual(['c'])
+    expect(store.actionError).toContain('1/3 条删除失败')
+
+    vi.mocked(trashMaterial).mockResolvedValueOnce({
+      material_id: 'c', path: 'c', trashed_path: 'c', file_missing: false,
+    })
+    expect(await store.retryFailedDelete()).toBe(0)
+    expect(trashMaterial).toHaveBeenLastCalledWith('c')
+    expect(store.deleteRetryIds).toEqual([])
+  })
+
+  it('单条删除失败保留可重试入口，成功后才移除', async () => {
+    const store = useMaterialsStore()
+    await store.load()
+    vi.mocked(trashMaterial).mockRejectedValueOnce(
+      new ApiRequestError('目标已存在', 'trash_target_exists', 409))
+
+    expect(await store.trashOne('a')).toBe(false)
+    expect(store.deleteRetryIds).toEqual(['a'])
+
+    vi.mocked(trashMaterial).mockResolvedValueOnce({
+      material_id: 'a', path: 'a', trashed_path: 'a', file_missing: false,
+    })
+    expect(await store.trashOne('a')).toBe(true)
+    expect(store.deleteRetryIds).toEqual([])
+  })
+
+  it('恢复：文件恢复但索引失败时分开说明，不提示全部成功', async () => {
+    vi.mocked(getMaterialTask).mockResolvedValue(task('FAILURE', { summary: '上游失败' }))
+    const store = useMaterialsStore()
+
+    expect(await store.restoreOne('运动/a.mp4')).toBe(false)
+
+    expect(restoreTrash).toHaveBeenCalledWith('运动/a.mp4')
+    expect(store.actionError).toContain('文件已恢复到素材目录')
+    expect(store.actionError).toContain('重新索引失败')
+    expect(store.actionMessage).toBeNull()
+  })
+
+  it('恢复成功提示新素材身份与历史关联边界', async () => {
+    const store = useMaterialsStore()
+
+    expect(await store.restoreOne('运动/a.mp4')).toBe(true)
+    expect(store.actionMessage).toContain('已作为新素材入库')
+    expect(store.actionMessage).toContain('历史关联未恢复')
+  })
+
   it('扫描：拿到 task_id 后轮询到 SUCCESS，刷新列表并给出摘要', async () => {
     const store = useMaterialsStore()
 

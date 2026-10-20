@@ -23,6 +23,18 @@ from xhs_agent.tools import materials as materials_tool
 pytestmark = [pytest.mark.integration, pytest.mark.asyncio]
 
 
+def _dir_link(target: Path, link: Path) -> None:
+    """目录视图：优先符号链接，Windows 无权限时退回 junction。"""
+    try:
+        link.symlink_to(target, target_is_directory=True)
+        return
+    except (OSError, NotImplementedError):
+        pass
+    if subprocess.run(["cmd", "/c", "mklink", "/J", str(link), str(target)],
+                      capture_output=True).returncode != 0:
+        pytest.skip("当前环境不能创建目录链接，跳过跨视图用例")
+
+
 class _Cfg:
     """轻量配置替身：同步服务只用到 materials_dir / index_dir 两个取路径的方法。"""
 
@@ -182,6 +194,58 @@ class TestIncrementalChanges:
             select(MaterialRow).where(MaterialRow.path == "宠物猫.png"))).scalar_one()
         assert row.embedding is None
         assert row.embedding_model is None
+
+    async def test_scan_failure_keeps_rows_and_never_deletes(
+            self, db_session: AsyncSession, tmp_path: Path, fake_frames: None,
+            monkeypatch: pytest.MonkeyPatch) -> None:
+        """R02：目录读取失败时整次同步中止，不产生删除计划、不改任何行。"""
+        pack = _make_pack(tmp_path)
+        cfg = _Cfg(pack, tmp_path / "idx")
+        await sync_materials(db_session, cfg)
+        before = (await db_session.execute(text(
+            "SELECT path, fingerprint, indexed_at, embedding_model FROM materials "
+            "ORDER BY path"))).all()
+
+        real_walk = os.walk
+
+        def failing_walk(path, **kwargs):
+            yield from real_walk(path, **kwargs)
+            kwargs["onerror"](PermissionError(13, "denied", str(Path(path) / "坏目录")))
+
+        monkeypatch.setattr(materials_tool.os, "walk", failing_walk)
+        with pytest.raises(materials_tool.MaterialScanError):
+            await sync_materials(db_session, cfg)
+
+        after = (await db_session.execute(text(
+            "SELECT path, fingerprint, indexed_at, embedding_model FROM materials "
+            "ORDER BY path"))).all()
+        assert after == before
+
+    async def test_two_mount_views_share_identity_without_reindex(
+            self, db_session: AsyncSession, tmp_path: Path, fake_frames: None) -> None:
+        """跨环境：同一素材集的另一个绝对根（junction 视图）不产生重复行 / 不重新打标。"""
+        pack = _make_pack(tmp_path)
+        view = tmp_path / "容器视图"
+        _dir_link(pack, view)
+        cfg_a = _Cfg(pack, tmp_path / "idx_a")
+        cfg_b = _Cfg(view, tmp_path / "idx_b")
+        vision = FakeVision()
+        first = await sync_materials(db_session, cfg_a, vision=vision)
+        assert first.added == 3
+        before = (await db_session.execute(text(
+            "SELECT path, id::text, indexed_at, embedding_model FROM materials "
+            "ORDER BY path"))).all()
+        vision.calls.clear()
+
+        second = await sync_materials(db_session, cfg_b, vision=vision)
+
+        assert (second.added, second.updated, second.deleted) == (0, 0, 0)
+        assert second.unchanged == 3
+        after = (await db_session.execute(text(
+            "SELECT path, id::text, indexed_at, embedding_model FROM materials "
+            "ORDER BY path"))).all()
+        assert after == before
+        assert vision.calls == []
 
     async def test_deleted_file_row_is_removed(self, db_session: AsyncSession, tmp_path: Path,
                                                fake_frames: None) -> None:

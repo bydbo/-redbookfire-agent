@@ -208,6 +208,22 @@ const trashError = computed(() => store.actionError)
 
       <n-alert v-if="store.failure" type="error" :title="store.failure" />
       <n-alert v-if="store.actionError" type="error" :title="store.actionError" />
+      <n-alert
+        v-if="store.actionMessage"
+        type="success"
+        :title="store.actionMessage"
+        closable
+        @close="store.clearActionMessage()"
+      >
+        <n-button
+          v-if="store.deleteRetryIds.length > 0"
+          size="tiny"
+          class="mt-1"
+          @click="store.retryFailedDelete()"
+        >
+          重试失败项（{{ store.deleteRetryIds.length }}）
+        </n-button>
+      </n-alert>
       <n-alert v-if="store.taskNote" type="info" :title="store.taskNote" />
 
       <!-- 上传区：选择文件 / 拖拽，多文件逐个上传各自进度 -->
@@ -340,7 +356,8 @@ const trashError = computed(() => store.actionError)
                   批量删除
                 </n-button>
               </template>
-              删除的素材会进入回收站（可从回收站恢复），确认删除？
+              文件可从回收站恢复；恢复后会作为新素材入库，历史候选及旧引用不会自动恢复。
+              确认删除选中的 {{ store.selection.length }} 条素材？
             </n-popconfirm>
             <n-button size="small" quaternary @click="store.clearSelection()">
               取消选择
@@ -434,7 +451,8 @@ const trashError = computed(() => store.actionError)
                       删除
                     </n-button>
                   </template>
-                  移入回收站（可恢复），确认删除「{{ item.title }}」？
+                  文件可从回收站恢复；恢复后会作为新素材入库，历史候选及旧引用不会自动恢复。
+                  确认删除「{{ item.title }}」？
                 </n-popconfirm>
               </div>
             </div>
@@ -504,7 +522,8 @@ const trashError = computed(() => store.actionError)
                       删除
                     </n-button>
                   </template>
-                  移入回收站（可恢复），确认删除「{{ item.title }}」？
+                  文件可从回收站恢复；恢复后会作为新素材入库，历史候选及旧引用不会自动恢复。
+                  确认删除「{{ item.title }}」？
                 </n-popconfirm>
               </div>
             </div>
@@ -751,7 +770,8 @@ const trashError = computed(() => store.actionError)
                     移入回收站
                   </n-button>
                 </template>
-                移入回收站（可恢复），确认删除「{{ store.detail?.title }}」？
+                文件可从回收站恢复；恢复后会作为新素材入库，历史候选及旧引用不会自动恢复。
+                确认删除「{{ store.detail?.title }}」？
               </n-popconfirm>
             </div>
             <n-button size="small" @click="store.closeDetail()">
@@ -783,6 +803,13 @@ const trashError = computed(() => store.actionError)
             </n-popconfirm>
           </div>
           <n-alert v-if="trashError" type="error" :title="trashError" />
+          <n-alert
+            v-if="store.actionMessage"
+            type="success"
+            :title="store.actionMessage"
+            closable
+            @close="store.clearActionMessage()"
+          />
           <n-spin :show="store.trashLoading">
             <n-empty v-if="store.trash.length === 0" description="回收站是空的" class="py-8" />
             <div v-else class="flex flex-col divide-y divide-line">

@@ -8,22 +8,26 @@ import os
 import subprocess
 import sys
 import uuid
+from contextlib import suppress
 from decimal import Decimal
 from pathlib import Path
 
 import pytest
 import pytest_asyncio
 from alembic.config import Config
-from sqlalchemy import select, text
-from sqlalchemy.ext.asyncio import async_sessionmaker
+from sqlalchemy import text
+from sqlalchemy.engine import make_url
+from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+from sqlalchemy.pool import NullPool
+from testcontainers.community.postgres import PostgresContainer
 
 from alembic import command
-from xhs_agent.db.models import MaterialIdentityArchive
 from xhs_agent.probe import check_material_identity
 from xhs_agent.services.material_identity import current_material
 from xhs_agent.services.material_identity_migration import (
     apply_migration,
     digest,
+    encoded,
     plan_migration,
     snapshot,
     verify_migration,
@@ -34,6 +38,9 @@ from xhs_agent.services.runs import load_material_frames
 pytestmark = [pytest.mark.integration, pytest.mark.asyncio]
 ROOTS = [{"flavor": "posix", "root": "/app/data/materials"},
          {"flavor": "windows", "root": "D:\\project\\data\\materials"}]
+POSTGRES_IMAGE = "pgvector/pgvector:0.8.6-pg16"
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+INIT_DIR = PROJECT_ROOT / "docker" / "postgres" / "init"
 
 
 @pytest_asyncio.fixture
@@ -99,15 +106,18 @@ async def test_merge_archives_exact_values_and_preserves_history(identity_db):
         assert canonical.duration_s == Decimal("12.34")
         assert canonical.embedding_model == "fixed"
         assert await current_material(session, ids["single"]) is not None
-        archives = (await session.execute(select(MaterialIdentityArchive))).scalars().all()
-        assert len(archives) == 7  # 3 素材 + 3 候选 + 1 热点
-        for row in archives:
-            assert digest(row.record) == row.digest
+        archive_rows = (await session.execute(text(
+            "SELECT entity_type, record::text AS record, digest "
+            "FROM material_identity_archive"))).mappings().all()
+        assert len(archive_rows) == 7  # 3 素材 + 3 候选 + 1 热点
+        for row in archive_rows:
+            record = json.loads(str(row["record"]), parse_float=Decimal)
+            assert digest(record) == str(row["digest"])
             # 数据能原样由 PostgreSQL JSON 再反序列化为对应行（含 vector / numeric / 时间）。
-            if row.entity_type == "materials":
+            if row["entity_type"] == "materials":
                 restored = (await session.execute(text(
                     "SELECT (jsonb_populate_record(NULL::materials, CAST(:record AS jsonb))).duration_s"),
-                    {"record": __import__("json").dumps(row.record)})).scalar_one()
+                    {"record": str(row["record"])})).scalar_one()
                 assert restored == Decimal("12.34")
         check = await verify_migration(session, uuid.UUID(plan["batch_id"]))
         assert check["status"] == "verified"
@@ -120,6 +130,56 @@ async def test_merge_archives_exact_values_and_preserves_history(identity_db):
     assert replay["status"] == "already_applied"
     with pytest.raises(RuntimeError, match="备份"):
         await asyncio.to_thread(command.downgrade, config, "0012")
+
+
+async def test_archive_preserves_numeric_precision_and_isolated_refill(identity_db):
+    """R04：嵌套 JSON / 高精度小数 / 大整数 / Unicode / 空值经归档与隔离回填后 DB 值一致。"""
+    factory, _, ids = identity_db
+    elements = ('{"weight": 0.123456789012345678901234567890, '
+                '"big": 123456789012345678901234567890, '
+                '"nested": {"ratio": 1.0000000000000000001, "null": null}, '
+                '"unicode": "夜跑·球场"}')
+    async with factory() as session:
+        await session.execute(text(
+            "UPDATE materials SET elements = CAST(:elements AS jsonb), "
+            "size_bytes = 922337203685477580, title = '高精度 素材' WHERE id = :id"),
+            {"elements": elements, "id": ids["single"]})
+        await session.commit()
+        before = (await session.execute(text(
+            "SELECT elements::text AS elements, size_bytes, duration_s::text AS duration_s, "
+            "mtime::text AS mtime, embedding::text AS embedding "
+            "FROM materials WHERE id = :id"), {"id": ids["single"]})).mappings().one()
+
+    plan = await make_plan(factory)
+    assert plan["rule_version"] == 3
+    encoded(plan)                       # 计划本身必须 JSON 可序列化且无 float
+
+    async with factory() as session:
+        await apply_migration(session, plan)
+    async with factory() as session:
+        archived = (await session.execute(text(
+            "SELECT record::text AS record, digest FROM material_identity_archive "
+            "WHERE entity_type = 'materials' AND original_key = :key"),
+            {"key": str(ids["single"])})).mappings().one()
+        record = json.loads(str(archived["record"]), parse_float=Decimal)
+        assert digest(record) == str(archived["digest"])
+        await session.execute(text(
+            "CREATE TEMP TABLE restore_check (LIKE materials INCLUDING DEFAULTS) "
+            "ON COMMIT DROP"))
+        await session.execute(text(
+            "INSERT INTO restore_check SELECT * FROM jsonb_populate_record("
+            "NULL::restore_check, CAST(:record AS jsonb))"),
+            {"record": str(archived["record"])})
+        restored = (await session.execute(text(
+            "SELECT elements::text AS elements, size_bytes, duration_s::text AS duration_s, "
+            "mtime::text AS mtime, embedding::text AS embedding "
+            "FROM restore_check"))).mappings().one()
+        # 逐字段比较数据库真实值，而不是两份已损失精度的 Python 对象
+        assert restored["elements"] == before["elements"]
+        assert restored["size_bytes"] == before["size_bytes"] == 922337203685477580
+        assert restored["duration_s"] == before["duration_s"]
+        assert restored["mtime"] == before["mtime"]
+        assert restored["embedding"] == before["embedding"]
 
 
 @pytest.mark.parametrize("stage", ["after_archive", "after_matches", "before_delete", "after_delete"])
@@ -164,6 +224,65 @@ async def test_stale_and_unknown_plans_are_non_mutating(identity_db):
     assert await read_snapshot(factory) == before
 
 
+async def test_extra_alias_and_tampered_plan_fail_exact_verify(identity_db):
+    """R05：额外别名、计划摘要被改都必须让最新批次精确核验失败。"""
+    factory, _, ids = identity_db
+    plan = await make_plan(factory)
+    async with factory() as session:
+        await apply_migration(session, plan)
+    extra = uuid.uuid4()
+    async with factory() as session:
+        await session.execute(text(
+            "INSERT INTO material_id_aliases (old_id, canonical_id, batch_id) "
+            "VALUES (:old, :canon, :batch)"),
+            {"old": extra, "canon": ids["b"], "batch": uuid.UUID(plan["batch_id"])})
+        await session.commit()
+    async with factory() as session:
+        with pytest.raises(ValueError, match="别名"):
+            await verify_migration(session, uuid.UUID(plan["batch_id"]))
+    async with factory() as session:
+        await session.execute(text("DELETE FROM material_id_aliases WHERE old_id = :old"),
+                              {"old": extra})
+        await session.execute(text(
+            "UPDATE material_identity_batches SET plan = jsonb_set("
+            "plan, '{counts,materials_after}', '999'::jsonb)"))
+        await session.commit()
+    async with factory() as session:
+        with pytest.raises(ValueError, match="摘要"):
+            await verify_migration(session, uuid.UUID(plan["batch_id"]))
+
+
+async def test_zero_alias_batch_verifies(identity_db):
+    """0 个别名是合法计数，不能被 `or -1` 误判成缺失。"""
+    factory, _, ids = identity_db
+    async with factory() as session:
+        await session.execute(text("DELETE FROM materials WHERE id=:id"), {"id": ids["b"]})
+        await session.commit()
+    plan = await make_plan(factory)
+    assert plan["aliases"] == {} and plan["counts"]["aliases_after"] == 0
+    async with factory() as session:
+        result = await apply_migration(session, plan)
+    assert result["aliases_after"] == 0
+    async with factory() as session:
+        assert (await verify_migration(session, uuid.UUID(plan["batch_id"])))["status"] == "verified"
+
+
+async def test_concurrent_apply_creates_single_batch(identity_db):
+    """CLI / worker / 同步共用同一互斥边界：并发 apply 只产生一个批次。"""
+    factory, _, _ = identity_db
+    plan = await make_plan(factory)
+
+    async def run():
+        async with factory() as session:
+            return await apply_migration(session, plan)
+
+    results = await asyncio.gather(run(), run())
+    assert sorted(result["status"] for result in results) == ["already_applied", "verified"]
+    async with factory() as session:
+        assert (await session.execute(text(
+            "SELECT count(*) FROM material_identity_batches"))).scalar() == 1
+
+
 async def test_alias_survives_delete_without_rebinding_same_path(identity_db):
     factory, _, ids = identity_db
     plan = await make_plan(factory)
@@ -186,11 +305,16 @@ async def test_archive_manifest_detects_tampering(identity_db):
         await apply_migration(session, plan)
 
     async with factory() as session:      # 改内容但同步重算自带摘要 → 清单摘要不匹配
-        row = (await session.execute(select(MaterialIdentityArchive).limit(1))).scalar_one()
-        record = dict(row.record)
+        row = (await session.execute(text(
+            "SELECT entity_type, original_key, record::text AS record "
+            "FROM material_identity_archive LIMIT 1"))).mappings().one()
+        record = json.loads(str(row["record"]), parse_float=Decimal)
         record["title"] = "tampered"
-        row.record = record
-        row.digest = digest(record)
+        await session.execute(text(
+            "UPDATE material_identity_archive SET record = CAST(:record AS jsonb), "
+            "digest = :digest WHERE entity_type = :entity AND original_key = :key"),
+            {"record": encoded(record), "digest": digest(record),
+             "entity": row["entity_type"], "key": row["original_key"]})
         await session.commit()
     async with factory() as session:
         with pytest.raises(ValueError, match="清单"):
@@ -357,3 +481,89 @@ async def test_cli_plan_apply_verify_on_temporary_database(
     rejected = run("apply", "--plan", str(tampered_path))
     assert rejected.returncode == 1
     assert "未完成" in rejected.stdout or "未完成" in rejected.stderr
+
+
+async def test_low_privilege_plan_is_readonly_and_not_executable(
+    identity_db, db_engine, postgres_dsn
+):
+    """R08：低权限可生成只读计划（executable=false），但不能 apply。"""
+    factory, _, _ = identity_db
+    role = f"e6_limited_{uuid.uuid4().hex[:8]}"
+    database = make_url(postgres_dsn).database
+
+    async def _drop_role(conn) -> None:
+        for statement in (
+            f"REVOKE ALL PRIVILEGES ON ALL TABLES IN SCHEMA public FROM {role}",
+            f"REVOKE ALL PRIVILEGES ON SCHEMA public FROM {role}",
+            f'REVOKE ALL PRIVILEGES ON DATABASE "{database}" FROM {role}',
+            f"DROP ROLE IF EXISTS {role}",
+        ):
+            with suppress(Exception):
+                await conn.execute(text(statement))
+
+    async with db_engine.begin() as conn:
+        await conn.execute(text(f"CREATE ROLE {role} LOGIN PASSWORD 'limited'"))
+        await conn.execute(text(f'GRANT CONNECT ON DATABASE "{database}" TO {role}'))
+        await conn.execute(text(f"GRANT USAGE ON SCHEMA public TO {role}"))
+        await conn.execute(text(f"GRANT SELECT ON ALL TABLES IN SCHEMA public TO {role}"))
+        # 模拟真实低权限部署：没有 pg_monitor，也不允许执行 pg_control_system()
+        await conn.execute(text(
+            "REVOKE EXECUTE ON FUNCTION pg_control_system() FROM PUBLIC"))
+    limited_url = make_url(postgres_dsn).set(username=role, password="limited")
+    engine = create_async_engine(limited_url.render_as_string(hide_password=False),
+                                 poolclass=NullPool)
+    try:
+        limited_factory = async_sessionmaker(engine, expire_on_commit=False)
+        async with limited_factory() as session:
+            plan = await plan_migration(session, ROOTS, code_version="fixture")
+        assert plan["executable"] is False
+        assert plan["database"]["cluster_source"] == "unavailable"
+        async with limited_factory() as session:
+            with pytest.raises(ValueError, match="集群身份|不可执行"):
+                await apply_migration(session, plan)
+    finally:
+        await engine.dispose()
+        async with db_engine.begin() as conn:
+            await _drop_role(conn)
+            await conn.execute(text(
+                "GRANT EXECUTE ON FUNCTION pg_control_system() TO PUBLIC"))
+
+
+async def test_identical_cluster_cannot_apply_foreign_plan(
+    identity_db, db_engine, postgres_dsn, monkeypatch
+):
+    """R08：两个数据相同的独立集群不能交叉应用计划（集群标识不同，写入前失败）。"""
+    factory, _, ids = identity_db
+    plan = await make_plan(factory)
+    container = PostgresContainer(
+        POSTGRES_IMAGE, driver="asyncpg", username="xhs", password="xhs", dbname="xhs",
+    ).with_volume_mapping(str(INIT_DIR), "/docker-entrypoint-initdb.d", "ro")
+    with container:
+        second_dsn = container.get_connection_url()
+        monkeypatch.setenv("DATABASE_URL", second_dsn)
+        config = Config(str(PROJECT_ROOT / "alembic.ini"))
+        await asyncio.to_thread(command.upgrade, config, "0012")
+        engine = create_async_engine(second_dsn, poolclass=NullPool)
+        try:
+            second_factory = async_sessionmaker(engine, expire_on_commit=False)
+            async with second_factory() as session:
+                for source_id, path, title in (
+                    (ids["a"], "/app/data/materials/运动/a.mp4", "a"),
+                    (ids["b"], "D:\\project\\data\\materials\\运动\\a.mp4", "b"),
+                    (ids["single"], "/app/data/materials/missing.mp4", "single"),
+                ):
+                    await session.execute(text(
+                        "INSERT INTO materials (id, path, source, title) "
+                        "VALUES (:id, :path, 'filename', :title)"),
+                        {"id": source_id, "path": path, "title": title})
+                await session.commit()
+            async with second_factory() as session:
+                with pytest.raises(ValueError, match="不属于当前数据库"):
+                    await apply_migration(session, plan)
+            async with second_factory() as session:
+                assert (await session.execute(text(
+                    "SELECT count(*) FROM materials"))).scalar() == 3
+                assert (await session.execute(text(
+                    "SELECT count(*) FROM material_identity_batches"))).scalar() == 0
+        finally:
+            await engine.dispose()

@@ -88,6 +88,10 @@ export const useMaterialsStore = defineStore('materials', () => {
   /** 扫描 / 恢复这类后台任务的人话进度（显示在工具条下面） */
   const taskNote = ref<string | null>(null)
   const actionError = ref<string | null>(null)
+  /** 删除 / 恢复这类会改变素材身份的操作结果（成功提示，刷新列表不清空）。 */
+  const actionMessage = ref<string | null>(null)
+  /** 批量删除失败的素材 ID：保留可重试入口。 */
+  const deleteRetryIds = ref<string[]>([])
 
   const trash = ref<TrashItem[]>([])
   const trashOpen = ref(false)
@@ -392,43 +396,85 @@ export const useMaterialsStore = defineStore('materials', () => {
   /** 移入回收站：单条；失败返回 false 并把原因写进 `actionError`。 */
   async function trashOne(id: string): Promise<boolean> {
     actionError.value = null
+    actionMessage.value = null
+    deleteRetryIds.value = deleteRetryIds.value.filter((item) => item !== id)
     try {
-      await trashMaterial(id)
+      const result = await trashMaterial(id)
       removeFromSelection(id)
+      actionMessage.value = result.file_missing
+        ? '原文件缺失，本次仅移除索引，没有文件进入回收站。恢复后会作为新素材入库，历史关联不会自动恢复。'
+        : '已移入回收站。文件可从回收站恢复；恢复后会作为新素材入库，历史候选及旧引用不会自动恢复。'
       await load()
       if (trashOpen.value) await refreshTrash()
       return true
     } catch (err) {
       actionError.value = describeError(err)
+      deleteRetryIds.value = [...deleteRetryIds.value, id]
       return false
     }
   }
 
-  /** 批量删除：并发调单条接口，汇总失败条数（部分失败不影响其它条目）。 */
+  /** 批量删除：并发调单条接口，分别统计移入回收站 / 文件缺失 / 失败。 */
   async function trashSelected(): Promise<number> {
     const targets = [...selection.value]
     if (targets.length === 0) return 0
     actionError.value = null
+    actionMessage.value = null
     const results = await Promise.allSettled(targets.map((id) => trashMaterial(id)))
-    const failed = results.filter((result) => result.status === 'rejected').length
-    if (failed > 0) {
+    let moved = 0
+    let missing = 0
+    const failedIds: string[] = []
+    results.forEach((result, index) => {
+      if (result.status === 'fulfilled') {
+        if (result.value.file_missing) missing += 1
+        else moved += 1
+      } else {
+        failedIds.push(targets[index])
+      }
+    })
+    deleteRetryIds.value = failedIds
+    const parts = [`已移入回收站 ${moved} 条`]
+    if (missing > 0) parts.push(`原文件缺失 ${missing} 条（仅移除索引，没有文件进入回收站）`)
+    if (failedIds.length > 0) parts.push(`失败 ${failedIds.length} 条（可重试）`)
+    actionMessage.value = `${parts.join('；')}。恢复后会作为新素材入库，历史关联不会自动恢复。`
+    if (failedIds.length > 0) {
       const first = results.find((result) => result.status === 'rejected')
-      actionError.value = `${failed}/${targets.length} 条删除失败：`
+      actionError.value = `${failedIds.length}/${targets.length} 条删除失败：`
         + describeError(first && first.status === 'rejected' ? first.reason : null)
     }
     selection.value = []
     await load()
     if (trashOpen.value) await refreshTrash()
-    return failed
+    return failedIds.length
+  }
+
+  /** 重试批量删除中失败的条目；只重试失败的 ID，刷新列表不会清掉结果。 */
+  async function retryFailedDelete(): Promise<number> {
+    const targets = [...deleteRetryIds.value]
+    if (targets.length === 0) return 0
+    selection.value = targets
+    return trashSelected()
+  }
+
+  function clearActionMessage(): void {
+    actionMessage.value = null
   }
 
   async function restoreOne(path: string): Promise<boolean> {
     actionError.value = null
+    actionMessage.value = null
     try {
       const accepted = await restoreTrash(path)
       const ok = await runIndexTask(accepted.task_id, '恢复后重新入库')
       await refreshTrash()
       await load()
+      if (ok) {
+        actionMessage.value = '已作为新素材入库，历史关联未恢复。'
+      } else {
+        // 文件已经移回素材目录，但索引失败：状态分开说，不能提示全部成功
+        const reason = actionError.value ?? '未知原因'
+        actionError.value = `文件已恢复到素材目录，但重新索引失败：${reason}；可重新扫描或重试索引。`
+      }
       return ok
     } catch (err) {
       actionError.value = describeError(err)
@@ -462,7 +508,8 @@ export const useMaterialsStore = defineStore('materials', () => {
 
   return {
     items, dirs, total, offset, filters, viewMode, loading, failure, selection,
-    uploads, scanning, taskNote, actionError, trash, trashOpen, trashLoading,
+    uploads, scanning, taskNote, actionError, actionMessage, deleteRetryIds,
+    trash, trashOpen, trashLoading,
     editing, editTags, editSaving, page, pageCount, selectedOnPage, allSelected, busy,
     detail, detailOpen, detailLoading, detailError,
     load, applyFilters, clearFilters, goPage, setView,
@@ -470,7 +517,8 @@ export const useMaterialsStore = defineStore('materials', () => {
     scan, uploadFiles, clearUploads,
     openEdit, closeEdit, saveEdit,
     openDetail, closeDetail, trashDetail,
-    openTrash, closeTrash, refreshTrash, trashOne, trashSelected, restoreOne,
+    openTrash, closeTrash, refreshTrash, trashOne, trashSelected, retryFailedDelete,
+    clearActionMessage, restoreOne,
     purgePaths, purgeAll,
   }
 })

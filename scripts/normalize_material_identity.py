@@ -90,6 +90,7 @@ async def run(args: argparse.Namespace) -> int:
                          f"数据库：{plan['database']['name']}（oid {plan['database']['oid']}；"
                          f"集群标识来源 {plan['database']['cluster_source']}）",
                          f"schema：{plan['schema_revision']}",
+                         f"可执行：{'是' if plan.get('executable') else '否（无法读取集群身份）'}",
                          "", "仅盘点，未修改数据库。文件可用性不参与保留 UUID 选择。", "",
                          f"计数：{json.dumps(plan['counts'], ensure_ascii=False)}",
                          f"归档条目：{len(plan['archive_manifest'])}；"
@@ -98,9 +99,13 @@ async def run(args: argparse.Namespace) -> int:
                          f"关联运行：{len(plan['affected_runs'])}",
                          f"未解决问题：{len(plan['issues'])}",
                          f"本机缺失文件：{len(missing)}", ""]
+                if not plan.get("executable"):
+                    lines.append("> 警告：当前账号无权读取 pg_control_system()，本计划**不可执行**。"
+                                 "只读预检可继续；正式 apply 必须由具备 pg_monitor 或同等权限的"
+                                 "操作者重新生成计划。")
+                    lines.append("")
                 if plan["database"]["cluster_source"] != "pg_control_system":
-                    lines.append("> 警告：当前账号无权读取 pg_control_system()，集群身份未能自动核对，"
-                                 "请人工确认计划与目标库属于同一集群。")
+                    lines.append("> 警告：集群身份未读取，不能用于判断两个集群是否相同。")
                     lines.append("")
                 for issue in plan["issues"]:
                     lines.append(f"- 问题 {issue['id']}：{issue['reason']}")

@@ -6,6 +6,8 @@ import json
 import os
 import pathlib
 
+import pytest
+
 from xhs_agent.tools import materials
 
 
@@ -30,6 +32,27 @@ class TestScanMaterials:
 
     def test_missing_directory_returns_empty(self, tmp_path):
         assert materials.scan_materials(str(tmp_path / "nope")) == []
+
+    def test_unreadable_subdirectory_aborts_without_partial_result(
+            self, materials_dir, monkeypatch):
+        """R02：任一目录读取失败即失败，不能返回"看起来完整"的部分结果。"""
+        real_walk = os.walk
+
+        def failing_walk(path, **kwargs):
+            yield from real_walk(path, **kwargs)
+            kwargs["onerror"](PermissionError(13, "denied", str(path)))
+
+        monkeypatch.setattr(materials.os, "walk", failing_walk)
+        with pytest.raises(materials.MaterialScanError):
+            materials.scan_materials(str(materials_dir))
+
+    def test_non_recursive_listdir_failure_aborts(self, materials_dir, monkeypatch):
+        def denied(_path):
+            raise PermissionError(13, "denied", str(materials_dir))
+
+        monkeypatch.setattr(materials.os, "listdir", denied)
+        with pytest.raises(materials.MaterialScanError):
+            materials.scan_materials(str(materials_dir), recursive=False)
 
 
 class TestSidecar:

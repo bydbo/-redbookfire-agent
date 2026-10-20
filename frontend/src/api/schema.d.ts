@@ -1826,6 +1826,15 @@ export interface operations {
                     "application/json": components["schemas"]["TrashList"];
                 };
             };
+            /** @description 回收站目录或子路径包含符号链接 / junction，或路径越界 */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
             503: components["responses"]["DependencyUnavailable"];
         };
     };
@@ -1856,7 +1865,10 @@ export interface operations {
             };
             400: components["responses"]["BadRequest"];
             404: components["responses"]["NotFound"];
-            /** @description 目标位置已有同名文件 */
+            /**
+             * @description 目标位置已有同名文件（媒体或任一将写入的旁车）。整组不移动，双方原文件保留；
+             *     `reason=restore_target_exists`，`conflicts` 列出冲突的相对路径。
+             */
             409: {
                 headers: {
                     [name: string]: unknown;
@@ -1985,6 +1997,18 @@ export interface operations {
             };
             400: components["responses"]["BadRequest"];
             404: components["responses"]["NotFound"];
+            /**
+             * @description 文件组移动冲突或无法自动补偿。`reason=trash_target_exists` 表示目标已存在；
+             *     `reason=manual_review_required` 表示已保留操作记录、需要人工核对，不能当成功。
+             */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
             503: components["responses"]["DependencyUnavailable"];
         };
     };

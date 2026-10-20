@@ -29,13 +29,38 @@ _TITLE_KEYS = ("title", "标题")
 _DESC_KEYS = ("desc", "description", "描述", "说明", "内容")
 
 
+class MaterialScanError(ValueError):
+    """递归扫描失败：任一目录不可读即中止，不返回部分结果。"""
+
+    def __init__(self, path: str, reason: str) -> None:
+        self.path = str(path)
+        self.reason = reason
+        super().__init__(f"素材目录扫描失败：{self.path}（{reason}）")
+
+
 def scan_materials(materials_dir: str, recursive: bool = True) -> list:
-    """扫描素材目录，返回媒体文件路径列表（忽略说明文件和隐藏文件）。"""
+    """扫描素材目录，返回媒体文件路径列表（忽略说明文件和隐藏文件）。
+
+    任一目录读取失败即抛 `MaterialScanError`——**不返回部分结果**。调用方只能在完整扫描
+    成功后计算删除集合，避免把"读不到的目录"当成"文件已删除"。
+    """
     if not os.path.isdir(materials_dir):
         return []
+
+    def onerror(exc: OSError) -> None:
+        raise MaterialScanError(getattr(exc, "filename", materials_dir),
+                                type(exc).__name__) from exc
+
     found = []
     folded: dict[str, str] = {}
-    walker = os.walk(materials_dir) if recursive else [(materials_dir, [], os.listdir(materials_dir))]
+    if recursive:
+        walker = os.walk(materials_dir, onerror=onerror)
+    else:
+        try:
+            names = os.listdir(materials_dir)
+        except OSError as exc:
+            raise MaterialScanError(materials_dir, type(exc).__name__) from exc
+        walker = [(materials_dir, [], names)]
     for root, dirs, files in walker:
         for name in dirs + files:
             path = os.path.join(root, name)
