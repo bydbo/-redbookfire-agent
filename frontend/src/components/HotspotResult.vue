@@ -8,23 +8,55 @@
  * 只有展示与「一键复制」，没有请求、没有路由——数据全由 props 进来。
  * 图表（`RunCharts`）是**运行级**的，仍只留在结果页，不进这个组件。
  */
-import { NAlert, NButton, NEmpty, NProgress, NTag } from 'naive-ui'
+import { NAlert, NButton, NProgress, NTag } from 'naive-ui'
 import { reactive } from 'vue'
 
 import type { HotspotResult } from '@/api/analysis'
-import { ELEMENT_TYPE_LABELS, getKeyframeUrl } from '@/api/analysis'
+import { ELEMENT_TYPE_LABELS, getRunKeyframeUrl } from '@/api/analysis'
 
 const props = withDefaults(defineProps<{
   hotspot: HotspotResult
+  /** 历史预览必须带运行与 1-based 热点位置，不能按当前素材 ID 取图 */
+  runId: string
+  position: number
   /** 对话里更紧凑：标题小一档、候选卡片不留大间距 */
   compact?: boolean
 }>(), { compact: false })
 
-/** 关键帧加载失败的素材（隐藏 img、展示占位），键为 material_id */
+/** 关键帧加载失败：键为 position:rank；候选可能没有素材摘要 */
 const frameFailed = reactive<Record<string, boolean>>({})
 
-function onFrameError(materialId: string): void {
-  frameFailed[materialId] = true
+function frameKey(rank: number): string {
+  return `${props.position}:${rank}`
+}
+
+function canPreview(cand: HotspotResult['candidates'][number]): boolean {
+  return Boolean(cand.material?.keyframes?.length
+    && cand.current_material.preview_available
+    && !frameFailed[frameKey(cand.rank)])
+}
+
+function previewUrl(cand: HotspotResult['candidates'][number]): string {
+  return getRunKeyframeUrl(props.runId, props.position, cand.rank, 0)
+}
+
+function onFrameError(rank: number): void {
+  frameFailed[frameKey(rank)] = true
+}
+
+function materialTitle(cand: HotspotResult['candidates'][number]): string {
+  if (!cand.material) return '历史素材摘要缺失'
+  return cand.material.title || cand.material.path.split(/[\\/]/).pop() || '未命名素材'
+}
+
+function currentStatus(cand: HotspotResult['candidates'][number]): string {
+  if (!cand.current_material.exists) return '原素材已删除，历史文字依据仍保留'
+  if (cand.current_material.reason === 'material_version_changed') {
+    return '素材已更新，历史预览无法确认'
+  }
+  if (cand.current_material.reason === 'keyframes_missing') return '当前关键帧缺失'
+  if (!cand.current_material.preview_available) return '历史预览不可用'
+  return ''
 }
 
 // ---------- 文案一键复制（键为 hotspot_id，同页多个热点互不干扰） ----------
@@ -89,26 +121,31 @@ async function copyDraft(draft: Draft, hotspotId: string): Promise<void> {
       <h2 class="mb-2 text-sm font-semibold text-ink-strong">
         爆点要素
       </h2>
+      <n-alert
+        v-if="!props.hotspot.clue"
+        type="warning"
+        title="历史线索缺失或无法确认，未用当前线索补历史"
+      />
       <div class="flex flex-wrap gap-2">
         <n-tag
-          v-for="(el, i) in props.hotspot.clue.elements"
+          v-for="(el, i) in props.hotspot.clue?.elements ?? []"
           :key="i"
           size="small"
           :title="`权重 ${(el.weight * 100).toFixed(0)}%`"
         >
           {{ ELEMENT_TYPE_LABELS[el.type] }} · {{ el.value }}
         </n-tag>
-        <span v-if="props.hotspot.clue.elements.length === 0" class="text-sm text-ink-muted">未识别到要素</span>
+        <span v-if="(props.hotspot.clue?.elements.length ?? 0) === 0" class="text-sm text-ink-muted">未识别到要素</span>
       </div>
-      <ul v-if="props.hotspot.clue.why_it_works.length > 0" class="mt-2 list-disc pl-5 text-sm text-ink">
-        <li v-for="(why, i) in props.hotspot.clue.why_it_works" :key="i">
+      <ul v-if="(props.hotspot.clue?.why_it_works.length ?? 0) > 0" class="mt-2 list-disc pl-5 text-sm text-ink">
+        <li v-for="(why, i) in props.hotspot.clue?.why_it_works ?? []" :key="i">
           {{ why }}
         </li>
       </ul>
-      <div v-if="props.hotspot.clue.risk_notes && props.hotspot.clue.risk_notes.length > 0" class="mt-2">
+      <div v-if="(props.hotspot.clue?.risk_notes?.length ?? 0) > 0" class="mt-2">
         <n-alert type="warning" title="不可直用的要素（侵权/合规风险）">
           <ul class="list-disc pl-5 text-sm">
-            <li v-for="(note, i) in props.hotspot.clue.risk_notes" :key="i">
+            <li v-for="(note, i) in props.hotspot.clue?.risk_notes ?? []" :key="i">
               {{ note }}
             </li>
           </ul>
@@ -121,7 +158,12 @@ async function copyDraft(draft: Draft, hotspotId: string): Promise<void> {
       <h2 class="mb-2 text-sm font-semibold text-ink-strong">
         候选素材（{{ props.hotspot.candidates.length }}）
       </h2>
-      <n-empty v-if="props.hotspot.candidates.length === 0" description="没有命中的素材" />
+      <n-alert v-if="props.hotspot.status === 'failed'" type="error"
+               :title="props.hotspot.error || '该热点执行失败，已完成依据会保留'" />
+      <n-alert v-if="props.hotspot.candidates.length === 0"
+               type="info"
+               :title="props.hotspot.evidence?.clue?.completeness === 'missing'
+                 ? '旧候选完整性无法确认，不能当作“没有候选”' : '没有命中的素材'" />
       <div
         v-for="cand in props.hotspot.candidates"
         :key="cand.material_id"
@@ -129,11 +171,11 @@ async function copyDraft(draft: Draft, hotspotId: string): Promise<void> {
       >
         <div class="h-24 w-36 shrink-0 overflow-hidden rounded-lg bg-surface-muted">
           <img
-            v-if="cand.material.keyframes?.length && !frameFailed[cand.material.id]"
-            :src="getKeyframeUrl(cand.material.id, 0)"
-            :alt="cand.material.title ?? '关键帧'"
+            v-if="canPreview(cand)"
+            :src="previewUrl(cand)"
+            :alt="materialTitle(cand)"
             class="h-full w-full object-cover"
-            @error="onFrameError(cand.material.id)"
+            @error="onFrameError(cand.rank)"
           >
           <div v-else class="flex h-full w-full items-center justify-center text-xs text-ink-muted">
             无预览
@@ -142,7 +184,7 @@ async function copyDraft(draft: Draft, hotspotId: string): Promise<void> {
         <div class="min-w-0 flex-1">
           <div class="flex items-baseline justify-between gap-2">
             <div class="font-medium text-ink-strong">
-              #{{ cand.rank }} {{ cand.material.title || cand.material.path.split(/[\\/]/).pop() }}
+              #{{ cand.rank }} {{ materialTitle(cand) }}
             </div>
             <div class="shrink-0 text-sm font-semibold" :class="cand.score >= 0.6 ? 'text-brand-strong' : 'text-ink'">
               {{ (cand.score * 100).toFixed(0) }} 分
@@ -152,8 +194,11 @@ async function copyDraft(draft: Draft, hotspotId: string): Promise<void> {
             <n-tag v-for="src in cand.recall_sources" :key="src" size="tiny" :type="src === 'vector' ? 'info' : 'default'">
               {{ src === 'vector' ? '语义召回' : '字面召回' }}
             </n-tag>
-            <span v-if="cand.material.duration_s">{{ cand.material.duration_s.toFixed(1) }}s · </span>
-            <span>{{ cand.material.type === 'video' ? '视频' : '图片' }}</span>
+            <span v-if="cand.material?.duration_s">{{ cand.material.duration_s.toFixed(1) }}s · </span>
+            <span v-if="cand.material">{{ cand.material.type === 'video' ? '视频' : '图片' }}</span>
+            <n-tag v-if="currentStatus(cand)" size="tiny" type="warning">
+              {{ currentStatus(cand) }}
+            </n-tag>
           </div>
           <div v-if="cand.hits.length > 0" class="mt-2 flex flex-wrap gap-1">
             <n-tag v-for="(hit, i) in cand.hits" :key="i" size="tiny" type="success">

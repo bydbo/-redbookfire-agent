@@ -60,7 +60,13 @@ function element(value: string) {
 
 function hotspot(raw: string, ratio: number, scores: number[], gaps = 0): HotspotResult {
   return {
+    position: 1,
     hotspot_id: crypto.randomUUID(),
+    status: 'succeeded',
+    error: null,
+    retrieval_meta: {},
+    gap_advice: null,
+    evidence: {},
     hotspot_raw: raw,
     clue: { why_it_works: ['反差'], mechanisms: [{ name: '反差' }], elements: [element('羽毛球')] },
     coverage: {
@@ -82,8 +88,30 @@ function hotspot(raw: string, ratio: number, scores: number[], gaps = 0): Hotspo
         path: `D:/materials/片段-${index}.mp4`,
         type: 'video' as const,
         title: `片段 ${index}`,
+        description: '',
+        tags: [],
+        elements: [],
+        duration_s: 12,
+        width: 1080,
+        height: 1920,
+        has_audio: true,
+        size_bytes: 10,
+        mtime: null,
+        source: 'sidecar' as const,
         keyframes: [],
+        indexed_at: null,
+        fingerprint: 'fp',
+        embedding_model: null,
       },
+      current_material: {
+        exists: true,
+        file_available: true,
+        preview_available: false,
+        reason: 'keyframes_missing',
+        path: `D:/materials/片段-${index}.mp4`,
+        title: `片段 ${index}`,
+      },
+      evidence: {},
     })),
     draft: null,
   }
@@ -102,6 +130,8 @@ const RUN: RunDetail = {
     latency_ms: 102869,
   },
   prompt_versions: { hotspot_clue: 1 },
+  execution_snapshot: {},
+  evidence: {},
   hotspots: [
     hotspot('热点一', 1, [0.954, 0.949, 0.94, 0.923, 0.885]),
     hotspot('热点二', 1, [0.935, 0.913, 0.907, 0.905, 0.303]),

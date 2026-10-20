@@ -16,6 +16,23 @@ const rawText = ref('')
 const editor = ref<Clue | null>(null)
 let epoch = 0
 const preview = computed(() => store.artifactPreview)
+const evidence = computed(() => (preview.value?.evidence_snapshot ?? {}) as {
+  origin?: string
+  completeness?: string
+  missing_fields?: string[]
+  current_material?: { exists?: boolean }
+})
+const evidenceNote = computed(() => {
+  if (!preview.value || preview.value.object_type !== 'draft') return ''
+  if (evidence.value.completeness === 'missing') {
+    return `历史依据不完整（缺失：${(evidence.value.missing_fields ?? []).join('、') || '未知'}），不应用当前素材补写`
+  }
+  const unavailable = evidence.value.current_material?.exists === false
+  const source = evidence.value.origin === 'runtime'
+    ? '运行时保存' : evidence.value.origin === 'legacy_run_record'
+      ? '原运行记录' : '历史采集'
+  return `本次改稿使用${source}的文字依据${unavailable ? '；原素材当前不可用' : ''}`
+})
 const heads = computed(() => store.context?.artifact_heads ?? [])
 const elementOptions = ELEMENT_TYPES.map(type => ({ label: ELEMENT_TYPE_LABELS[type], value: type }))
 const draftBody = computed(() => String(preview.value?.content?.body ?? ''))
@@ -116,6 +133,7 @@ async function save(): Promise<void> {
     <n-card v-if="preview" size="small" :title="`${objectLabel(preview.object_key)} · 第 ${preview.version_no ?? '—'} 版`">
       <div class="flex flex-col gap-3">
         <span class="text-xs text-ink-muted">{{ preview.created_at }} · 历史内容保持不变</span>
+        <n-alert v-if="evidenceNote" type="info" :title="evidenceNote" />
         <n-tag v-if="selectedClue" size="tiny" type="success">当前选定线索</n-tag>
         <div v-if="preview.object_type === 'draft'" class="whitespace-pre-wrap text-sm text-ink-strong">
           <p v-for="title in draftTitles" :key="title" class="font-medium">{{ title }}</p>

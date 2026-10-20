@@ -387,7 +387,7 @@ async def add_run_match(session: AsyncSession, material_id: str, cfg: AppConfig)
 
 
 class TestTrash:
-    async def test_moves_file_and_deletes_row_with_cascade(self, db_session: AsyncSession,
+    async def test_moves_file_and_keeps_historical_candidates(self, db_session: AsyncSession,
                                                           cfg: AppConfig) -> None:
         media = touch("运动/挥拍.mp4", cfg)
         Path(media + ".txt").write_text("标题: 手工\n", encoding="utf-8")
@@ -405,7 +405,8 @@ class TestTrash:
         assert await load_material(db_session, cfg,
                                    uuid.UUID(ids["运动/挥拍.mp4"])) is None
         matches = (await db_session.execute(select(RunMatch))).scalars().all()
-        assert matches == []                      # 级联清理：历史候选不再回来
+        assert [str(row.material_id) for row in matches] == [ids["运动/挥拍.mp4"]]
+        assert matches[0].material_snapshot is None   # 旧数据未回填时如实为空
 
     async def test_missing_file_still_deletes_row(self, db_session: AsyncSession,
                                                  cfg: AppConfig) -> None:

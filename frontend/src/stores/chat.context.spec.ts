@@ -24,7 +24,7 @@ const detail = (id: string): ChatSessionDetail => ({
 const artifact = (id = 'v1'): ArtifactVersion => ({
   session_id: 's1', version_id: id, object_key: 'clue:images:group1', object_type: 'clue',
   status: 'succeeded', version_no: 1, prompt_versions: {}, usage: {}, created_at: '',
-  content: { raw_text: 'C0', clue: {} }, source: {},
+  content: { raw_text: 'C0', clue: {} }, source: {}, evidence_snapshot: {},
 })
 const action = (context: ChatContext): ContextActionResponse => ({
   session_id: context.session_id, state_version: context.state_version,

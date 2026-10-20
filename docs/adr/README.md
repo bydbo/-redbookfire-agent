@@ -62,3 +62,4 @@
 | [0016](0016-prompt-machine-readable-assets.md) | `prompts/` 携带机读数据资产（能力清单） | 已采纳 |
 
 | [0017](0017-material-root-relative-identity.md) | 素材根相对身份与可审计合并 | 已采纳 |
+| [0018](0018-historical-evidence-snapshots.md) | 历史依据采用不可变证据快照，删除素材不级联历史候选 | 已采纳 |

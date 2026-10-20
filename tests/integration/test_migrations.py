@@ -27,7 +27,7 @@ from alembic import command
 pytestmark = pytest.mark.integration
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
-REVISION = "0013"
+REVISION = "0015"
 
 
 @pytest.fixture
@@ -147,6 +147,31 @@ class TestUpgrade:
         await _alembic(command.upgrade, alembic_config, "head")
         assert {"material_identity_batches", "material_identity_archive",
                 "material_id_aliases"} <= await _tables(db_engine)
+
+    @pytest.mark.asyncio
+    async def test_e8_snapshot_structure_round_trip(
+        self, alembic_config: Config, db_engine: AsyncEngine
+    ) -> None:
+        """E8：0014 扩列 + 批次表，0015 解除素材级联；有批次时拒绝回退。"""
+        await _alembic(command.upgrade, alembic_config, "head")
+        assert {"execution_snapshot", "evidence_meta"} <= await _columns(db_engine, "runs")
+        assert {"raw_text", "clue", "gap_advice", "retrieval_meta", "evidence_meta"} <=             await _columns(db_engine, "run_hotspots")
+        assert {"material_snapshot", "evidence_meta"} <= await _columns(db_engine, "run_matches")
+        assert "e8_snapshot_batches" in await _tables(db_engine)
+        async with db_engine.begin() as conn:
+            await conn.execute(text(
+                "INSERT INTO e8_snapshot_batches (id,rule_version,code_version,database,"
+                "schema_revision,plan_digest,source_digest,plan,counts,status) VALUES "
+                "('00000000-0000-0000-0000-0000000000e8',1,'c','{}','0015','d','s','{}','{}',"
+                "'applied')"))
+        with pytest.raises(RuntimeError):
+            await _alembic(command.downgrade, alembic_config, "0013")
+        async with db_engine.begin() as conn:
+            await conn.execute(text("DELETE FROM e8_snapshot_batches"))
+        await _alembic(command.downgrade, alembic_config, "0013")
+        assert "e8_snapshot_batches" not in await _tables(db_engine)
+        await _alembic(command.upgrade, alembic_config, "head")
+        assert "e8_snapshot_batches" in await _tables(db_engine)
 
     @pytest.mark.asyncio
     async def test_constraint_gate_blocks_legacy_material_rows(

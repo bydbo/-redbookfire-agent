@@ -209,10 +209,11 @@ class TestWriteBack:
 
         await run_for(db_session, run_id, cfg, provider=FakeProvider())
         before = await _match_count(db_session, run_id)
-        await run_for(db_session, run_id, cfg, provider=FakeProvider())
+        with pytest.raises(RuntimeError):
+            await run_for(db_session, run_id, cfg, provider=FakeProvider())
 
         assert before == 3
-        assert await _match_count(db_session, run_id) == before   # 先删后插 → 不重复
+        assert await _match_count(db_session, run_id) == before   # 终态拒绝覆盖
         assert await _run_hotspot_count(db_session, run_id) == 1
 
     async def test_second_submission_reuses_clue_and_skips_extraction(

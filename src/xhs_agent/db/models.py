@@ -194,6 +194,12 @@ class Run(Base):
     # 读取同一份；空对象表示本次没有可用约束（旧行 / 离线路径）。
     context_snapshot: Mapped[dict[str, Any]] = mapped_column(
         JSONB, nullable=False, server_default=text("'{}'"))
+    # E8：本次执行实际生效的配置 / 模型 / prompt / 检索参数允许名单快照。
+    execution_snapshot: Mapped[dict[str, Any]] = mapped_column(
+        JSONB, nullable=False, server_default=text("'{}'"))
+    # E8：各字段组的来源 / 完整度 / 摘要 / 缺失说明，不能用一个顶层 runtime 覆盖混合来源。
+    evidence_meta: Mapped[dict[str, Any]] = mapped_column(
+        JSONB, nullable=False, server_default=text("'{}'"))
     error: Mapped[str | None] = mapped_column(Text, nullable=True)
 
     __table_args__ = (
@@ -218,6 +224,15 @@ class RunHotspot(Base):
         UUID(as_uuid=True), ForeignKey("hotspots.id", ondelete="RESTRICT"), nullable=False)
     position: Mapped[int] = mapped_column(Integer, nullable=False)
     status: Mapped[str] = mapped_column(Text, nullable=False, server_default=text("'queued'"))
+    # E8：提交时冻结热点原文与本次输入线索；此后读取不再看共享 `hotspots.clue`。
+    raw_text: Mapped[str | None] = mapped_column(Text, nullable=True)
+    clue: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
+    # E8：执行结果快照（旧行允许 NULL，同时 evidence_meta 说明缺失）。
+    gap_advice: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
+    retrieval_meta: Mapped[dict[str, Any]] = mapped_column(
+        JSONB, nullable=False, server_default=text("'{}'"))
+    evidence_meta: Mapped[dict[str, Any]] = mapped_column(
+        JSONB, nullable=False, server_default=text("'{}'"))
     coverage: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False,
                                                       server_default=text("'{}'"))
     draft: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
@@ -240,9 +255,13 @@ class RunMatch(Base):
     run_hotspot_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), ForeignKey("run_hotspots.id", ondelete="CASCADE"), primary_key=True)
     material_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), ForeignKey("materials.id", ondelete="CASCADE"), primary_key=True)
+        UUID(as_uuid=True), primary_key=True)
     rank: Mapped[int] = mapped_column(Integer, nullable=False)
     score: Mapped[Decimal] = mapped_column(Numeric(6, 4), nullable=False)
+    # E8：冻结候选实际使用的素材摘要与版本标识；旧行允许 NULL + evidence 说明缺失。
+    material_snapshot: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
+    evidence_meta: Mapped[dict[str, Any]] = mapped_column(
+        JSONB, nullable=False, server_default=text("'{}'"))
     recall_sources: Mapped[list[str]] = mapped_column(ARRAY(Text), nullable=False,
                                                       server_default=text("'{}'"))
     hits: Mapped[list[dict[str, Any]]] = mapped_column(JSONB, nullable=False,
@@ -408,6 +427,9 @@ class ChatArtifactVersion(Base):
     version_no: Mapped[int | None] = mapped_column(Integer, nullable=True)
     base_version_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
     content: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
+    # E8：本次改稿实际使用的线索 / 素材文字依据 / 基础稿及逐字段来源。
+    evidence_snapshot: Mapped[dict[str, Any]] = mapped_column(
+        JSONB, nullable=False, server_default=text("'{}'"))
     source: Mapped[dict[str, Any]] = mapped_column(
         JSONB, nullable=False, server_default=text("'{}'"))
     prompt_versions: Mapped[dict[str, int]] = mapped_column(
@@ -440,6 +462,38 @@ class ChatArtifactVersion(Base):
                         name="base_not_self"),
         CheckConstraint("hotspot_position IS NULL OR hotspot_position >= 1",
                         name="position_positive"),
+    )
+
+
+class E8SnapshotBatch(Base):
+    """`e8_snapshot_batches` — E8 历史快照回填批次（数据契约 §3.12）。
+
+    与 E6 身份批次分开：这里记录的是**快照回填**的计划、来源摘要与核验结果，不能把
+    `migration_capture` 伪装成身份合并，也不能复用 `material_identity_batches`。
+    """
+
+    __tablename__ = "e8_snapshot_batches"
+
+    id: Mapped[uuid.UUID] = _pk()
+    rule_version: Mapped[int] = mapped_column(Integer, nullable=False)
+    code_version: Mapped[str] = mapped_column(Text, nullable=False)
+    database: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)
+    schema_revision: Mapped[str] = mapped_column(Text, nullable=False)
+    plan_digest: Mapped[str] = mapped_column(Text, nullable=False, unique=True)
+    source_digest: Mapped[str] = mapped_column(Text, nullable=False)
+    plan: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)
+    counts: Mapped[dict[str, Any]] = mapped_column(
+        JSONB, nullable=False, server_default=text("'{}'"))
+    status: Mapped[str] = mapped_column(Text, nullable=False, server_default=text("'applied'"))
+    verification: Mapped[dict[str, Any]] = mapped_column(
+        JSONB, nullable=False, server_default=text("'{}'"))
+    applied_at: Mapped[datetime] = _created_at()
+    verified_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    __table_args__ = (
+        CheckConstraint("status IN ('applied', 'verified', 'failed')",
+                        name="status_allowed"),
+        Index("ix_e8_snapshot_batches_applied_at", "applied_at"),
     )
 
 

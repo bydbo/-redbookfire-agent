@@ -293,6 +293,61 @@ paths:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
 
+  /api/runs/{run_id}/hotspots/{position}/candidates/{rank}/keyframes/{index}:
+    get:
+      tags:
+        - 结果
+      summary: 读取历史候选关键帧
+      description: |
+        按运行、热点位置和候选排名定位**冻结快照**中的关键帧；只接受运行内身份，
+        不接受客户端路径。当前素材已删除、快照缺失或下标越界返回 404；
+        当前 UUID 的版本与快照不一致时返回 409，避免显示可能被覆盖的新图片。
+      operationId: getRunCandidateKeyframe
+      parameters:
+        - $ref: '#/components/parameters/RequestId'
+        - name: run_id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+        - name: position
+          in: path
+          required: true
+          schema:
+            type: integer
+            minimum: 1
+        - name: rank
+          in: path
+          required: true
+          schema:
+            type: integer
+            minimum: 1
+        - name: index
+          in: path
+          required: true
+          schema:
+            type: integer
+            minimum: 0
+      responses:
+        '200':
+          description: 历史关键帧图片（JPEG）
+          content:
+            image/jpeg:
+              schema:
+                type: string
+                format: binary
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          description: 历史素材版本与当前不一致，预览不可确认
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '503':
+          $ref: '#/components/responses/DependencyUnavailable'
+
   /api/materials/{material_id}/keyframes/{index}:
     get:
       tags:
@@ -1427,6 +1482,8 @@ components:
         - created_at
         - totals
         - prompt_versions
+        - execution_snapshot
+        - evidence
         - hotspots
       properties:
         run_id:
@@ -1454,6 +1511,15 @@ components:
           description: 本次运行各任务所用的 prompt 版本；键为 task_id，见 docs/contracts/prompt契约.md
           additionalProperties:
             type: integer
+        execution_snapshot:
+          type: object
+          description: 本次执行实际生效的允许名单配置（模型 / 向量 / 检索参数 / prompt / 工作区），不保存密钥
+          additionalProperties: true
+        evidence:
+          type: object
+          description: 各字段组的来源 / 完整度 / 摘要 / 缺失说明
+          additionalProperties:
+            $ref: '#/components/schemas/EvidenceMeta'
         hotspots:
           type: array
           description: 本次运行中每个热点的分析结果
@@ -1463,21 +1529,55 @@ components:
     HotspotResult:
       type: object
       required:
+        - position
         - hotspot_id
         - hotspot_raw
         - clue
+        - status
+        - error
         - coverage
+        - retrieval_meta
+        - gap_advice
         - candidates
+        - draft
+        - evidence
       properties:
+        position:
+          type: integer
+          minimum: 1
         hotspot_id:
           type: string
           format: uuid
         hotspot_raw:
           type: string
         clue:
-          $ref: '#/components/schemas/HotspotClue'
+          description: 本次运行冻结的线索；旧数据无法证明原运行线索时为 null
+          oneOf:
+            - $ref: '#/components/schemas/HotspotClue'
+            - type: 'null'
+        status:
+          type: string
+          enum:
+            - queued
+            - running
+            - succeeded
+            - failed
+        error:
+          oneOf:
+            - type: string
+            - type: 'null'
         coverage:
           $ref: '#/components/schemas/Coverage'
+        retrieval_meta:
+          type: object
+          description: 本次检索的通道计数、候选数与索引清单摘要
+          additionalProperties: true
+        gap_advice:
+          description: 本次执行保存的缺口建议；旧数据不重算时为 null
+          oneOf:
+            - type: object
+              additionalProperties: true
+            - type: 'null'
         candidates:
           type: array
           items:
@@ -1486,6 +1586,10 @@ components:
           oneOf:
             - $ref: '#/components/schemas/Draft'
             - type: 'null'
+        evidence:
+          type: object
+          additionalProperties:
+            $ref: '#/components/schemas/EvidenceMeta'
 
     HotspotClue:
       type: object
@@ -1596,6 +1700,8 @@ components:
         - reasons
         - usage
         - material
+        - current_material
+        - evidence
       properties:
         rank:
           type: integer
@@ -1633,7 +1739,16 @@ components:
           type: string
           description: 建议怎么用（放开头 3 秒 / 当过程画面等）
         material:
-          $ref: '#/components/schemas/MaterialSummary'
+          description: 运行当时冻结的素材摘要；旧数据无法恢复时为 null
+          oneOf:
+            - $ref: '#/components/schemas/HistoricalMaterial'
+            - type: 'null'
+        current_material:
+          $ref: '#/components/schemas/CurrentMaterialStatus'
+        evidence:
+          type: object
+          additionalProperties:
+            $ref: '#/components/schemas/EvidenceMeta'
 
     MatchHit:
       type: object
@@ -1665,6 +1780,162 @@ components:
           type: number
           minimum: 0
           maximum: 1
+
+    EvidenceMeta:
+      type: object
+      description: 一个字段组的来源与完整度；来源和完整度独立，不能用顶层 runtime 覆盖混合来源
+      required:
+        - schema_version
+        - origin
+        - captured_at
+        - source_ref
+        - digest
+        - completeness
+        - missing_fields
+      properties:
+        schema_version:
+          type: integer
+          minimum: 1
+        origin:
+          type: string
+          enum:
+            - runtime
+            - legacy_run_record
+            - migration_capture
+            - cutover_capture
+            - missing
+        captured_at:
+          type: string
+          format: date-time
+        source_ref:
+          type: string
+        digest:
+          type: string
+        completeness:
+          type: string
+          enum:
+            - complete
+            - partial
+            - missing
+        missing_fields:
+          type: array
+          items:
+            type: string
+
+    HistoricalMaterial:
+      type: object
+      description: 候选在运行当时实际使用的素材摘要；不随当前素材生命周期改写
+      required:
+        - id
+        - path
+        - type
+        - title
+        - description
+        - tags
+        - elements
+        - duration_s
+        - width
+        - height
+        - has_audio
+        - size_bytes
+        - mtime
+        - source
+        - keyframes
+        - indexed_at
+        - fingerprint
+        - embedding_model
+      properties:
+        id:
+          type: string
+          format: uuid
+        path:
+          type: string
+        type:
+          type: string
+          enum:
+            - video
+            - image
+        title:
+          type: string
+        description:
+          type: string
+        tags:
+          type: array
+          items:
+            type: string
+        elements:
+          type: array
+          items:
+            $ref: '#/components/schemas/Element'
+        duration_s:
+          type: number
+        width:
+          type: integer
+        height:
+          type: integer
+        has_audio:
+          type: boolean
+        size_bytes:
+          type: integer
+        mtime:
+          oneOf:
+            - type: string
+              format: date-time
+            - type: 'null'
+        source:
+          type: string
+          enum:
+            - sidecar
+            - vision
+            - filename
+            - legacy
+        keyframes:
+          type: array
+          items:
+            type: string
+        indexed_at:
+          oneOf:
+            - type: string
+              format: date-time
+            - type: 'null'
+        fingerprint:
+          type: string
+        embedding_model:
+          oneOf:
+            - type: string
+            - type: 'null'
+
+    CurrentMaterialStatus:
+      type: object
+      description: 当前素材的动态状态；只用于展示，不写回历史字段
+      required:
+        - exists
+        - file_available
+        - preview_available
+        - reason
+        - path
+        - title
+      properties:
+        exists:
+          type: boolean
+        file_available:
+          oneOf:
+            - type: boolean
+            - type: 'null'
+        preview_available:
+          type: boolean
+        reason:
+          oneOf:
+            - type: string
+            - type: 'null'
+        path:
+          oneOf:
+            - type: string
+            - type: 'null'
+        title:
+          oneOf:
+            - type: string
+            - type: 'null'
 
     MaterialSummary:
       type: object
@@ -2885,6 +3156,7 @@ components:
         - status
         - prompt_versions
         - usage
+        - evidence_snapshot
         - created_at
       properties:
         version_id:
@@ -2933,6 +3205,10 @@ components:
             - type: 'null'
         source:
           type: object
+          additionalProperties: true
+        evidence_snapshot:
+          type: object
+          description: 本版本改稿实际使用的线索 / 素材文字依据 / 基础稿与逐字段来源
           additionalProperties: true
         prompt_versions:
           type: object

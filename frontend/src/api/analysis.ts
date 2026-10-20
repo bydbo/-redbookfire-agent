@@ -61,6 +61,21 @@ export function getKeyframeUrl(materialId: string, index: number): string {
 }
 
 /**
+ * 历史候选关键帧地址（E8）：按运行 / 热点位置 / 排名取冻结快照对应图。
+ * 不使用当前素材接口，避免素材删除或同路径更新后显示错误图片。
+ */
+export function getRunKeyframeUrl(
+  runId: string,
+  position: number,
+  rank: number,
+  index: number,
+): string {
+  return apiUrl(
+    `/runs/${encodeURIComponent(runId)}/hotspots/${position}/candidates/${rank}/keyframes/${index}`,
+  )
+}
+
+/**
  * 图片热点解析（S6.6 接口，S6.8 前端入口）：上传一张图，拿回热点描述 + 爆点线索。
  * multipart 单文件字段 `file`；后端只在内存里转成模型输入，不落盘、不入库，结果也不进 `runs` 统计。
  */

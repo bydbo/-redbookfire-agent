@@ -67,6 +67,7 @@ class TestImageView:
             base_version_id = None
             content = {"revised": {"body": "x"}}
             source = {"turn_id": "t"}
+            evidence_snapshot = {}
             prompt_versions = {"copy_revise": 1}
             usage = {"cost_cny": 0.01}
             error = None

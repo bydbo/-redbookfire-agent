@@ -40,15 +40,22 @@ COLUMN_SPECS: dict[str, dict[str, str]] = {
         "stage": "jsonb",
         # A05：提交时固化的适用事实快照（worker 撰稿读同一份）
         "context_snapshot": "jsonb",
+        # E8：执行配置与证据来源
+        "execution_snapshot": "jsonb", "evidence_meta": "jsonb",
     },
     "run_hotspots": {
         "id": "uuid", "run_id": "uuid", "hotspot_id": "uuid", "position": "int4",
         "status": "text", "coverage": "jsonb", "draft": "jsonb", "error": "text",
+        # E8：提交时冻结的输入与执行结果证据
+        "raw_text": "text", "clue": "jsonb", "gap_advice": "jsonb",
+        "retrieval_meta": "jsonb", "evidence_meta": "jsonb",
     },
     "run_matches": {
         "run_hotspot_id": "uuid", "material_id": "uuid", "rank": "int4", "score": "numeric",
         "recall_sources": "_text", "hits": "jsonb", "missing": "jsonb", "reasons": "jsonb",
         "usage": "text",
+        # E8：历史素材摘要与来源（material_id 不再外键级联）
+        "material_snapshot": "jsonb", "evidence_meta": "jsonb",
     },
     "chat_sessions": {
         "id": "uuid", "title": "text", "created_at": "timestamptz", "updated_at": "timestamptz",
@@ -80,7 +87,8 @@ COLUMN_SPECS: dict[str, dict[str, str]] = {
         # v2 §3.4（E7CTX-07）：认领时固化的并发预期与来源消息
         "expected_head_version_id": "uuid", "expected_state_version": "int4",
         "source_message_id": "uuid",
-        "content": "jsonb", "source": "jsonb", "prompt_versions": "jsonb",
+        "content": "jsonb", "evidence_snapshot": "jsonb",
+        "source": "jsonb", "prompt_versions": "jsonb",
         "usage": "jsonb", "error": "text", "created_at": "timestamptz",
         "updated_at": "timestamptz",
     },
@@ -116,14 +124,22 @@ COLUMN_SPECS: dict[str, dict[str, str]] = {
     "material_id_aliases": {
         "old_id": "uuid", "canonical_id": "uuid", "batch_id": "uuid",
     },
+    # E8：历史快照回填批次
+    "e8_snapshot_batches": {
+        "id": "uuid", "rule_version": "int4", "code_version": "text",
+        "database": "jsonb", "schema_revision": "text", "plan_digest": "text",
+        "source_digest": "text", "plan": "jsonb", "counts": "jsonb",
+        "status": "text", "verification": "jsonb", "applied_at": "timestamptz",
+        "verified_at": "timestamptz",
+    },
 }
 
 NULLABLE_COLUMNS: dict[str, set[str]] = {
     "materials": {"mtime", "fingerprint", "embedding", "embedding_model"},
     "hotspots": set(),
     "runs": {"started_at", "finished_at", "error", "request_id"},
-    "run_hotspots": {"draft", "error"},
-    "run_matches": set(),
+    "run_hotspots": {"draft", "error", "raw_text", "clue", "gap_advice"},
+    "run_matches": {"material_snapshot"},
     "chat_sessions": {"topic_id"},
     "chat_messages": {"run_id", "error", "turn_id", "trace_id", "operation_binding"},
     "chat_context_events": set(),
@@ -139,6 +155,7 @@ NULLABLE_COLUMNS: dict[str, set[str]] = {
     "material_identity_batches": set(),
     "material_identity_archive": set(),
     "material_id_aliases": set(),
+    "e8_snapshot_batches": {"verified_at"},
 }
 
 # 数据契约 §4.1 的 16 条索引（唯一约束在 PG 里也是索引）
@@ -165,6 +182,8 @@ EXPECTED_INDEXES = {
     # E6 主题三：批次计划摘要唯一、别名目标索引
     "uq_material_identity_batches_plan_digest",
     "ix_material_id_aliases_canonical_id",
+    "uq_e8_snapshot_batches_plan_digest",
+    "ix_e8_snapshot_batches_applied_at",
 }
 
 
@@ -397,6 +416,14 @@ class TestConstraints:
                 "INSERT INTO run_matches (run_hotspot_id, material_id, rank, score, reasons) "
                 "VALUES (:rh, :m, 1, 0.5, '[{\"why\": \"x\"}]')"),
                 {"rh": ids["run_hotspot"], "m": ids["material"]})
+
+        # E8：删除当前素材不再级联删除历史候选
+        async with db_engine.begin() as conn:
+            await conn.execute(text("DELETE FROM materials WHERE id = :m"),
+                               {"m": ids["material"]})
+            kept = (await conn.execute(text(
+                "SELECT count(*) FROM run_matches"))).scalar_one()
+        assert kept == 1
 
         # 1) RESTRICT：热点仍被 run_hotspots 引用，删不掉
         with pytest.raises(IntegrityError):

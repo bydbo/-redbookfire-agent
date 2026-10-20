@@ -629,15 +629,38 @@ def run_detail(
                     ],
                     "match_keywords": ["夜跑"],
                 },
+                "position": position,
+                "status": "succeeded",
+                "error": None,
                 "coverage": {"ratio": 1.0, "covered": [], "gaps": []},
+                "retrieval_meta": {},
+                "gap_advice": {"items": []},
+                "evidence": {"clue": {"origin": "runtime"}},
                 "candidates": [
                     {
+                        "material_id": "m-1",
                         "material": {
                             "id": "m-1",
                             "path": "D:/m/夜跑.mp4",
                             "type": "video",
                             "title": "夜里的球鞋",
-                        }
+                            "description": "夜里跑步",
+                            "tags": ["夜跑"],
+                            "elements": [],
+                            "duration_s": 12.0,
+                            "width": 1080,
+                            "height": 1920,
+                            "has_audio": True,
+                            "size_bytes": 10,
+                            "mtime": None,
+                            "source": "sidecar",
+                            "keyframes": [],
+                            "indexed_at": None,
+                            "fingerprint": "fp",
+                            "embedding_model": None,
+                        },
+                        "current_material": {"exists": True},
+                        "evidence": {"candidate": {"origin": "runtime"}},
                     }
                 ],
                 "draft": (
@@ -662,6 +685,8 @@ def run_detail(
         "status": status,
         "created_at": "",
         "totals": {},
+        "execution_snapshot": {},
+        "evidence": {},
         "hotspots": items,
     }
 

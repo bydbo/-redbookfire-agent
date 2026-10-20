@@ -12,6 +12,19 @@ import RunCharts from '@/components/RunCharts.vue'
 const route = useRoute()
 const runId = computed(() => String(route.params.runId))
 
+const EVIDENCE_ORIGIN_LABELS: Record<string, string> = {
+  runtime: '运行时保存',
+  legacy_run_record: '原运行记录',
+  migration_capture: 'E6 迁移归档',
+  cutover_capture: '切换时采集',
+  missing: '缺失',
+}
+
+type SnapshotView = {
+  llm?: { provider?: string; model?: string }
+  retrieval?: { topk?: number }
+}
+const snapshot = computed(() => (run.value?.execution_snapshot ?? {}) as SnapshotView)
 const run = ref<RunDetail | null>(null)
 const notFinished = ref(false)
 const failure = ref<string | null>(null)
@@ -112,6 +125,28 @@ const reportUrl = computed(() => apiUrl(`/runs/${runId.value}/report?format=html
         </div>
       </n-card>
 
+      <n-card v-if="run" title="执行与证据">
+        <div class="flex flex-col gap-2 text-sm text-ink">
+          <p>
+            模型：{{ snapshot.llm?.provider || '未知' }} /
+            {{ snapshot.llm?.model || '未知' }}；
+            topk：{{ snapshot.retrieval?.topk ?? '未知' }}
+          </p>
+          <div class="flex flex-wrap gap-2">
+            <n-tag
+              v-for="[name, meta] in Object.entries(run.evidence || {})"
+              :key="name"
+              size="small"
+              :type="meta.completeness === 'complete' ? 'success'
+                : meta.completeness === 'partial' ? 'warning' : 'error'"
+            >
+              {{ name }}：{{ EVIDENCE_ORIGIN_LABELS[meta.origin] }}
+              （{{ meta.completeness }}）
+            </n-tag>
+          </div>
+        </div>
+      </n-card>
+
       <n-card v-if="run" title="数据可视化">
         <RunCharts :run="run" />
       </n-card>
@@ -122,7 +157,8 @@ const reportUrl = computed(() => apiUrl(`/runs/${runId.value}/report?format=html
           <p class="mb-4 text-base font-medium text-ink-strong">
             {{ hotspot.hotspot_raw }}
           </p>
-          <HotspotResult :hotspot="hotspot" />
+          <HotspotResult :hotspot="hotspot" :run-id="run?.run_id || runId"
+                         :position="hotspot.position" />
         </n-card>
       </template>
 

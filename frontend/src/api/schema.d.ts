@@ -148,6 +148,28 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/runs/{run_id}/hotspots/{position}/candidates/{rank}/keyframes/{index}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * 读取历史候选关键帧
+         * @description 按运行、热点位置和候选排名定位**冻结快照**中的关键帧；只接受运行内身份，
+         *     不接受客户端路径。当前素材已删除、快照缺失或下标越界返回 404；
+         *     当前 UUID 的版本与快照不一致时返回 409，避免显示可能被覆盖的新图片。
+         */
+        get: operations["getRunCandidateKeyframe"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/materials/{material_id}/keyframes/{index}": {
         parameters: {
             query?: never;
@@ -703,17 +725,41 @@ export interface components {
             prompt_versions: {
                 [key: string]: number;
             };
+            /** @description 本次执行实际生效的允许名单配置（模型 / 向量 / 检索参数 / prompt / 工作区），不保存密钥 */
+            execution_snapshot: {
+                [key: string]: unknown;
+            };
+            /** @description 各字段组的来源 / 完整度 / 摘要 / 缺失说明 */
+            evidence: {
+                [key: string]: components["schemas"]["EvidenceMeta"];
+            };
             /** @description 本次运行中每个热点的分析结果 */
             hotspots: components["schemas"]["HotspotResult"][];
         };
         HotspotResult: {
+            position: number;
             /** Format: uuid */
             hotspot_id: string;
             hotspot_raw: string;
-            clue: components["schemas"]["HotspotClue"];
+            /** @description 本次运行冻结的线索；旧数据无法证明原运行线索时为 null */
+            clue: components["schemas"]["HotspotClue"] | null;
+            /** @enum {string} */
+            status: "queued" | "running" | "succeeded" | "failed";
+            error: string | null;
             coverage: components["schemas"]["Coverage"];
+            /** @description 本次检索的通道计数、候选数与索引清单摘要 */
+            retrieval_meta: {
+                [key: string]: unknown;
+            };
+            /** @description 本次执行保存的缺口建议；旧数据不重算时为 null */
+            gap_advice: {
+                [key: string]: unknown;
+            } | null;
             candidates: components["schemas"]["MatchCandidate"][];
-            draft?: components["schemas"]["Draft"] | null;
+            draft: components["schemas"]["Draft"] | null;
+            evidence: {
+                [key: string]: components["schemas"]["EvidenceMeta"];
+            };
         };
         HotspotClue: {
             why_it_works: string[];
@@ -761,7 +807,12 @@ export interface components {
             reasons: string[];
             /** @description 建议怎么用（放开头 3 秒 / 当过程画面等） */
             usage: string;
-            material: components["schemas"]["MaterialSummary"];
+            /** @description 运行当时冻结的素材摘要；旧数据无法恢复时为 null */
+            material: components["schemas"]["HistoricalMaterial"] | null;
+            current_material: components["schemas"]["CurrentMaterialStatus"];
+            evidence: {
+                [key: string]: components["schemas"]["EvidenceMeta"];
+            };
         };
         MatchHit: {
             /** @enum {string} */
@@ -770,6 +821,52 @@ export interface components {
             hit_value?: string;
             similarity?: number;
             contribution?: number;
+        };
+        /** @description 一个字段组的来源与完整度；来源和完整度独立，不能用顶层 runtime 覆盖混合来源 */
+        EvidenceMeta: {
+            schema_version: number;
+            /** @enum {string} */
+            origin: "runtime" | "legacy_run_record" | "migration_capture" | "cutover_capture" | "missing";
+            /** Format: date-time */
+            captured_at: string;
+            source_ref: string;
+            digest: string;
+            /** @enum {string} */
+            completeness: "complete" | "partial" | "missing";
+            missing_fields: string[];
+        };
+        /** @description 候选在运行当时实际使用的素材摘要；不随当前素材生命周期改写 */
+        HistoricalMaterial: {
+            /** Format: uuid */
+            id: string;
+            path: string;
+            /** @enum {string} */
+            type: "video" | "image";
+            title: string;
+            description: string;
+            tags: string[];
+            elements: components["schemas"]["Element"][];
+            duration_s: number;
+            width: number;
+            height: number;
+            has_audio: boolean;
+            size_bytes: number;
+            mtime: string | null;
+            /** @enum {string} */
+            source: "sidecar" | "vision" | "filename" | "legacy";
+            keyframes: string[];
+            indexed_at: string | null;
+            fingerprint: string;
+            embedding_model: string | null;
+        };
+        /** @description 当前素材的动态状态；只用于展示，不写回历史字段 */
+        CurrentMaterialStatus: {
+            exists: boolean;
+            file_available: boolean | null;
+            preview_available: boolean;
+            reason: string | null;
+            path: string | null;
+            title: string | null;
         };
         MaterialSummary: {
             /** Format: uuid */
@@ -1266,6 +1363,10 @@ export interface components {
             source?: {
                 [key: string]: unknown;
             };
+            /** @description 本版本改稿实际使用的线索 / 素材文字依据 / 基础稿与逐字段来源 */
+            evidence_snapshot: {
+                [key: string]: unknown;
+            };
             prompt_versions: {
                 [key: string]: number;
             };
@@ -1653,6 +1754,45 @@ export interface operations {
                     "application/json": components["schemas"]["ErrorResponse"];
                 };
             };
+        };
+    };
+    getRunCandidateKeyframe: {
+        parameters: {
+            query?: never;
+            header?: {
+                /** @description 客户端生成的请求标识；未提供时由服务端生成。用于贯穿日志、调用追踪与数据库记录。 */
+                "X-Request-ID"?: components["parameters"]["RequestId"];
+            };
+            path: {
+                run_id: string;
+                position: number;
+                rank: number;
+                index: number;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description 历史关键帧图片（JPEG） */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "image/jpeg": string;
+                };
+            };
+            404: components["responses"]["NotFound"];
+            /** @description 历史素材版本与当前不一致，预览不可确认 */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            503: components["responses"]["DependencyUnavailable"];
         };
     };
     getMaterialKeyframe: {

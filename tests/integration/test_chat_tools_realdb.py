@@ -33,6 +33,7 @@ from xhs_agent.db.models import (
     RunHotspot,
     RunMatch,
 )
+from xhs_agent.services import artifact_versions
 from xhs_agent.services.chat import append_message, create_session
 from xhs_agent.services.chat_tools import (
     ToolContext,
@@ -41,6 +42,7 @@ from xhs_agent.services.chat_tools import (
     search_materials,
 )
 from xhs_agent.services.chat_turns import build_tool_runner
+from xhs_agent.services.run_snapshots import evidence_meta, material_snapshot
 from xhs_agent.services.runs import submit_analysis
 from xhs_agent.tools import llm
 from xhs_agent.tools.llm import LLMResult, StructuredCaller
@@ -199,8 +201,12 @@ async def seed_finished_run(session: AsyncSession, *, hotspot: str = "夜跑球�
         "borrow_angles": ["从夜跑场景切入"],
         "risk_notes": [],
     }
+    run_hotspot.raw_text = hotspot
+    run_hotspot.clue = dict(hotspot_row.clue)
     run_hotspot.status = "succeeded"
     run_hotspot.coverage = {"ratio": 1.0, "covered": [], "gaps": []}
+    run_hotspot.gap_advice = {"items": []}
+    run_hotspot.retrieval_meta = {"index_summary": {"materials_count": 1, "digest": "x"}}
     material = Material(path="夜跑球鞋.mp4", type="video", title="夜里的球鞋",
                         description="夜里跑步的球鞋特写", tags=["夜跑"], elements=[],
                         source="sidecar", width=1080, height=1920, size_bytes=2048)
@@ -211,12 +217,32 @@ async def seed_finished_run(session: AsyncSession, *, hotspot: str = "夜跑球�
              "tags": ["#夜跑"], "cover_text": "", "first_3s": "", "shot_list": [],
              "compliance_notes": []}
     run_hotspot.draft = dict(draft)
+    snapshot = material_snapshot(material)
+    run_hotspot.evidence_meta = {
+        "raw_text": evidence_meta(origin="runtime", source_ref="run:seed/p:1",
+                                  completeness="complete", payload=hotspot),
+        "clue": evidence_meta(origin="runtime", source_ref="run:seed/p:1",
+                              completeness="complete", payload=hotspot_row.clue),
+        "gap_advice": evidence_meta(origin="runtime", source_ref="run:seed/p:1",
+                                    completeness="complete", payload={"items": []}),
+        "retrieval": evidence_meta(origin="runtime", source_ref="run:seed/p:1",
+                                   completeness="complete",
+                                   payload=run_hotspot.retrieval_meta),
+    }
     session.add(RunMatch(run_hotspot_id=run_hotspot.id, material_id=material.id, rank=1,
                          score=Decimal("0.8000"), recall_sources=["literal"],
-                         hits=[], missing=[], reasons=["命中主题「夜跑」"], usage="放开头 3 秒"))
+                         hits=[], missing=[], reasons=["命中主题「夜跑」"],
+                         usage="放开头 3 秒", material_snapshot=snapshot,
+                         evidence_meta={"candidate": evidence_meta(
+                             origin="runtime", source_ref="candidate",
+                             completeness="complete", payload=snapshot)}))
     run = (await session.execute(select(Run).where(Run.id == run_id))).scalar_one()
     run.status = "succeeded"
     run.prompt_versions = {"hotspot_clue": 1, "material_select": 1, "copy_draft": 1}
+    run.execution_snapshot = {"schema_version": 1, "llm": {"model": "fake"}}
+    run.evidence_meta = {"execution": evidence_meta(
+        origin="runtime", source_ref="run:seed", completeness="complete",
+        payload=run.execution_snapshot)}
     await session.commit()
     return str(run_id), draft
 
@@ -350,6 +376,69 @@ class TestReviseDraft:
         assert str(canonical) in prompt
         assert str(old_id) not in prompt
         assert outcome.payload["revised"]["material_id"] == str(canonical)
+
+    async def test_missing_evidence_is_refused_before_any_model_call(
+            self, db_session: AsyncSession, cfg: AppConfig) -> None:
+        run_id, _ = await seed_finished_run(db_session)
+        await db_session.execute(text(
+            "UPDATE run_hotspots SET clue=NULL, evidence_meta='{}'::jsonb "
+            "WHERE run_id=:r"), {"r": run_id})
+        await db_session.execute(text(
+            "UPDATE run_matches SET material_snapshot=NULL, evidence_meta='{}'::jsonb "
+            "WHERE run_hotspot_id IN (SELECT id FROM run_hotspots WHERE run_id=:r)"),
+            {"r": run_id})
+        await db_session.commit()
+        provider = CountingProvider(REVISED_PAYLOAD)
+        ctx = ToolContext(cfg=cfg, session=db_session,
+                          caller=StructuredCaller(provider))
+
+        outcome = await revise_draft(ctx, {"run_id": run_id, "request": "改成避坑向"})
+
+        assert outcome.status == "failed"
+        assert outcome.payload["reason"] == "historical_evidence_incomplete"
+        assert provider.calls == 0
+
+    async def test_base_version_evidence_can_survive_missing_run_snapshot(
+            self, db_session: AsyncSession, cfg: AppConfig) -> None:
+        run_id, original = await seed_finished_run(db_session)
+        row = (await db_session.execute(text(
+            "SELECT material_snapshot::text AS snapshot FROM run_matches LIMIT 1"))).scalar_one()
+        snapshot = json.loads(row)
+        clue = (await db_session.execute(text(
+            "SELECT clue::text FROM run_hotspots WHERE run_id=:r"), {"r": run_id})).scalar_one()
+        evidence = {"schema_version": 1, "origin": "legacy_run_record",
+                    "captured_at": "2026-10-01T00:00:00+00:00",
+                    "source_ref": "run:seed", "digest": "d", "completeness": "complete",
+                    "missing_fields": [], "clue": json.loads(clue),
+                    "material": snapshot, "base_draft": original,
+                    "sources": {}}
+        key = f"draft:{run_id}:1"
+        sid = uuid.UUID((await create_session(db_session))["session_id"])
+        await append_message(db_session, sid, role="assistant", content="draft",
+                             run_id=run_id)
+        version = await artifact_versions.ensure_initial(
+            db_session, session_id=sid, object_key_value=key,
+            object_type="draft", run_id=run_id, position=1, content=original,
+            evidence_snapshot=evidence)
+        # 清理运行快照，只保留基础版本证据
+        await db_session.execute(text(
+            "UPDATE run_hotspots SET clue=NULL, evidence_meta='{}'::jsonb "
+            "WHERE run_id=:r"), {"r": run_id})
+        await db_session.execute(text(
+            "UPDATE run_matches SET material_snapshot=NULL, evidence_meta='{}'::jsonb "
+            "WHERE run_hotspot_id IN (SELECT id FROM run_hotspots WHERE run_id=:r)"),
+            {"r": run_id})
+        await db_session.commit()
+        provider = CountingProvider(REVISED_PAYLOAD)
+        ctx = ToolContext(cfg=cfg, session=db_session, session_id=sid,
+                          caller=StructuredCaller(provider))
+
+        outcome = await revise_draft(ctx, {
+            "run_id": run_id, "base_version_id": str(version.id),
+            "request": "改成避坑向"})
+
+        assert outcome.status == "succeeded", outcome.error
+        assert provider.calls == 1
 
     async def test_refusal_keeps_the_snapshot_and_reports_the_reason(
             self, db_session: AsyncSession, cfg: AppConfig) -> None:

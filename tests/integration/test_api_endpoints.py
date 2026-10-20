@@ -21,6 +21,7 @@ from xhs_agent.config import AppConfig, load_config
 from xhs_agent.core.errors import DependencyUnavailableError
 from xhs_agent.db import Base
 from xhs_agent.db.models import Hotspot, Material, Run, RunHotspot, RunMatch
+from xhs_agent.services.run_snapshots import evidence_meta, material_snapshot
 
 pytestmark = [pytest.mark.integration]
 
@@ -123,24 +124,51 @@ async def _finish_run(db_engine: AsyncEngine, run_id: str) -> str:
                              "body": "正文……", "tags": ["#羽毛球"], "cover_text": "封面",
                              "first_3s": "开头给挥拍特写", "shot_list": ["先拍球场"],
                              "compliance_notes": ["别用明星肖像"]}
+        clue = {"hotspot_raw": "某明星打羽毛球",
+                "why_it_works": ["反差：身份与场景错位"],
+                "mechanisms": [{"name": "反差", "explain": "身份反差"}],
+                "elements": [{"type": "topic", "value": "羽毛球", "weight": 0.9,
+                              "confidence": 0.9, "evidence": "热点原文"}],
+                "match_keywords": ["羽毛球"], "audience": {},
+                "borrow_angles": ["同款球场热场"],
+                "risk_notes": ["别用明星肖像"]}
         hotspot = (await session.execute(
             select(Hotspot).where(Hotspot.id == run_hotspot.hotspot_id))).scalar_one()
-        hotspot.clue = {"hotspot_raw": hotspot.raw_text,
-                        "why_it_works": ["反差：身份与场景错位"],
-                        "mechanisms": [{"name": "反差", "explain": "身份反差"}],
-                        "elements": [{"type": "topic", "value": "羽毛球", "weight": 0.9,
-                                      "confidence": 0.9, "evidence": "热点原文"}],
-                        "match_keywords": ["羽毛球"], "audience": {},
-                        "borrow_angles": ["同款球场热场"],
-                        "risk_notes": ["别用明星肖像"]}
+        hotspot.clue = clue
+        run_hotspot.raw_text = hotspot.raw_text
+        run_hotspot.clue = clue
+        run_hotspot.gap_advice = {"items": [{"type": "topic", "value": "观众",
+                                             "suggestion": "补观众反应"}]}
+        run_hotspot.retrieval_meta = {
+            "literal_recalled": 1, "vector_recalled": 1, "candidates_considered": 1,
+            "index_summary": {"materials_count": 1, "digest": "idx",
+                              "vector_coverage": {"enabled": True, "model": "fake",
+                                                  "total": 1, "with_embedding": 1,
+                                                  "ratio": 1.0}}}
         await session.flush()
+        snapshot = material_snapshot(material)
+        run_hotspot.evidence_meta = {
+            "raw_text": evidence_meta(origin="runtime", source_ref="run:r/p:1",
+                                      completeness="complete", payload=hotspot.raw_text),
+            "clue": evidence_meta(origin="runtime", source_ref="run:r/p:1",
+                                  completeness="complete", payload=clue),
+            "gap_advice": evidence_meta(origin="runtime", source_ref="run:r/p:1",
+                                        completeness="complete",
+                                        payload=run_hotspot.gap_advice),
+            "retrieval": evidence_meta(origin="runtime", source_ref="run:r/p:1",
+                                       completeness="complete",
+                                       payload=run_hotspot.retrieval_meta),
+        }
         session.add(RunMatch(run_hotspot_id=run_hotspot.id, material_id=material.id, rank=1,
                              score=Decimal("0.8123"), recall_sources=["literal", "vector"],
                              hits=[{"element_type": "topic", "clue_value": "羽毛球",
                                     "hit_value": "球场热身", "similarity": 0.9,
                                     "contribution": 0.8}],
                              missing=[], reasons=["命中主题「羽毛球」↔ 素材标签「羽毛球」"],
-                             usage="放开头 3 秒"))
+                             usage="放开头 3 秒", material_snapshot=snapshot,
+                             evidence_meta={"candidate": evidence_meta(
+                                 origin="runtime", source_ref="candidate",
+                                 completeness="complete", payload=snapshot)}))
         run = (await session.execute(select(Run).where(Run.id == uuid.UUID(run_id)))).scalar_one()
         run.status = "succeeded"
         run.finished_at = datetime.now(UTC)
@@ -148,6 +176,12 @@ async def _finish_run(db_engine: AsyncEngine, run_id: str) -> str:
         run.cost_cny = Decimal("0.0123")
         run.latency_ms = 2400
         run.prompt_versions = {"hotspot_clue": 1, "material_select": 1, "copy_draft": 1}
+        run.execution_snapshot = {"schema_version": 1, "llm": {"provider": "fake",
+                                   "model": "fake"}, "retrieval": {"topk": 5},
+                                   "prompt_versions": run.prompt_versions}
+        run.evidence_meta = {"execution": evidence_meta(
+            origin="runtime", source_ref=f"run:{run_id}", completeness="complete",
+            payload=run.execution_snapshot)}
         await session.commit()
         return str(material.id)
 
@@ -251,7 +285,8 @@ class TestRunResults:
         assert response.status_code == 200, response.text
         body = response.json()
         assert set(body) == {"run_id", "status", "created_at", "finished_at", "totals",
-                             "prompt_versions", "hotspots"}
+                             "prompt_versions", "execution_snapshot", "evidence",
+                             "hotspots"}
         assert body["status"] == "succeeded"
         assert body["prompt_versions"] == {"hotspot_clue": 1, "material_select": 1,
                                           "copy_draft": 1}
@@ -259,8 +294,9 @@ class TestRunResults:
                                   "completion_tokens": 150, "cost_cny": 0.0123,
                                   "latency_ms": 2400}
         hotspot = body["hotspots"][0]
-        assert set(hotspot) == {"hotspot_id", "hotspot_raw", "clue", "coverage",
-                                "candidates", "draft"}
+        assert set(hotspot) == {"position", "hotspot_id", "hotspot_raw", "clue", "status",
+                                "error", "coverage", "retrieval_meta", "gap_advice",
+                                "candidates", "draft", "evidence"}
         assert hotspot["hotspot_raw"] == "某明星打羽毛球"
         assert hotspot["clue"]["elements"][0]["value"] == "羽毛球"
         assert hotspot["coverage"]["ratio"] == 1.0
@@ -268,7 +304,8 @@ class TestRunResults:
 
         candidate = hotspot["candidates"][0]
         assert set(candidate) == {"rank", "material_id", "score", "recall_sources", "hits",
-                                  "missing", "reasons", "usage", "material"}
+                                  "missing", "reasons", "usage", "material",
+                                  "current_material", "evidence"}
         assert candidate["material_id"] == material_id
         assert candidate["recall_sources"] == ["literal", "vector"]
         assert candidate["reasons"] and candidate["usage"]

@@ -22,6 +22,8 @@ vi.mock('@/api/chat', () => ({
 vi.mock('@/api/analysis', () => ({
   getRun: vi.fn(),
   getKeyframeUrl: (id: string, index: number) => `/api/materials/${id}/keyframes/${index}`,
+  getRunKeyframeUrl: (run: string, position: number, rank: number, index: number) =>
+    `/api/runs/${run}/hotspots/${position}/candidates/${rank}/keyframes/${index}`,
   ELEMENT_TYPE_LABELS: {
     ip: 'IP', topic: '主题', scene: '场景', visual: '画面', emotion: '情绪',
     sound: '声音', conflict: '冲突', format: '形式', audience: '人群',
@@ -78,8 +80,16 @@ function runDetail(): RunDetail {
     created_at: '2026-10-06T04:00:00+00:00',
     totals: { llm_calls: 3, prompt_tokens: 10, completion_tokens: 5, cost_cny: 0.05, latency_ms: 1200 },
     prompt_versions: { hotspot_clue: 1 },
+    execution_snapshot: {},
+    evidence: {},
     hotspots: [{
+      position: 1,
       hotspot_id: 'h-1',
+      status: 'succeeded',
+      error: null,
+      retrieval_meta: {},
+      gap_advice: null,
+      evidence: {},
       hotspot_raw: '球场上的球拍特写',
       clue: {
         why_it_works: ['日常器材拍出陌生感'],

@@ -67,7 +67,7 @@ from ..core import context_rules
 from ..core import progress as progress_tool
 from ..core.errors import ApiError, BadRequestError, ConflictError
 from ..core.observations import record as record_observation
-from ..db.models import ChatArtifactVersion, ChatMessage
+from ..db.models import ChatArtifactVersion, ChatMessage, MaterialIdAlias
 from ..schemas import TYPE_LABELS, Element, HotspotClue, SchemaError
 from ..services import artifact_versions, context_state, image_cache
 from ..services.chat import latest_run_id, resolve_attachment
@@ -77,13 +77,88 @@ from ..services.image_clue import (
     parse_image_clue_multi,
 )
 from ..services.retrieval import literal_only_candidates, retrieve_candidates
+from ..services.run_snapshots import digest, evidence_meta
 from ..services.runs import load_job, load_run, submit_analysis
 from ..tools.embedding import EmbeddingError
 from ..tools.gaps import gap_advice
 from ..tools.llm import LLMError, StructuredCaller
 from ..tools.vision import sniff_image_mime
-from .material_identity import current_material
-from .materials import row_to_material
+
+
+async def _canonical_base_material(session: Any, base_draft: dict[str, Any]) -> dict[str, Any]:
+    """基础稿持有 E6 旧 UUID 时，经已验证别名映射到规范 ID；不改写版本正文。"""
+    if session is None:
+        return base_draft
+    try:
+        old_id = uuid.UUID(str(base_draft.get("material_id") or ""))
+    except (TypeError, ValueError):
+        return base_draft
+    alias = await session.get(MaterialIdAlias, old_id)
+    if alias is None:
+        return base_draft
+    return {**base_draft, "material_id": str(alias.canonical_id)}
+
+
+
+def _historical_evidence(
+    *, item: dict[str, Any], base_draft: dict[str, Any], run_id: str,
+    position: int, base_version: Any = None,
+) -> tuple[dict[str, Any] | None, list[str]]:
+    """为改稿定位唯一历史证据：基础版本自身 > 本运行冻结快照；缺失则明确拒绝。
+
+    返回 `(evidence, missing_fields)`；不读取当前素材、不猜第一候选或最新运行。
+    """
+    if base_version is not None and isinstance(base_version.evidence_snapshot, dict):
+        stored = dict(base_version.evidence_snapshot or {})
+        stored_missing = [key for key in ("clue", "material", "base_draft")
+                          if not stored.get(key)]
+        if stored and not stored_missing:
+            return stored, []
+    clue = item.get("clue")
+    material_id = str(base_draft.get("material_id") or "")
+    candidates = list(item.get("candidates") or [])
+    matches = [row for row in candidates if str(row.get("material_id") or "") == material_id]
+    material = dict(matches[0].get("material") or {}) if len(matches) == 1 else {}
+    missing: list[str] = []
+    if not isinstance(clue, dict) or not clue:
+        missing.append("clue")
+    if not material or not material.get("id"):
+        missing.append("material")
+    if not base_draft.get("body") and not base_draft.get("titles"):
+        missing.append("base_draft")
+    if missing:
+        return None, missing
+    origins = []
+    for key in ("clue", "candidate"):
+        meta = (item.get("evidence") or {}).get(key) or {}
+        if meta.get("origin"):
+            origins.append(str(meta["origin"]))
+    if not origins:
+        origins = ["legacy_run_record"]
+    origin = "runtime" if all(value == "runtime" for value in origins) else "legacy_run_record"
+    current = dict(matches[0].get("current_material") or {})
+    payload = {
+        "schema_version": 1,
+        "origin": origin,
+        "captured_at": evidence_meta(
+            origin=origin, source_ref=f"run:{run_id}/position:{position}",
+            completeness="complete", payload={})["captured_at"],
+        "source_ref": f"run:{run_id}/position:{position}",
+        "digest": digest({"clue": clue, "material": material, "base_draft": base_draft}),
+        "completeness": "complete",
+        "missing_fields": [],
+        "clue": clue,
+        "material": material,
+        "base_draft": base_draft,
+        "sources": {
+            "clue": (item.get("evidence") or {}).get("clue") or {},
+            "material": (matches[0].get("evidence") or {}).get("candidate") or {},
+        },
+        "current_material": current,
+    }
+    return payload, []
+
+
 
 TOOL_RUN_ANALYSIS = "run_hotspot_analysis"
 TOOL_PARSE_IMAGE = "parse_image_clue"
@@ -1774,6 +1849,9 @@ async def revise_draft(
     req_key = ""
     session_obj = ctx.session
     session_uuid = ctx.session_id
+    initial_evidence, _initial_missing = _historical_evidence(
+        item=item, base_draft=dict(draft), run_id=raw_run, position=index)
+    evidence: dict[str, Any] | None = None
     if versioning and session_obj is not None and session_uuid is not None:
         try:
             initial = await artifact_versions.ensure_initial(
@@ -1789,6 +1867,7 @@ async def revise_draft(
                     str(k): int(v)
                     for k, v in (detail.get("prompt_versions") or {}).items()
                 },
+                evidence_snapshot=initial_evidence,
             )
         except ApiError as exc:
             return ToolOutcome(status="failed", steps=steps, error=_reason(exc))
@@ -1851,6 +1930,25 @@ async def revise_draft(
                 error=f"基础版本内容无法读取：{exc.message}",
             )
 
+        base_draft = await _canonical_base_material(ctx.session, base_draft)
+        evidence, evidence_missing = _historical_evidence(
+            item=item, base_draft=dict(base_draft), run_id=raw_run,
+            position=index, base_version=base,
+        )
+        if evidence is None:
+            if claim is not None:  # pragma: no cover - 当前分支尚未认领
+                await artifact_versions.finish(
+                    ctx.session, claim.row, status="refused",
+                    error="historical_evidence_incomplete")
+            return ToolOutcome(
+                status="failed", steps=steps,
+                payload={"reason": "historical_evidence_incomplete",
+                         "object_key": key,
+                         "base_version_id": str(base.id) if base is not None else None,
+                         "missing_fields": evidence_missing},
+                error="历史依据不完整，无法在缺少证据的情况下改稿；请回到原运行查看并重新选择",
+            )
+
         req_key = artifact_versions.request_key(
             session_uuid,
             key,
@@ -1877,6 +1975,7 @@ async def revise_draft(
             expected_head_version_id=current_head.id if current_head is not None else None,
             expected_state_version=expected_state_version,
             source_message_id=ctx.source_message_id or None,
+            evidence_snapshot=evidence,
         )
         if not claim.is_new and claim.row is not None:
             if claim.status == "succeeded" and isinstance(claim.row.content, dict):
@@ -1946,34 +2045,28 @@ async def revise_draft(
                 if current_head is not None else None,
                 expected_state_version=expected_state_version,
                 source_message_id=ctx.source_message_id or None,
+                evidence_snapshot=evidence,
             )
         if claim.row is None:
             return ToolOutcome(
                 status="failed", steps=steps, error="改写失败：请求认领没有落库，请稍后重试"
             )
 
-    # 基础版本的素材才是此次改稿对象；不能默默改用第一候选。
-    material = None
-    raw_material = str(base_draft.get("material_id") or "")
-    try:
-        if ctx.session is not None:
-            selected = await current_material(ctx.session, uuid.UUID(raw_material))
-            if selected is not None:
-                material = row_to_material(selected).to_dict()
-        else:
-            # 固定样本 / 无数据库调用方只允许精确匹配，不猜别名。
-            matches = [candidate for candidate in item.get("candidates", [])
-                       if str(candidate.get("material_id")
-                              or candidate.get("material", {}).get("id")) == raw_material]
-            if raw_material and len(matches) == 1:
-                material = dict(matches[0].get("material") or {})
-        if material is None:
-            raise ValueError("基础文案关联的素材不存在或无法唯一确定")
-    except (ValueError, ApiError) as exc:
-        if claim is not None:
-            await artifact_versions.finish(ctx.session, claim.row, status="failed", error=str(exc))
-        return ToolOutcome(status="failed", steps=steps, error="改写失败：基础文案素材引用失效",
-                           payload={"reason": "material_reference_missing"})
+    if evidence is None:
+        base_draft = await _canonical_base_material(ctx.session, base_draft)
+        evidence, evidence_missing = _historical_evidence(
+            item=item, base_draft=dict(base_draft), run_id=raw_run,
+            position=index, base_version=None)
+        if evidence is None:
+            return ToolOutcome(
+                status="failed", steps=steps,
+                payload={"reason": "historical_evidence_incomplete",
+                         "object_key": key, "missing_fields": evidence_missing},
+                error="历史依据不完整，无法在缺少证据的情况下改稿；请回到原运行查看并重新选择",
+            )
+    # E8：只用冻结证据里的素材文字；当前素材是否存在不改变改稿依据。
+    assert evidence is not None
+    material = dict(evidence["material"])
     base_draft = {**base_draft, "material_id": str(material["id"])}
     # A05：适用约束快照进入真正的改稿请求（不是只在 supervisor 里提示）
     constraints = await _constraints_for(ctx, object_key=key)
@@ -1981,7 +2074,7 @@ async def revise_draft(
     before = len(ctx.caller.records)
     try:
         outcome = await revise_agent(
-            clue=HotspotClue.from_dict(item.get("clue") or {}),
+            clue=HotspotClue.from_dict(evidence.get("clue") or {}),
             material=material,
             draft=dict(base_draft),
             request=request,
@@ -2056,6 +2149,7 @@ async def revise_draft(
                 prompt_versions=versions,
                 usage=usage,
                 expected_state_version=expected_state_version,
+                evidence_snapshot=evidence,
             )
         except ConflictError as exc:
             await artifact_versions.finish(

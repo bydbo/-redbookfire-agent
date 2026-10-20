@@ -143,6 +143,7 @@ async def claim(
     expected_head_version_id: uuid.UUID | None = None,
     expected_state_version: int | None = None,
     source_message_id: str | None = None,
+    evidence_snapshot: dict[str, Any] | None = None,
 ) -> ClaimResult:
     """认领一次生成请求；重复的 `request_key` 返回既有行（`is_new=False`）。
 
@@ -165,6 +166,7 @@ async def claim(
             expected_state_version=expected_state_version,
             source_message_id=_uuid_or_none(source_message_id),
             source=dict(source or {}),
+            evidence_snapshot=dict(evidence_snapshot or {}),
         )
         .on_conflict_do_nothing(constraint="uq_chat_artifact_versions_session_request")
         .returning(ChatArtifactVersion.id)
@@ -203,6 +205,7 @@ async def ensure_initial(
     content: dict[str, Any],
     source: dict[str, Any] | None = None,
     prompt_versions: dict[str, int] | None = None,
+    evidence_snapshot: dict[str, Any] | None = None,
 ) -> ChatArtifactVersion:
     """把运行初稿登记为对象首个成功版本（幂等）；不修改 `run_hotspots.draft`。
 
@@ -236,6 +239,7 @@ async def ensure_initial(
         content=dict(content),
         source={"actor": "run_initial", **dict(source or {})},
         prompt_versions=dict(prompt_versions or {}),
+        evidence_snapshot=dict(evidence_snapshot or {}),
         usage={},
     )
     session.add(row)
@@ -304,6 +308,7 @@ async def commit_success(
     prompt_versions: dict[str, int] | None = None,
     usage: dict[str, Any] | None = None,
     expected_state_version: int | None = None,
+    evidence_snapshot: dict[str, Any] | None = None,
     commit: bool = True,
 ) -> ChatArtifactVersion:
     """提交一次成功版本：按**认领时固化**的预期提交，不接受模型给的新预期值（§3.4）。
@@ -392,6 +397,8 @@ async def commit_success(
     claim_row.content = dict(content)
     claim_row.prompt_versions = dict(prompt_versions or {})
     claim_row.usage = dict(usage or {})
+    if evidence_snapshot is not None:
+        claim_row.evidence_snapshot = dict(evidence_snapshot)
     claim_row.error = None
     claim_row.updated_at = _now()
     _set_head(chat, object_key_value, claim_row)
@@ -515,6 +522,7 @@ def view(row: ChatArtifactVersion) -> dict[str, Any]:
         "content": dict(row.content) if isinstance(row.content, dict) else None,
         "source": dict(row.source or {}),
         "prompt_versions": {str(k): int(v) for k, v in (row.prompt_versions or {}).items()},
+        "evidence_snapshot": dict(row.evidence_snapshot or {}),
         "usage": dict(row.usage or {}),
         "error": row.error,
         "created_at": row.created_at.isoformat() if row.created_at else "",

@@ -575,9 +575,24 @@ function versionTag(call: { version_no?: number | null; base_version_no?: number
                   <p class="mb-3 text-sm font-medium text-ink-strong">
                     {{ hotspot.hotspot_raw }}
                   </p>
-                  <HotspotResult :hotspot="hotspot" compact />
+                  <HotspotResult :hotspot="hotspot" compact
+                                 :run-id="message.run_id" :position="hotspot.position" />
                 </n-card>
+                <n-alert
+                  v-if="(store.runs[message.run_id]?.hotspots.length ?? 0) === 0"
+                  :type="store.runs[message.run_id]?.status === 'failed' ? 'error' : 'info'"
+                  :title="store.runs[message.run_id]?.status === 'failed'
+                    ? '这次运行没有产出结果' : '这次运行没有热点结果'"
+                >
+                  {{ store.runs[message.run_id]?.hotspots[0]?.error || '可到运行历史查看详情。' }}
+                </n-alert>
               </template>
+              <div
+                v-else-if="message.run_id && message.run_id in store.runs"
+                class="mr-auto text-xs text-ink-muted"
+              >
+                结果暂不可用（run_id：{{ message.run_id }}），可稍后刷新
+              </div>
               <div
                 v-else-if="message.run_id"
                 class="mr-auto text-xs text-ink-muted"

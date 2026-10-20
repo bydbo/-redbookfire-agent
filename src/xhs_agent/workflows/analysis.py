@@ -43,6 +43,7 @@ from ..core.tracing import (
 from ..schemas import HotspotClue
 from ..services.reporting import build_report_model, hotspot_entry, render_and_save
 from ..services.retrieval import RetrievalOutcome, retrieve_candidates
+from ..services.run_snapshots import execution_snapshot
 from ..services.runs import RunRecorder
 from ..tools import gaps as gaps_tool
 from ..tools.http import build_http_client
@@ -286,6 +287,9 @@ def build_graph(
                 "literal_recalled": outcome.literal_recalled,
                 "vector_recalled": outcome.vector_recalled,
                 "candidates_considered": outcome.candidates_considered,
+                # E8：解释模型调用前已读取的素材快照与索引摘要，随结果一起冻结。
+                "material_snapshots": dict(outcome.material_snapshots),
+                "index_summary": dict(outcome.index_summary),
             },
             "prompt_versions": _merge_version(state, explained),
         }
@@ -462,7 +466,7 @@ async def _run_analysis(
         raise ValueError("至少需要一个非空的热点原文")
     tracer = tracer if tracer is not None else get_tracer(cfg)
 
-    recorder = RunRecorder(session, run_id) if run_id is not None else None
+    recorder = RunRecorder(session, run_id, cfg) if run_id is not None else None
     effective_topk = topk
     if effective_topk is None and recorder is not None:
         effective_topk = (
@@ -474,7 +478,11 @@ async def _run_analysis(
             raise ValueError(
                 f"热点数量与 run_hotspots 不一致：传入 {len(raws)}、库里 {total}"
             )
-        await recorder.start()
+        await recorder.start(
+            execution_snapshot(cfg, topk=int(effective_topk or cfg.match.topk),
+                               context_snapshot=await recorder.context_snapshot()),
+            generation=generation,
+        )
 
     store = (
         store
@@ -589,6 +597,7 @@ async def _run_analysis(
                             draft=None,
                             status="failed",
                             error=detail,
+                            generation=generation,
                         )
                     continue
                 model = result.get("report_model") or model
@@ -596,14 +605,23 @@ async def _run_analysis(
                 errors = result.get("errors") or errors
                 report_paths = result.get("report_paths") or report_paths
                 if recorder is not None:
+                    retrieval = result.get("retrieval") or {}
                     await recorder.hotspot_finished(
                         position,
                         clue=result.get("clue") or reused or {},
-                        coverage=(result.get("retrieval") or {}).get("coverage") or {},
-                        candidates=(result.get("retrieval") or {}).get("candidates")
-                        or [],
+                        coverage=retrieval.get("coverage") or {},
+                        candidates=retrieval.get("candidates") or [],
                         draft=result.get("draft"),
                         status="succeeded",
+                        gap_advice=result.get("gap_advice"),
+                        retrieval_meta={
+                            "literal_recalled": retrieval.get("literal_recalled", 0),
+                            "vector_recalled": retrieval.get("vector_recalled", 0),
+                            "candidates_considered": retrieval.get("candidates_considered", 0),
+                            "index_summary": retrieval.get("index_summary") or {},
+                        },
+                        material_snapshots=retrieval.get("material_snapshots") or {},
+                        generation=generation,
                     )
 
         if failed:
@@ -626,6 +644,7 @@ async def _run_analysis(
                 totals=dict(store.state["totals"]),
                 prompt_versions=versions,
                 errors=errors,
+                generation=generation,
             )
         return RunResult(
             run_id=store.run_id,

@@ -19,9 +19,12 @@ from typing import Annotated, Any
 
 from fastapi import APIRouter, Depends, Query
 from fastapi.responses import FileResponse, Response
+from sqlalchemy import select
 
-from ...config import PROJECT_ROOT
+from ...config import PROJECT_ROOT, AppConfig
 from ...core.errors import ConflictError, NotFoundError
+from ...db.models import Run, RunHotspot, RunMatch
+from ...services.material_identity import current_material
 from ...services.runs import (
     UNFINISHED_STATUSES,
     list_runs,
@@ -29,11 +32,26 @@ from ...services.runs import (
     load_report_model,
     load_run,
 )
+from ...tools.material_paths import is_link
 from ...tools.report import render_html, render_markdown
 from ..deps import ConfigDep, SessionDep, request_id_header
 from ..models import ReportFormat, RunDetail, RunList, UuidPath, error_response
 
 router = APIRouter(tags=["结果"], dependencies=[Depends(request_id_header)])
+
+
+def _frame_target(frames: list[str], index: int, cfg: AppConfig) -> Path:
+    """把素材 / 历史快照里的帧路径安全解析到关键帧缓存目录内。"""
+    if index < 0 or index >= len(frames):
+        raise NotFoundError(f"关键帧不存在：[{index}]", {"index": index})
+    root = Path(cfg.index_dir(), "keyframes").resolve()
+    try:
+        target = Path(PROJECT_ROOT, frames[index]).resolve()
+    except OSError as exc:
+        raise NotFoundError(f"关键帧不存在：[{index}]", {"index": index}) from exc
+    if root not in target.parents or is_link(target) or not target.is_file():
+        raise NotFoundError(f"关键帧不存在：[{index}]", {"index": index})
+    return target
 
 
 def _run_uuid(run_id: str) -> uuid.UUID:
@@ -63,9 +81,9 @@ async def get_runs(session: SessionDep,
             responses={404: error_response("资源不存在"),
                        409: error_response("运行尚未完成"),
                        503: error_response("依赖不可用（不做降级，直接返回错误）")})
-async def get_run(run_id: UuidPath, session: SessionDep) -> dict[str, Any]:
-    """读取运行结果：线索、候选素材、覆盖缺口与文稿。"""
-    payload = await load_run(session, _run_uuid(run_id))
+async def get_run(run_id: UuidPath, session: SessionDep, cfg: ConfigDep) -> dict[str, Any]:
+    """读取运行结果：冻结的线索、候选、覆盖缺口与文稿 + 当前素材状态。"""
+    payload = await load_run(session, _run_uuid(run_id), cfg)
     if payload is None:
         raise NotFoundError(f"run 不存在：{run_id}", {"run_id": run_id})
     _require_finished(payload)
@@ -82,7 +100,7 @@ async def get_run_report(run_id: UuidPath, session: SessionDep, cfg: ConfigDep,
                          format: Annotated[ReportFormat, Query()] = "html") -> Response:
     """读取报告：`format=html`（默认）返回单文件 HTML，`format=md` 返回 Markdown 文本。"""
     run_uuid = _run_uuid(run_id)
-    payload = await load_run(session, run_uuid)
+    payload = await load_run(session, run_uuid, cfg)
     if payload is None:
         raise NotFoundError(f"run 不存在：{run_id}", {"run_id": run_id})
     _require_finished(payload)
@@ -109,16 +127,48 @@ async def get_material_keyframe(material_id: UuidPath, index: int,
     帧路径解析后必须位于关键帧缓存目录内，否则同样 404——挡住任何路径穿越。
     """
     frames = await load_material_frames(session, _run_uuid(material_id))
-    if frames is None or index < 0 or index >= len(frames):
+    if frames is None:
         raise NotFoundError(f"关键帧不存在：{material_id}[{index}]",
                             {"material_id": material_id, "index": index})
-    root = Path(cfg.index_dir(), "keyframes").resolve()
-    try:
-        target = Path(PROJECT_ROOT, frames[index]).resolve()
-    except OSError as exc:  # 非法路径字符等
-        raise NotFoundError(f"关键帧不存在：{material_id}[{index}]",
-                            {"material_id": material_id, "index": index}) from exc
-    if root not in target.parents or not target.is_file():
-        raise NotFoundError(f"关键帧不存在：{material_id}[{index}]",
-                            {"material_id": material_id, "index": index})
+    target = _frame_target(frames, index, cfg)
+    return FileResponse(target, media_type="image/jpeg")
+
+
+@router.get("/runs/{run_id}/hotspots/{position}/candidates/{rank}/keyframes/{index}",
+            responses={200: {"description": "历史候选关键帧（JPEG）",
+                             "content": {"image/jpeg": {"schema": {"type": "string",
+                                                                   "format": "binary"}}}},
+                       404: error_response("运行 / 候选 / 关键帧不存在或快照缺失"),
+                       409: error_response("历史素材版本与当前不一致，预览不可确认"),
+                       503: error_response("依赖不可用（不做降级，直接返回错误）")})
+async def get_run_candidate_keyframe(run_id: UuidPath, position: int, rank: int,
+                                     index: int, session: SessionDep,
+                                     cfg: ConfigDep) -> FileResponse:
+    """运行范围关键帧：只从候选快照定位，且必须与当前 UUID / 版本校验一致。"""
+    run_uuid = _run_uuid(run_id)
+    run = (await session.execute(select(Run).where(Run.id == run_uuid))).scalar_one_or_none()
+    if run is None:
+        raise NotFoundError(f"run 不存在：{run_id}", {"run_id": run_id})
+    run_hotspot = (await session.execute(select(RunHotspot).where(
+        RunHotspot.run_id == run_uuid, RunHotspot.position == position))).scalar_one_or_none()
+    if run_hotspot is None:
+        raise NotFoundError("热点不存在", {"position": position})
+    match = (await session.execute(select(RunMatch).where(
+        RunMatch.run_hotspot_id == run_hotspot.id, RunMatch.rank == rank))).scalar_one_or_none()
+    if match is None or not match.material_snapshot:
+        raise NotFoundError("历史候选快照不可用", {"position": position, "rank": rank})
+    snapshot = dict(match.material_snapshot)
+    current = await current_material(session, match.material_id)
+    if current is None:
+        raise NotFoundError("原素材已删除，历史预览不可用",
+                            {"material_id": str(match.material_id)})
+    if str(snapshot.get("fingerprint") or "") != str(current.fingerprint or ""):
+        raise ConflictError("历史素材版本与当前不一致，预览不可确认",
+                            {"reason": "preview_version_mismatch",
+                             "material_id": str(match.material_id)})
+    frames = [str(item) for item in snapshot.get("keyframes") or []]
+    current_frames = [str(item) for item in current.keyframes or []]
+    if index < 0 or index >= len(frames) or frames[index] not in current_frames:
+        raise NotFoundError("历史关键帧不可用", {"index": index})
+    target = _frame_target(frames, index, cfg)
     return FileResponse(target, media_type="image/jpeg")

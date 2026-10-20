@@ -28,6 +28,7 @@ from xhs_agent.services import artifact_versions, chat_tools, context_state
 from xhs_agent.services.chat import append_message, create_session, save_attachment
 from xhs_agent.services.chat_turns import _load_source_binding, _prepare_context
 from xhs_agent.services.image_clue import ImageClueParse
+from xhs_agent.services.run_snapshots import evidence_meta, material_snapshot
 from xhs_agent.tools.llm import BaseProvider, LLMResult, StructuredCaller
 
 pytestmark = [pytest.mark.integration, pytest.mark.asyncio]
@@ -415,7 +416,31 @@ async def test_bound_v1_with_v2_head_reaches_real_revise_input_and_replays(
     original = {"material_id": str(material.id),
                 "titles": [{"text": "夜跑", "style": "建议"}], "body": "D0 初稿",
                 "tags": ["夜跑"], "cover_text": "开始", "first_3s": "慢慢走", "shot_list": [], "compliance_notes": []}
-    db.add(RunHotspot(run_id=run.id, hotspot_id=hotspot.id, position=1, status="succeeded", draft=original))
+    run_hotspot = RunHotspot(run_id=run.id, hotspot_id=hotspot.id, position=1,
+                            status="succeeded", draft=original, raw_text="夜跑",
+                            clue=clue().to_dict(), gap_advice={"items": []},
+                            retrieval_meta={"index_summary": {"materials_count": 1}})
+    db.add(run_hotspot)
+    await db.flush()
+    snapshot = material_snapshot(material)
+    run_hotspot.evidence_meta = {
+        "raw_text": evidence_meta(origin="runtime", source_ref="run:x/p:1",
+                                  completeness="complete", payload="夜跑"),
+        "clue": evidence_meta(origin="runtime", source_ref="run:x/p:1",
+                              completeness="complete", payload=clue().to_dict()),
+        "gap_advice": evidence_meta(origin="runtime", source_ref="run:x/p:1",
+                                    completeness="complete", payload={"items": []}),
+        "retrieval": evidence_meta(origin="runtime", source_ref="run:x/p:1",
+                                   completeness="complete",
+                                   payload=run_hotspot.retrieval_meta),
+    }
+    from xhs_agent.db.models import RunMatch
+    db.add(RunMatch(run_hotspot_id=run_hotspot.id, material_id=material.id, rank=1,
+                    score=0.9, recall_sources=["literal"], reasons=["夜跑"],
+                    hits=[], missing=[], usage="", material_snapshot=snapshot,
+                    evidence_meta={"candidate": evidence_meta(
+                        origin="runtime", source_ref="candidate",
+                        completeness="complete", payload=snapshot)}))
     hotspot.clue = clue().to_dict()
     await db.commit()
     await append_message(db, sid, role="assistant", content="初稿", run_id=str(run.id))

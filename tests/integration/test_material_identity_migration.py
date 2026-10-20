@@ -98,7 +98,7 @@ async def test_merge_archives_exact_values_and_preserves_history(identity_db):
         result = await apply_migration(session, plan)
     assert result["materials_after"] == 2
     assert result["matches_after"] == 2
-    await asyncio.to_thread(command.upgrade, config, "head")
+    await asyncio.to_thread(command.upgrade, config, "0013")
     async with factory() as session:
         canonical = await current_material(session, ids["a"])
         assert canonical.id == ids["b"]

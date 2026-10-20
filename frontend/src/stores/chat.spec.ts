@@ -81,6 +81,8 @@ function runDetail(): RunDetail {
     created_at: '2026-10-06T04:00:00+00:00',
     totals: { llm_calls: 3, prompt_tokens: 10, completion_tokens: 5, cost_cny: 0.05, latency_ms: 1200 },
     prompt_versions: {},
+    execution_snapshot: {},
+    evidence: {},
     hotspots: [],
   }
 }

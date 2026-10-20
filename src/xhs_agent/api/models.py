@@ -611,6 +611,7 @@ class ArtifactVersion(_Response):
     base_version_id: UuidStr | None = None
     content: dict[str, Any] | None = None
     source: dict[str, Any] = Field(default_factory=dict)
+    evidence_snapshot: dict[str, Any]
     error: str | None = None
     updated_at: DateTimeStr = ""
 
@@ -658,6 +659,57 @@ class ChatSessionDetail(_Response):
     context: ChatContext | None = None
 
 
+EvidenceOrigin = Literal["runtime", "legacy_run_record", "migration_capture",
+                         "cutover_capture", "missing"]
+EvidenceCompleteness = Literal["complete", "partial", "missing"]
+
+
+class EvidenceMeta(_Response):
+    """字段组来源 / 完整度 / 摘要；origin 与 completeness 独立。"""
+
+    schema_version: int
+    origin: EvidenceOrigin
+    captured_at: DateTimeStr
+    source_ref: str
+    digest: str
+    completeness: EvidenceCompleteness
+    missing_fields: list[str]
+
+
+class HistoricalMaterial(_Response):
+    """候选在运行当时实际使用的素材摘要（不读当前库覆盖）。"""
+
+    id: UuidStr
+    path: str
+    type: MaterialType
+    title: str
+    description: str
+    tags: list[str]
+    elements: list[Element]
+    duration_s: float
+    width: int
+    height: int
+    has_audio: bool
+    size_bytes: int
+    mtime: DateTimeStr | None
+    source: MaterialSource
+    keyframes: list[str]
+    indexed_at: DateTimeStr | None
+    fingerprint: str
+    embedding_model: str | None
+
+
+class CurrentMaterialStatus(_Response):
+    """当前素材是否还在、文件是否可读、预览是否可用；不写回历史字段。"""
+
+    exists: bool
+    file_available: bool | None
+    preview_available: bool
+    reason: str | None
+    path: str | None
+    title: str | None
+
+
 class MatchCandidate(_Response):
     rank: int
     material_id: UuidStr
@@ -667,7 +719,9 @@ class MatchCandidate(_Response):
     missing: list[Element]
     reasons: list[str] = Field(min_length=1)
     usage: str
-    material: MaterialSummary
+    material: HistoricalMaterial | None
+    current_material: CurrentMaterialStatus
+    evidence: dict[str, EvidenceMeta]
 
 
 class DraftTitle(_Response):
@@ -686,12 +740,18 @@ class Draft(_Response):
 
 
 class HotspotResult(_Response):
+    position: int = Field(ge=1)
     hotspot_id: UuidStr
     hotspot_raw: str
-    clue: HotspotClue
+    clue: HotspotClue | None
+    status: RunStatus
+    error: str | None
     coverage: Coverage
+    retrieval_meta: dict[str, Any]
+    gap_advice: dict[str, Any] | None
     candidates: list[MatchCandidate]
-    draft: Draft | None = None
+    draft: Draft | None
+    evidence: dict[str, EvidenceMeta]
 
 
 class RunDetail(_Response):
@@ -701,6 +761,8 @@ class RunDetail(_Response):
     finished_at: DateTimeStr | None = None
     totals: RunTotals
     prompt_versions: dict[str, int]
+    execution_snapshot: dict[str, Any]
+    evidence: dict[str, EvidenceMeta]
     hotspots: list[HotspotResult]
 
 

@@ -37,6 +37,7 @@ from ..tools import retrieval as retrieval_tool
 from ..tools.embedding import EmbeddingClient, build_embedder
 from ..tools.http import build_http_client
 from .materials import row_to_material
+from .run_snapshots import digest, material_snapshot
 
 # 通道 A 的文本表达式必须与数据契约 §4.1 的索引表达式逐字一致，
 # 否则查询走不到 `ix_materials_text_trgm`（gin_trgm_ops）。
@@ -77,6 +78,9 @@ class RetrievalOutcome:
     literal_recalled: int = 0
     vector_recalled: int = 0
     candidates_considered: int = 0
+    # E8：本次检索实际读到的候选素材快照与索引清单摘要；在模型解释前固化。
+    material_snapshots: dict[str, dict[str, Any]] = field(default_factory=dict)
+    index_summary: dict[str, Any] = field(default_factory=dict)
 
 
 async def literal_recall(session: AsyncSession, keywords: list[str], *, limit: int,
@@ -239,10 +243,32 @@ async def retrieve_candidates(session: AsyncSession, cfg: AppConfig, clue: Hotsp
     order = {material_id: index for index, material_id in enumerate(material_ids)}
     materials = sorted((row_to_material(row) for row in rows),
                        key=lambda material: order.get(material.id, 0))
+    by_id = {str(row.id): row for row in rows}
+    outcome.material_snapshots = {
+        material.id: material_snapshot(by_id[material.id])
+        for material in materials if material.id in by_id
+    }
     outcome.candidates_considered = len(materials)
     outcome.candidates, outcome.coverage = retrieval_tool.rank_candidates(
         clue, materials, channel_ranks, params, now=now)
+    outcome.index_summary = await _index_summary(session, outcome.vector_coverage)
     return outcome
+
+
+async def _index_summary(session: AsyncSession, coverage: VectorCoverage) -> dict[str, Any]:
+    """索引清单摘要：同一读快照里的素材身份 / 指纹 / 索引时间 / 向量模型。"""
+    rows = (await session.execute(text(
+        "SELECT id::text AS id, path, coalesce(fingerprint, '') AS fingerprint, "
+        "coalesce(indexed_at::text, '') AS indexed_at, "
+        "coalesce(embedding_model, '') AS embedding_model "
+        "FROM materials ORDER BY id"))).mappings().all()
+    digest_input = [dict(row) for row in rows]
+    return {
+        "schema_version": 1,
+        "materials_count": len(rows),
+        "digest": digest(digest_input),
+        "vector_coverage": coverage.to_dict(),
+    }
 
 
 async def literal_only_candidates(session: AsyncSession, cfg: AppConfig, clue: HotspotClue, *,

@@ -93,6 +93,8 @@ class TestResponseModels:
             "totals": {"llm_calls": 0, "prompt_tokens": 0, "completion_tokens": 0,
                        "cost_cny": 0.0, "latency_ms": 0},
             "prompt_versions": {},
+            "execution_snapshot": {},
+            "evidence": {},
             "hotspots": [],
             "extra_field": "keep-me",
         }
