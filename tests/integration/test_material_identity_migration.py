@@ -368,7 +368,7 @@ async def test_second_batch_repoints_alias_and_both_batches_verify(identity_db):
     async with factory() as session:
         with pytest.raises(ValueError, match="来源批次"):
             await verify_migration(session, uuid.UUID(second["batch_id"]))
-    await asyncio.to_thread(command.upgrade, config, "head")
+    await asyncio.to_thread(command.upgrade, config, "0013")
 
 
 async def test_audit_rejects_forged_repoint_without_later_batch(identity_db):

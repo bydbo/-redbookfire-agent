@@ -25,18 +25,38 @@ from ..db.models import (
     E8SnapshotBatch,
     Hotspot,
     Material,
+    MaterialIdentityBatch,
     Run,
     RunHotspot,
     RunMatch,
 )
-from .material_identity_migration import database_identity
-from .material_identity_migration import digest as identity_digest
-from .run_snapshots import canonical, digest, evidence_meta, utc_now_iso
+from .material_identity_migration import _verify_archive as verify_identity_archive
+from .material_identity_migration import _verify_plan_integrity as verify_identity_plan
+from .material_identity_migration import database_identity, encoded
+from .run_snapshots import (
+    COMPLETENESS,
+    ORIGINS,
+    canonical,
+    digest,
+    evidence_meta,
+    text_evidence_missing,
+    utc_now_iso,
+)
 
-RULE_VERSION = 1
+RULE_VERSION = 2
 LOCK_KEY = 728_001
 TABLES = ("runs", "run_hotspots", "run_matches", "chat_artifact_versions", "materials",
-          "hotspots", "material_identity_archive")
+          "hotspots", "material_identity_archive", "material_identity_batches",
+          "material_id_aliases", "alembic_version")
+
+# Existing business values remain authoritative. Stage progress / updated_at are
+# operational metadata and are not immutable evidence after service resumes.
+PROTECTED_EXCLUDED = {
+    "runs": ("execution_snapshot", "evidence_meta", "stage"),
+    "run_hotspots": ("raw_text", "clue", "gap_advice", "retrieval_meta", "evidence_meta"),
+    "run_matches": ("material_snapshot", "evidence_meta"),
+    "chat_artifact_versions": ("evidence_snapshot", "updated_at"),
+}
 
 
 def _iso(value: datetime | None) -> str | None:
@@ -56,6 +76,7 @@ def _material_record_snapshot(record: Mapping[str, Any]) -> dict[str, Any]:
     keyframes = [str(item) for item in record.get("keyframes") or []]
     return {
         "id": str(record.get("id") or ""),
+        "original_material_id": str(record.get("id") or ""),
         "path": str(record.get("path") or ""),
         "type": str(record.get("type") or "video"),
         "title": str(record.get("title") or ""),
@@ -71,6 +92,7 @@ def _material_record_snapshot(record: Mapping[str, Any]) -> dict[str, Any]:
         "source": str(record.get("source") or "filename"),
         "keyframes": keyframes,
         "keyframe_digest": digest(keyframes),
+        "keyframe_contents": [],  # E6 did not capture image bytes at run time.
         "indexed_at": record.get("indexed_at"),
         "fingerprint": str(record.get("fingerprint") or ""),
         "embedding_model": record.get("embedding_model"),
@@ -96,25 +118,120 @@ def _snapshot_from_row(row: Material) -> dict[str, Any]:
         "source": row.source,
         "keyframes": keyframes,
         "keyframe_digest": digest(keyframes),
+        "keyframe_contents": [],  # Cutover files cannot prove the historical image version.
         "indexed_at": _iso(row.indexed_at),
         "fingerprint": row.fingerprint or "",
         "embedding_model": row.embedding_model,
     }
 
 
-async def _e6_materials(session: AsyncSession) -> dict[str, tuple[dict[str, Any], str]]:
-    """E6 归档中的 materials（逐条先用归档自带 digest 校验，坏记录不参与回填）。"""
-    rows = (await session.execute(text(
-        "SELECT original_key, record::text AS record, digest FROM material_identity_archive "
-        "WHERE entity_type = 'materials' ORDER BY batch_id, original_key"))).mappings().all()
-    out: dict[str, tuple[dict[str, Any], str]] = {}
-    for row in rows:
-        record = json.loads(str(row["record"]), parse_float=Decimal)
-        if identity_digest(record) != str(row["digest"]):
-            raise ValueError(f"E6 归档摘要校验失败：materials/{row['original_key']}")
-        valid = json.loads(str(row["record"]), parse_float=Decimal)
-        out[str(row["original_key"])] = (valid, str(row["digest"]))
-    return out
+async def _e6_sources(session: AsyncSession) -> dict[str, Any]:
+    """Use only batches whose plan, manifest and every archive record verify.
+
+    Candidate decisions select the actual original material, which can differ
+    from the canonical material chosen by E6. Multiple owners are an error.
+    """
+    batches = (await session.execute(select(MaterialIdentityBatch).order_by(
+        MaterialIdentityBatch.created_at, MaterialIdentityBatch.id))).scalars().all()
+    material_sources: dict[str, list[dict[str, Any]]] = {}
+    decisions: dict[tuple[str, str], dict[str, Any]] = {}
+    aliases: dict[str, str] = {}
+    source_refs = []
+    for batch in batches:
+        if batch.status not in {"applied", "verified"}:
+            raise ValueError("E6 批次尚未成功应用，不能作为历史来源")
+        verify_identity_plan(batch)
+        await verify_identity_archive(session, batch)
+        aliases.update({str(old): str(new) for old, new in batch.plan["aliases"].items()})
+        rows = (await session.execute(text(
+            "SELECT entity_type, original_key, record::text AS record, digest "
+            "FROM material_identity_archive WHERE batch_id=:b ORDER BY entity_type,original_key"),
+            {"b": batch.id})).mappings().all()
+        archives = {(str(row["entity_type"]), str(row["original_key"])): {
+            "record": json.loads(str(row["record"]), parse_float=Decimal),
+            "ref": f"e6:{batch.id}/{row['entity_type']}/{row['original_key']}:{row['digest']}",
+        } for row in rows}
+        for (entity, key), archive in archives.items():
+            if entity == "materials":
+                if str(archive["record"].get("id")) != key:
+                    raise ValueError("E6 素材归档身份与主键不一致")
+                material_sources.setdefault(key, []).append(archive)
+        for decision in batch.plan.get("candidate_decisions") or []:
+            candidate_key = (str(decision["run_hotspot_id"]), str(decision["canonical_id"]))
+            if candidate_key in decisions:
+                raise ValueError("E6 候选归属不唯一，不能任选归档")
+            original = str(decision["original_material_id"])
+            candidate = archives.get(("run_matches", f"{candidate_key[0]}:{original}"))
+            material = archives.get(("materials", original))
+            if candidate is None or material is None:
+                raise ValueError("E6 候选所需的原素材或候选归档缺失")
+            if (str(candidate["record"].get("run_hotspot_id")) != candidate_key[0]
+                    or str(candidate["record"].get("material_id")) != original):
+                raise ValueError("E6 候选归档身份不一致")
+            decisions[candidate_key] = {"candidate": candidate["record"], "material": material}
+        source_refs.append({"batch_id": str(batch.id), "plan_digest": batch.plan_digest,
+                            "manifest": batch.plan["archive_manifest"]})
+    actual_aliases = {str(row.old_id): str(row.canonical_id) for row in (
+        await session.execute(text("SELECT old_id,canonical_id FROM material_id_aliases"))).all()}
+    if (actual_aliases != aliases or any(value in aliases or key == value
+                                        for key, value in aliases.items())):
+        raise ValueError("E6 别名与已验证批次不一致或存在链环")
+    return {"materials": material_sources, "decisions": decisions, "sources": source_refs,
+            "aliases": aliases}
+
+
+async def _protected_records(session: AsyncSession) -> dict[str, list[dict[str, str]]]:
+    """Lossless business records keyed by identity, without a second result store."""
+    await session.execute(text("SET LOCAL TIME ZONE 'UTC'"))
+    output: dict[str, list[dict[str, str]]] = {}
+    for table, excluded in PROTECTED_EXCLUDED.items():
+        # Identifiers / excluded columns are module constants, never user input.
+        columns = ",".join(f"'{name}'" for name in excluded)
+        rows = (await session.execute(text(
+            f"SELECT (to_jsonb(t) - ARRAY[{columns}]::text[])::text FROM {table} t"
+        ))).scalars().all()
+        records = []
+        for raw in rows:
+            record = json.loads(raw, parse_float=Decimal)
+            key = (f"{record['run_hotspot_id']}:{record['material_id']}"
+                   if table == "run_matches" else str(record["id"]))
+            records.append({"key": key, "record": encoded(record)})
+        output[table] = sorted(records, key=lambda item: item["key"])
+    return output
+
+
+def _validate_existing_group(meta: Any, payload: Any, *, name: str) -> None:
+    """A later plan must not re-sign corrupted already accepted evidence."""
+    if (not isinstance(meta, dict) or meta.get("schema_version") != 1
+            or meta.get("origin") not in ORIGINS
+            or meta.get("completeness") not in COMPLETENESS
+            or not meta.get("source_ref") or not meta.get("captured_at")
+            or not isinstance(meta.get("missing_fields"), list)
+            or (meta["completeness"] == "complete" and meta["missing_fields"])
+            or (meta["origin"] == "missing" and meta["completeness"] != "missing")):
+        raise ValueError(f"既有 {name} 证据元信息非法")
+    expected = digest(payload) if payload is not None else ""
+    accepted_digests = {expected}
+    if meta["completeness"] == "missing" and payload in (None, {}, []):
+        accepted_digests.add("")
+    if meta.get("digest") not in accepted_digests:
+        raise ValueError(f"既有 {name} 快照与证据摘要不一致")
+
+
+def _validate_existing_artifact(snapshot: Mapping[str, Any]) -> None:
+    if snapshot.get("completeness") == "missing":
+        _validate_existing_group(snapshot, None, name="artifact")
+        return
+    payload = {key: snapshot.get(key) for key in ("clue", "material", "base_draft")}
+    _validate_existing_group(snapshot, payload, name="artifact")
+    if text_evidence_missing(payload["clue"], payload["material"], payload["base_draft"]):
+        raise ValueError("既有 artifact 文字依据不完整")
+    sources = snapshot.get("sources") or {}
+    for key in ("clue", "material"):
+        _validate_existing_group(sources.get(key), payload[key], name=f"artifact.sources.{key}")
+        if (sources[key]["origin"] == "missing"
+                or sources[key]["completeness"] != "complete"):
+            raise ValueError("既有 artifact 来源不完整")
 
 
 def _run_evidence(captured_at: str, run_id: uuid.UUID) -> dict[str, Any]:
@@ -127,6 +244,7 @@ def _run_evidence(captured_at: str, run_id: uuid.UUID) -> dict[str, Any]:
 def _hotspot_evidence(
     *, captured_at: str, run_id: uuid.UUID, position: int, raw: str | None,
     clue: dict[str, Any] | None, coverage: dict[str, Any], draft: dict[str, Any] | None,
+    candidate_count: int,
 ) -> dict[str, Any]:
     source_ref = f"run:{run_id}/position:{position}"
     meta = {
@@ -152,6 +270,10 @@ def _hotspot_evidence(
         "retrieval": evidence_meta(
             origin="missing", source_ref=source_ref, captured_at=captured_at,
             completeness="missing", payload=None, missing_fields=["retrieval_meta"]),
+        "candidate_integrity": evidence_meta(
+            origin="legacy_run_record", source_ref=source_ref, captured_at=captured_at,
+            completeness="partial", payload={"count": candidate_count},
+            missing_fields=["deleted_candidates_unknown"]),
     }
     return meta
 
@@ -160,14 +282,18 @@ def _artifact_evidence(
     *, captured_at: str, run_id: str | None, position: int | None,
     content: dict[str, Any] | None, clue: dict[str, Any] | None,
     material: dict[str, Any] | None, clue_origin: str, material_origin: str,
+    canonical_material_id: str = "",
 ) -> dict[str, Any]:
-    missing = []
-    if not clue:
-        missing.append("clue")
-    if not material:
-        missing.append("material")
-    if not content:
-        missing.append("content")
+    missing = text_evidence_missing(clue, material, content)
+    if clue_origin == "missing":
+        missing.append("sources.clue")
+    if material_origin == "missing":
+        missing.append("sources.material")
+    if (isinstance(content, dict) and isinstance(material, dict)
+            and str(content.get("material_id") or "") != str(material.get("id") or "")):
+        # E6 aliases prove canonical identity, not that two distinct original
+        # descriptions were interchangeable when the draft was generated.
+        missing.append("material_identity")
     source_ref = f"run:{run_id}/position:{position}"
     if missing:
         return {"schema_version": 1, "origin": "missing", "captured_at": captured_at,
@@ -182,6 +308,8 @@ def _artifact_evidence(
         "digest": digest({"clue": clue, "material": material, "base_draft": content}),
         "completeness": "complete", "missing_fields": [],
         "clue": clue, "material": material, "base_draft": content,
+        "canonical_material_id": canonical_material_id,
+        "draft_original_material_id": str((content or {}).get("material_id") or ""),
         "sources": {
             "clue": evidence_meta(origin=clue_origin, source_ref=source_ref,
                                   captured_at=captured_at, completeness="complete",
@@ -201,7 +329,21 @@ async def build_plan(
     captured_at = captured_at or utc_now_iso()
     revision = str((await session.execute(text(
         "SELECT version_num FROM alembic_version"))).scalar_one())
-    e6 = await _e6_materials(session)
+    await session.execute(text("SET LOCAL TIME ZONE 'UTC'"))
+    # Existing batches are independent anchors for the original business values.
+    # Rebuilding a new plan from today's rows must never bless an older damaged
+    # score / reason simply because its material snapshot digest still matches.
+    batches = (await session.execute(select(E8SnapshotBatch).order_by(
+        E8SnapshotBatch.applied_at, E8SnapshotBatch.id))).scalars().all()
+    for batch in batches:
+        if batch.rule_version != RULE_VERSION:
+            raise ValueError("既有 E8 旧规则批次缺少完整历史保护锚点，不能生成新的可执行计划")
+        await verify_snapshot(session, batch.id, record_result=False)
+    database_schema = str((await session.execute(text("SELECT current_schema()"))).scalar_one())
+    e6 = await _e6_sources(session)
+    protected_records = await _protected_records(session)
+    protected_matches = {item["key"]: json.loads(item["record"], parse_float=Decimal)
+                         for item in protected_records["run_matches"]}
     runs = (await session.execute(select(Run).order_by(Run.id))).scalars().all()
     hotspots = (
         await session.execute(select(RunHotspot).order_by(RunHotspot.run_id, RunHotspot.position))
@@ -226,21 +368,35 @@ async def build_plan(
     run_targets = []
     for run in runs:
         existing_evidence = dict(run.evidence_meta or {})
-        if run.execution_snapshot and existing_evidence.get("execution"):
+        if existing_evidence.get("execution"):
+            _validate_existing_group(existing_evidence["execution"], dict(run.execution_snapshot or {}),
+                                     name="run.execution")
             execution_evidence = existing_evidence["execution"]
         else:
             execution_evidence = _run_evidence(captured_at, run.id)["execution"]
         run_targets.append({
             "id": str(run.id),
             "execution_snapshot": dict(run.execution_snapshot or {}),
-            "evidence_meta": {"execution": execution_evidence},
+            "evidence_meta": {**existing_evidence, "execution": execution_evidence},
         })
-    hotspot_targets = []
+    hotspot_targets: list[dict[str, Any]] = []
     for row in hotspots:
         existing = dict(row.evidence_meta or {})
-        if (existing.get("clue") or {}).get("origin") == "runtime" and row.clue:
+        candidate_count = sum(match.run_hotspot_id == row.id for match in matches)
+        if existing.get("clue"):
+            for name, payload in (("raw_text", row.raw_text), ("clue", row.clue),
+                                  ("coverage", row.coverage), ("draft", row.draft),
+                                  ("gap_advice", row.gap_advice), ("retrieval", row.retrieval_meta),
+                                  ("candidate_integrity", {"count": candidate_count})):
+                if name in existing:
+                    _validate_existing_group(existing[name], payload, name=f"hotspot.{name}")
+            existing.setdefault("candidate_integrity", evidence_meta(
+                origin="legacy_run_record", source_ref=f"run:{row.run_id}/position:{row.position}",
+                captured_at=captured_at, completeness="partial", payload={"count": candidate_count},
+                missing_fields=["deleted_candidates_unknown"]))
             hotspot_targets.append({
-                "id": str(row.id), "raw_text": row.raw_text, "clue": dict(row.clue),
+                "id": str(row.id), "raw_text": row.raw_text,
+                "clue": dict(row.clue) if row.clue is not None else None,
                 "gap_advice": dict(row.gap_advice or {}) or None,
                 "retrieval_meta": dict(row.retrieval_meta or {}),
                 "evidence_meta": existing,
@@ -261,7 +417,8 @@ async def build_plan(
             "retrieval_meta": dict(row.retrieval_meta or {}),
             "evidence_meta": _hotspot_evidence(
                 captured_at=captured_at, run_id=row.run_id, position=row.position,
-                raw=raw, clue=clue, coverage=dict(row.coverage or {}), draft=row.draft),
+                raw=raw, clue=clue, coverage=dict(row.coverage or {}), draft=row.draft,
+                candidate_count=candidate_count),
         })
     match_targets: list[dict[str, Any]] = []
     match_origins: dict[tuple[str, str], str] = {}
@@ -269,20 +426,36 @@ async def build_plan(
              "materials_missing": 0, "artifacts_complete": 0, "artifacts_missing": 0}
     for match in matches:
         existing_candidate = (dict(match.evidence_meta or {}).get("candidate") or {})
-        if (match.material_snapshot is not None
-                and existing_candidate.get("origin") == "runtime"):
+        if existing_candidate:
+            _validate_existing_group(existing_candidate, match.material_snapshot,
+                                     name="candidate.material")
             match_targets.append({
                 "run_hotspot_id": str(match.run_hotspot_id),
                 "material_id": str(match.material_id),
-                "material_snapshot": dict(match.material_snapshot),
+                "material_snapshot": dict(match.material_snapshot)
+                if match.material_snapshot is not None else None,
                 "evidence_meta": dict(match.evidence_meta or {}),
             })
-            match_origins[(str(match.run_hotspot_id), str(match.material_id))] = "runtime"
+            preserved_origin = str(existing_candidate.get("origin") or "missing")
+            match_origins[(str(match.run_hotspot_id), str(match.material_id))] = preserved_origin
+            if preserved_origin in {"migration_capture", "cutover_capture", "missing"}:
+                stats[f"materials_{preserved_origin}"] += 1
             continue
-        archived = e6.get(str(match.material_id))
+        decision = e6["decisions"].get((str(match.run_hotspot_id), str(match.material_id)))
+        if decision is not None:
+            current_record = protected_matches[f"{match.run_hotspot_id}:{match.material_id}"]
+            if any(current_record.get(key) != decision["candidate"].get(key)
+                   for key in ("rank", "score", "recall_sources", "hits", "missing", "reasons", "usage")):
+                raise ValueError("E6 候选业务字段与归档不符，不能证明原素材归属")
+            archived = decision["material"]
+        else:
+            sources = e6["materials"].get(str(match.material_id), [])
+            if len(sources) > 1:
+                raise ValueError("E6 素材归档来源不唯一，不能任选批次")
+            archived = sources[0] if sources else None
         if archived is not None:
-            snapshot = _material_record_snapshot(archived[0])
-            origin, source_ref = "migration_capture", f"e6:{archived[1]}"
+            snapshot = _material_record_snapshot(archived["record"])
+            origin, source_ref = "migration_capture", archived["ref"]
             stats["materials_migration_capture"] += 1
         elif match.material_id in current_materials:
             snapshot = _snapshot_from_row(current_materials[match.material_id])
@@ -314,13 +487,14 @@ async def build_plan(
         await session.execute(select(ChatArtifactVersion).order_by(ChatArtifactVersion.id))
     ).scalars().all()
     for artifact in artifacts:
-        if (artifact.evidence_snapshot
-                and (artifact.evidence_snapshot or {}).get("origin") == "runtime"):
+        if artifact.evidence_snapshot:
+            _validate_existing_artifact(artifact.evidence_snapshot)
             artifact_targets.append({
                 "id": str(artifact.id),
                 "evidence_snapshot": dict(artifact.evidence_snapshot),
             })
-            stats["artifacts_complete"] += 1
+            stats["artifacts_complete" if artifact.evidence_snapshot.get("completeness") == "complete"
+                  else "artifacts_missing"] += 1
             continue
         if artifact.object_type != "draft" or not artifact.run_id:
             artifact_targets.append({
@@ -339,6 +513,8 @@ async def build_plan(
         material_id = ""
         if isinstance(artifact.content, dict):
             material_id = str(artifact.content.get("material_id") or "")
+        # Resolve only verified E6 aliases; never rewrite the version content.
+        material_id = e6["aliases"].get(material_id, material_id)
         artifact_match = next((item for item in matches
                                if run_hotspot is not None
                                and item.run_hotspot_id == run_hotspot.id
@@ -352,20 +528,18 @@ async def build_plan(
             material_origin = match_origins.get(
                 (str(artifact_match.run_hotspot_id), str(artifact_match.material_id)),
                 "missing")
-        clue = dict(run_hotspot.clue) if run_hotspot is not None and run_hotspot.clue else None
-        if clue is None and run_hotspot is not None:
-            hotspot_row = shared.get(run_hotspot.hotspot_id)
-            if hotspot_row is not None and hotspot_row.clue:
-                clue = dict(hotspot_row.clue)
-        clue_meta = ((run_hotspot.evidence_meta or {}).get("clue")
-                     if run_hotspot is not None else None) or {}
+        planned_hotspot = next((target for target in hotspot_targets
+                                if run_hotspot is not None
+                                and target["id"] == str(run_hotspot.id)), {})
+        clue = dict(planned_hotspot["clue"]) if planned_hotspot.get("clue") else None
+        clue_meta = (planned_hotspot.get("evidence_meta") or {}).get("clue") or {}
         clue_origin = str(clue_meta.get("origin") or ("cutover_capture" if clue else "missing"))
         evidence = _artifact_evidence(
             captured_at=captured_at, run_id=str(artifact.run_id),
             position=artifact.hotspot_position,
             content=dict(artifact.content) if isinstance(artifact.content, dict) else None,
             clue=clue, material=material, clue_origin=clue_origin,
-            material_origin=material_origin)
+            material_origin=material_origin, canonical_material_id=material_id)
         stats["artifacts_complete" if evidence["completeness"] == "complete"
               else "artifacts_missing"] += 1
         artifact_targets.append({"id": str(artifact.id),
@@ -376,6 +550,8 @@ async def build_plan(
         "run_matches": len(match_targets), "artifacts": len(artifact_targets), **stats,
     }
     source_digest = digest({
+        "protected_records": protected_records,
+        "e6_sources": e6["sources"],
         "runs": [{
             "id": str(row.id), "topk": row.topk, "status": row.status,
             "prompt_versions": dict(row.prompt_versions or {}),
@@ -413,7 +589,9 @@ async def build_plan(
     plan: dict[str, Any] = {
         "rule_version": RULE_VERSION, "code_version": code_version,
         "schema_revision": revision, "database": identity,
+        "database_schema": database_schema,
         "captured_at": captured_at, "counts": counts, "source_digest": source_digest,
+        "protected_records": protected_records,
         "targets": {
             "runs": run_targets, "run_hotspots": hotspot_targets,
             "run_matches": match_targets, "artifacts": artifact_targets,
@@ -429,6 +607,7 @@ async def build_plan(
 
 
 async def plan_snapshot(session: AsyncSession, *, code_version: str) -> dict[str, Any]:
+    await session.execute(text("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY"))
     return await build_plan(session, code_version=code_version,
                             identity=await database_identity(session))
 
@@ -440,6 +619,10 @@ def _verify_plan_integrity(plan: Mapping[str, Any]) -> None:
         raise ValueError("计划摘要不一致（内容被修改）")
     if str(plan.get("rule_version")) != str(RULE_VERSION):
         raise ValueError("规则版本不兼容")
+    if str(plan.get("batch_id")) != str(uuid.uuid5(uuid.NAMESPACE_URL, str(plan["plan_digest"]))):
+        raise ValueError("批次 ID 与计划摘要不一致")
+    if not isinstance(plan.get("protected_records"), dict):
+        raise ValueError("计划缺少受保护业务记录")
 
 
 async def apply_snapshot(
@@ -447,23 +630,32 @@ async def apply_snapshot(
 ) -> dict[str, Any]:
     """事务内重建计划并核对，再按目标写入；已有批次只读返回。"""
     _verify_plan_integrity(plan)
+    if str(plan.get("code_version")) != code_version:
+        raise ValueError("代码版本与批准计划不一致，请重新 plan")
     if not plan.get("executable"):
         raise ValueError("计划不可执行：缺少可读的数据库集群身份")
     batch_id = uuid.UUID(str(plan["batch_id"]))
     async with session.begin():
+        # Stop every writer (including direct CLI calls) between source comparison
+        # and verification. Advisory lock alone does not fence ordinary writes.
+        await session.execute(text("LOCK TABLE " + ", ".join(TABLES) + " IN SHARE ROW EXCLUSIVE MODE"))
         if await database_identity(session) != plan["database"]:
             raise ValueError("计划不属于当前数据库")
+        revision = str((await session.execute(text("SELECT version_num FROM alembic_version"))).scalar_one())
+        schema = str((await session.execute(text("SELECT current_schema()"))).scalar_one())
+        if revision != plan["schema_revision"] or schema != plan["database_schema"]:
+            raise ValueError("数据库 schema / 迁移版本与批准计划不一致")
         await session.execute(text("SELECT pg_advisory_xact_lock(:key)"),
                               {"key": LOCK_KEY})
         existing = await session.get(E8SnapshotBatch, batch_id)
         if existing is not None:
-            await verify_snapshot(session, batch_id)
+            await verify_snapshot(session, batch_id, commit=False)
             return {"batch_id": str(batch_id), "status": "already_applied",
                     **dict(existing.counts or {})}
         rebuilt = await build_plan(session, code_version=code_version,
                                    identity=plan["database"],
                                    captured_at=str(plan["captured_at"]))
-        if rebuilt["targets"] != plan["targets"] or rebuilt["source_digest"] != plan["source_digest"]:
+        if rebuilt != dict(plan):
             raise ValueError("计划已过期或与源数据不符，请重新 plan")
         for target in plan["targets"]["runs"]:
             await session.execute(text(
@@ -501,12 +693,13 @@ async def apply_snapshot(
             plan_digest=plan["plan_digest"], source_digest=plan["source_digest"],
             plan=dict(plan), counts=dict(plan["counts"]), status="applied"))
         await session.flush()
-        result = await verify_snapshot(session, batch_id, commit=False)
+        result = await verify_snapshot(session, batch_id, commit=False, exact=True)
     return result
 
 
 async def verify_snapshot(session: AsyncSession, batch_id: uuid.UUID, *,
-                          commit: bool = True) -> dict[str, Any]:
+                          commit: bool = True, exact: bool = False,
+                          record_result: bool = True) -> dict[str, Any]:
     batch = await session.get(E8SnapshotBatch, batch_id)
     if batch is None:
         raise ValueError("E8 快照批次不存在")
@@ -514,6 +707,31 @@ async def verify_snapshot(session: AsyncSession, batch_id: uuid.UUID, *,
     _verify_plan_integrity(plan)
     if str(batch.plan_digest) != str(plan["plan_digest"]):
         raise ValueError("批次计划摘要不一致")
+    if (str(batch.id) != str(plan["batch_id"])
+            or batch.rule_version != plan["rule_version"]
+            or batch.code_version != plan["code_version"]
+            or batch.schema_revision != plan["schema_revision"]
+            or batch.database != plan["database"]
+            or batch.source_digest != plan["source_digest"]
+            or dict(batch.counts) != plan["counts"]):
+        raise ValueError("批次字段与已批准计划不一致")
+    actual_protected = await _protected_records(session)
+    for table, expected_rows in plan["protected_records"].items():
+        actual_by_key = {item["key"]: item["record"] for item in actual_protected[table]}
+        if any(actual_by_key.get(item["key"]) != item["record"] for item in expected_rows):
+            raise ValueError(f"{table} 受保护业务字段核验失败")
+    # New runs / versions after cutover are expected. New hotspots / candidates
+    # inside a protected historical run are not: they change its old result.
+    protected_run_ids = {item["id"] for item in plan["targets"]["runs"]}
+    protected_hotspot_ids = {item["id"] for item in plan["targets"]["run_hotspots"]}
+    expected_hotspots = {item["key"] for item in plan["protected_records"]["run_hotspots"]}
+    actual_hotspots = {item["key"] for item in actual_protected["run_hotspots"]
+                       if json.loads(item["record"])["run_id"] in protected_run_ids}
+    expected_matches = {item["key"] for item in plan["protected_records"]["run_matches"]}
+    actual_matches = {item["key"] for item in actual_protected["run_matches"]
+                      if json.loads(item["record"])["run_hotspot_id"] in protected_hotspot_ids}
+    if actual_hotspots != expected_hotspots or actual_matches != expected_matches:
+        raise ValueError("受保护历史运行的热点 / 候选集合核验失败")
     for target in plan["targets"]["runs"]:
         row = (await session.execute(text(
             "SELECT execution_snapshot::text AS s, evidence_meta::text AS e "
@@ -540,12 +758,13 @@ async def verify_snapshot(session: AsyncSession, batch_id: uuid.UUID, *,
             raise ValueError("run_hotspots 快照核验失败")
     for target in plan["targets"]["run_matches"]:
         row = (await session.execute(text(
-            "SELECT material_snapshot::text AS s FROM run_matches "
+            "SELECT material_snapshot::text AS s,evidence_meta::text AS e FROM run_matches "
             "WHERE run_hotspot_id=:rh AND material_id=:mid"),
-            {"rh": target["run_hotspot_id"], "mid": target["material_id"]})).scalar_one_or_none()
+            {"rh": target["run_hotspot_id"], "mid": target["material_id"]})).mappings().one_or_none()
         expected = target["material_snapshot"]
-        actual_snapshot = json.loads(row) if row is not None else None
-        if actual_snapshot != expected:
+        actual_snapshot = json.loads(row["s"]) if row is not None and row["s"] is not None else None
+        if (row is None or actual_snapshot != expected
+                or json.loads(row["e"]) != target["evidence_meta"]):
             raise ValueError("run_matches 素材快照核验失败")
     for target in plan["targets"]["artifacts"]:
         row = (await session.execute(text(
@@ -553,19 +772,17 @@ async def verify_snapshot(session: AsyncSession, batch_id: uuid.UUID, *,
             {"id": target["id"]})).scalar_one_or_none()
         if row is None or json.loads(row) != target["evidence_snapshot"]:
             raise ValueError("chat_artifact_versions 证据核验失败")
-    actual_counts = (await session.execute(text(
-        "SELECT (SELECT count(*) FROM runs) AS runs, "
-        "(SELECT count(*) FROM run_hotspots) AS run_hotspots, "
-        "(SELECT count(*) FROM run_matches) AS run_matches, "
-        "(SELECT count(*) FROM chat_artifact_versions) AS artifacts"))).mappings().one()
-    for key in ("runs", "run_hotspots", "run_matches", "artifacts"):
-        if int(actual_counts[key]) != int(plan["counts"][key]):
-            raise ValueError(f"E8 快照计数核验失败：{key}")
-    batch.status = "verified"
-    batch.verification = {"counts": dict(batch.counts), "verified": True}
-    batch.verified_at = datetime.now(UTC)
-    if commit:
-        await session.commit()
-    else:
-        await session.flush()
+    if exact:
+        for table, rows in actual_protected.items():
+            if len(rows) != len(plan["protected_records"][table]):
+                raise ValueError(f"E8 停写窗口计数核验失败：{table}")
+    if record_result:
+        batch.status = "verified"
+        batch.verification = {"counts": dict(batch.counts), "verified": True,
+                              "scope": "cutover_exact" if exact else "protected_records"}
+        batch.verified_at = datetime.now(UTC)
+        if commit:
+            await session.commit()
+        else:
+            await session.flush()
     return {"batch_id": str(batch_id), "status": "verified", **dict(batch.counts)}

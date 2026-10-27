@@ -15,6 +15,7 @@ function candidate(overrides: Record<string, unknown> = {}) {
     reasons: ['命中原素材标题'],
     usage: '放开头',
     material: {
+      original_material_id: null,
       id: 'm-1', path: '运动/旧片.mp4', type: 'video' as const, title: '历史标题',
       description: '历史描述', tags: ['旧标签'], elements: [], duration_s: 12,
       width: 1080, height: 1920, has_audio: true, size_bytes: 10, mtime: null,
@@ -95,6 +96,11 @@ describe('HotspotResult（E8 历史依据）', () => {
         hotspot: hotspot({
           clue: null, status: 'failed', error: '模型超时', candidates: [],
           evidence: {
+            candidate_integrity: {
+              schema_version: 1, origin: 'legacy_run_record', captured_at: '2026-10-01T00:00:00+00:00',
+              source_ref: 'run:r-1/p:1', digest: '', completeness: 'partial',
+              missing_fields: ['deleted_candidates_unknown'],
+            },
             clue: {
               schema_version: 1, origin: 'missing', captured_at: '2026-10-01T00:00:00+00:00',
               source_ref: 'run:r-1/p:1', digest: '', completeness: 'missing',
@@ -109,5 +115,38 @@ describe('HotspotResult（E8 历史依据）', () => {
     expect(wrapper.text()).toContain('历史线索缺失')
     expect(wrapper.text()).toContain('模型超时')
     expect(wrapper.text()).toContain('旧候选完整性无法确认')
+  })
+
+  it.each([
+    ['complete', 'runtime', 'succeeded', '没有命中的素材'],
+    ['partial', 'legacy_run_record', 'succeeded', '旧候选完整性无法确认'],
+    [null, null, 'failed', '本次检索未完成或失败'],
+  ])('按候选完整性区分合法空结果、旧数据缺口和本次失败：%s', (completeness, origin, status, note) => {
+    const wrapper = mount(HotspotResult, {
+      props: {
+        hotspot: hotspot({
+          candidates: [], status: status as HotspotResultData['status'],
+          evidence: completeness ? {
+            candidate_integrity: {
+              schema_version: 1, origin, captured_at: '2026-10-01T00:00:00+00:00',
+              source_ref: 'run:r-1/p:1', digest: '', completeness, missing_fields: [],
+            },
+          } as HotspotResultData['evidence'] : {},
+        }), runId: 'r-1', position: 1,
+      },
+    })
+    expect(wrapper.text()).toContain(note)
+    if (status === 'failed') expect(wrapper.text()).not.toContain('旧候选完整性无法确认')
+  })
+
+  it('缺失覆盖结果显示未知，不画 0% 或声称无缺口', () => {
+    const wrapper = mount(HotspotResult, {
+      props: { hotspot: hotspot({ coverage: null, status: 'failed', candidates: [] }),
+        runId: 'r-1', position: 1 },
+    })
+    expect(wrapper.text()).toContain('覆盖情况未知')
+    expect(wrapper.text()).toContain('本次检索未完成或失败')
+    expect(wrapper.text()).not.toContain('无缺口，素材全要素覆盖')
+    expect(wrapper.text()).not.toContain('要素覆盖率 0%')
   })
 })

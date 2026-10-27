@@ -159,7 +159,8 @@ export interface paths {
          * 读取历史候选关键帧
          * @description 按运行、热点位置和候选排名定位**冻结快照**中的关键帧；只接受运行内身份，
          *     不接受客户端路径。当前素材已删除、快照缺失或下标越界返回 404；
-         *     当前 UUID 的版本与快照不一致时返回 409，避免显示可能被覆盖的新图片。
+         *     当前 UUID 的版本、图片内容 SHA-256 与快照不一致，或旧快照没有可信内容摘要时返回 409。
+         *     路径清单摘要不能证明图片版本；成功响应禁止缓存，并返回本次已校验的同一份图片字节。
          */
         get: operations["getRunCandidateKeyframe"];
         put?: never;
@@ -746,7 +747,8 @@ export interface components {
             /** @enum {string} */
             status: "queued" | "running" | "succeeded" | "failed";
             error: string | null;
-            coverage: components["schemas"]["Coverage"];
+            /** @description 已保存的覆盖结果；尚未取得或旧数据缺失时为 null，不伪造 0%。 */
+            coverage: components["schemas"]["Coverage"] | null;
             /** @description 本次检索的通道计数、候选数与索引清单摘要 */
             retrieval_meta: {
                 [key: string]: unknown;
@@ -835,7 +837,12 @@ export interface components {
             completeness: "complete" | "partial" | "missing";
             missing_fields: string[];
         };
-        /** @description 候选在运行当时实际使用的素材摘要；不随当前素材生命周期改写 */
+        HistoricalKeyframeContent: {
+            path: string;
+            sha256: string;
+            size_bytes: number;
+        };
+        /** @description 候选在运行当时实际使用的素材摘要；不随当前素材生命周期改写。E6 原素材身份与规范候选身份分别保留；旧图片无内容摘要时不能确认历史预览。 */
         HistoricalMaterial: {
             /** Format: uuid */
             id: string;
@@ -858,6 +865,9 @@ export interface components {
             indexed_at: string | null;
             fingerprint: string;
             embedding_model: string | null;
+            /** @default null */
+            original_material_id: string | null;
+            keyframe_contents?: components["schemas"]["HistoricalKeyframeContent"][];
         };
         /** @description 当前素材的动态状态；只用于展示，不写回历史字段 */
         CurrentMaterialStatus: {

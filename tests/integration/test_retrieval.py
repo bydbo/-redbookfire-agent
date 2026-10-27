@@ -97,7 +97,7 @@ async def seed(session: AsyncSession, *, path: str, title: str = "", description
                embedding: list[float] | None = None, model: str = MODEL) -> str:
     """直接插一条素材行（绕过文件扫描），返回数据库 uuid 字符串。"""
     literal = None if embedding is None else "[" + ",".join(repr(float(v)) for v in embedding) + "]"
-    return (await session.execute(text(
+    material_id = (await session.execute(text(
         "INSERT INTO materials (path, type, title, description, tags, elements, source, "
         "duration_s, width, height, has_audio, size_bytes, fingerprint, embedding, embedding_model) "
         "VALUES (:path, 'video', :title, :description, CAST(:tags AS text[]), "
@@ -106,6 +106,9 @@ async def seed(session: AsyncSession, *, path: str, title: str = "", description
     ), {"path": path, "title": title, "description": description, "tags": list(tags or []),
         "elements": json.dumps(elements or [], ensure_ascii=False), "fingerprint": f"fp-{path}",
         "embedding": literal, "model": model if embedding is not None else None})).scalar_one()
+    # 检索消费已经发布的素材库，通过独立一致性读事务读取。
+    await session.commit()
+    return material_id
 
 
 async def seed_hit(session: AsyncSession, path: str, **overrides) -> str:

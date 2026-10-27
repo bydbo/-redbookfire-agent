@@ -20,7 +20,6 @@
 from __future__ import annotations
 
 import logging
-import os
 import uuid
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
@@ -28,7 +27,7 @@ from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from typing import Any
 
-from sqlalchemy import delete, func, select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..config import AppConfig
@@ -36,7 +35,8 @@ from ..core import progress as progress_tool
 from ..core.tracing import traced_db
 from ..db.models import Hotspot, Material, Run, RunHotspot, RunMatch
 from ..schemas import SchemaError
-from ..tools.material_paths import resolve_material
+from ..tools.historical_media import run_keyframe_url
+from .historical_preview import current_material_status
 from .material_identity import current_material
 from .reporting import build_report_model
 from .run_snapshots import digest, evidence_meta
@@ -51,6 +51,11 @@ FAILED = "failed"
 _DONE_STATUSES = (SUCCEEDED, FAILED)
 # 未完成状态：接口层据此把"取结果/报告"折成 409
 UNFINISHED_STATUSES = (QUEUED, RUNNING)
+
+
+class SnapshotWriteConflict(RuntimeError):
+    """已接受快照冲突；属于不可重试的业务错误，不能触发付费节点重做。"""
+
 
 TOPK_RANGE = (1, 20)
 
@@ -246,9 +251,13 @@ async def set_run_stage(
     那些仍由 `RunRecorder` 收尾。调用方（worker / 工作流）负责给出阶段键与状态。
     """
     run = (
-        await session.execute(select(Run).where(Run.id == uuid.UUID(str(run_id))))
+        await session.execute(select(Run).where(Run.id == uuid.UUID(str(run_id)))
+                              .with_for_update().execution_options(populate_existing=True))
     ).scalar_one_or_none()
     if run is None:
+        return False
+    if run.status in _DONE_STATUSES:
+        await session.commit()
         return False
     current = progress_tool.normalize(run.stage)
     # E7OBS4-03（C6）：worker 重试后的新代次开始后，旧代次的迟到写入直接拒绝——
@@ -264,6 +273,7 @@ async def set_run_stage(
             current_generation,
             stage,
         )
+        await session.commit()
         return False
     if not source_seq:
         source_seq = int(current.get("source_seq") or 0) + 1
@@ -351,31 +361,7 @@ async def _matches_by_run_hotspot(
     grouped: dict[str, list[dict[str, Any]]] = {}
     for match, material in rows:
         snapshot = dict(match.material_snapshot or {}) or None
-        current: dict[str, Any] = {
-            "exists": material is not None,
-            "file_available": None,
-            "preview_available": False,
-            "reason": None if material is not None else "material_deleted",
-            "path": material.path if material is not None else None,
-            "title": material.title if material is not None else None,
-        }
-        if material is not None:
-            current["path"] = material.path
-            current["title"] = material.title
-            keyframes = list(material.keyframes or [])
-            if cfg is not None:
-                try:
-                    media = resolve_material(cfg.materials_dir(), material.path)
-                    current["file_available"] = os.path.isfile(media)
-                except (OSError, ValueError):
-                    current["file_available"] = False
-            current["preview_available"] = bool(
-                keyframes and current["file_available"] is not False)
-            if snapshot and snapshot.get("fingerprint") != (material.fingerprint or ""):
-                current["reason"] = "material_version_changed"
-                current["preview_available"] = False
-            elif not keyframes:
-                current["reason"] = "keyframes_missing"
+        current = current_material_status(material, snapshot, cfg)
         grouped.setdefault(str(match.run_hotspot_id), []).append(
             {
                 "rank": match.rank,
@@ -438,7 +424,7 @@ async def load_run(session: AsyncSession, run_id: uuid.UUID,
             "clue": dict(run_hotspot.clue) if run_hotspot.clue else None,
             "status": run_hotspot.status,
             "error": run_hotspot.error,
-            "coverage": dict(run_hotspot.coverage or {}),
+            "coverage": dict(run_hotspot.coverage) if run_hotspot.coverage else None,
             "retrieval_meta": dict(run_hotspot.retrieval_meta or {}),
             "gap_advice": dict(run_hotspot.gap_advice or {}) or None,
             "candidates": candidates.get(str(run_hotspot.id), []),
@@ -455,7 +441,8 @@ async def load_run(session: AsyncSession, run_id: uuid.UUID,
         "totals": _totals(run),
         "prompt_versions": dict(run.prompt_versions or {}),
         "execution_snapshot": dict(run.execution_snapshot or {}),
-        "evidence": dict(run.evidence_meta or {}),
+        "evidence": {key: value for key, value in dict(run.evidence_meta or {}).items()
+                     if not key.startswith("_")},
         "hotspots": hotspots,
     }
 
@@ -508,7 +495,8 @@ async def list_runs(
             counts[run_id] = count
         for run_id, raw_text in (
             await session.execute(
-                select(RunHotspot.run_id, Hotspot.raw_text)
+                select(RunHotspot.run_id, func.coalesce(RunHotspot.raw_text, Hotspot.raw_text)
+                       .label("raw_text"))
                 .join(Hotspot, Hotspot.id == RunHotspot.hotspot_id)
                 .where(RunHotspot.run_id.in_(run_ids), RunHotspot.position == 1)
             )
@@ -565,8 +553,16 @@ async def load_report_model(
         dict(item, gap_advice=list((item.get("gap_advice") or {}).get("items") or []))
         for item in detail["hotspots"]
     ]
+    for item in hotspots:
+        item["candidates"] = [
+            {**candidate, "preview_url": (
+                run_keyframe_url(str(run.id), item["position"], candidate["rank"])
+                if (candidate.get("current_material") or {}).get("preview_available") else None
+            )}
+            for candidate in item["candidates"]
+        ]
     vector = {}
-    materials_count = 0
+    materials_count: int | None = None
     for item in detail["hotspots"]:
         summary = ((item.get("retrieval_meta") or {}).get("index_summary") or {})
         if summary:
@@ -575,7 +571,7 @@ async def load_report_model(
             break
     errors = [run.error] if run.status == FAILED and run.error else []
     workspace = dict(snapshot.get("workspace") or {})
-    return build_report_model(
+    model = build_report_model(
         run_id=str(run.id),
         created_at=_iso(run.created_at) or "",
         materials_count=materials_count,
@@ -588,6 +584,8 @@ async def load_report_model(
         errors=errors,
         vector_coverage=vector or None,
     )
+    model["evidence"] = dict(detail.get("evidence") or {})
+    return model
 
 
 # ---------------------------------------------------------------------------
@@ -651,7 +649,8 @@ async def planned_hotspots(
     """
     rows = (
         await session.execute(
-            select(RunHotspot.position, Hotspot.raw_text)
+            select(RunHotspot.position, func.coalesce(RunHotspot.raw_text, Hotspot.raw_text)
+                   .label("raw_text"))
             .join(Hotspot, Hotspot.id == RunHotspot.hotspot_id)
             .where(RunHotspot.run_id == uuid.UUID(str(run_id)))
             .order_by(RunHotspot.position)
@@ -663,15 +662,16 @@ async def planned_hotspots(
 class RunRecorder:
     """一次运行在库里的写回句柄（每跑完一个热点就落一次库）。
 
-    用途：让 `JobStatus.progress` 能由"已完成热点数 / 热点总数"推导；批次收尾再写 `runs`
-          的状态与统计。写回是**先删后插**，因此同一 run 重跑按 `(run_hotspot_id, rank)` 幂等。
+    用途：逐阶段保存已接受依据；相同写入幂等，不同结果不能替换已接受字段或候选。
+          run 与热点按同一顺序加锁，代次和终态检查在锁内执行。
     输入：`AsyncSession` 与 `run_id`（S3.3 已建好的 `runs` 行）。
     输出：无（就地写库）。每个写方法内部提交，失败回滚后原样上抛——不静默吞错。
     """
 
     def __init__(self, session: AsyncSession, run_id: uuid.UUID | str,
-                 cfg: AppConfig | None = None) -> None:
+                 cfg: AppConfig | None = None, *, owner_token: str | None = None) -> None:
         self.session = session
+        self.owner_token = owner_token or str(uuid.uuid4())
         if cfg is not None:
             self.cfg = cfg
         try:
@@ -686,6 +686,61 @@ class RunRecorder:
         if run is None:
             raise ValueError(f"run 不存在：{self.run_id}")
         return run
+
+    async def _locked_run(self, generation: int, *, starting: bool = False) -> Run:
+        run = (await self.session.execute(
+            select(Run).where(Run.id == self.run_id).with_for_update()
+            .execution_options(populate_existing=True)
+        )).scalar_one_or_none()
+        if run is None:
+            raise ValueError(f"run 不存在：{self.run_id}")
+        current = int((run.stage or {}).get("generation") or 0)
+        if generation < current or (not starting and generation != current):
+            raise SnapshotWriteConflict("执行代次不一致，不能覆盖已接受快照")
+        claim = dict((run.evidence_meta or {}).get("_execution_claim") or {})
+        if not starting and claim and claim.get("token") != self.owner_token:
+            raise SnapshotWriteConflict("运行已被其他执行认领，不能覆盖其快照")
+        return run
+
+    async def _claim_locked(self, run: Run, generation: int) -> None:
+        if run.status in _DONE_STATUSES:
+            raise SnapshotWriteConflict("运行已终结，不能重新开跑；重新分析请创建新 run")
+        current = int((run.stage or {}).get("generation") or 0)
+        previous = dict((run.evidence_meta or {}).get("_execution_claim") or {})
+        if run.status == RUNNING and generation == current:
+            if previous.get("token") != self.owner_token:
+                raise SnapshotWriteConflict("同代次运行已被认领，重复投递不能再次执行")
+            return
+        accepted = (await self.session.execute(
+            select(RunHotspot.id).where(RunHotspot.run_id == self.run_id,
+                                        RunHotspot.status != QUEUED).limit(1)
+        )).scalar_one_or_none()
+        if accepted is not None:
+            raise SnapshotWriteConflict("运行已有已接受阶段，不支持整批重跑；请创建新 run")
+        run.status = RUNNING
+        run.started_at = run.started_at or datetime.now(UTC)
+        run.stage = {**dict(run.stage or {}), "generation": generation}
+        run.evidence_meta = {**dict(run.evidence_meta or {}),
+                             "_execution_claim": {"token": self.owner_token,
+                                                  "generation": generation}}
+
+    async def claim(self, *, generation: int = 0) -> str:
+        """在索引及任何模型调用前原子认领；token 仅用于内部写入归属。"""
+        run = await self._locked_run(generation, starting=True)
+        await self._claim_locked(run, generation)
+        await self._commit()
+        return self.owner_token
+
+    async def _locked_hotspot(self, position: int, generation: int) -> tuple[Run, RunHotspot]:
+        run = await self._locked_run(generation)
+        hotspot = (await self.session.execute(
+            select(RunHotspot).where(RunHotspot.run_id == self.run_id,
+                                     RunHotspot.position == position).with_for_update()
+            .execution_options(populate_existing=True)
+        )).scalar_one_or_none()
+        if hotspot is None:
+            raise ValueError(f"run_hotspots 缺少 position={position} 的行")
+        return run, hotspot
 
     async def _commit(self) -> None:
         try:
@@ -720,6 +775,9 @@ class RunRecorder:
 
     async def context_snapshot(self) -> dict[str, Any]:
         return dict((await self._run()).context_snapshot or {})
+
+    async def execution(self) -> dict[str, Any]:
+        return dict((await self._run()).execution_snapshot or {})
 
     async def set_stage(
         self,
@@ -757,15 +815,27 @@ class RunRecorder:
     async def start(self, execution: dict[str, Any] | None = None,
                     *, generation: int = 0) -> None:
         """开跑：`runs.status='running'`、`started_at` 与执行配置快照。"""
-        run = await self._run()
-        current_generation = int((run.stage or {}).get("generation") or 0)
-        if current_generation and generation and generation < current_generation:
-            raise RuntimeError("旧执行代次的写入被拒绝，请使用当前代次或创建新 run")
+        run = await self._locked_run(generation, starting=True)
         if run.status in _DONE_STATUSES:
-            raise RuntimeError("运行已终结，不能重新开跑；重新分析请创建新 run")
+            raise SnapshotWriteConflict("运行已终结，不能重新开跑；重新分析请创建新 run")
+        if execution is not None and run.execution_snapshot:
+            def binding(value: dict[str, Any]) -> dict[str, Any]:
+                return {key: val for key, val in value.items()
+                        if key not in ("captured_at", "prompt_versions")}
+            if binding(dict(run.execution_snapshot)) != binding(execution):
+                raise SnapshotWriteConflict("执行配置、实现或 prompt 已变化；请创建新 run")
+        await self._claim_locked(run, generation)
+        # E8 只提供阶段证据保全，不声称支持任意节点恢复；整批重投必须在付费调用前拒绝。
+        accepted = (await self.session.execute(
+            select(RunHotspot.id).where(RunHotspot.run_id == self.run_id,
+                                        RunHotspot.status != QUEUED).limit(1)
+        )).scalar_one_or_none()
+        if accepted is not None:
+            raise SnapshotWriteConflict("运行已有已接受阶段，不支持整批重跑；请创建新 run")
         run.status = RUNNING
-        run.started_at = datetime.now(UTC)
+        run.started_at = run.started_at or datetime.now(UTC)
         run.error = None
+        run.stage = {**dict(run.stage or {}), "generation": generation}
         if execution is not None and not run.execution_snapshot:
             run.execution_snapshot = dict(execution)
             run.evidence_meta = {
@@ -788,6 +858,82 @@ class RunRecorder:
         ).scalar_one_or_none()
         return dict(clue) if clue else None
 
+    async def checkpoint(self, position: int, phase: str, payload: dict[str, Any], *,
+                         generation: int = 0) -> None:
+        """模型阶段成功后立即保存；阶段字段只认领一次，合法空结果也属于已接受依据。"""
+        run, hotspot = await self._locked_hotspot(position, generation)
+        if run.status in _DONE_STATUSES or hotspot.status in _DONE_STATUSES:
+            raise SnapshotWriteConflict("运行或热点已终结，不能继续写入阶段依据")
+        await self._accept_phase(hotspot, phase, payload)
+        hotspot.status = RUNNING
+        await self._commit()
+
+    async def _accept_phase(self, hotspot: RunHotspot, phase: str,
+                            payload: dict[str, Any]) -> None:
+        meta = dict(hotspot.evidence_meta or {})
+        source = f"run:{self.run_id}/position:{hotspot.position}"
+
+        def accept(key: str, value: Any) -> None:
+            previous = meta.get(key) or {}
+            attr = "retrieval_meta" if key == "retrieval" else key
+            if previous.get("origin") == "runtime":
+                if digest(getattr(hotspot, attr)) != digest(value):
+                    raise SnapshotWriteConflict(f"{key} 已接受，不同结果不能覆盖历史依据")
+                return
+            setattr(hotspot, attr, value)
+            meta[key] = evidence_meta(origin="runtime", source_ref=source,
+                                      completeness="complete", payload=value)
+
+        if phase == "clue":
+            clue = dict(payload["clue"])
+            accept("clue", clue)
+            shared = (await self.session.execute(select(Hotspot).where(
+                Hotspot.id == hotspot.hotspot_id))).scalar_one()
+            shared.clue = clue
+        elif phase == "retrieve":
+            retrieval = dict(payload["retrieval"])
+            rows = self._candidate_rows(hotspot.id, retrieval.get("candidates") or [],
+                                        retrieval.get("material_snapshots") or {})
+            accepted = (meta.get("coverage") or {}).get("origin") == "runtime"
+            if accepted and not await self._same_candidates(hotspot.id, rows):
+                raise SnapshotWriteConflict("候选已接受，不同结果不能覆盖历史依据")
+            accept("coverage", dict(retrieval.get("coverage") or {}))
+            accept("retrieval", {
+                "literal_recalled": retrieval.get("literal_recalled", 0),
+                "vector_recalled": retrieval.get("vector_recalled", 0),
+                "candidates_considered": retrieval.get("candidates_considered", 0),
+                "index_summary": retrieval.get("index_summary") or {},
+            })
+            if not accepted:
+                existing = (await self.session.execute(select(RunMatch.material_id).where(
+                    RunMatch.run_hotspot_id == hotspot.id).limit(1))).scalar_one_or_none()
+                if existing is not None:
+                    raise SnapshotWriteConflict("已有候选缺少阶段标记，拒绝覆盖，请创建新 run")
+                self.session.add_all([RunMatch(**row) for row in rows])
+                meta["candidate_integrity"] = evidence_meta(
+                    origin="runtime", source_ref=source, completeness="complete",
+                    payload={"count": len(rows)})
+        elif phase == "gaps":
+            accept("gap_advice", {"items": list(payload.get("gap_advice") or [])})
+        elif phase == "draft":
+            draft = payload.get("draft")
+            accept("draft", dict(draft) if draft is not None else None)
+        else:
+            raise ValueError(f"未知快照阶段：{phase}")
+        hotspot.evidence_meta = meta
+
+    async def fail_hotspot(self, position: int, error: str, *, generation: int = 0) -> None:
+        """失败只终结状态，不用空对象清除已经接受的线索、候选或初稿。"""
+        run, hotspot = await self._locked_hotspot(position, generation)
+        if run.status in _DONE_STATUSES or hotspot.status in _DONE_STATUSES:
+            if hotspot.status == FAILED and (hotspot.error or "") == error:
+                await self._commit()
+                return
+            raise SnapshotWriteConflict("运行或热点已终结，不能覆盖失败状态")
+        hotspot.status = FAILED
+        hotspot.error = error or "热点失败"
+        await self._commit()
+
     @traced_db(
         "db.run_recorder.hotspot_finished",
         operation="write",
@@ -809,28 +955,16 @@ class RunRecorder:
         generation: int = 0,
     ) -> None:
         """冻结一个热点的结果；终态后相同结果幂等、不同结果拒绝覆盖。"""
-        run = await self._run()
-        current_generation = int((run.stage or {}).get("generation") or 0)
-        if current_generation and generation and generation < current_generation:
-            raise RuntimeError("旧执行代次的热点写入被拒绝，不能覆盖已接受快照")
-        run_hotspot = (
-            await self.session.execute(
-                select(RunHotspot).where(
-                    RunHotspot.run_id == self.run_id,
-                    RunHotspot.position == position,
-                ).with_for_update()
-            )
-        ).scalar_one_or_none()
-        if run_hotspot is None:
-            raise ValueError(f"run_hotspots 缺少 position={position} 的行")
+        run, run_hotspot = await self._locked_hotspot(position, generation)
         new_rows = self._candidate_rows(run_hotspot.id, candidates, material_snapshots)
-        if run.status in _DONE_STATUSES:
+        if run.status in _DONE_STATUSES or run_hotspot.status in _DONE_STATUSES:
             if await self._same_hotspot(
                     run_hotspot, clue=clue, coverage=coverage, draft=draft,
                     status=status, error=error, gap_advice=gap_advice,
                     retrieval_meta=retrieval_meta, new_rows=new_rows):
+                await self._commit()
                 return
-            raise RuntimeError("运行已终结，迟到或不同的结果不能覆盖已接受快照")
+            raise SnapshotWriteConflict("运行或热点已终结，迟到或不同的结果不能覆盖已接受快照")
 
         if run_hotspot.raw_text is None:
             legacy_raw = (await self.session.execute(
@@ -845,50 +979,17 @@ class RunRecorder:
                 run_hotspot.evidence_meta = evidence
 
         if clue:
-            hotspot = (await self.session.execute(
-                select(Hotspot).where(Hotspot.id == run_hotspot.hotspot_id)
-            )).scalar_one()
-            hotspot.clue = dict(clue)  # 共享缓存可继续复用；历史读取仍只看 run_hotspots.clue
+            await self._accept_phase(run_hotspot, "clue", {"clue": clue})
+        metadata = retrieval_meta or {}
+        await self._accept_phase(run_hotspot, "retrieve", {"retrieval": {
+            **metadata, "coverage": coverage, "candidates": candidates,
+            "material_snapshots": material_snapshots or {},
+        }})
+        if gap_advice is not None:
+            await self._accept_phase(run_hotspot, "gaps", {"gap_advice": gap_advice})
+        await self._accept_phase(run_hotspot, "draft", {"draft": draft})
         run_hotspot.status = status
-        run_hotspot.coverage = dict(coverage or {})
-        run_hotspot.draft = dict(draft) if draft else None
         run_hotspot.error = error or None
-        run_hotspot.clue = dict(clue) if clue else None
-        run_hotspot.gap_advice = {"items": list(gap_advice)} if gap_advice is not None else None
-        run_hotspot.retrieval_meta = dict(retrieval_meta or {})
-        meta = dict(run_hotspot.evidence_meta or {})
-        meta["clue"] = evidence_meta(
-            origin="runtime" if clue else "missing",
-            source_ref=f"run:{run.id}/position:{position}",
-            completeness="complete" if clue else "missing",
-            payload=dict(clue) if clue else None,
-            missing_fields=[] if clue else ["clue"],
-        )
-        meta["coverage"] = evidence_meta(
-            origin="runtime", source_ref=f"run:{run.id}/position:{position}",
-            completeness="complete" if coverage else "partial", payload=dict(coverage or {}))
-        meta["gap_advice"] = evidence_meta(
-            origin="runtime" if gap_advice is not None else "missing",
-            source_ref=f"run:{run.id}/position:{position}",
-            completeness="complete" if gap_advice is not None else "missing",
-            payload={"items": list(gap_advice)} if gap_advice is not None else None,
-            missing_fields=[] if gap_advice is not None else ["gap_advice"],
-        )
-        meta["retrieval"] = evidence_meta(
-            origin="runtime" if retrieval_meta else "missing",
-            source_ref=f"run:{run.id}/position:{position}",
-            completeness="complete" if retrieval_meta else "missing",
-            payload=dict(retrieval_meta or {}),
-            missing_fields=[] if retrieval_meta else ["retrieval_meta"],
-        )
-        run_hotspot.evidence_meta = meta
-
-        # 先证明旧候选可以被替换，再重建；保留原 rank / score / reasons。
-        await self.session.execute(
-            delete(RunMatch).where(RunMatch.run_hotspot_id == run_hotspot.id)
-        )
-        for row in new_rows:
-            self.session.add(RunMatch(**row))
         await self._commit()
 
     @staticmethod
@@ -937,6 +1038,9 @@ class RunRecorder:
         new_rows: list[dict[str, Any]],
     ) -> bool:
         """判断重投是否与已接受快照逐字段相同（相同幂等，不同拒绝）。"""
+        normalized_retrieval = {"literal_recalled": 0, "vector_recalled": 0,
+                                "candidates_considered": 0, "index_summary": {},
+                                **dict(retrieval_meta or {})}
         if (run_hotspot.status != status
                 or dict(run_hotspot.clue or {}) != (dict(clue) if clue else {})
                 or dict(run_hotspot.coverage or {}) != dict(coverage or {})
@@ -944,11 +1048,15 @@ class RunRecorder:
                 or (run_hotspot.error or "") != error
                 or (run_hotspot.gap_advice or None)
                 != ({"items": list(gap_advice)} if gap_advice is not None else None)
-                or dict(run_hotspot.retrieval_meta or {}) != dict(retrieval_meta or {})):
+                or dict(run_hotspot.retrieval_meta or {}) != normalized_retrieval):
             return False
+        return await self._same_candidates(run_hotspot.id, new_rows)
+
+    async def _same_candidates(self, hotspot_id: uuid.UUID,
+                                new_rows: list[dict[str, Any]]) -> bool:
         existing = (
             await self.session.execute(
-                select(RunMatch).where(RunMatch.run_hotspot_id == run_hotspot.id)
+                select(RunMatch).where(RunMatch.run_hotspot_id == hotspot_id)
             )
         ).scalars().all()
         if len(existing) != len(new_rows):
@@ -959,7 +1067,8 @@ class RunRecorder:
             if row is None:
                 return False
             if (row.rank != expected["rank"]
-                    or Decimal(str(row.score)) != Decimal(str(expected["score"]))
+                    or Decimal(str(row.score)) != Decimal(str(expected["score"])).quantize(
+                        Decimal("0.0001"))
                     or list(row.recall_sources or []) != list(expected["recall_sources"])
                     or list(row.reasons or []) != list(expected["reasons"])
                     or list(row.hits or []) != list(expected["hits"])
@@ -980,10 +1089,7 @@ class RunRecorder:
         generation: int = 0,
     ) -> None:
         """批次收尾：写状态 / 统计 / prompt 版本，并补齐执行快照后不再改写。"""
-        run = await self._run()
-        current_generation = int((run.stage or {}).get("generation") or 0)
-        if current_generation and generation and generation < current_generation:
-            raise RuntimeError("旧执行代次的收尾被拒绝，不能覆盖已接受快照")
+        run = await self._locked_run(generation)
         normalized_versions = {
             str(key): int(value) for key, value in (prompt_versions or {}).items()
         }
@@ -993,11 +1099,16 @@ class RunRecorder:
                 and run.llm_calls == int(totals.get("llm_calls") or 0)
                 and run.prompt_tokens == int(totals.get("prompt_tokens") or 0)
                 and run.completion_tokens == int(totals.get("completion_tokens") or 0)
+                and run.cost_cny == Decimal(f"{float(totals.get('cost_cny') or 0.0):.4f}")
+                and run.latency_ms == int(totals.get("latency_ms") or 0)
+                and (run.error or "") == ("" if status == SUCCEEDED else
+                                          ("；".join(errors) or "运行失败"))
                 and dict(run.prompt_versions or {}) == normalized_versions
             )
             if same:
+                await self._commit()
                 return
-            raise RuntimeError("运行已终结，迟到或不同的收尾不能覆盖已接受快照")
+            raise SnapshotWriteConflict("运行已终结，迟到或不同的收尾不能覆盖已接受快照")
         run.status = status
         run.finished_at = datetime.now(UTC)
         run.llm_calls = int(totals.get("llm_calls") or 0)
@@ -1020,7 +1131,8 @@ class RunRecorder:
 
 
 async def mark_run_failed(
-    session: AsyncSession, run_id: uuid.UUID | str, error: str
+    session: AsyncSession, run_id: uuid.UUID | str, error: str, *, generation: int = 0,
+    owner_token: str | None = None,
 ) -> bool:
     """把运行标成 `failed`（兜底路径：异常逃出 `run_analysis`，S3.4b 的任务层调用）。
 
@@ -1028,9 +1140,16 @@ async def mark_run_failed(
     可能已被逐热点写回更新过，覆盖成 0 等于丢事实。查不到该 run 时返回 `False`。
     """
     run = (
-        await session.execute(select(Run).where(Run.id == uuid.UUID(str(run_id))))
+        await session.execute(select(Run).where(Run.id == uuid.UUID(str(run_id)))
+                              .with_for_update().execution_options(populate_existing=True))
     ).scalar_one_or_none()
     if run is None:
+        return False
+    claim = dict((run.evidence_meta or {}).get("_execution_claim") or {})
+    if (run.status in _DONE_STATUSES
+            or generation != int((run.stage or {}).get("generation") or 0)
+            or (claim and claim.get("token") != owner_token)):
+        await session.commit()
         return False
     run.status = FAILED
     run.finished_at = datetime.now(UTC)
@@ -1077,7 +1196,7 @@ async def reconcile_stale_runs(
                     Run.status == RUNNING,
                     Run.started_at.is_not(None),
                     Run.started_at < cutoff,
-                )
+                ).with_for_update(skip_locked=True).execution_options(populate_existing=True)
             )
         )
         .scalars()

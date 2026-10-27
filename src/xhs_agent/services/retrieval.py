@@ -205,14 +205,8 @@ async def retrieve_candidates(session: AsyncSession, cfg: AppConfig, clue: Hotsp
     params = retrieval_tool.RetrievalParams.from_config(cfg)
     if topk is not None:
         params = replace(params, topk=int(topk))   # RetrievalParams 是 frozen dataclass
-    outcome = RetrievalOutcome(vector_coverage=await vector_coverage(session, cfg))
-
-    literal_hits = await literal_recall(session, retrieval_tool.literal_query_keywords(clue),
-                                        limit=params.recall_limit,
-                                        threshold=params.similarity_threshold)
-    outcome.literal_recalled = len(literal_hits)
-
-    vector_hits: list[tuple[str, float]] = []
+    # 查询向量先准备：外部模型等待不能占住素材库的一致性读事务。
+    query_vector: list[float] | None = None
     if cfg.embedding.enabled:
         # 注入的 embedder 用自己的生命周期；没注入时起一个短生命周期客户端（独立调用路径）。
         async with AsyncExitStack() as stack:
@@ -227,31 +221,41 @@ async def retrieve_candidates(session: AsyncSession, cfg: AppConfig, clue: Hotsp
                 raise RuntimeError("向量召回已启用但没有可用的 embedding 客户端")
             embedded = await _embed_query(client, clue, tracer=tracer)
         query_vector = embedded.vectors[0]
-        vector_hits = await vector_recall(session, query_vector, cfg.embedding.model,
-                                          limit=params.recall_limit,
-                                          max_distance=params.max_cosine_distance)
-        outcome.vector_recalled = len(vector_hits)
 
-    channel_ranks: dict[str, dict[str, int]] = {}
-    if literal_hits:
-        channel_ranks[retrieval_tool.LITERAL] = _ranks(literal_hits)
-    if vector_hits:
-        channel_ranks[retrieval_tool.VECTOR] = _ranks(vector_hits)
-
-    material_ids = sorted({material_id for ranks in channel_ranks.values() for material_id in ranks})
-    rows = await _load_materials(session, material_ids)
-    order = {material_id: index for index, material_id in enumerate(material_ids)}
-    materials = sorted((row_to_material(row) for row in rows),
-                       key=lambda material: order.get(material.id, 0))
-    by_id = {str(row.id): row for row in rows}
-    outcome.material_snapshots = {
-        material.id: material_snapshot(by_id[material.id])
-        for material in materials if material.id in by_id
-    }
-    outcome.candidates_considered = len(materials)
-    outcome.candidates, outcome.coverage = retrieval_tool.rank_candidates(
-        clue, materials, channel_ranks, params, now=now)
-    outcome.index_summary = await _index_summary(session, outcome.vector_coverage)
+    # 独立会话避免继承调用方 READ COMMITTED 事务或 identity-map 中的陈旧 ORM 对象。
+    # 调用方的未提交写入不属于已发布素材库，也不会被本方法擅自提交。
+    async with (AsyncSession(bind=session.bind, expire_on_commit=False) as read_session,
+                read_session.begin()):
+            await read_session.execute(text(
+                "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY"))
+            outcome = RetrievalOutcome(vector_coverage=await vector_coverage(read_session, cfg))
+            literal_hits = await literal_recall(
+                read_session, retrieval_tool.literal_query_keywords(clue),
+                limit=params.recall_limit, threshold=params.similarity_threshold)
+            outcome.literal_recalled = len(literal_hits)
+            vector_hits = [] if query_vector is None else await vector_recall(
+                read_session, query_vector, cfg.embedding.model,
+                limit=params.recall_limit, max_distance=params.max_cosine_distance)
+            outcome.vector_recalled = len(vector_hits)
+            channel_ranks: dict[str, dict[str, int]] = {}
+            if literal_hits:
+                channel_ranks[retrieval_tool.LITERAL] = _ranks(literal_hits)
+            if vector_hits:
+                channel_ranks[retrieval_tool.VECTOR] = _ranks(vector_hits)
+            material_ids = sorted({mid for ranks in channel_ranks.values() for mid in ranks})
+            rows = await _load_materials(read_session, material_ids)
+            order = {mid: index for index, mid in enumerate(material_ids)}
+            materials = sorted((row_to_material(row) for row in rows),
+                               key=lambda material: order.get(material.id, 0))
+            by_id = {str(row.id): row for row in rows}
+            outcome.material_snapshots = {
+                material.id: material_snapshot(by_id[material.id], cfg=cfg)
+                for material in materials if material.id in by_id
+            }
+            outcome.candidates_considered = len(materials)
+            outcome.candidates, outcome.coverage = retrieval_tool.rank_candidates(
+                clue, materials, channel_ranks, params, now=now)
+            outcome.index_summary = await _index_summary(read_session, outcome.vector_coverage)
     return outcome
 
 

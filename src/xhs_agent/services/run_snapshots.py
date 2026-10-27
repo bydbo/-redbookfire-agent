@@ -15,10 +15,13 @@ from collections.abc import Mapping
 from dataclasses import asdict, fields, is_dataclass
 from datetime import UTC, datetime
 from decimal import Decimal
+from pathlib import Path
 from typing import Any
 
-from ..config import AppConfig
+from ..config import PROJECT_ROOT, AppConfig
 from ..db.models import Material as MaterialRow
+from ..schemas import Draft, Element, HotspotClue, SchemaError
+from ..tools.historical_media import frame_content_records
 from ..tools.retrieval import RetrievalParams
 
 SCHEMA_VERSION = 1
@@ -84,7 +87,7 @@ def missing_meta(source_ref: str, fields: list[str]) -> dict[str, Any]:
                          missing_fields=fields)
 
 
-def material_snapshot(row: MaterialRow) -> dict[str, Any]:
+def material_snapshot(row: MaterialRow, *, cfg: AppConfig | None = None) -> dict[str, Any]:
     """当前素材行 → 历史快照（完整字段；不复制媒体内容）。"""
     keyframes = list(row.keyframes or [])
     return {
@@ -104,6 +107,9 @@ def material_snapshot(row: MaterialRow) -> dict[str, Any]:
         "source": row.source,
         "keyframes": keyframes,
         "keyframe_digest": digest(keyframes),
+        "keyframe_contents": frame_content_records(
+            keyframes, keyframes_root=str(Path(cfg.index_dir(), "keyframes")),
+            project_root=PROJECT_ROOT) if cfg is not None else [],
         "indexed_at": row.indexed_at.astimezone(UTC).isoformat() if row.indexed_at else None,
         "fingerprint": row.fingerprint or "",
         "embedding_model": row.embedding_model,
@@ -148,3 +154,59 @@ def execution_evidence(snapshot: Mapping[str, Any], source_ref: str) -> dict[str
 
 def score_text(value: Any) -> str:
     return format(Decimal(str(value)), "f")
+
+
+def text_evidence_missing(clue: Any, material: Any, draft: Any) -> list[str]:
+    """必要文字字段与身份校验；合法空字段保留，缺字段或不合法结构不得由默认值补齐。"""
+    missing = []
+    try:
+        if not isinstance(clue, dict):
+            raise SchemaError("clue")
+        if any(not isinstance(clue.get(key), list)
+               for key in ("elements", "why_it_works", "match_keywords")):
+            raise SchemaError("clue")
+        HotspotClue.from_dict(clue)
+    except (SchemaError, TypeError, ValueError):
+        missing.append("clue")
+    required = {"id": str, "path": str, "type": str, "title": str,
+                "description": str, "tags": list, "elements": list, "source": str}
+    if not isinstance(material, dict):
+        missing.append("material")
+    else:
+        for key, kind in required.items():
+            if key not in material or not isinstance(material[key], kind):
+                missing.append(f"material.{key}")
+        try:
+            uuid.UUID(str(material.get("id") or ""))
+            if (not material.get("path") or material.get("type") not in {"video", "image", "text"}
+                    or material.get("source") not in {"filename", "sidecar", "vision", "legacy"}):
+                raise ValueError("material")
+            for element in material.get("elements") or []:
+                Element.from_dict(element)
+            if any(not isinstance(tag, str) for tag in material.get("tags") or []):
+                raise ValueError("material.tags")
+        except (SchemaError, TypeError, ValueError):
+            missing.append("material")
+    try:
+        if (not isinstance(draft, dict)
+                or any(key not in draft for key in ("titles", "body", "tags", "cover_text",
+                                                     "first_3s", "shot_list", "compliance_notes"))):
+            raise SchemaError("base_draft")
+        uuid.UUID(str(draft.get("material_id") or ""))
+        if (not isinstance(draft.get("body"), str)
+                or not isinstance(draft.get("cover_text"), str)
+                or not isinstance(draft.get("first_3s"), str)
+                or any(not isinstance(draft.get(key), list)
+                       for key in ("titles", "tags", "shot_list", "compliance_notes"))
+                or any(not isinstance(title, dict) or not isinstance(title.get("text"), str)
+                       for title in draft.get("titles") or [])
+                or any(not isinstance(value, str)
+                       for key in ("tags", "shot_list", "compliance_notes")
+                       for value in draft.get(key) or [])):
+            raise SchemaError("base_draft")
+        parsed = Draft.from_dict(draft)
+        if not parsed.body.strip():
+            raise SchemaError("base_draft.body")
+    except (SchemaError, TypeError, ValueError):
+        missing.append("base_draft")
+    return missing

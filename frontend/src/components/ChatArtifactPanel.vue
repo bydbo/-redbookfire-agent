@@ -20,18 +20,23 @@ const evidence = computed(() => (preview.value?.evidence_snapshot ?? {}) as {
   origin?: string
   completeness?: string
   missing_fields?: string[]
-  current_material?: { exists?: boolean }
+  sources?: Record<string, { origin?: string }>
 })
 const evidenceNote = computed(() => {
   if (!preview.value || preview.value.object_type !== 'draft') return ''
   if (evidence.value.completeness === 'missing') {
     return `历史依据不完整（缺失：${(evidence.value.missing_fields ?? []).join('、') || '未知'}），不应用当前素材补写`
   }
-  const unavailable = evidence.value.current_material?.exists === false
-  const source = evidence.value.origin === 'runtime'
-    ? '运行时保存' : evidence.value.origin === 'legacy_run_record'
-      ? '原运行记录' : '历史采集'
-  return `本次改稿使用${source}的文字依据${unavailable ? '；原素材当前不可用' : ''}`
+  const labels: Record<string, string> = {
+    runtime: '运行时保存', legacy_run_record: '原运行记录',
+    migration_capture: 'E6 迁移归档', cutover_capture: '切换时采集', missing: '缺失',
+  }
+  const sources = evidence.value.sources ?? {}
+  const detail = Object.entries(sources).map(([field, source]) => (
+    `${field === 'clue' ? '线索' : field === 'material' ? '素材文字' : '基础稿'}：${labels[source.origin ?? ''] ?? '来源未知'}`
+  )).join('；')
+  const source = detail || labels[evidence.value.origin ?? ''] || '来源未知'
+  return `本次改稿基于历史文字依据（${source}）`
 })
 const heads = computed(() => store.context?.artifact_heads ?? [])
 const elementOptions = ELEMENT_TYPES.map(type => ({ label: ELEMENT_TYPE_LABELS[type], value: type }))

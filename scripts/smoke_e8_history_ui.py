@@ -99,11 +99,11 @@ def seed(factory, cfg, index_dir: Path) -> dict[str, str]:
             session.add(rh)
             await session.flush()
             deleted_snapshot = {
-                **material_snapshot(current), "id": str(uuid.UUID("00000000-0000-4000-8000-000000000001")),
+                **material_snapshot(current, cfg=cfg), "id": str(uuid.UUID("00000000-0000-4000-8000-000000000001")),
                 "path": "sport/deleted.mp4", "title": "已删除历史素材",
                 "fingerprint": "fp-deleted", "keyframes": [],
             }
-            current_snapshot = material_snapshot(current)
+            current_snapshot = material_snapshot(current, cfg=cfg)
             deleted_id = uuid.UUID("00000000-0000-4000-8000-000000000001")
             session.add_all([
                 RunMatch(run_hotspot_id=rh.id, material_id=deleted_id, rank=1, score=0.9,
@@ -221,7 +221,8 @@ def main() -> int:
         env = {**os.environ, "DATABASE_URL": dsn, "REDIS_URL": redis_url,
                "XHS_CONFIG_PATH": str(config), "PYTHONIOENCODING": "utf-8"}
         subprocess.run([sys.executable, "-m", "alembic", "upgrade", "head"], cwd=PROJECT_ROOT,
-                       env=env, check=True, capture_output=True, text=True)
+                       env=env, check=True, capture_output=True, text=True,
+                       encoding="utf-8", errors="replace")
         factory = async_sessionmaker(create_async_engine(dsn, poolclass=NullPool),
                                      expire_on_commit=False)
         cfg = load_config(str(config))

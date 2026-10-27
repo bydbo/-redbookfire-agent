@@ -49,7 +49,14 @@ from ..db.models import Run
 from ..db.session import create_engine_from_config, create_session_factory
 from ..services.materials import backfill_embeddings, sync_materials
 from ..services.model_observations import observer as attempt_observer
-from ..services.runs import load_job, mark_run_failed, planned_hotspots, set_run_stage
+from ..services.runs import (
+    RunRecorder,
+    SnapshotWriteConflict,
+    load_job,
+    mark_run_failed,
+    planned_hotspots,
+    set_run_stage,
+)
 from ..workflows import run_analysis
 
 ANALYZE_TASK_NAME = "xhs_agent.analyze_run"
@@ -86,6 +93,7 @@ async def run_job(
     carrier: dict[str, str] | None = None,
     turn_id: str = "",
     retries: int = 0,
+    execution_token: str | None = None,
 ) -> str:
     """任务体（异步）：查状态 → 索引新鲜度 → 分析，返回终态字符串。
 
@@ -112,6 +120,7 @@ async def run_job(
             sync_index=sync_index,
             turn_id=turn_id,
             retries=retries,
+            execution_token=execution_token,
         )
 
 
@@ -209,6 +218,7 @@ async def _run_job(
     sync_index: bool = True,
     turn_id: str = "",
     retries: int = 0,
+    execution_token: str | None = None,
 ) -> str:
     """`run_job` 的实现体（拆出来只是为了让 trace 上下文包住整段）。"""
     engine = create_engine_from_config(cfg)
@@ -230,6 +240,9 @@ async def _run_job(
                     "job %s 已是终态 %s，跳过（重复投递幂等）", job_id, job["status"]
                 )
                 return str(job["status"])
+
+            execution_token = await RunRecorder(
+                session, job["run_id"], owner_token=execution_token).claim(generation=retries)
 
             token = bind_run_id(job["run_id"])
             run = await session.get(Run, uuid.UUID(job["run_id"]))
@@ -266,6 +279,7 @@ async def _run_job(
                 embedder=embedder,
                 trace_metadata={"job_id": job_id},
                 generation=retries,
+                execution_token=execution_token,
             )
             return result.status
     finally:
@@ -279,14 +293,18 @@ async def _run_job(
 
 
 async def _write_failed(
-    cfg: AppConfig, job_id: str, detail: str, carrier: dict[str, str] | None = None
+    cfg: AppConfig, job_id: str, detail: str, carrier: dict[str, str] | None = None,
+    *, generation: int = 0,
+    owner_token: str | None = None,
 ) -> None:
     """用独立引擎/会话把 run 标成 failed（不复用可能已损坏的原会话）。"""
     with use_trace_carrier(carrier):
-        await _write_failed_inner(cfg, job_id, detail)
+        await _write_failed_inner(cfg, job_id, detail, generation=generation,
+                                  owner_token=owner_token)
 
 
-async def _write_failed_inner(cfg: AppConfig, job_id: str, detail: str) -> None:
+async def _write_failed_inner(cfg: AppConfig, job_id: str, detail: str, *,
+                             generation: int = 0, owner_token: str | None = None) -> None:
     engine = create_engine_from_config(cfg)
     token: Token[str] | None = None
     try:
@@ -297,7 +315,8 @@ async def _write_failed_inner(cfg: AppConfig, job_id: str, detail: str) -> None:
                 logger.warning("job %s 不存在，无法标记 failed", job_id)
                 return
             token = bind_run_id(job["run_id"])
-            await mark_run_failed(session, job["run_id"], detail)
+            await mark_run_failed(session, job["run_id"], detail, generation=generation,
+                                  owner_token=owner_token)
     finally:
         if token is not None:
             reset_run_id(token)
@@ -305,11 +324,14 @@ async def _write_failed_inner(cfg: AppConfig, job_id: str, detail: str) -> None:
 
 
 def mark_failed(
-    job_id: str, cfg: AppConfig, detail: str, carrier: dict[str, str] | None = None
+    job_id: str, cfg: AppConfig, detail: str, carrier: dict[str, str] | None = None,
+    *, generation: int = 0,
+    owner_token: str | None = None,
 ) -> None:
     """兜底标记失败；这一步再失败只记日志，不掩盖原始异常。"""
     try:
-        asyncio.run(_write_failed(cfg, job_id, detail, carrier))
+        asyncio.run(_write_failed(cfg, job_id, detail, carrier, generation=generation,
+                                   owner_token=owner_token))
     except Exception:  # noqa: BLE001 - 兜底路径不能再抛，否则原始异常会被吞掉
         logger.exception(
             "把 job %s 标记为 failed 时又失败（原始错误：%s）", job_id, detail
@@ -349,6 +371,7 @@ def execute(
     carrier = _carrier_from_task(task)
     turn_id = _turn_id_from_task(task)
     retries = int(getattr(getattr(task, "request", None), "retries", 0) or 0)
+    execution_token = str(uuid.uuid4())
     try:
         return asyncio.run(
             run_job(
@@ -360,12 +383,17 @@ def execute(
                 carrier=carrier,
                 turn_id=turn_id,
                 retries=retries,
+                execution_token=execution_token,
             )
         )
+    except SnapshotWriteConflict:
+        # 重复/迟到投递没有执行所有权，无权终结正在工作的合法执行。
+        raise
     except SoftTimeLimitExceeded as exc:
         detail = f"软超时（{cfg.queue.task_soft_time_limit_s}s 上限）：{exc}"
         logger.error("job %s %s，标记 failed（不重试）", job_id, detail)
-        mark_failed(job_id, cfg, detail, carrier=carrier)
+        mark_failed(job_id, cfg, detail, carrier=carrier, generation=retries,
+                    owner_token=execution_token)
         raise
     except TRANSIENT_ERRORS as exc:
         detail = f"{type(exc).__name__}: {exc}"
@@ -383,11 +411,13 @@ def execute(
                 exc=exc, countdown=min(MAX_RETRY_COUNTDOWN_S, 2 ** (retries + 1))
             ) from exc
         logger.error("job %s 重试 %s 次仍失败，标记 failed：%s", job_id, budget, detail)
-        mark_failed(job_id, cfg, detail, carrier=carrier)
+        mark_failed(job_id, cfg, detail, carrier=carrier, generation=retries,
+                    owner_token=execution_token)
         raise
     except Exception as exc:
         # 分析类失败（或任何非基础设施错误）：不重试，直接标 failed 再上抛
-        mark_failed(job_id, cfg, f"{type(exc).__name__}: {exc}", carrier=carrier)
+        mark_failed(job_id, cfg, f"{type(exc).__name__}: {exc}", carrier=carrier,
+                    generation=retries, owner_token=execution_token)
         raise
 
 

@@ -19,12 +19,10 @@ from typing import Annotated, Any
 
 from fastapi import APIRouter, Depends, Query
 from fastapi.responses import FileResponse, Response
-from sqlalchemy import select
 
 from ...config import PROJECT_ROOT, AppConfig
 from ...core.errors import ConflictError, NotFoundError
-from ...db.models import Run, RunHotspot, RunMatch
-from ...services.material_identity import current_material
+from ...services.historical_preview import load_run_preview
 from ...services.runs import (
     UNFINISHED_STATUSES,
     list_runs,
@@ -143,32 +141,8 @@ async def get_material_keyframe(material_id: UuidPath, index: int,
                        503: error_response("依赖不可用（不做降级，直接返回错误）")})
 async def get_run_candidate_keyframe(run_id: UuidPath, position: int, rank: int,
                                      index: int, session: SessionDep,
-                                     cfg: ConfigDep) -> FileResponse:
+                                     cfg: ConfigDep) -> Response:
     """运行范围关键帧：只从候选快照定位，且必须与当前 UUID / 版本校验一致。"""
-    run_uuid = _run_uuid(run_id)
-    run = (await session.execute(select(Run).where(Run.id == run_uuid))).scalar_one_or_none()
-    if run is None:
-        raise NotFoundError(f"run 不存在：{run_id}", {"run_id": run_id})
-    run_hotspot = (await session.execute(select(RunHotspot).where(
-        RunHotspot.run_id == run_uuid, RunHotspot.position == position))).scalar_one_or_none()
-    if run_hotspot is None:
-        raise NotFoundError("热点不存在", {"position": position})
-    match = (await session.execute(select(RunMatch).where(
-        RunMatch.run_hotspot_id == run_hotspot.id, RunMatch.rank == rank))).scalar_one_or_none()
-    if match is None or not match.material_snapshot:
-        raise NotFoundError("历史候选快照不可用", {"position": position, "rank": rank})
-    snapshot = dict(match.material_snapshot)
-    current = await current_material(session, match.material_id)
-    if current is None:
-        raise NotFoundError("原素材已删除，历史预览不可用",
-                            {"material_id": str(match.material_id)})
-    if str(snapshot.get("fingerprint") or "") != str(current.fingerprint or ""):
-        raise ConflictError("历史素材版本与当前不一致，预览不可确认",
-                            {"reason": "preview_version_mismatch",
-                             "material_id": str(match.material_id)})
-    frames = [str(item) for item in snapshot.get("keyframes") or []]
-    current_frames = [str(item) for item in current.keyframes or []]
-    if index < 0 or index >= len(frames) or frames[index] not in current_frames:
-        raise NotFoundError("历史关键帧不可用", {"index": index})
-    target = _frame_target(frames, index, cfg)
-    return FileResponse(target, media_type="image/jpeg")
+    content = await load_run_preview(session, _run_uuid(run_id), position, rank, index, cfg)
+    return Response(content=content, media_type="image/jpeg",
+                    headers={"Cache-Control": "no-store"})

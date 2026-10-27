@@ -10,6 +10,7 @@ from sqlalchemy.exc import InterfaceError, OperationalError
 
 from xhs_agent.config import AppConfig, ConfigError, EnvView, load_config
 from xhs_agent.schemas import SchemaError
+from xhs_agent.services.runs import SnapshotWriteConflict
 from xhs_agent.tasks import analysis
 from xhs_agent.tasks import reconcile as reconcile_task
 from xhs_agent.tasks.analysis import (
@@ -272,6 +273,16 @@ def _boom(exc_type: type[BaseException], message: str = "炸了"):
 
 
 class TestExecuteSemantics:
+    def test_duplicate_claim_conflict_never_marks_active_owner_failed(self, tmp_path, monkeypatch):
+        cfg = make_config(tmp_path)
+        task = FakeTask(retries=0, max_retries=2)
+        monkeypatch.setattr(analysis, "run_job", _boom(SnapshotWriteConflict))
+        monkeypatch.setattr(analysis, "mark_failed",
+                            lambda *_a, **_k: pytest.fail("重复执行不能终结合法 owner"))
+        with pytest.raises(SnapshotWriteConflict):
+            execute(task, "job-1", cfg)
+        assert task.retry_calls == []
+
     def test_transient_error_retries_with_backoff(self, tmp_path, monkeypatch):
         cfg = make_config(tmp_path)
         task = FakeTask(retries=0, max_retries=2)

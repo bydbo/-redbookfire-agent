@@ -51,9 +51,9 @@ function round4(value: number): number {
  */
 export function buildCoverageOption(run: RunDetail, palette: ChartPalette = CHART_LIGHT): EChartsCoreOption {
   const labels = run.hotspots.map((_, index) => `热点 ${index + 1}`)
-  const ratios = run.hotspots.map((hotspot) => round1(hotspot.coverage.ratio * 100))
-  const covered = run.hotspots.map((hotspot) => hotspot.coverage.covered.length)
-  const gaps = run.hotspots.map((hotspot) => hotspot.coverage.gaps.length)
+  const ratios = run.hotspots.map((hotspot) => hotspot.coverage ? round1(hotspot.coverage.ratio * 100) : null)
+  const covered = run.hotspots.map((hotspot) => hotspot.coverage?.covered.length ?? null)
+  const gaps = run.hotspots.map((hotspot) => hotspot.coverage?.gaps.length ?? null)
 
   return {
     aria: { enabled: true, description: '各热点要素覆盖率（百分比），虚线为 60% 目标' },
@@ -62,6 +62,7 @@ export function buildCoverageOption(run: RunDetail, palette: ChartPalette = CHAR
       axisPointer: { type: 'shadow' },
       formatter: (params: unknown) => {
         const index = toItems(params)[0]?.dataIndex ?? 0
+        if (ratios[index] === null) return `${labels[index]}<br/>覆盖情况未知，检索未完成或历史依据缺失`
         return `${labels[index]}<br/>覆盖率：${ratios[index]}%<br/>已覆盖要素：${covered[index]}<br/>缺口要素：${gaps[index]}`
       },
     },

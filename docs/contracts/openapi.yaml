@@ -301,7 +301,8 @@ paths:
       description: |
         按运行、热点位置和候选排名定位**冻结快照**中的关键帧；只接受运行内身份，
         不接受客户端路径。当前素材已删除、快照缺失或下标越界返回 404；
-        当前 UUID 的版本与快照不一致时返回 409，避免显示可能被覆盖的新图片。
+        当前 UUID 的版本、图片内容 SHA-256 与快照不一致，或旧快照没有可信内容摘要时返回 409。
+        路径清单摘要不能证明图片版本；成功响应禁止缓存，并返回本次已校验的同一份图片字节。
       operationId: getRunCandidateKeyframe
       parameters:
         - $ref: '#/components/parameters/RequestId'
@@ -1567,7 +1568,10 @@ components:
             - type: string
             - type: 'null'
         coverage:
-          $ref: '#/components/schemas/Coverage'
+          description: 已保存的覆盖结果；尚未取得或旧数据缺失时为 null，不伪造 0%。
+          oneOf:
+            - $ref: '#/components/schemas/Coverage'
+            - type: 'null'
         retrieval_meta:
           type: object
           description: 本次检索的通道计数、候选数与索引清单摘要
@@ -1822,9 +1826,23 @@ components:
           items:
             type: string
 
+    HistoricalKeyframeContent:
+      type: object
+      required:
+        - path
+        - sha256
+        - size_bytes
+      properties:
+        path:
+          type: string
+        sha256:
+          type: string
+        size_bytes:
+          type: integer
+
     HistoricalMaterial:
       type: object
-      description: 候选在运行当时实际使用的素材摘要；不随当前素材生命周期改写
+      description: 候选在运行当时实际使用的素材摘要；不随当前素材生命周期改写。E6 原素材身份与规范候选身份分别保留；旧图片无内容摘要时不能确认历史预览。
       required:
         - id
         - path
@@ -1904,6 +1922,17 @@ components:
           oneOf:
             - type: string
             - type: 'null'
+
+        original_material_id:
+          oneOf:
+            - type: string
+              format: uuid
+            - type: 'null'
+          default: null
+        keyframe_contents:
+          type: array
+          items:
+            $ref: '#/components/schemas/HistoricalKeyframeContent'
 
     CurrentMaterialStatus:
       type: object

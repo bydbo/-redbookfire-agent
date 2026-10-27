@@ -11,18 +11,20 @@ import asyncio
 import os
 import subprocess
 import sys
+import uuid
 import warnings
 from pathlib import Path
 
 import pytest
 from alembic.config import Config
 from sqlalchemy import text
-from sqlalchemy.ext.asyncio import AsyncEngine
+from sqlalchemy.ext.asyncio import AsyncEngine, async_sessionmaker
 
 # 期望清单与 S2.2 共用同一份"契约 → 结构"映射，避免两处漂移
 from test_db_schema import COLUMN_SPECS, EXPECTED_INDEXES
 
 from alembic import command
+from xhs_agent.services.e8_snapshot_migration import apply_snapshot, plan_snapshot
 
 pytestmark = pytest.mark.integration
 
@@ -214,6 +216,71 @@ class TestUpgrade:
             version = (await conn.execute(text(
                 "SELECT version_num FROM alembic_version"))).scalar_one()
         assert version == REVISION
+
+
+async def _seed_e8_legacy_history(config: Config, engine: AsyncEngine) -> None:
+    await _alembic(command.upgrade, config, "0013")
+    ids = {name: uuid.uuid4() for name in ("material", "run", "hotspot", "rh")}
+    async with engine.begin() as conn:
+        await conn.execute(text("INSERT INTO materials(id,path,title) VALUES(:m,'guard/a.mp4','old')"),
+                           {"m": ids["material"]})
+        await conn.execute(text("INSERT INTO runs(id,job_id,status) VALUES(:r,'e8-guard','succeeded')"),
+                           {"r": ids["run"]})
+        await conn.execute(text("INSERT INTO hotspots(id,raw_text,clue) VALUES(:h,'guard hotspot','{}')"),
+                           {"h": ids["hotspot"]})
+        await conn.execute(text("INSERT INTO run_hotspots(id,run_id,hotspot_id,position,status) "
+                                "VALUES(:rh,:r,:h,1,'succeeded')"),
+                           {"rh": ids["rh"], "r": ids["run"], "h": ids["hotspot"]})
+        await conn.execute(text("INSERT INTO run_matches(run_hotspot_id,material_id,rank,score,reasons) "
+                                "VALUES(:rh,:material,1,0.9,'[\"old reason\"]')"), ids)
+
+
+async def _backfill_e8_at_0014(config: Config, engine: AsyncEngine) -> None:
+    await _alembic(command.upgrade, config, "0014")
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+    async with factory() as session:
+        plan = await plan_snapshot(session, code_version="guard-fixture")
+    async with factory() as session:
+        await apply_snapshot(session, plan, code_version="guard-fixture")
+
+
+class TestSnapshotCutoverGuard:
+    @pytest.mark.asyncio
+    async def test_nonempty_upgrade_requires_backfill_then_allows_verified_cutover(
+        self, alembic_config: Config, db_engine: AsyncEngine
+    ) -> None:
+        await _seed_e8_legacy_history(alembic_config, db_engine)
+        with pytest.raises(RuntimeError, match="停在 0014"):
+            await _alembic(command.upgrade, alembic_config, "head")
+        await _backfill_e8_at_0014(alembic_config, db_engine)
+        await _alembic(command.upgrade, alembic_config, "head")
+        async with db_engine.connect() as conn:
+            assert (await conn.execute(text("SELECT version_num FROM alembic_version"))).scalar_one() == "0015"
+            assert (await conn.execute(text("SELECT count(*) FROM pg_constraint WHERE conname="
+                                            "'fk_run_matches_material_id_materials'"))).scalar_one() == 0
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("statement", [
+        "UPDATE run_matches SET score=0.1",
+        "UPDATE run_matches SET material_snapshot=jsonb_set(material_snapshot,'{title}','\"changed\"')",
+        "INSERT INTO runs(job_id,status) VALUES('uncovered','succeeded')",
+        "UPDATE e8_snapshot_batches SET verification='{}'",
+        "UPDATE e8_snapshot_batches SET plan_digest='forged'",
+        "UPDATE e8_snapshot_batches SET database=jsonb_build_object('name','other')",
+    ])
+    async def test_cutover_guard_rejects_corruption_and_uncovered_history(
+        self, alembic_config: Config, db_engine: AsyncEngine, statement: str
+    ) -> None:
+        await _seed_e8_legacy_history(alembic_config, db_engine)
+        await _backfill_e8_at_0014(alembic_config, db_engine)
+        async with db_engine.begin() as conn:
+            await conn.execute(text(statement))
+        with pytest.raises(RuntimeError, match="停在 0014"):
+            await _alembic(command.upgrade, alembic_config, "head")
+        async with db_engine.connect() as conn:
+            assert (await conn.execute(text("SELECT version_num FROM alembic_version"))).scalar_one() == "0014"
+            assert (await conn.execute(text("SELECT count(*) FROM pg_constraint WHERE conname="
+                                            "'fk_run_matches_material_id_materials'"))).scalar_one() == 1
 
 
 class TestDowngrade:

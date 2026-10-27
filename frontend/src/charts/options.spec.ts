@@ -29,6 +29,7 @@ interface TestOption {
   xAxis: { data: string[] }
   yAxis: TestAxis | TestAxis[]
   series: TestSeries[]
+  tooltip?: { formatter?: (params: unknown) => string }
 }
 
 function asOption(option: unknown): TestOption {
@@ -84,6 +85,7 @@ function hotspot(raw: string, ratio: number, scores: number[], gaps = 0): Hotspo
       reasons: ['命中主题'],
       usage: '放开头 3 秒',
       material: {
+        original_material_id: null,
         id: crypto.randomUUID(),
         path: `D:/materials/片段-${index}.mp4`,
         type: 'video' as const,
@@ -150,6 +152,15 @@ describe('buildCoverageOption', () => {
     expect(series(option).markLine?.data[0].yAxis).toBe(60)
     expect(axis(option).max).toBe(100)
     expect(option.aria?.enabled).toBe(true)
+  })
+
+  it('覆盖依据缺失时保留空数据点与未知提示，不画成零覆盖', () => {
+    const run: RunDetail = { ...RUN, hotspots: [{ ...RUN.hotspots[0], coverage: null }] }
+    const unknown = asOption(buildCoverageOption(run))
+    expect(series(unknown).data).toEqual([null])
+    const tooltip = unknown.tooltip?.formatter?.([{ dataIndex: 0 }])
+    expect(tooltip).toContain('覆盖情况未知')
+    expect(tooltip).not.toContain('覆盖率：0%')
   })
 })
 

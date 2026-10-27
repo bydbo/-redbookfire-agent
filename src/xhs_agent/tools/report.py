@@ -24,22 +24,87 @@ from __future__ import annotations
 import html
 import os
 
-from ..config import PROJECT_ROOT
 from ..schemas import TYPE_LABELS
+from .historical_media import safe_preview_url
 
 
-def _rel(base_dir: str, path: str) -> str:
-    if not path:
-        return ""
-    try:
-        rel = os.path.relpath(os.path.join(PROJECT_ROOT, path), base_dir)
-    except ValueError:
-        return path
-    return rel.replace("\\", "/")
+def _raw(item: dict) -> str:
+    return str(item.get("hotspot_raw") or (item.get("clue") or {}).get("hotspot_raw") or "原文缺失")
+
+
+def _evidence_notes(item: dict) -> list[str]:
+    origins = {"runtime": "运行时保存", "legacy_run_record": "原运行记录",
+               "migration_capture": "E6 迁移归档", "cutover_capture": "切换时采集",
+               "missing": "缺失"}
+    labels = {"clue": "线索", "candidate": "素材文字", "coverage": "覆盖度",
+              "draft": "初稿", "gap_advice": "缺口建议", "retrieval": "检索信息",
+              "execution": "执行配置", "candidate_integrity": "候选完整性"}
+    notes = []
+    for key, meta in (item.get("evidence") or {}).items():
+        if not isinstance(meta, dict):
+            continue
+        label = labels.get(key, key)
+        origin = origins.get(meta.get("origin"), "来源未知")
+        completeness = {"complete": "完整", "partial": "部分缺失", "missing": "缺失"}.get(
+            meta.get("completeness"), "完整度未知")
+        notes.append(f"{label}：{origin}（{completeness}）")
+    if "clue" in item and item.get("clue") is None:
+        notes.append("历史线索缺失，无法确认原运行依据")
+    if item.get("error"):
+        notes.append(f"热点执行失败：{item['error']}")
+    return notes
+
+
+def _preview_note(candidate: dict) -> str:
+    current = candidate.get("current_material") or {}
+    if current.get("exists") is False:
+        return "原素材已删除，历史文字依据仍保留"
+    reason = current.get("reason")
+    notes = {"material_version_changed": "素材版本已变化，历史预览无法确认",
+             "preview_unverified": "历史预览缺少内容摘要，无法确认",
+             "keyframe_content_changed": "关键帧内容已变化，历史预览无法确认",
+             "keyframe_path_invalid": "历史关键帧路径不可用",
+             "keyframes_missing": "历史关键帧缺失"}
+    if reason in notes:
+        return notes[reason]
+    if current.get("file_available") is False:
+        return "原媒体文件缺失；关键帧可用性单独校验"
+    return "" if current.get("preview_available") else "历史预览不可用"
+
+
+def _coverage_text(item: dict) -> str:
+    coverage = item.get("coverage") or {}
+    evidence = (item.get("evidence") or {}).get("coverage") or {}
+    if "ratio" not in coverage or evidence.get("completeness") in {"missing", "partial"}:
+        return "未知"
+    return _fmt_score(coverage["ratio"])
+
+
+def _empty_candidates_note(item: dict) -> str:
+    integrity = (item.get("evidence") or {}).get("candidate_integrity")
+    if integrity and integrity.get("completeness") == "complete":
+        return "没有达到阈值的素材"
+    if integrity:
+        return "旧候选完整性无法确认"
+    if item.get("status") == "failed":
+        return "本次检索未完成或失败，尚无可确认候选"
+    if item.get("status") in {"queued", "running"}:
+        return "本次检索尚未完成"
+    return "旧候选完整性无法确认" if item.get("evidence") else "没有达到阈值的素材"
 
 
 def _fmt_score(score: float) -> str:
     return f"{score * 100:.0f}%"
+
+
+def _model_label(config: dict) -> str:
+    llm = config.get("llm") or {}
+    return f"{llm.get('provider') or '未知'} / {llm.get('model') or '未知'}"
+
+
+def _materials_count(meta: dict) -> str:
+    value = meta.get("materials_count")
+    return "未知" if value is None else str(value)
 
 
 def _vector_coverage_text(vector: dict) -> str:
@@ -60,8 +125,8 @@ def render_markdown(model: dict) -> str:
         f"# 热点相关性报告｜{meta.get('run_id', '')}",
         "",
         f"- 生成时间：{meta.get('created_at', '')}",
-        f"- 分析模型：{(cfg.get('llm') or {}).get('provider', '')} / {(cfg.get('llm') or {}).get('model', '')}",
-        f"- 素材库：`{cfg.get('materials_dir', '')}`（{meta.get('materials_count', 0)} 条）",
+        f"- 分析模型：{_model_label(cfg)}",
+        f"- 素材库：`{cfg.get('materials_dir') or '未知'}`（{_materials_count(meta)} 条）",
         f"- 输入热点：{len(hotspots)} 条",
         "",
         "## 一、机会总览",
@@ -76,13 +141,14 @@ def render_markdown(model: dict) -> str:
         best = candidates[0] if candidates else {}
         best_title = ((best.get("material") or {}).get("title") or (best.get("material") or {}).get("path", ""))
         lines.append(
-            f"| {index} | {_cell(clue.get('hotspot_raw', ''))} | {_fmt_score(coverage.get('ratio', 0))} | "
+            f"| {item.get('position', index)} | {_cell(_raw(item))} | {_coverage_text(item)} | "
             f"{_fmt_score(best.get('score', 0))} | {_cell(best_title)} |"
         )
 
     for index, item in enumerate(hotspots, start=1):
         clue = item.get("clue") or {}
-        lines += ["", f"## 二.{index} 热点：{clue.get('hotspot_raw', '')}", ""]
+        lines += ["", f"## 二.{item.get('position', index)} 热点：{_raw(item)}", ""]
+        lines.extend(f"> {note}" for note in _evidence_notes(item))
         if clue.get("note"):
             lines += [f"> {clue['note']}", ""]
 
@@ -116,10 +182,15 @@ def render_markdown(model: dict) -> str:
                 f"{_fmt_score(candidate.get('score', 0))} | {_cell(hit_text)} | {_cell(candidate.get('usage', ''))} |"
             )
         if not item.get("candidates"):
-            lines.append("| — | 没有达到阈值的素材 | — | — | — |")
+            empty = _empty_candidates_note(item)
+            lines.append(f"| — | {empty} | — | — | — |")
+        for candidate in item.get("candidates") or []:
+            lines.append(f"- #{candidate.get('rank')} 匹配理由：{'；'.join(candidate.get('reasons') or [])}")
+            lines.extend(f"  - {note}" for note in _evidence_notes(candidate))
+            lines.append(f"  - {_preview_note(candidate)}")
 
         coverage = item.get("coverage") or {}
-        lines += ["", f"### 覆盖缺口（{_fmt_score(coverage.get('ratio', 0))} 的线索有素材）", ""]
+        lines += ["", f"### 覆盖缺口（{_coverage_text(item)} 的线索有素材）", ""]
         gaps = coverage.get("gaps") or []
         advice = item.get("gap_advice") or []
         if advice:
@@ -129,10 +200,14 @@ def render_markdown(model: dict) -> str:
                                                               entry.get("type"))
                 lines.append(f"- 缺少 [{label}] {_cell(entry.get('value', ''))} → "
                              f"{_cell(entry.get('advice', ''), 90)}")
-        elif gaps:
+        elif (item.get("evidence") or {}).get("gap_advice", {}).get("completeness") == "missing":
+            lines.append("- 历史缺口建议缺失，未重新计算")
+        elif gaps and not item.get("evidence"):
             for gap in gaps:
                 lines.append(f"- 缺少 [{TYPE_LABELS.get(gap.get('type'), gap.get('type'))}] {gap.get('value')} 相关素材 → 建议补拍或去素材库再捞")
-        else:
+        elif _coverage_text(item) == "未知":
+            lines.append("- 历史覆盖情况未知")
+        elif not gaps:
             lines.append("- 线索要素都有素材覆盖，可以直接剪")
 
         draft = item.get("draft")
@@ -153,6 +228,7 @@ def render_markdown(model: dict) -> str:
         lines.append(f"- {_vector_coverage_text(vector)}")
     for note in model.get("errors") or []:
         lines.append(f"- ⚠️ {note}")
+    lines.extend(f"- {note}" for note in _evidence_notes(model))
     return "\n".join(lines) + "\n"
 
 
@@ -165,7 +241,6 @@ def render_html(model: dict, base_dir: str = "") -> str:
     cards = []
     for index, item in enumerate(hotspots, start=1):
         clue = item.get("clue") or {}
-        coverage = item.get("coverage") or {}
         candidates = item.get("candidates") or []
         draft = item.get("draft") or {}
 
@@ -182,6 +257,11 @@ def render_html(model: dict, base_dir: str = "") -> str:
                 f'<li>缺少 [{html.escape(str(a.get("label") or a.get("type", "")))}] '
                 f'{html.escape(str(a.get("value", "")))} → {html.escape(str(a.get("advice", "")))}</li>'
                 for a in advice)
+        elif (item.get("evidence") or {}).get("gap_advice", {}).get("completeness") == "missing":
+            gap_html = "<li>历史缺口建议缺失，未重新计算</li>"
+        elif item.get("evidence"):
+            gap_html = ("<li>历史覆盖情况未知</li>" if _coverage_text(item) == "未知"
+                        else "<li>本次保存的缺口建议为空</li>")
         else:
             gaps = item.get("coverage", {}).get("gaps") or []
             gap_html = "".join(
@@ -192,8 +272,15 @@ def render_html(model: dict, base_dir: str = "") -> str:
         rows = []
         for candidate in candidates:
             material = candidate.get("material") or {}
-            frame = (material.get("keyframes") or [""])[0]
-            img = f'<img src="{html.escape(_rel(base_dir, frame))}" alt="">' if frame else '<div class="ph">无预览</div>'
+            frame = safe_preview_url(candidate.get("preview_url"))
+            current = candidate.get("current_material") or {}
+            frame = frame if current.get("preview_available") is True else ""
+            preview_note = html.escape(_preview_note(candidate))
+            img = (f'<img src="{html.escape(frame)}" alt="历史关键帧" loading="lazy">'
+                   if frame else f'<div class="ph">{preview_note}</div>')
+            evidence_html = "".join(f'<div class="dim">{html.escape(note)}</div>'
+                                    for note in _evidence_notes(candidate))
+            reasons = html.escape("；".join(candidate.get("reasons") or []))
             hits = "".join(
                 f'<span class="hit">{html.escape(str(TYPE_LABELS.get(h.get("element_type"), h.get("element_type"))))}'
                 f' · {html.escape(str(h.get("clue_value", "")))}</span>'
@@ -208,10 +295,13 @@ def render_html(model: dict, base_dir: str = "") -> str:
                 <div class="path">{html.escape(str(material.get('path', '')))}</div>
                 <div class="hits">{hits}</div>
                 <div class="usage">{html.escape(str(candidate.get('usage', '')))}</div>
+                <div class="usage">匹配理由：{reasons}</div>
+                {evidence_html}<div class="dim">{preview_note}</div>
               </div>
             </div>""")
         if not rows:
-            rows.append('<p class="dim">没有达到阈值的素材，建议放宽阈值或补充素材。</p>')
+            empty = _empty_candidates_note(item)
+            rows.append(f'<p class="dim">{empty}</p>')
 
         draft_html = ""
         if draft:
@@ -233,9 +323,12 @@ def render_html(model: dict, base_dir: str = "") -> str:
               {'<h4>合规提醒</h4><ul>' + notes + '</ul>' if notes else ''}
             </div>"""
 
+        evidence_html = "".join(f'<p class="dim">{html.escape(note)}</p>'
+                                for note in _evidence_notes(item))
         cards.append(f"""
         <section class="card">
-          <h2><span class="idx">{index}</span>{html.escape(str(clue.get('hotspot_raw', '')))}</h2>
+          <h2><span class="idx">{item.get('position', index)}</span>{html.escape(_raw(item))}</h2>
+          {evidence_html}
           <div class="chips">{elements}</div>
           <div class="grid">
             <div><h4>为什么能火</h4><ul>{whys}</ul></div>
@@ -243,7 +336,7 @@ def render_html(model: dict, base_dir: str = "") -> str:
           </div>
           <h4>素材匹配榜</h4>
           {''.join(rows)}
-          <h4>覆盖缺口（{_fmt_score(coverage.get('ratio', 0))} 的线索有素材）</h4>
+          <h4>覆盖缺口（{_coverage_text(item)} 的线索有素材）</h4>
           <ul>{gap_html}</ul>
           {draft_html}
         </section>""")
@@ -295,8 +388,8 @@ footer {{ padding:0 32px 40px; color:var(--dim); font-size:13px; }}
   <div class="meta">
     运行 {html.escape(str(meta.get('run_id', '')))} ·
     {html.escape(str(meta.get('created_at', '')))} ·
-    模型 {html.escape(str((cfg.get('llm') or {}).get('provider', '')))}/{html.escape(str((cfg.get('llm') or {}).get('model', '')))} ·
-    素材 {meta.get('materials_count', 0)} 条 · 热点 {len(hotspots)} 条
+    模型 {html.escape(_model_label(cfg))} ·
+    素材 {_materials_count(meta)} 条 · 热点 {len(hotspots)} 条
   </div>
 </header>
 <main>

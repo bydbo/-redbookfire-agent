@@ -2,7 +2,7 @@
 
 用途：`build_report_model` 是纯函数，产出 `tools/report.py` 约定的 model 形状；
       `render_and_save` 渲染 Markdown 与单文件 HTML，经 `RunStore` 落盘到 `runs/<run_id>/`。
-输入：热点条目、运行元信息、`RunStore`、相对路径基准目录（关键帧路径以工程根为基准）。
+输入：热点条目、运行元信息、`RunStore`；历史预览仅消费服务端运行范围 URL。
 输出：报告 model dict；`render_and_save` 返回 `(markdown 路径, html 路径)`。
 """
 
@@ -14,7 +14,7 @@ from ..tools.report import render_html, render_markdown
 from ..tools.trace import RunStore
 
 
-def build_report_model(*, run_id: str, created_at: str, materials_count: int,
+def build_report_model(*, run_id: str, created_at: str, materials_count: int | None,
                        config: dict[str, Any], hotspots: list[dict[str, Any]],
                        totals: dict[str, Any], errors: list[str],
                        vector_coverage: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -59,7 +59,7 @@ def hotspot_entry(clue: dict[str, Any], coverage: dict[str, Any],
 def render_and_save(model: dict[str, Any], store: RunStore, *, base_dir: str) -> tuple[str, str]:
     """渲染 Markdown + 单文件 HTML 并落盘，返回两个产物路径。
 
-    只有 HTML 需要 `base_dir`（把关键帧路径转成相对路径）；Markdown 用原始路径。
+    `base_dir` 保留调用兼容；历史预览通过已校验的运行范围 URL 提供，不暴露缓存路径。
     """
     markdown = render_markdown(model)
     html = render_html(model, base_dir=base_dir)

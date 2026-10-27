@@ -55,8 +55,22 @@ function currentStatus(cand: HotspotResult['candidates'][number]): string {
     return '素材已更新，历史预览无法确认'
   }
   if (cand.current_material.reason === 'keyframes_missing') return '当前关键帧缺失'
+  if (cand.current_material.reason === 'preview_unverified') return '历史预览缺少内容摘要，无法确认'
+  if (cand.current_material.reason === 'keyframe_content_changed') return '关键帧已变化，历史预览无法确认'
+  if (cand.current_material.file_available === false) return '原媒体文件缺失，关键帧可用性单独校验'
   if (!cand.current_material.preview_available) return '历史预览不可用'
   return ''
+}
+
+function emptyCandidatesNote(): string {
+  const integrity = props.hotspot.evidence?.candidate_integrity
+  if (integrity?.completeness === 'complete') return '没有命中的素材'
+  if (integrity) return '旧候选完整性无法确认，不能当作“没有候选”'
+  if (props.hotspot.status === 'failed') return '本次检索未完成或失败，尚无可确认候选'
+  if (props.hotspot.status === 'running' || props.hotspot.status === 'queued') {
+    return '本次检索尚未完成'
+  }
+  return '旧候选完整性无法确认，不能当作“没有候选”'
 }
 
 // ---------- 文案一键复制（键为 hotspot_id，同页多个热点互不干扰） ----------
@@ -162,8 +176,7 @@ async function copyDraft(draft: Draft, hotspotId: string): Promise<void> {
                :title="props.hotspot.error || '该热点执行失败，已完成依据会保留'" />
       <n-alert v-if="props.hotspot.candidates.length === 0"
                type="info"
-               :title="props.hotspot.evidence?.clue?.completeness === 'missing'
-                 ? '旧候选完整性无法确认，不能当作“没有候选”' : '没有命中的素材'" />
+               :title="emptyCandidatesNote()" />
       <div
         v-for="cand in props.hotspot.candidates"
         :key="cand.material_id"
@@ -222,17 +235,19 @@ async function copyDraft(draft: Draft, hotspotId: string): Promise<void> {
       <h2 class="mb-2 text-sm font-semibold text-ink-strong">
         覆盖缺口
       </h2>
-      <div class="flex items-center gap-3">
+      <n-alert v-if="!props.hotspot.coverage" type="info"
+               :title="props.hotspot.status === 'failed' ? '覆盖情况未知，本次检索未完成或失败' : '覆盖情况未知，尚无可确认的覆盖结果'" />
+      <div v-else class="flex items-center gap-3">
         <n-progress type="line" :percentage="Math.round(props.hotspot.coverage.ratio * 100)" class="flex-1" />
         <span class="text-sm text-ink">要素覆盖率 {{ (props.hotspot.coverage.ratio * 100).toFixed(0) }}%</span>
       </div>
-      <div v-if="props.hotspot.coverage.covered.length > 0" class="mt-2 flex flex-wrap items-center gap-2 text-sm">
+      <div v-if="props.hotspot.coverage && props.hotspot.coverage.covered.length > 0" class="mt-2 flex flex-wrap items-center gap-2 text-sm">
         <span class="text-ink-muted">已覆盖：</span>
         <n-tag v-for="(el, i) in props.hotspot.coverage.covered" :key="i" size="tiny" type="success">
           {{ ELEMENT_TYPE_LABELS[el.type] }} · {{ el.value }}
         </n-tag>
       </div>
-      <div class="mt-2 flex flex-wrap items-center gap-2 text-sm">
+      <div v-if="props.hotspot.coverage" class="mt-2 flex flex-wrap items-center gap-2 text-sm">
         <span class="text-ink-muted">缺口：</span>
         <n-tag v-for="(el, i) in props.hotspot.coverage.gaps" :key="i" size="tiny" type="warning">
           {{ ELEMENT_TYPE_LABELS[el.type] }} · {{ el.value }}

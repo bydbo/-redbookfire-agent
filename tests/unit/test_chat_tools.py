@@ -39,6 +39,7 @@ from xhs_agent.services.chat_tools import (
 )
 from xhs_agent.services.image_clue import ImageClueParse
 from xhs_agent.services.retrieval import RetrievalOutcome
+from xhs_agent.services.run_snapshots import evidence_meta
 from xhs_agent.tools import llm
 from xhs_agent.tools.llm import LLMError, LLMResult, StructuredCaller
 
@@ -638,9 +639,9 @@ def run_detail(
                 "evidence": {"clue": {"origin": "runtime"}},
                 "candidates": [
                     {
-                        "material_id": "m-1",
+                        "material_id": "11111111-1111-1111-1111-111111111111",
                         "material": {
-                            "id": "m-1",
+                            "id": "11111111-1111-1111-1111-111111111111",
                             "path": "D:/m/夜跑.mp4",
                             "type": "video",
                             "title": "夜里的球鞋",
@@ -665,7 +666,7 @@ def run_detail(
                 ],
                 "draft": (
                     {
-                        "material_id": "m-1",
+                        "material_id": "11111111-1111-1111-1111-111111111111",
                         "hotspot_key": raw,
                         "titles": [{"text": "原标题", "style": "直给"}],
                         "body": "原始正文",
@@ -680,6 +681,13 @@ def run_detail(
                 ),
             }
         )
+    for item in items:
+        item["evidence"]["clue"] = evidence_meta(
+            origin="runtime", source_ref="unit:clue", completeness="complete", payload=item["clue"])
+        candidate = item["candidates"][0]
+        candidate["evidence"]["candidate"] = evidence_meta(
+            origin="runtime", source_ref="unit:material", completeness="complete",
+            payload=candidate["material"])
     return {
         "run_id": RUN_UUID,
         "status": status,
@@ -749,7 +757,7 @@ class TestRevisePaths:
         assert outcome.status == "succeeded", outcome.error
         assert outcome.payload["refused"] is False
         assert outcome.payload["revised"]["body"] == "改后的正文"
-        assert outcome.payload["revised"]["material_id"] == "m-1"  # 关联字段按原稿写回
+        assert outcome.payload["revised"]["material_id"] == "11111111-1111-1111-1111-111111111111"
         assert outcome.payload["cost_cny"] > 0
         assert outcome.prompt_versions == {"copy_revise": 2}
         assert provider.calls == 1

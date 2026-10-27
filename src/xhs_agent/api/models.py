@@ -676,6 +676,14 @@ class EvidenceMeta(_Response):
     missing_fields: list[str]
 
 
+class HistoricalKeyframeContent(_Response):
+    """捕获时可验证的图片内容；路径清单摘要不能代替此证据。"""
+
+    path: str
+    sha256: str
+    size_bytes: int
+
+
 class HistoricalMaterial(_Response):
     """候选在运行当时实际使用的素材摘要（不读当前库覆盖）。"""
 
@@ -697,6 +705,8 @@ class HistoricalMaterial(_Response):
     indexed_at: DateTimeStr | None
     fingerprint: str
     embedding_model: str | None
+    original_material_id: UuidStr | None = None
+    keyframe_contents: list[HistoricalKeyframeContent] = Field(default_factory=list)
 
 
 class CurrentMaterialStatus(_Response):
@@ -746,7 +756,7 @@ class HotspotResult(_Response):
     clue: HotspotClue | None
     status: RunStatus
     error: str | None
-    coverage: Coverage
+    coverage: Coverage | None
     retrieval_meta: dict[str, Any]
     gap_advice: dict[str, Any] | None
     candidates: list[MatchCandidate]

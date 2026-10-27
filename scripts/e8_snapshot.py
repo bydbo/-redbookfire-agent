@@ -9,7 +9,6 @@ import argparse
 import asyncio
 import hashlib
 import json
-import subprocess
 import uuid
 from pathlib import Path
 
@@ -21,29 +20,37 @@ from xhs_agent.services.e8_snapshot_migration import (
     verify_snapshot,
 )
 
-_VERSION_PATHS = ("src", "alembic", "scripts")
+_VERSION_PATHS = ("src", "alembic", "scripts", "config/config.toml",
+                  "alembic.ini", "pyproject.toml", "uv.lock")
 
 
-def _git(*args: str) -> str:
-    result = subprocess.run(["git", *args], cwd=PROJECT_ROOT, capture_output=True,
-                            text=True, encoding="utf-8", errors="replace", check=True)
-    return result.stdout
+def implementation_version(root: Path | None = None) -> str:
+    """Content identity shared by checkout and image; requires neither Git nor env overrides.
 
-
-def implementation_version() -> str:
-    head = _git("rev-parse", "HEAD").strip()
-    digest = hashlib.sha256()
-    for args in (("diff", "--binary", "HEAD", "--", *_VERSION_PATHS),
-                 ("status", "--porcelain", "--", *_VERSION_PATHS)):
-        digest.update(_git(*args).encode("utf-8"))
-        digest.update(b"\0")
-    untracked = _git("ls-files", "--others", "--exclude-standard", "--", *_VERSION_PATHS)
-    for relative in sorted(item for item in untracked.splitlines() if item):
-        digest.update(relative.encode("utf-8"))
-        digest.update(b"\0")
-        digest.update((Path(PROJECT_ROOT) / relative).read_bytes())
-        digest.update(b"\0")
-    return f"{head}+worktree:{digest.hexdigest()[:16]}"
+    Hash source/runtime assets, migrations and locked dependencies. Normalize only
+    text line endings so Windows checkout and Linux COPY produce the same identity.
+    Bytecode / tool caches are excluded because importing code generates them.
+    """
+    base = root or Path(PROJECT_ROOT)
+    files: list[Path] = []
+    for relative in _VERSION_PATHS:
+        target = base / relative
+        if not target.exists():
+            raise ValueError(f"缺少实现版本所需文件：{relative}")
+        if target.is_dir():
+            files.extend(path for path in target.rglob("*") if path.is_file())
+        else:
+            files.append(target)
+    fingerprint = hashlib.sha256()
+    for path in sorted(files, key=lambda item: item.relative_to(base).as_posix()):
+        if (any(part in {"__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache"}
+                for part in path.parts) or path.suffix in {".pyc", ".pyo"}):
+            continue
+        relative = path.relative_to(base).as_posix()
+        payload = path.read_bytes().replace(b"\r\n", b"\n")
+        fingerprint.update(relative.encode("utf-8") + b"\0")
+        fingerprint.update(hashlib.sha256(payload).digest())
+    return f"source-sha256:{fingerprint.hexdigest()}"
 
 
 async def run(args: argparse.Namespace) -> int:

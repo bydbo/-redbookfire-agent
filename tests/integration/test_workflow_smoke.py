@@ -97,7 +97,7 @@ async def schema(db_engine: AsyncEngine, reset_database: None) -> None:
 async def seed(session: AsyncSession, *, path: str, title: str, description: str,
                tags: list[str], embedding: list[float]) -> str:
     literal = "[" + ",".join(repr(float(value)) for value in embedding) + "]"
-    return (await session.execute(text(
+    material_id = (await session.execute(text(
         "INSERT INTO materials (path, type, title, description, tags, elements, source, "
         "duration_s, width, height, has_audio, size_bytes, fingerprint, embedding, embedding_model) "
         "VALUES (:path, 'video', :title, :description, CAST(:tags AS text[]), '[]'::jsonb, "
@@ -105,6 +105,8 @@ async def seed(session: AsyncSession, *, path: str, title: str, description: str
         "RETURNING id::text"
     ), {"path": path, "title": title, "description": description, "tags": list(tags),
         "fingerprint": f"fp-{path}", "embedding": literal, "model": MODEL})).scalar_one()
+    await session.commit()
+    return material_id
 
 
 class TestWorkflowSmoke:

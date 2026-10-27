@@ -13,6 +13,7 @@ class AnalysisState(TypedDict, total=False):
     """五节点共用的 state。"""
 
     hotspot_raw: str                      # 输入：热点原文
+    position: int                         # 本批次中原始顺序（报告含失败热点仍保持原序）
     clue: dict[str, Any]                  # 拆解节点产出（HotspotClue.to_dict()）
     retrieval: dict[str, Any]             # 检索节点产出：候选 / 覆盖度 / 向量覆盖率 / 通道计数
     gap_advice: list[dict[str, Any]]      # 缺口节点产出：结构化补拍建议

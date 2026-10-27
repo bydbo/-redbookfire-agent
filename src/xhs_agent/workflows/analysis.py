@@ -22,6 +22,7 @@ import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 from langgraph.graph import END, START, StateGraph
@@ -43,12 +44,18 @@ from ..core.tracing import (
 from ..schemas import HotspotClue
 from ..services.reporting import build_report_model, hotspot_entry, render_and_save
 from ..services.retrieval import RetrievalOutcome, retrieve_candidates
-from ..services.run_snapshots import execution_snapshot
-from ..services.runs import RunRecorder
+from ..services.run_snapshots import digest, execution_snapshot
+from ..services.runs import (
+    RunRecorder,
+    SnapshotWriteConflict,
+    load_report_model,
+    planned_hotspots,
+)
 from ..tools import gaps as gaps_tool
 from ..tools.http import build_http_client
 from ..tools.llm import StructuredCaller, build_provider
 from ..tools.prompt import PromptError
+from ..tools.prompt import load as load_prompt
 from ..tools.trace import RunStore
 from .state import AnalysisState
 
@@ -66,6 +73,22 @@ NODE_KEYS: dict[str, str] = {
 
 # 阶段上报回调：`{"stage", "status", "attempt", "latency_ms", "error_category"}`
 StageReporter = Callable[[dict[str, Any]], Awaitable[None]]
+SnapshotReporter = Callable[[str, dict[str, Any]], Awaitable[None]]
+
+
+def _execution_assets() -> dict[str, Any]:
+    """绑定运行实际可用的模板和实现；不依赖 Git 工作树或部署机器的路径。"""
+    prompts = {}
+    for task in ("hotspot_clue", "material_select", "copy_draft"):
+        asset = load_prompt(task)
+        prompts[task] = {"version": asset.version, "digest": digest(asset.sections)}
+    package = Path(__file__).resolve().parents[1]
+    implementation = digest({name: (package / name).read_text(encoding="utf-8") for name in (
+        "workflows/analysis.py", "services/runs.py", "services/retrieval.py",
+        "services/run_snapshots.py", "tools/retrieval.py", "tools/prompt.py",
+        "agents/clue.py", "agents/explain.py", "agents/draft.py",
+    )})
+    return {"prompt_assets": prompts, "implementation_digest": implementation}
 
 
 def retry_on_error(exc: Exception) -> bool:
@@ -77,7 +100,8 @@ def retry_on_error(exc: Exception) -> bool:
     TypeError 等契约/类型错误）不重试，其余一律重试。
     """
     return not isinstance(
-        exc, (PromptError, ValueError, TypeError, ImportError, LookupError, NameError)
+        exc, (PromptError, SnapshotWriteConflict, ValueError, TypeError, ImportError,
+              LookupError, NameError)
     )
 
 
@@ -235,6 +259,8 @@ def build_graph(
     on_stage: StageReporter | None = None,
     source_id: str = "",
     generation: int = 0,
+    on_snapshot: SnapshotReporter | None = None,
+    asset_binding: dict[str, Any] | None = None,
 ):
     """装配五节点图。依赖（模型调用 / 检索 / 运行记录）全部可注入，便于离线单测。"""
     policy = retry_policy if retry_policy is not None else DEFAULT_RETRY
@@ -251,6 +277,10 @@ def build_graph(
         for record in caller.records[before:]:
             store.record_llm(record)
 
+    def _verify_assets() -> None:
+        if asset_binding is not None and _execution_assets() != asset_binding:
+            raise ValueError("执行实现或 prompt 已变化，当前 run 不能继续")
+
     async def clue_node(state: AnalysisState) -> dict:
         # 线索复用：同一个热点第二次分析时直接用库里已存的快照，省掉一次模型调用
         # （数据契约 §3.2「避免重复付费」）。步骤照记并标 skipped（S7.20），pending 计算不受影响。
@@ -261,13 +291,19 @@ def build_graph(
                 pass
             return {}
         async with tracker.stage(NODE_STEPS[0], detail=state.get("hotspot_raw", "")):
+            _verify_assets()
             before = len(caller.records)
-            outcome = await extract_clue(state["hotspot_raw"], caller)
-            _record_llm(before)
-        return {
+            try:
+                outcome = await extract_clue(state["hotspot_raw"], caller)
+            finally:
+                _record_llm(before)
+        update = {
             "clue": outcome.value.to_dict(),
             "prompt_versions": _merge_version(state, outcome),
         }
+        if on_snapshot is not None:
+            await on_snapshot("clue", update)
+        return update
 
     async def retrieve_node(state: AnalysisState) -> dict:
         clue = HotspotClue.from_dict(
@@ -275,11 +311,14 @@ def build_graph(
         )
         async with tracker.stage(NODE_STEPS[1], detail=clue.hotspot_raw):
             outcome: RetrievalOutcome = await retrieve(clue)
+            _verify_assets()
             before = len(caller.records)
-            explained = await explain_candidates(clue, list(outcome.candidates), caller)
-            _record_llm(before)
+            try:
+                explained = await explain_candidates(clue, list(outcome.candidates), caller)
+            finally:
+                _record_llm(before)
         candidates = explained.value if explained.value else list(outcome.candidates)
-        return {
+        update = {
             "retrieval": {
                 "candidates": [item.to_dict() for item in candidates],
                 "coverage": outcome.coverage.to_dict(),
@@ -293,12 +332,18 @@ def build_graph(
             },
             "prompt_versions": _merge_version(state, explained),
         }
+        if on_snapshot is not None:
+            await on_snapshot("retrieve", update)
+        return update
 
     async def gaps_node(state: AnalysisState) -> dict:
         async with tracker.stage(NODE_STEPS[2]):
             coverage = (state.get("retrieval") or {}).get("coverage") or {}
             advice = gaps_tool.gap_advice(coverage)
-        return {"gap_advice": advice}
+        update = {"gap_advice": advice}
+        if on_snapshot is not None:
+            await on_snapshot("gaps", update)
+        return update
 
     async def draft_node(state: AnalysisState) -> dict:
         clue = HotspotClue.from_dict(
@@ -307,13 +352,16 @@ def build_graph(
         candidates = (state.get("retrieval") or {}).get("candidates") or []
         chosen = candidates[0].get("material") if candidates else None
         async with tracker.stage(NODE_STEPS[3], detail=clue.hotspot_raw):
+            _verify_assets()
             before = len(caller.records)
-            outcome = await write_draft(
-                clue, chosen, caller, style=style,
-                # A05：worker 生成阶段使用提交时固化的同一份约束快照
-                constraints=list(state.get("constraints") or []),
-            )
-            _record_llm(before)
+            try:
+                outcome = await write_draft(
+                    clue, chosen, caller, style=style,
+                    # A05：worker 生成阶段使用提交时固化的同一份约束快照
+                    constraints=list(state.get("constraints") or []),
+                )
+            finally:
+                _record_llm(before)
         update: dict = {
             "draft": outcome.value.to_dict() if outcome.value is not None else None,
             "prompt_versions": _merge_version(state, outcome),
@@ -323,6 +371,8 @@ def build_graph(
                 *(state.get("notes") or []),
                 "本次没有候选素材，跳过文案初稿",
             ]
+        if on_snapshot is not None:
+            await on_snapshot("draft", update)
         return update
 
     async def report_node(state: AnalysisState) -> dict:
@@ -335,6 +385,8 @@ def build_graph(
                 gap_advice=state.get("gap_advice"),
                 draft=state.get("draft"),
             )
+            entry["position"] = state.get("position", 1)
+            entry["hotspot_raw"] = state.get("hotspot_raw", "")
             updated = {
                 **model,
                 "meta": {**(model.get("meta") or {}), **_meta_from_retrieval(state)},
@@ -381,6 +433,7 @@ async def run_analysis(
     tracer: Tracer | None = None,
     trace_metadata: dict[str, Any] | None = None,
     generation: int = 0,
+    execution_token: str | None = None,
 ) -> RunResult:
     """公共入口：绑 `run_id` 日志上下文（S4.1）+ 开一条 Langfuse trace（S4.2），再跑 `_run_analysis`。
 
@@ -409,6 +462,7 @@ async def run_analysis(
                     topk=topk,
                     tracer=active,
                     generation=generation,
+                    execution_token=execution_token,
                 )
             except (
                 BaseException
@@ -451,6 +505,7 @@ async def _run_analysis(
     topk: int | None = None,
     tracer: Tracer | None = None,
     generation: int = 0,
+    execution_token: str | None = None,
 ) -> RunResult:
     """跑一批热点：循环调用五节点图，返回 `RunResult`。
 
@@ -465,8 +520,10 @@ async def _run_analysis(
     if not raws:
         raise ValueError("至少需要一个非空的热点原文")
     tracer = tracer if tracer is not None else get_tracer(cfg)
+    cfg = cfg.model_copy(deep=True)
 
-    recorder = RunRecorder(session, run_id, cfg) if run_id is not None else None
+    recorder = (RunRecorder(session, run_id, cfg, owner_token=execution_token)
+                if run_id is not None else None)
     effective_topk = topk
     if effective_topk is None and recorder is not None:
         effective_topk = (
@@ -478,11 +535,28 @@ async def _run_analysis(
             raise ValueError(
                 f"热点数量与 run_hotspots 不一致：传入 {len(raws)}、库里 {total}"
             )
-        await recorder.start(
-            execution_snapshot(cfg, topk=int(effective_topk or cfg.match.topk),
-                               context_snapshot=await recorder.context_snapshot()),
-            generation=generation,
-        )
+        if [raw for _, raw in await planned_hotspots(session, recorder.run_id)] != raws:
+            raise ValueError("热点原文与提交时的输入快照不一致")
+        previous_execution = await recorder.execution()
+        now = now if now is not None else previous_execution.get("retrieval_time_basis", time.time())
+        assets = _execution_assets()
+        execution = execution_snapshot(
+            cfg, topk=int(effective_topk or cfg.match.topk),
+            context_snapshot=await recorder.context_snapshot())
+        execution.update(assets)
+        execution["retrieval_time_basis"] = now
+        execution["style"] = style
+        if caller is not None:
+            actual_provider = {
+                "provider": str(getattr(caller.provider, "name", "")),
+                "model": str(getattr(caller.provider, "model", "")),
+            }
+            execution["configured_llm"] = dict(execution["llm"])
+            execution["llm"] = {**dict(execution["llm"]), **actual_provider}
+            execution["provider_identity"] = actual_provider
+        await recorder.start(execution, generation=generation)
+    else:
+        assets = None
 
     store = (
         store
@@ -536,6 +610,14 @@ async def _run_analysis(
         constraint_snapshot = (
             await recorder.constraints() if recorder is not None else []
         )
+        active_position = 0
+        partial: dict[str, Any] = {}
+
+        async def on_snapshot(phase: str, payload: dict[str, Any]) -> None:
+            partial.update(payload)
+            if recorder is not None:
+                await recorder.checkpoint(active_position, phase, payload, generation=generation)
+
         graph = build_graph(
             caller=caller,
             retrieve=retrieve,
@@ -546,6 +628,8 @@ async def _run_analysis(
             on_stage=on_stage,
             source_id=f"worker:{run_id or store.run_id}:g{generation}",
             generation=generation,
+            on_snapshot=on_snapshot,
+            asset_binding=assets,
         )
         model = build_report_model(
             run_id=store.run_id,
@@ -565,8 +649,10 @@ async def _run_analysis(
         report_paths: dict[str, str] = {}
 
         for position, raw in enumerate(raws, start=1):
+            active_position = position
             initial: dict = {
                 "hotspot_raw": raw,
+                "position": position,
                 "report_model": model,
                 "prompt_versions": versions,
                 "errors": errors,
@@ -575,30 +661,36 @@ async def _run_analysis(
             reused = await recorder.load_clue(raw) if recorder is not None else None
             if reused:
                 initial["clue"] = reused  # 预置线索 → 拆解节点短路，不再付费
+            partial = dict(initial)
+            # 上面的约束 / 线索读取只读事务到此结束，后续模型等待不占用连接。
+            if recorder is not None:
+                await session.commit()
             with tracer.hotspot(
                 index=position, metadata={"chars": len(raw)}, content=raw
             ):
                 try:
                     result = await graph.ainvoke(initial)
+                except SnapshotWriteConflict:
+                    # 重复或旧执行无权终结合法 owner 的热点或批次。
+                    if recorder is not None:
+                        await session.rollback()
+                    raise
                 except Exception as exc:  # 节点重试后仍失败：记进报告，不阻断整批
                     detail = f"{type(exc).__name__}: {exc}"
                     errors = [*errors, f"[{raw}] {detail}"]
-                    failed.append(
-                        hotspot_entry(
-                            clue=reused or {}, coverage={}, candidates=[], error=detail
-                        )
-                    )
+                    versions = dict(partial.get("prompt_versions") or versions)
+                    retained = partial.get("retrieval") or {}
+                    failed_entry = hotspot_entry(
+                            clue=partial.get("clue") or {},
+                            coverage=retained.get("coverage") or {},
+                            candidates=retained.get("candidates") or [],
+                            gap_advice=partial.get("gap_advice"),
+                            draft=partial.get("draft"), error=detail)
+                    failed_entry.update(position=position, hotspot_raw=raw)
+                    failed.append(failed_entry)
                     if recorder is not None:
-                        await recorder.hotspot_finished(
-                            position,
-                            clue=reused or {},
-                            coverage={},
-                            candidates=[],
-                            draft=None,
-                            status="failed",
-                            error=detail,
-                            generation=generation,
-                        )
+                        await session.rollback()
+                        await recorder.fail_hotspot(position, detail, generation=generation)
                     continue
                 model = result.get("report_model") or model
                 versions = result.get("prompt_versions") or versions
@@ -627,7 +719,8 @@ async def _run_analysis(
         if failed:
             model = {
                 **model,
-                "hotspots": [*(model.get("hotspots") or []), *failed],
+                "hotspots": sorted([*(model.get("hotspots") or []), *failed],
+                                   key=lambda item: int(item.get("position") or 0)),
                 "errors": errors,
                 "totals": dict(store.state["totals"]),
             }
@@ -646,6 +739,11 @@ async def _run_analysis(
                 errors=errors,
                 generation=generation,
             )
+            # 本地产物与 API 报告共同消费冻结投影，失败热点也按原 position 输出。
+            model = await load_report_model(session, cfg, recorder.run_id) or model
+            markdown_path, html_path = render_and_save(model, store, base_dir=PROJECT_ROOT)
+            report_paths = {"markdown": markdown_path, "html": html_path}
+            await session.commit()
         return RunResult(
             run_id=store.run_id,
             status=status,

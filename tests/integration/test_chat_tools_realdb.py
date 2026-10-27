@@ -323,6 +323,29 @@ class TestPreviewElementCoverage:
 
 
 class TestReviseDraft:
+    @pytest.mark.parametrize("mode", ["id_only", "missing_description", "tampered_digest", "malformed_clue"])
+    async def test_incomplete_or_tampered_text_refuses_before_model(
+            self, db_session: AsyncSession, cfg: AppConfig, mode: str) -> None:
+        run_id, _ = await seed_finished_run(db_session)
+        if mode == "id_only":
+            await db_session.execute(text(
+                "UPDATE run_matches SET material_snapshot=jsonb_build_object('id',material_id::text)"))
+        elif mode == "missing_description":
+            await db_session.execute(text(
+                "UPDATE run_matches SET material_snapshot=material_snapshot-'description'"))
+        elif mode == "tampered_digest":
+            await db_session.execute(text(
+                "UPDATE run_matches SET evidence_meta=jsonb_set(evidence_meta,'{candidate,digest}','\"bad\"')"))
+        else:
+            await db_session.execute(text("UPDATE run_hotspots SET clue='{\"hotspot_raw\":\"x\"}'"))
+        await db_session.commit()
+        provider = CountingProvider(REVISED_PAYLOAD)
+        ctx = ToolContext(cfg=cfg, session=db_session, caller=StructuredCaller(provider))
+        outcome = await revise_draft(ctx, {"run_id": run_id, "request": "改短一点"})
+        assert outcome.status == "failed"
+        assert outcome.payload["reason"] == "historical_evidence_incomplete"
+        assert provider.calls == 0
+
     async def test_returns_a_new_draft_and_keeps_the_snapshot(
             self, db_session: AsyncSession, cfg: AppConfig) -> None:
         run_id, original = await seed_finished_run(db_session)
@@ -363,6 +386,13 @@ class TestReviseDraft:
             select(RunHotspot).where(RunHotspot.run_id == uuid.UUID(run_id))
         )).scalar_one()
         run_hotspot.draft = {**run_hotspot.draft, "material_id": str(old_id)}
+        # This fixture proves the archived text was captured from that same original UUID.
+        match = (await db_session.execute(select(RunMatch).where(
+            RunMatch.run_hotspot_id == run_hotspot.id))).scalar_one()
+        snapshot = {**match.material_snapshot, "id": str(old_id), "original_material_id": str(old_id)}
+        match.material_snapshot = snapshot
+        match.evidence_meta = {"candidate": evidence_meta(
+            origin="migration_capture", source_ref="e6:verified-original", completeness="complete", payload=snapshot)}
         await db_session.commit()
 
         provider = CountingProvider(REVISED_PAYLOAD)
@@ -374,7 +404,7 @@ class TestReviseDraft:
         assert provider.calls == 1
         prompt = provider.requests[0].user
         assert str(canonical) in prompt
-        assert str(old_id) not in prompt
+        assert str(old_id) in prompt  # original evidence identity remains visible in material JSON
         assert outcome.payload["revised"]["material_id"] == str(canonical)
 
     async def test_missing_evidence_is_refused_before_any_model_call(
@@ -406,12 +436,19 @@ class TestReviseDraft:
         snapshot = json.loads(row)
         clue = (await db_session.execute(text(
             "SELECT clue::text FROM run_hotspots WHERE run_id=:r"), {"r": run_id})).scalar_one()
+        from xhs_agent.services.run_snapshots import digest
+        parsed_clue = json.loads(clue)
         evidence = {"schema_version": 1, "origin": "legacy_run_record",
                     "captured_at": "2026-10-01T00:00:00+00:00",
-                    "source_ref": "run:seed", "digest": "d", "completeness": "complete",
-                    "missing_fields": [], "clue": json.loads(clue),
+                    "source_ref": f"run:{run_id}/position:1", "digest": digest({
+                        "clue": parsed_clue, "material": snapshot, "base_draft": original}),
+                    "canonical_material_id": original["material_id"], "completeness": "complete",
+                    "missing_fields": [], "clue": parsed_clue,
                     "material": snapshot, "base_draft": original,
-                    "sources": {}}
+                    "sources": {"clue": evidence_meta(origin="runtime", source_ref="seed:clue",
+                        completeness="complete", payload=parsed_clue),
+                        "material": evidence_meta(origin="cutover_capture", source_ref="seed:material",
+                            completeness="complete", payload=snapshot)}}
         key = f"draft:{run_id}:1"
         sid = uuid.UUID((await create_session(db_session))["session_id"])
         await append_message(db_session, sid, role="assistant", content="draft",

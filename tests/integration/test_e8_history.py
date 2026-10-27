@@ -28,6 +28,7 @@ from xhs_agent.services.runs import (
     load_run,
     submit_analysis,
 )
+from xhs_agent.tools.historical_media import frame_content_records
 from xhs_agent.tools.report import render_markdown
 from xhs_agent.workflows import analysis as analysis_workflow
 
@@ -81,7 +82,13 @@ async def test_material_edit_and_delete_do_not_change_history(
         await load_report_model(db_session, cfg, uuid.UUID(run_id)))
     assert saved["title"] in report_after
     assert "新标题" not in report_after
-    assert report_after == report_before
+    # Current availability is deliberately dynamic; historical business data is frozen.
+    assert "原素材已删除" in report_after
+    assert "原素材已删除" not in report_before
+    assert after["hotspots"][0]["draft"] == before["hotspots"][0]["draft"]
+    for old, new in zip(before["hotspots"][0]["candidates"], after["hotspots"][0]["candidates"], strict=True):
+        for field in ("material", "rank", "score", "hits", "missing", "reasons", "usage", "evidence"):
+            assert old[field] == new[field]
 
 
 async def test_report_uses_saved_config_and_gap_advice(
@@ -89,7 +96,7 @@ async def test_report_uses_saved_config_and_gap_advice(
 ) -> None:
     cfg, run_id = await _run(db_session, tmp_path)
     model = await load_report_model(db_session, cfg, uuid.UUID(run_id))
-    assert model["config"]["llm"]["model"] == cfg.llm.model
+    assert model["config"]["llm"]["model"] == "fake-1"
     stored_advice = model["hotspots"][0]["gap_advice"]
     changed = cfg.model_copy(deep=True)
     changed.llm.model = "a-different-model"
@@ -98,7 +105,7 @@ async def test_report_uses_saved_config_and_gap_advice(
     monkeypatch.setattr(gap_tool, "gap_advice", lambda _coverage: [{"mutation": True}])
     again = await load_report_model(db_session, changed, uuid.UUID(run_id))
 
-    assert again["config"]["llm"]["model"] == cfg.llm.model
+    assert again["config"]["llm"]["model"] == "fake-1"
     assert again["hotspots"][0]["gap_advice"] == stored_advice
 
 
@@ -149,6 +156,8 @@ async def test_run_keyframe_route_checks_identity_and_version(
         "WHERE rh.run_id=:r ORDER BY m.rank LIMIT 1"), {"r": run_id})).mappings().one()
     snapshot = json.loads(row["snap"])
     snapshot["keyframes"] = [str(frame)]
+    snapshot["keyframe_contents"] = frame_content_records(
+        [str(frame)], keyframes_root=str(Path(cfg.index_dir()) / "keyframes"), project_root=str(tmp_path))
     await db_session.execute(text(
         "UPDATE materials SET keyframes=CAST(:kf AS jsonb) WHERE id=:id"),
         {"kf": json.dumps([str(frame)]), "id": row["material_id"]})
@@ -160,7 +169,13 @@ async def test_run_keyframe_route_checks_identity_and_version(
 
     response = await get_run_candidate_keyframe(
         run_id, 1, 1, 0, db_session, cfg)
-    assert Path(response.path) == frame
+    assert response.body == frame.read_bytes()
+    assert response.headers["cache-control"] == "no-store"
+
+    frame.write_bytes(b"replaced image bytes")
+    with pytest.raises(ConflictError):
+        await get_run_candidate_keyframe(run_id, 1, 1, 0, db_session, cfg)
+    frame.write_bytes(b"\xff\xd8\xff\xd9")
 
     await db_session.execute(text(
         "UPDATE materials SET fingerprint='changed' WHERE id=:id"), {"id": row["material_id"]})
