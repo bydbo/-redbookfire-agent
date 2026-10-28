@@ -14,8 +14,18 @@ import pytest
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from xhs_agent.config import load_config
-from xhs_agent.evaluation.experiment import index_dataset, run_split
-from xhs_agent.evaluation.models import Case, Dataset, DatasetManifest, MaterialAsset
+from xhs_agent.evaluation.experiment import (
+    index_dataset,
+    run_split,
+    run_sweep_experiment,
+)
+from xhs_agent.evaluation.models import (
+    Case,
+    Dataset,
+    DatasetManifest,
+    MaterialAsset,
+    Qrel,
+)
 from xhs_agent.tools.embedding import EmbeddingResult
 
 pytestmark = [pytest.mark.integration, pytest.mark.asyncio]
@@ -32,6 +42,16 @@ class FakeEmbedder:
         self.calls += len(texts)
         return EmbeddingResult(vectors=[[1.0] + [0.0] * 1023 for _ in texts],
                                model="fake", prompt_tokens=len(texts))
+
+
+class FakeCaller:
+    """真实拆解接口的假实现：只验证编排，不调用模型。"""
+
+    async def call(self, task_id, system, user, parse):
+        del task_id, system, user
+        clue = parse({"elements": [{"type": "topic", "value": "alpha"}],
+                      "match_keywords": ["alpha"], "why_it_works": []})
+        return clue, type("Result", (), {"provider": "fake", "model": "fake"})()
 
 
 def _config(tmp_path: Path, root: Path) -> tuple[Path, object]:
@@ -64,7 +84,9 @@ def _dataset(path: str) -> Dataset:
                        "match_keywords": ["alpha"]},
             "scenario_tags": ["natural_naming"], "notes": "",
         })],
-        qrels=[], reviews=[], e2e_tasks=[],
+        qrels=[Qrel(case_id="case-alpha", material_key="mat-alpha", grade=2,
+                    reason="直接可用", reviewer="test", confirmed=True)],
+        reviews=[], e2e_tasks=[],
     )
 
 
@@ -96,6 +118,12 @@ async def test_index_and_oracle_runner_on_alembic_db(
         attempts, index = await run_split(
             session, cfg, dataset, root, list(dataset.cases), split="dev",
             embedder=FakeEmbedder(), http=None, caller=None, modes=("oracle",))
+        sweep = await run_sweep_experiment(
+            session, cfg, dataset, root, list(dataset.cases),
+            embedder=FakeEmbedder(), http=None, caller=FakeCaller())
+    assert len(sweep["attempts"]) == 48
+    assert set(sweep["selected"]) == {"trgm_only", "vector_only", "hybrid"}
+    assert sweep["baseline"]["strategy"] in {"keyword", "trgm_only", "vector_only"}
     assert len(attempts) == 4
     assert {item.strategy for item in attempts} == {
         "keyword", "trgm_only", "vector_only", "hybrid"}

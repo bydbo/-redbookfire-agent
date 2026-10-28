@@ -518,6 +518,51 @@ async def _retrieval_async(cfg: AppConfig, dataset: Dataset, root: Path,
         await engine.dispose()
 
 
+async def _sweep_async(cfg: AppConfig, dataset: Dataset, root: Path,
+                       embedder_factory: Any) -> dict[str, Any]:
+    from ..db.session import create_engine_from_config, create_session_factory
+    from ..tools.http import build_http_client
+    from ..tools.llm import StructuredCaller, build_provider
+
+    engine = create_engine_from_config(cfg)
+    try:
+        factory = create_session_factory(engine)
+        async with build_http_client(cfg.llm.timeout_s) as http:
+            embedder = embedder_factory(http)
+            caller = StructuredCaller(provider=build_provider(cfg, client=http))
+            async with factory() as session:
+                from .experiment import run_sweep_experiment
+                return await run_sweep_experiment(
+                    session, cfg, dataset, root, list(dataset.cases), embedder=embedder,
+                    http=http, caller=caller, now=time.time())
+    finally:
+        await engine.dispose()
+
+
+def _sweep_summary(result: dict[str, Any]) -> dict[str, Any]:
+    selected = {
+        strategy: {
+            "label": decision["point"].label,
+            "similarity": decision["point"].similarity,
+            "distance": decision["point"].distance,
+            "meets_false_recommendation": decision["meets_false_recommendation"],
+            "status": decision["status"],
+            "metrics": decision["metrics"],
+        }
+        for strategy, decision in result["selected"].items()
+    }
+    baseline = result["baseline"]
+    return {
+        "selected": selected,
+        "baseline": {
+            "strategy": baseline["strategy"],
+            "point": None if baseline["point"] is None else baseline["point"].label,
+            "metrics": baseline["metrics"],
+        },
+        "metrics_by_point": result["metrics"],
+    }
+
+
 def _merge_attempts(root: Path, dataset: Dataset, split: str,
                     new_attempts: list[Any]) -> None:
     existing = read_attempts(root)
@@ -533,10 +578,6 @@ def cmd_retrieval(args: argparse.Namespace) -> int:
     if args.sweep and args.split == "holdout":
         print("留出集禁止调参：--sweep 只能用于开发集", file=sys.stderr)
         return EXIT_INVALID
-    if args.sweep:
-        print("--sweep 尚未接入；先运行固定参数，避免用未经验证的网格冒充选参",
-              file=sys.stderr)
-        return EXIT_INCOMPLETE
     root = Path(args.experiment)
     dataset, report = _load(root, require_frozen=True)
     if not report.ok:
@@ -555,9 +596,26 @@ def cmd_retrieval(args: argparse.Namespace) -> int:
     if not cfg.embedding.enabled:
         print("retrieval 需要 [embedding].enabled = true", file=sys.stderr)
         return EXIT_INVALID
-    modes = (("oracle", "real") if args.clue == "both" else (args.clue,))
+    if args.sweep and args.clue == "oracle":
+        print("--sweep 必须使用真实拆解（--clue real 或 both）", file=sys.stderr)
+        return EXIT_INVALID
     from ..tools.embedding import build_embedder
 
+    if args.sweep:
+        sweep_result = asyncio.run(_sweep_async(
+            cfg, dataset, root,
+            lambda http: build_embedder(cfg, client=http)))
+        sweep_attempts = sweep_result.pop("attempts")
+        _merge_attempts(root, dataset, "dev", sweep_attempts)
+        summary = {"split": "dev", "attempts": len(sweep_attempts),
+                   "generated_at": dt.datetime.now(dt.UTC).isoformat(timespec="seconds"),
+                   **_sweep_summary(sweep_result)}
+        (_results_dir(root) / "sweep.json").write_text(
+            json.dumps(summary, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        print(json.dumps(summary, ensure_ascii=False, indent=2))
+        return EXIT_OK
+
+    modes = (("oracle", "real") if args.clue == "both" else (args.clue,))
     attempts, index = asyncio.run(_retrieval_async(
         cfg, dataset, root, args.split, modes,
         lambda http: build_embedder(cfg, client=http)))

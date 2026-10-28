@@ -24,8 +24,10 @@ from ..services.run_snapshots import digest
 from ..tools.embedding import EmbeddingClient
 from ..tools.llm import StructuredCaller
 from ..tools.vision import sniff_image_mime
+from .metrics import aggregate
 from .models import Attempt, Case, Dataset
 from .retrieval import ClueProvider, run_retrieval
+from .sweep import choose_baseline, choose_point, grid_points
 
 
 class EvalPaths:
@@ -162,3 +164,64 @@ async def run_split(session: AsyncSession, cfg: AppConfig, dataset: Dataset,
         attempts.extend(real_attempts)
         index = real_index or index
     return attempts, index
+
+
+async def run_sweep_experiment(session: AsyncSession, cfg: AppConfig, dataset: Dataset,
+                               root: Path, cases: Sequence[Case], *,
+                               embedder: EmbeddingClient, http: Any,
+                               caller: StructuredCaller, now: float | None = None
+                               ) -> dict[str, Any]:
+    """开发集真实拆解三次，跑 3 + 3 + 9 个参数点并选参。
+
+    线索和查询向量跨参数点缓存：同一任务三次拆解只发生一次，向量也只算一次；
+    每个参数点只改变 `[retrieval]` 的阈值 / 距离，不改变模型、prompt 或排序公式。
+    """
+    selected_cases = [case for case in cases if case.split == "dev"]
+    if not selected_cases:
+        raise ValueError("开发集为空，不能选参")
+    provider = make_clue_provider(cfg, dataset, root, http, caller)
+    vector_cache: dict[tuple[str, int], list[float]] = {}
+    clue_cache: dict[tuple[str, int], Any] = {}
+    attempts: list[Attempt] = []
+    metrics_by_label: dict[str, dict[str, Any]] = {}
+    index: dict[str, Any] = {}
+
+    keyword_attempts, keyword_index = await run_retrieval(
+        session, cfg, dataset, selected_cases, embedder=embedder, clue_mode="real",
+        repeats=3, clue_provider=provider, strategies=("keyword",), variant="keyword",
+        clue_cache=clue_cache, now=now)
+    attempts.extend(keyword_attempts)
+    index = keyword_index or index
+    metrics_by_label["keyword"] = aggregate(
+        selected_cases, dataset.qrels, keyword_attempts, repeats=3)
+
+    for point in grid_points():
+        point_cfg = cfg.model_copy(update={
+            "retrieval": cfg.retrieval.model_copy(update={
+                "similarity_threshold": point.similarity,
+                "max_cosine_distance": point.distance,
+            })})
+        point_attempts, point_index = await run_retrieval(
+            session, point_cfg, dataset, selected_cases, embedder=embedder,
+            clue_mode="real", repeats=3, clue_provider=provider,
+            strategies=(point.strategy,), variant=point.label,
+            vector_cache=vector_cache, clue_cache=clue_cache, now=now)
+        attempts.extend(point_attempts)
+        index = point_index or index
+        metrics_by_label[point.label] = aggregate(
+            selected_cases, dataset.qrels, point_attempts, repeats=3)
+
+    selected: dict[str, Any] = {}
+    for strategy in ("trgm_only", "vector_only", "hybrid"):
+        points = [point for point in grid_points() if point.strategy == strategy]
+        selected[strategy] = choose_point(points, metrics_by_label)
+    baseline = choose_baseline(
+        {key: value["point"] for key, value in selected.items()},
+        metrics_by_label)
+    return {
+        "selected": selected,
+        "baseline": baseline,
+        "metrics": metrics_by_label,
+        "attempts": attempts,
+        "index": index,
+    }

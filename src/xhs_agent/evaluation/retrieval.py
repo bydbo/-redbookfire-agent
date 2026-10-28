@@ -87,30 +87,58 @@ async def run_retrieval(session: AsyncSession, cfg: AppConfig, dataset: Dataset,
                         cases: Sequence[Case], *, embedder: EmbeddingClient,
                         clue_mode: Literal["oracle", "real"] = "oracle", repeats: int = 1,
                         clue_provider: ClueProvider | None = None,
+                        strategies: Sequence[Strategy] = STRATEGIES,
+                        variant: str = "",
+                        vector_cache: dict[tuple[str, int], list[float]] | None = None,
+                        clue_cache: dict[tuple[str, int], HotspotClue] | None = None,
                         now: float | None = None) -> tuple[list[Attempt], dict[str, Any]]:
-    """执行四策略对照并返回全部尝试；单策略失败不影响其他策略留下证据。"""
+    """执行指定策略并返回全部尝试；单策略失败不影响其他策略留下证据。
+
+    `variant` 用于 sweep 参数点，写进 attempt_id 避免同任务多参数点互相覆盖；
+    `vector_cache` / `clue_cache` 让同一开发集的多个参数点共享查询向量和拆解结果。
+    """
+    unknown = [item for item in strategies if item not in STRATEGIES]
+    if unknown:
+        raise ValueError(f"未知检索策略：{unknown}")
     materials, id_to_key = await load_library(session, dataset)
     attempts: list[Attempt] = []
     index_summary: dict[str, Any] = {}
+    need_vector = any(item in ("vector_only", "hybrid") for item in strategies)
     for case in cases:
         clue_rounds = 1 if clue_mode == "oracle" else repeats
         for repeat in range(1, clue_rounds + 1):
-            if clue_mode == "oracle":
-                clue = build_oracle_clue(case)
-            elif clue_provider is not None:
-                clue = await clue_provider(case, repeat)
-            else:
-                raise ValueError("真实拆解模式需要注入 clue_provider")
+            cache_key = (case.case_id, repeat)
+            clue = None
+            if clue_cache is not None:
+                clue = clue_cache.get(cache_key)
+            if clue is None:
+                if clue_mode == "oracle":
+                    clue = build_oracle_clue(case)
+                elif clue_provider is not None:
+                    clue = await clue_provider(case, repeat)
+                else:
+                    raise ValueError("真实拆解模式需要注入 clue_provider")
+                if clue_cache is not None:
+                    clue_cache[cache_key] = clue
             vector: list[float] | None = None
             vector_error = ""
-            started = time.perf_counter()
-            try:
-                vector = await _query_vector(embedder, clue)
-            except Exception as exc:  # 失败要记录，不能把字面策略也一起中断
-                vector_error = f"{type(exc).__name__}: {exc}"
-            embed_ms = int((time.perf_counter() - started) * 1000)
-            for strategy in STRATEGIES:
-                attempt_id = f"{case.case_id}:{clue_mode}:r{repeat}:{strategy}"
+            embed_ms = 0
+            if need_vector:
+                started = time.perf_counter()
+                cached = vector_cache.get(cache_key) if vector_cache is not None else None
+                if cached is not None:
+                    vector = list(cached)
+                else:
+                    try:
+                        vector = await _query_vector(embedder, clue)
+                        if vector_cache is not None:
+                            vector_cache[cache_key] = list(vector)
+                    except Exception as exc:  # 失败要记录，不能把字面策略也一起中断
+                        vector_error = f"{type(exc).__name__}: {exc}"
+                embed_ms = int((time.perf_counter() - started) * 1000)
+            for strategy in strategies:
+                suffix = f":{variant}" if variant else ""
+                attempt_id = f"{case.case_id}:{clue_mode}:r{repeat}:{strategy}{suffix}"
                 start = time.perf_counter()
                 if strategy == "keyword":
                     ranked = retrieval_tool.keyword_substring_rank(clue, materials, cfg.match.topk)
