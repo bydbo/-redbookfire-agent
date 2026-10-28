@@ -13,7 +13,7 @@
 |---|---|---|---|
 | S9.0 协议 | ✅ | 协议 v1、指标 / 判定 / 预算 / 退出码、检索契约 §十二、ADR 0019、评测文档更新 | — |
 | S9.1 数据 | 🔄 | `evals/e9-v1/` 草稿包、Pydantic 记录、hash / 分区 / 全库审阅 / 无答案 / 授权校验、盲标矩阵导出 / 回填、模板、封存脚本 | 100 条授权素材、50 个自然任务、约 5,000 个任务—素材关系的人工确认与冻结 |
-| S9.2 工具 | 🔄 | 四策略共享库 / 线索 / 查询向量；nDCG、Top-1、Hit@5、空结果、nearest-rank、分组 bootstrap；evidence / quality / benefit；持久费用账本、本地转发服务；`index` / `retrieval` 隔离库编排与 CLI；离线测试 | live runner 未在本机 Docker 下执行；参数扫描网格未接入；真实价格快照、正式开发集 / 留出集；S8.3 正式切换未完成 |
+| S9.2 工具 | 🔄 | 四策略共享库 / 线索 / 查询向量；nDCG、Top-1、Hit@5、空结果、nearest-rank、分组 bootstrap；evidence / quality / benefit；持久费用账本、本地转发服务；`index` / `retrieval` 隔离库编排与 CLI；**Alembic + 索引 + oracle 四策略已在真实 Postgres 容器通过（fake embedder）** | 参数扫描网格未接入；真实供应商 / 真实拆解 3 次未执行；真实价格快照、正式开发集 / 留出集；S8.3 正式切换未完成 |
 | S9.3 工具 | 🔄 | 20 任务 / 32 次 E2E 证据结构、`e2e` 离线校验、单任务真实 UI 尝试器（新建会话 → 提交 → 刷新 → 证据）；假模型隔离 | 未在本机启动真实 API / Redis / worker 跑通；S7.29 未签收；正式实验未执行 |
 | S9.4 执行包 | ⬜ 仅模板 | 同意书、主持脚本、任务表、采纳 / 失败记录、脱敏汇总模板 | 未招募、未取得同意、未开展真人试用；S11.1 未完成 |
 
@@ -27,7 +27,7 @@
 | `uv run ruff check .` | 通过（退出码 0；仅对用户遗留的受限目录打印权限警告） |
 | `uv run mypy` | 通过（80 个 source files） |
 | `uv run pytest --cov=xhs_agent --cov-fail-under=0` | 单测覆盖率 66%；**不是联合门槛**，集成未跑 |
-| `uv run pytest -m integration` | **未执行**：Docker Desktop API 不可用（`CreateFile` 找不到文件），环境失败 |
+| `uv run pytest -m integration` | **401 passed**（真实 Postgres / Redis 容器；含 E9 Alembic + 索引 + oracle 四策略 1 条） |
 | `uv run python scripts/eval_e9.py validate --experiment evals/e9-v1 --allow-draft` | 退出 0，提示 draft |
 | `... validate`（严格） | 退出 3：数据未冻结，符合预期 |
 | `... estimate --experiment evals/e9-v1` | 退出 0；按预期 token 估算约 **0.9844 元**（含 20% 重试余量）；价格来源为未核验的配置默认值 |
@@ -73,8 +73,8 @@
 ## 五、风险与后续
 
 - 本地转发服务只做了 MockTransport 测试，未对真实供应商端点验证 SSE / usage 差异；live 前必须补。
-- `index` / `retrieval` 的数据库路径已接 Alembic + 隔离库编排，但未在本机 Docker 下验证；
-  需要恢复 Docker 后跑集成测试。
+- `index` / `retrieval` 的数据库路径已接 Alembic + 隔离库编排，并在真实 Postgres 容器用
+  fake embedder 跑通；真实供应商端点、真实拆解和正式实验仍未执行。
 - `--sweep` 参数网格尚未接入，命令会明确返回 4，不会假装完成选参。
 - e2e live 仍未接浏览器 / worker 自动启动；单任务运行器需要调用方先起好隔离堆栈。
 - 数据封存脚本要求逐字确认短语；封存后仍须人工复核 manifest hash。

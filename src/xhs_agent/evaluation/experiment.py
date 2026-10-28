@@ -11,7 +11,7 @@ from collections.abc import Sequence
 from pathlib import Path
 from typing import Any, cast
 
-from sqlalchemy import select
+from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..agents.clue import extract_clue
@@ -81,9 +81,15 @@ async def index_dataset(session: AsyncSession, cfg: AppConfig, dataset: Dataset,
     extra = sorted(actual - expected)
     if extra:
         raise ValueError(f"隔离库含数据集之外素材：{extra[:5]}；请使用空库或重建")
+    # 与检索服务的 `_index_summary` 使用同一 SQL 口径，确保 index.json 的 digest 可对照。
+    digest_rows = (await session.execute(text(
+        "SELECT id::text AS id, path, coalesce(fingerprint, '') AS fingerprint, "
+        "coalesce(indexed_at::text, '') AS indexed_at, "
+        "coalesce(embedding_model, '') AS embedding_model "
+        "FROM materials ORDER BY id"))).mappings().all()
     payload = {
         "materials_count": len(rows),
-        "digest": library_digest(rows),
+        "digest": digest([dict(row) for row in digest_rows]),
         "embedding_model": cfg.embedding.model,
         "prompt_tokens": report.prompt_tokens,
         "embedded": report.embedded,
