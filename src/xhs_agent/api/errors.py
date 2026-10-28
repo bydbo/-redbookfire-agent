@@ -85,7 +85,7 @@ def register_exception_handlers(app: FastAPI) -> None:
         logger.exception("数据库不可用（request_id=%s）", request_id)
         return json_error(DEPENDENCY_UNAVAILABLE, "数据库不可用",
                           {"request_id": request_id,
-                           "error": f"{type(exc).__name__}: {exc}"[:200]})
+                           "error": type(exc).__name__})
 
     for exc_type in (OperationalError, InterfaceError):
         app.add_exception_handler(exc_type, _handle_db_unavailable)
@@ -98,7 +98,7 @@ def register_exception_handlers(app: FastAPI) -> None:
         logger.warning("上游调用失败（request_id=%s）：%s", request_id, exc)
         return json_error(UPSTREAM_ERROR, DEFAULT_MESSAGE[UPSTREAM_ERROR],
                           {"request_id": request_id,
-                           "error": f"{type(exc).__name__}: {exc}"[:200]})
+                           "error": type(exc).__name__})
 
     for upstream_type in (LLMError, EmbeddingError):
         app.add_exception_handler(upstream_type, _handle_upstream_error)
@@ -110,7 +110,7 @@ def register_exception_handlers(app: FastAPI) -> None:
         logger.warning("任务队列不可用（request_id=%s）：%s", request_id, exc)
         return json_error(DEPENDENCY_UNAVAILABLE, "任务队列不可用",
                           {"request_id": request_id,
-                           "error": f"{type(exc).__name__}: {exc}"[:200]})
+                           "error": type(exc).__name__})
 
     for queue_type in (KombuError, RedisError):
         app.add_exception_handler(queue_type, _handle_queue_unavailable)

@@ -46,7 +46,7 @@ from ..core import progress as progress_tool
 from ..core.budget import BudgetDecision, BudgetPolicy
 from ..core.context_policy import TurnContextPolicy
 from ..core.context_rules import BLOCKING_REASONS
-from ..core.errors import DependencyUnavailableError
+from ..core.errors import DependencyUnavailableError, public_error_message
 from ..core.logging import bind_turn_id, reset_turn_id
 from ..core.observations import record as record_observation
 from ..core.progress import error_category as error_category_of
@@ -1281,7 +1281,7 @@ async def run_turn_task(
                     trace_id=trace_id,
                     status="failed",
                     error_category=category,
-                    error=f"{type(exc).__name__}: {exc}"[:200],
+                    error=public_error_message(exc),
                     ledger=ledger,
                 )
                 totals = _ledger_totals(ledger, window, open_status="failed")

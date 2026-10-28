@@ -270,7 +270,7 @@ class TestChatApi:
         assert assistant["content"] == "跑了完整分析，命中 5 条。"
         assert assistant["run_id"] == RUN_ID
         assert assistant["cost_cny"] == pytest.approx(0.054)
-        assert assistant["prompt_versions"] == {"chat_supervisor": 3}
+        assert assistant["prompt_versions"] == {"chat_supervisor": 5}
         # S7.21：轮次标识 / 阶段快照 / trace 关联都落库（刷新后据此恢复阶段）
         assert assistant["turn_id"] and assistant["turn_id"] == finished["turn_id"]
         snapshot = assistant["progress"]

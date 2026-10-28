@@ -53,12 +53,7 @@ pytestmark = [pytest.mark.integration, pytest.mark.asyncio]
 EMBED_KEY_ENV = "SMOKE_ONLY_EMBED_KEY"          # 故意不设：用来证明"没碰 embedding"
 
 # 线索里只有「羽毛球」能被示例素材的字面命中，另外两个要素必然落进缺口。
-#
-# **夹具为什么长这样**（踩过一次，别再改回去）：`tools/matching.py` 有一条既有行为
-# ——只要任一 `match_keywords` 或 `element.evidence` 是素材文案的**子串**，就会给**每一个**
-# 线索要素都抬到 0.9 相似度（见 `tests/unit/test_matching.py::test_keyword_hit_is_not_type_aware`）。
-# 所以 `match_keywords`（这里是「球场」）与所有 `evidence` 都必须**不出现在素材文案里**，
-# 否则覆盖率恒为 1.0、缺口恒为空，这条用例就白测了。
+# 全局关键词只参与召回，命中与覆盖必须分别来自各要素的直接证据或同类型词典。
 CLUE_PAYLOAD: dict[str, Any] = {
     "hotspot_raw": "",
     "why_it_works": ["日常器材拍出陌生感"],
@@ -265,7 +260,7 @@ class TestSearchMaterials:
         assert top["tags"][:2] == ["羽毛球", "运动"]
         assert top["usage"]
         assert first.payload["elements"] and first.payload["elements"][0]["label"]
-        assert first.prompt_versions == {"hotspot_clue": 1}
+        assert first.prompt_versions == {"hotspot_clue": 2}
         assert first.payload["cost_cny"] > 0
         assert provider.calls == 1
 
@@ -297,7 +292,7 @@ class TestPreviewElementCoverage:
         assert [item["type"] for item in advice] == ["scene", "ip"]      # 顺序与 gaps 一致
         assert "同款" in advice[1]["advice"]                              # IP 的建议来自 gaps.py
         assert "不产出候选素材" in outcome.payload["note"]
-        assert outcome.prompt_versions == {"hotspot_clue": 1}
+        assert outcome.prompt_versions == {"hotspot_clue": 2}
         assert provider.calls == 1
         assert await runs_count(db_session) == 0                # 不新增 runs 行
 
@@ -359,7 +354,7 @@ class TestReviseDraft:
         assert outcome.payload["refused"] is False
         assert outcome.payload["revised"]["body"] == REVISED_BODY
         assert outcome.payload["revised"]["material_id"] == original["material_id"]
-        assert outcome.prompt_versions == {"copy_revise": 2}
+        assert outcome.prompt_versions == {"copy_revise": 3}
         assert provider.calls == 1
         # 关键：改后文案只在对话里，run 的初稿快照一个字都没动
         db_session.expire_all()
@@ -596,7 +591,7 @@ class TestTurnPromptVersions:
         assert [item["tool"] for item in turn.tool_calls] == ["search_materials"]
         assert turn.tool_calls[0]["status"] == "succeeded"
         # supervisor 的版本（v2）+ 工具内部拆解的版本，都记进这一轮
-        assert turn.prompt_versions == {"chat_supervisor": 3, "hotspot_clue": 1}
+        assert turn.prompt_versions == {"chat_supervisor": 5, "hotspot_clue": 2}
         assert provider.tasks == ["hotspot_clue"]
         assert turn.run_id == ""                      # 只读工具不产生 run
         assert turn.cost_cny > 0
@@ -618,5 +613,5 @@ class TestTurnPromptVersions:
 
         assert turn.status == "succeeded", turn.error
         assert turn.tool_calls[0]["tool"] == "revise_draft"
-        assert turn.prompt_versions == {"chat_supervisor": 3, "copy_revise": 2}
+        assert turn.prompt_versions == {"chat_supervisor": 5, "copy_revise": 3}
         assert provider.tasks == ["copy_revise"]

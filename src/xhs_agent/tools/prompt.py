@@ -2,7 +2,7 @@
 
 - 资源位置：`src/xhs_agent/prompts/<task_id>.md`，随 wheel 分发，用 importlib.resources 读取。
 - 五段：01 System / 02 Task / 03 Constraints / 04 Examples / 05 Output Schema。
-- 组装：system = 01 System + 03 Constraints；user = 02 Task（渲染后）+ 04 Examples + 05 Output Schema。
+- 组装：system = 具名 01 / 03 / 04 / 05；user = 具名 02 Task（渲染后）。
 - 占位符 `{{name}}` **只在 02 Task 段生效**，其它段里出现的按字面文本处理。
 - 同目录另有**机读能力清单** `chat_capabilities.json`（S7.11）：它不是 prompt 资产、不进
   `available_tasks()`，由 `load_capabilities()` / `render_capabilities()` 读写（ADR 0016）。
@@ -91,9 +91,9 @@ class Prompt:
         task_body = _PLACEHOLDER_RE.sub(lambda m: str(provided[m.group(1)]),
                                         self.sections["task"])
         system = SECTION_SEPARATOR.join(
-            (self.sections["system"], self.sections["constraints"]))
-        user = SECTION_SEPARATOR.join(
-            (task_body, self.sections["examples"], self.sections["output_schema"]))
+            f"## {SECTION_TITLES[index]}\n\n{self.sections[SECTION_KEYS[index]]}"
+            for index in (0, 2, 3, 4))
+        user = f"## {SECTION_TITLES[1]}\n\n{task_body}"
         return RenderedPrompt(task_id=self.task_id, version=self.version,
                               system=system, user=user)
 
@@ -176,6 +176,16 @@ def available_tasks() -> tuple[str, ...]:
         for entry in resources.files(PACKAGE).iterdir()
         if entry.name.endswith(SUFFIX)
     ))
+
+
+def protected_prompt_texts() -> tuple[str, ...]:
+    """服务端输出检查的静态保护文本；不含用户变量，不得作为公开 API 返回。
+
+    读取随包分发的五段原文，稳定去重；调用方负责输出匹配策略。不会读取密钥或运行数据。
+    """
+    return tuple(dict.fromkeys(
+        body for task_id in available_tasks()
+        for body in load(task_id).sections.values()))
 
 
 def load_capabilities() -> dict[str, Any]:

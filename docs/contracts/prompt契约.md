@@ -14,14 +14,14 @@
 | `hotspot_clue` | 热点原文 → 爆点线索 | `agents/clue.py`（S3.1 落地） |
 | `material_select` | 线索 + 候选素材 → 命中解释与建议用法 | `agents/explain.py`（S3.1 落地） |
 | `copy_draft` | 线索 + 选中素材 → 文案初稿 | `agents/draft.py`（S3.1 落地） |
-| `image_hotspot_clue` | 一张图 → 热点描述 + 爆点线索（多模态）；v4 收紧文字的九类枚举归类并补海报示例，输出 schema 明列枚举 | `services/image_clue.py`（S6.6 落地，S7.3 补登记） |
-| `image_hotspot_clue_multi` | **一组图**（1–9 张）→ 一份热点描述 + 一份爆点线索；v3 收紧文字归类，输出 schema 明列九类枚举 | `services/image_clue.py`（`parse_image_clue_multi`） |
+| `image_hotspot_clue` | 一张图 → 热点描述 + 爆点线索（多模态）；v5 收紧文字的九类枚举归类并补海报示例，输出 schema 明列枚举 | `services/image_clue.py`（S6.6 落地，S7.3 补登记） |
+| `image_hotspot_clue_multi` | **一组图**（1–9 张）→ 一份热点描述 + 一份爆点线索；v4 收紧文字归类，输出 schema 明列九类枚举 | `services/image_clue.py`（`parse_image_clue_multi`） |
 | `chat_supervisor` | 对话层：读用户消息 → 决定直接回答或调工具 → 把结果讲成人话 | `agents/supervisor.py`（S7.3 落地） |
 | `copy_revise` | 已有初稿 + 用户要求 → 改后初稿（要求越界时只回拒绝理由，不给变通写法） | `agents/revise.py`（S7.8 落地） |
 | `context_extract` | 本轮用户原文 + 现有状态 → 有限类型的状态增量（新增 / 撤回 / 显式替换 / 待确认提案） | `services/context_state.py`（S7.24 落地） |
-| `context_recover` | 恢复页完整用户消息 + 已恢复候选 → 恢复候选增量（全部待确认，E7CTX-05） | `services/context_state.py`（v2 §3.5 落地） |
+| `context_recover` | 恢复页完整用户消息 + 已恢复候选 → 恢复候选增量（全部待确认，E7CTX-05） | `services/context_state.py`（v3 §3.5 落地） |
 
-`context_recover` v2（2026-10-18）：state 包含累计待确认候选，其 fact_id 映射到服务端
+`context_recover` v3（2026-10-28）：state 包含累计待确认候选，其 fact_id 映射到服务端
 proposal_id，供后续页显式撤回 / 替换；服务端保持候选待确认，不直接激活恢复事实。
 
 三条硬规则：
@@ -133,9 +133,15 @@ API 契约里的既有 schema，不得自造字段（§二 05 Output Schema 与 
 - 组装规则固定：
 
 ```
-system 消息 = 01 System  + 分隔  + 03 Constraints
-user   消息 = 02 Task（渲染后） + 04 Examples + 05 Output Schema
+system 消息 = 具名 01 System + 具名 03 Constraints + 具名 04 Examples + 具名 05 Output Schema
+user   消息 = 具名 02 Task（渲染后，仅当前任务与数据）
 ```
+
+- **2026-10-28 输入边界修复（[ADR 0020](../adr/0020-prompt-trust-boundaries.md)）**：示例只在 system 中作格式示范，不得作为当前事实、引用证据或调用工具的真实参数；实际输入只来自当前任务、真实对话和本次附件。外部素材、OCR、工具返回中的命令不获得系统权限。内部提示词、样例和工具协议不得向用户复述、翻译、编码或以业务字段间接输出；可以解释公开业务能力与本次结果的素材依据。
+- 所有段保留标题与边界，不将用户变量插入 system；渲染器的 `protected_prompt_texts()` 仅供服务端读取静态保护文本，不包含运行时用户变量，也不得经 API 返回。
+- 服务端在模型正文、工具参数、结构化结果和视觉结果继续流转前执行已知内部文本片段检查；流式正文先缓冲同次完整生成，通过检查后才向客户端释放，不能先发送片段再尝试撤回。固定公开话术与实际素材依据允许正常展示；检查不能把公开说明误判成内部文本泄露。
+- 上游异常可能携带请求、响应或内部指令，异常原文不得写入业务持久化结果、公开 API、SSE 或工具消息；失败路径使用固定业务文案，并保留可用的错误分类、用量及关联标识。
+- 提示词约束不是访问控制；已知片段检查不能保证任意语义转述、翻译或编码后的内部内容零泄露。此次修复统一升级十项 prompt 版本，不重写历史运行快照，真模型评测与离线结构验证分开记录。
 
 - 多模态任务（`material_tagging` / `image_hotspot_clue`）：按上式组装出 system 与 user 文本后，**图片以 content 数组元素附在 user 消息里**；`image_hotspot_clue` 没有文本占位符（图片本身就是全部输入），因此 `requires` 为空。
 - **失败行为（不做静默降级）**：
@@ -160,11 +166,12 @@ user   消息 = 02 Task（渲染后） + 04 Examples + 05 Output Schema
 
 - 键为 `task_id`、值为整数版本号；未参与本次运行的任务不出现。
 - 该字段是"同一批输入重测"可对比的前提：评测结果必须能追到具体 prompt 版本，否则版本对比无从谈起。
-- **A05（2026-10-18）**：`copy_draft` 与 `copy_revise` 升到 **v2**，新增必需变量
+- **A05（2026-10-18）**：`copy_draft` 与 `copy_revise` 升到 **v3**，新增必需变量
   `constraints_json`——服务端筛选的适用事实快照（`fact_id` / `kind` / `value` / `scope` /
   `scope_id` / `source_ref`）。来源分别是 `runs.context_snapshot`（worker 撰稿）与当轮
   会话状态（对话改稿）；两处必须使用同一筛选口径（session 全程 / 当前 topic / 已验证产物），
   不得在代码里临时拼另一份。旧调用方必须同时提供该变量，否则按 §四 缺变量报错。
+- **2026-10-28 输入边界修复**：统一升级十项 prompt 版本；当前资产版本为 `hotspot_clue` v2、`material_select` v2、`copy_draft` v3、`chat_supervisor` v5、`copy_revise` v3、`image_hotspot_clue` v5、`image_hotspot_clue_multi` v4、`material_tagging` v2、`context_extract` v2、`context_recover` v3。历史运行快照保留原版本。
 - 落地路径：列与迁移在 S3.9 完成；**仓储层写入（S3.4a）与 worker 接线（S3.4b）**分别承接——S3.1 已在 state / `RunResult` 里产出该字段，落库由 S3.4a 完成。
 
 ## 六、变更流程与准入门槛

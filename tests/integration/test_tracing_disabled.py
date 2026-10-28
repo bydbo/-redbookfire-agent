@@ -117,7 +117,7 @@ class TestTracingDisabled:
                                     embedder=FakeEmbedder())
 
         assert result.status == "succeeded"
-        assert result.prompt_versions == {"hotspot_clue": 1}
+        assert result.prompt_versions == {"hotspot_clue": 2}
         assert isinstance(get_tracer(cfg), NullTracer)
         run = (await db_session.execute(
             select(Run).where(Run.id == uuid.UUID(submission.run_id)))).scalar_one()

@@ -426,8 +426,10 @@ async def test_start_turn_marks_message_failed_on_crash(
     assert [item["event"] for item in received] == ["turn_started", "error"]
     assert saved[-1][0] == message_id
     assert saved[-1][1]["status"] == "failed"
-    assert "boom" in saved[-1][1]["error"]
-    assert "boom" in received[-1]["data"]["message"]
+    assert "RuntimeError" in saved[-1][1]["error"]
+    assert "RuntimeError" in received[-1]["data"]["message"]
+    assert "boom" not in json.dumps(saved, default=str)
+    assert "boom" not in json.dumps(received)
     assert engine.disposed == 1
 
 
@@ -510,7 +512,9 @@ async def test_crash_path_survives_whole_sdk_failure(
 
     assert [item["event"] for item in received] == ["turn_started", "error"]
     assert saved[-1][1]["status"] == "failed"
-    assert "boom" in saved[-1][1]["error"]
+    assert "RuntimeError" in saved[-1][1]["error"]
+    assert "boom" not in json.dumps(saved, default=str)
+    assert "boom" not in json.dumps(received)
     assert engine.disposed == 1
 
 
@@ -540,7 +544,7 @@ async def test_start_turn_maps_timeout_to_failed_terminal_state(
         await on_event(
             "stage", {"stage": "retrieve", "status": "running", "attempt": 1}
         )
-        raise TimeoutError("模型超时")
+        raise TimeoutError("PRIVATE_MODEL_REQUEST_SENTINEL")
 
     engine = DummyEngine()
     monkeypatch.setattr(chat_turns, "update_message", fake_update)
@@ -584,7 +588,9 @@ async def test_start_turn_maps_timeout_to_failed_terminal_state(
     ]
     assert running_writes and running_writes[0]["progress"]["stage"] == "retrieve"
     final = saved[-1][1]
-    assert final["status"] == "failed" and "模型超时" in final["error"]
+    assert final["status"] == "failed" and "超时" in final["error"]
+    assert "PRIVATE_MODEL_REQUEST_SENTINEL" not in json.dumps(saved, default=str)
+    assert "PRIVATE_MODEL_REQUEST_SENTINEL" not in json.dumps(received)
     assert final["progress"]["status"] == "failed"  # 失败阶段终结为 failed
     assert final["progress"]["stage"] == "retrieve"  # 真实失败阶段，不臆造 final_reply
     assert final["progress"]["error_category"] == "timeout"
@@ -739,11 +745,11 @@ async def test_tool_structure_failure_or_cancel_keeps_prior_repair_usage(monkeyp
             await runner("fixture", {}, meta={"scope": "scope1"})
         total = project(ledger)
         assert total["prompt_tokens"] == 100 and total["cost_cny"] == 0.01
-        assert total["prompt_versions"] == {"copy_revise": 2}
+        assert total["prompt_versions"] == {"copy_revise": 3}
     else:
         outcome = await runner("fixture", {}, meta={"scope": "scope1"})
         assert outcome.payload["prompt_tokens"] == 100 and outcome.payload["cost_cny"] == 0.01
-        assert outcome.prompt_versions == {"copy_revise": 2}
+        assert outcome.prompt_versions == {"copy_revise": 3}
 
 
 # ---------- R2（OBS-03 / 04 / 09）：一个入口、真实失败阶段、取消终态 ----------

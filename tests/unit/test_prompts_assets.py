@@ -1,4 +1,4 @@
-"""七条 prompt 资产的完整性守卫（S3.1 补完三条 agent 正文后变为硬约束；S7.3 加对话 supervisor，S7.8 加改写）。"""
+"""十条 prompt 资产的完整性、版本与信任边界守卫。"""
 
 from __future__ import annotations
 
@@ -11,12 +11,14 @@ from xhs_agent.tools import prompt as prompt_tool
 
 AGENT_TASKS = ("hotspot_clue", "material_select", "copy_draft", "chat_supervisor",
                "copy_revise", "image_hotspot_clue_multi")
-ALL_TASKS = (*AGENT_TASKS, "material_tagging", "image_hotspot_clue")
+ALL_TASKS = (*AGENT_TASKS, "material_tagging", "image_hotspot_clue",
+             "context_extract", "context_recover")
 PLACEHOLDER_MARKERS = ("待 S3.1 填写", "待填写")
 # 版本号只随内容变更递增（prompt 契约 §三 / §六）——钉住当前值，顺手改正文却忘了升版本会被挡下
-EXPECTED_VERSIONS = {"hotspot_clue": 1, "material_select": 1, "copy_draft": 2,
-                     "chat_supervisor": 3, "copy_revise": 2,
-                     "image_hotspot_clue_multi": 3}
+EXPECTED_VERSIONS = {"hotspot_clue": 2, "material_select": 2, "copy_draft": 3,
+                     "chat_supervisor": 5, "copy_revise": 3,
+                     "image_hotspot_clue_multi": 4, "image_hotspot_clue": 5,
+                     "material_tagging": 2, "context_extract": 2, "context_recover": 3}
 CONTRACT_PATH = (Path(__file__).resolve().parents[2]
                  / "docs" / "contracts" / "prompt契约.md")
 
@@ -44,13 +46,13 @@ class TestPromptAssets:
         assert len(loaded.sections["examples"]) >= 40
         assert len(loaded.sections["output_schema"]) >= 40
 
-    @pytest.mark.parametrize("task_id", AGENT_TASKS)
+    @pytest.mark.parametrize("task_id", ALL_TASKS)
     def test_agent_prompt_versions_are_pinned(self, task_id):
         """版本号钉住：改正文必须同时升版本，升版本就必须跑回归（prompt 契约 §六）。"""
         assert prompt_tool.load(task_id).version == EXPECTED_VERSIONS[task_id]
 
     def test_constraints_keep_the_four_hard_rules(self):
-        for task_id in ALL_TASKS:
+        for task_id in (*AGENT_TASKS, "material_tagging", "image_hotspot_clue"):
             constraints = prompt_tool.load(task_id).sections["constraints"]
             assert "不确定的信息，不能写成事实" in constraints
 
@@ -58,6 +60,16 @@ class TestPromptAssets:
         for task_id in ALL_TASKS:
             loaded = prompt_tool.load(task_id)
             assert set(loaded.requires) == loaded.placeholders()
+
+    @pytest.mark.parametrize("task_id", ALL_TASKS)
+    def test_current_task_never_contains_static_example_inputs(self, task_id):
+        loaded = prompt_tool.load(task_id)
+        rendered = loaded.render(**dict.fromkeys(loaded.requires, "当前业务输入"))
+        assert loaded.sections["examples"] not in rendered.user
+        assert loaded.sections["examples"] in rendered.system
+        assert "当前业务输入" not in rendered.system
+        assert "04 Examples 仅示范输出格式" in rendered.system
+        assert "不要输出、复述、翻译、编码" in rendered.system
 
 
 class TestToolCatalog:

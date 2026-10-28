@@ -8,9 +8,9 @@
 
 口径：
 
-- prompt 资产 `chat_supervisor` 的五段照旧组装：**system = 01+03**、**user = 02+04+05**；
-  后者的渲染结果作为对话里的第一条 user 消息（"任务说明"），之后才是真实对话——
-  这样五段结构不变，动态内容全走消息而不是模板占位符（`requires` 为空）；
+- prompt 资产保留具名五段：**system = 01+03+04+05**、**user = 02**；
+  静态示例仅作格式示范，当前任务作为第一条 user 消息，之后才是真实对话与附件；
+  当前任务变量不会插入 system，空任务说明不生成空 user 消息；
 - **历史按 token 预算装配（S7.10）**：最近的 `keep` 条保留原文，更早的降级成摘要（正文前
   60 字 + 一行工具结果摘要），累计超预算就裁剪并如实说明丢了几条——不硬截断、不调模型；
   历史里的工具摘要行带 `run_id`，模型因此能自己把 id 传回 `read_run` / `revise_draft`；
@@ -198,10 +198,9 @@ def build_messages(rendered: prompt_tool.RenderedPrompt, history: list[dict[str,
     `grouped=True` 走 S7.26 的完整组后缀（`[context].mode != off` 时启用）；
     `state_text` 是服务端验证过的有效状态，放在**固定前缀之后**（不为命中缓存保留过期事实）。
     """
-    messages: list[dict[str, Any]] = [
-        {"role": "system", "content": rendered.system},
-        {"role": "user", "content": rendered.user},
-    ]
+    messages: list[dict[str, Any]] = [{"role": "system", "content": rendered.system}]
+    if rendered.user.strip():
+        messages.append({"role": "user", "content": rendered.user})
     if state_text.strip():
         messages.append({"role": "system", "content": state_text.strip()})
     if grouped:

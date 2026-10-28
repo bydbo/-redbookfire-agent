@@ -13,13 +13,14 @@ from typing import Any, cast
 
 import pytest
 
-from xhs_agent.agents.supervisor import TASK_ID, initial_messages
+from xhs_agent.agents.supervisor import TASK_ID, build_messages, initial_messages
 from xhs_agent.config import AppConfig, load_config
 from xhs_agent.services import chat_tools
 from xhs_agent.services.chat_tools import TOOL_RUN_ANALYSIS, TOOLS, ToolOutcome
 from xhs_agent.services.chat_turns import build_tool_runner
 from xhs_agent.tools import llm
 from xhs_agent.tools.llm import LLMResult
+from xhs_agent.tools.prompt import RenderedPrompt
 from xhs_agent.workflows import chat as chat_workflow
 from xhs_agent.workflows.chat import run_turn
 
@@ -165,6 +166,13 @@ class TestMessages:
     def test_blank_text_with_attachment_gets_placeholder(self) -> None:
         _rendered, messages = initial_messages([], "   ", attachment_note="1 张图片")
         assert "没有文字，只有附件" in messages[-1]["content"]
+
+    def test_empty_task_does_not_create_empty_user_message(self) -> None:
+        rendered = RenderedPrompt(TASK_ID, SUPERVISOR_VERSION, "系统指令", "  ")
+        assert build_messages(rendered, [], "当前问题") == [
+            {"role": "system", "content": "系统指令"},
+            {"role": "user", "content": "当前问题"},
+        ]
 
 
 class TestTurn:
@@ -395,7 +403,8 @@ class TestTurn:
         )
 
         assert turn.status == "failed"
-        assert "HTTP 500" in turn.error
+        assert "LLMError" in turn.error
+        assert "HTTP 500: boom" not in turn.error
         assert turn.reply == ""
         assert turn.prompt_versions == {TASK_ID: SUPERVISOR_VERSION}
 
@@ -405,7 +414,7 @@ class TestTurn:
 FAKE_TOOL = "fake_probe"
 FAKE_TASK = "fake_probe_task"
 # `chat_supervisor` 当前的 prompt 版本：prompt 升版时这条要跟着改（prompt 契约 §六 要求升版必跑回归）
-SUPERVISOR_VERSION = 3
+SUPERVISOR_VERSION = 5
 
 
 def register_fake_tool(monkeypatch: pytest.MonkeyPatch) -> list[dict[str, Any]]:
@@ -654,7 +663,8 @@ class TestFailureLedgerAndUsage:
             ),
         )
 
-        assert turn.status == "failed" and "第二次模型调用失败" in turn.error
+        assert turn.status == "failed" and "RuntimeError" in turn.error
+        assert "第二次模型调用失败" not in turn.error
         # 已知消费与引用：第一次 supervisor（10/5）+ 那次工具（700/300）都在
         assert turn.cost_cny == pytest.approx(0.001 + 0.05)
         assert turn.prompt_tokens == 710 and turn.completion_tokens == 305

@@ -325,6 +325,33 @@ class TestVectorCoverageAndFailures:
         assert outcome.candidates_considered == 0
 
 
+async def test_recalled_lake_material_does_not_claim_bad_sports_elements(
+        db_session: AsyncSession, tmp_path: Path) -> None:
+    material_id = await seed(
+        db_session, path="outdoor/lake.jpg", title="多人划桨板游湖",
+        description="户外湖面上多人划桨板", tags=["桨板", "湖泊", "户外"],
+        elements=[{"type": "scene", "value": "户外山野", "evidence": "标签：户外"}],
+        embedding=E0,
+    )
+    clue = clue_with([
+        ("topic", "羽毛球"), ("scene", "球场"), ("ip", "明星艺人"),
+        ("format", "路人随手拍"), ("scene", "户外山野"),
+    ], keywords=["户外"], raw="户外游山玩水")
+    for element in clue.elements:
+        element.evidence = "户外"
+    outcome = await retrieve_candidates(db_session, write_config(tmp_path), clue,
+                                        embedder=FakeEmbedder(), now=1_700_000_000.0)
+    assert [candidate.material_id for candidate in outcome.candidates] == [material_id]
+    candidate = outcome.candidates[0]
+    assert candidate.recall_sources == ["literal", "vector"]
+    assert [hit.clue_value for hit in candidate.hits] == ["户外山野"]
+    assert {item.value for item in candidate.missing} == {"羽毛球", "球场", "明星艺人", "路人随手拍"}
+    assert candidate.score < 0.6
+    assert all("羽毛球" not in reason and "明星艺人" not in reason for reason in candidate.reasons)
+    assert [item.value for item in outcome.coverage.covered] == ["户外山野"]
+    assert 0 < outcome.coverage.ratio < 1
+
+
 class TestExplicitE9Channels:
     async def test_literal_channel_does_not_embed(self, db_session: AsyncSession,
                                                   tmp_path: Path) -> None:

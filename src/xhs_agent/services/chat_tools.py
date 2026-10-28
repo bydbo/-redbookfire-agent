@@ -65,7 +65,7 @@ from ..agents.revise import revise_draft as revise_agent
 from ..config import AppConfig
 from ..core import context_rules
 from ..core import progress as progress_tool
-from ..core.errors import ApiError, BadRequestError, ConflictError
+from ..core.errors import ApiError, BadRequestError, ConflictError, public_error_message
 from ..core.observations import record as record_observation
 from ..db.models import ChatArtifactVersion, ChatMessage
 from ..schemas import TYPE_LABELS, Element, HotspotClue, SchemaError
@@ -540,7 +540,7 @@ def _step(
 
 def _reason(exc: Exception) -> str:
     """异常 → 一句能直接回给用户的原因（ApiError 有写好的 message）。"""
-    return exc.message if isinstance(exc, ApiError) else f"{type(exc).__name__}: {exc}"
+    return public_error_message(exc)
 
 
 def _records_cost(caller: StructuredCaller, before: int) -> float:
@@ -1381,7 +1381,7 @@ async def run_hotspot_analysis(
                                  "policy": str(ctx.policy.mode if ctx.policy else "off")},
         )
     except ValueError as exc:  # 参数兜底（理论上前面已挡）
-        return ToolOutcome(status="failed", steps=steps, error=str(exc))
+        return ToolOutcome(status="failed", steps=steps, error=public_error_message(exc))
 
     # 提交成功即取得稳定运行引用；等待 worker 的可取消阶段不应阻止它落入轮次账本。
     if group:

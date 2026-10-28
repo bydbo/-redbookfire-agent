@@ -35,6 +35,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..config import AppConfig
 from ..core import model_attempts
+from ..core.errors import public_error_message
 from ..core.logging import bind_run_id, bind_turn_id, reset_run_id, reset_turn_id
 from ..core.progress import TURN_ID_HEADER
 from ..core.progress import error_category as error_category_of
@@ -389,14 +390,14 @@ def execute(
     except SnapshotWriteConflict:
         # 重复/迟到投递没有执行所有权，无权终结正在工作的合法执行。
         raise
-    except SoftTimeLimitExceeded as exc:
-        detail = f"软超时（{cfg.queue.task_soft_time_limit_s}s 上限）：{exc}"
+    except SoftTimeLimitExceeded:
+        detail = f"软超时（{cfg.queue.task_soft_time_limit_s}s 上限），请稍后重试"
         logger.error("job %s %s，标记 failed（不重试）", job_id, detail)
         mark_failed(job_id, cfg, detail, carrier=carrier, generation=retries,
                     owner_token=execution_token)
         raise
     except TRANSIENT_ERRORS as exc:
-        detail = f"{type(exc).__name__}: {exc}"
+        detail = public_error_message(exc)
         retries = int(getattr(task.request, "retries", 0) or 0)
         budget = int(getattr(task, "max_retries", 0) or 0)
         if retries < budget:
@@ -416,7 +417,7 @@ def execute(
         raise
     except Exception as exc:
         # 分析类失败（或任何非基础设施错误）：不重试，直接标 failed 再上抛
-        mark_failed(job_id, cfg, f"{type(exc).__name__}: {exc}", carrier=carrier,
+        mark_failed(job_id, cfg, public_error_message(exc), carrier=carrier,
                     generation=retries, owner_token=execution_token)
         raise
 

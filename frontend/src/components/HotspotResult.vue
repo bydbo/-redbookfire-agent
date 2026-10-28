@@ -213,10 +213,26 @@ async function copyDraft(draft: Draft, hotspotId: string): Promise<void> {
               {{ currentStatus(cand) }}
             </n-tag>
           </div>
-          <div v-if="cand.hits.length > 0" class="mt-2 flex flex-wrap gap-1">
-            <n-tag v-for="(hit, i) in cand.hits" :key="i" size="tiny" type="success">
-              {{ ELEMENT_TYPE_LABELS[hit.element_type] }} · {{ hit.clue_value }}
-            </n-tag>
+          <div class="mt-2" data-testid="material-tags">
+            <div class="mb-1 text-xs font-medium text-ink-muted">素材标签</div>
+            <div class="flex flex-wrap gap-1">
+              <n-tag v-for="(tag, i) in cand.material?.tags ?? []" :key="i" size="tiny">
+                {{ tag }}
+              </n-tag>
+              <span v-if="!(cand.material?.tags?.length)" class="text-xs text-ink-muted">未记录素材标签</span>
+            </div>
+          </div>
+          <div class="mt-2" data-testid="matched-elements">
+            <div class="mb-1 text-xs font-medium text-ink-muted">命中热点要素</div>
+            <ul v-if="cand.hits.length > 0" class="flex flex-col gap-1">
+              <li v-for="(hit, i) in cand.hits" :key="i" class="flex flex-wrap items-center gap-1 text-xs">
+                <n-tag size="tiny" type="success">
+                  {{ ELEMENT_TYPE_LABELS[hit.element_type] }} · {{ hit.clue_value }}
+                </n-tag>
+                <span class="break-words text-ink-muted">依据：{{ hit.hit_value || '未记录命中依据' }}</span>
+              </li>
+            </ul>
+            <span v-else class="text-xs text-ink-muted">未记录命中要素</span>
           </div>
           <ul class="mt-2 list-disc pl-5 text-sm text-ink">
             <li v-for="(reason, i) in cand.reasons" :key="i">

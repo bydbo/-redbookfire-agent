@@ -30,6 +30,7 @@ from langgraph.types import RetryPolicy
 
 from ..agents import DEFAULT_STYLE, explain_candidates, extract_clue, write_draft
 from ..config import PROJECT_ROOT, AppConfig
+from ..core.errors import public_error_message
 from ..core.logging import bind_run_id, reset_run_id
 from ..core.progress import error_category as error_category_of
 from ..core.tracing import (
@@ -467,7 +468,7 @@ async def run_analysis(
             except (
                 BaseException
             ) as exc:  # 整批崩掉（热点级失败在 _run_analysis 内已兜住）
-                # R1（OBS-02）：收尾只写安全类别，异常正文留在本地日志与 runs.error
+                # R1（OBS-02）：收尾只写安全类别，公开运行错误也不包含异常原文。
                 active.finish_run(
                     status="failed",
                     totals={},
@@ -676,7 +677,7 @@ async def _run_analysis(
                         await session.rollback()
                     raise
                 except Exception as exc:  # 节点重试后仍失败：记进报告，不阻断整批
-                    detail = f"{type(exc).__name__}: {exc}"
+                    detail = public_error_message(exc)
                     errors = [*errors, f"[{raw}] {detail}"]
                     versions = dict(partial.get("prompt_versions") or versions)
                     retained = partial.get("retrieval") or {}

@@ -134,7 +134,7 @@ class CeleryDispatcher:
         except (KombuError, OSError) as exc:
             raise DependencyUnavailableError(
                 "分析队列不可用：投递失败",
-                {"job_id": job_id, "error": f"{type(exc).__name__}: {exc}"[:200]}) from exc
+                {"job_id": job_id, "error": type(exc).__name__}) from exc
 
     async def enqueue_index(self, *, force_paths: list[str] | None = None) -> str:
         """投递一次素材索引任务，返回 `task_id`（S6.3）。
@@ -154,7 +154,7 @@ class CeleryDispatcher:
         except (KombuError, OSError) as exc:
             raise DependencyUnavailableError(
                 "素材索引队列不可用：投递失败",
-                {"error": f"{type(exc).__name__}: {exc}"[:200]}) from exc
+                {"error": type(exc).__name__}) from exc
         return task_id
 
     async def task_state(self, task_id: str) -> tuple[str, Any]:
@@ -171,7 +171,7 @@ class CeleryDispatcher:
         except (KombuError, OSError, TimeoutError, RedisError) as exc:
             raise DependencyUnavailableError(
                 "素材索引任务状态不可用：结果后端读不到",
-                {"task_id": task_id, "error": f"{type(exc).__name__}: {exc}"[:200]}) from exc
+                {"task_id": task_id, "error": type(exc).__name__}) from exc
         return result
 
     def _read_state(self, task_id: str) -> tuple[str, Any]:

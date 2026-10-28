@@ -30,7 +30,7 @@ import os
 import urllib.error
 import urllib.request
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
 
 import httpx
@@ -40,6 +40,7 @@ from ..core import model_attempts
 from ..util import extract_json
 from . import prompt as prompt_tools
 from .llm import resolve_cache_usage, resolve_usage
+from .output_guard import UnsafeModelOutput, ensure_safe_output
 
 TASK_ID = "material_tagging"
 IMAGE_TASK_ID = "image_hotspot_clue"
@@ -51,6 +52,11 @@ _MAGIC_PNG = b"\x89PNG\r\n\x1a\n"
 
 class VisionError(RuntimeError):
     """多模态调用失败：上游 HTTP 错误、超时、返回结构异常。"""
+
+    def __init__(self, message: str, *, completion: ImageCompletion | None = None) -> None:
+        super().__init__(message)
+        # 安全拒绝仍保留已消费用量；原始文本不附在异常上。
+        self.completion = replace(completion, text="") if completion is not None else None
 
 
 def sniff_image_mime(data: bytes) -> str:
@@ -128,7 +134,11 @@ def make_describer(cfg: AppConfig) -> Callable[[list[str], str], dict[str, Any] 
                 "usage_status": source, "cache_status": cache_status, "cache_hit_tokens": hit,
                 "cache_miss_tokens": miss, "cost_cny": (incoming * cfg.vision.price_in_per_m
                     + outgoing * cfg.vision.price_out_per_m) / 1_000_000}
+            ensure_safe_output(str(text), system=rendered.system)
             parsed = extract_json(text)
+        except UnsafeModelOutput:
+            terminal.update(status="failed", error=True)
+            return None
         except (urllib.error.URLError, KeyError, IndexError, ValueError, json.JSONDecodeError):
             return None
         finally:
@@ -180,7 +190,7 @@ class ImageCompletion:
 class AsyncImageClient:
     """一张图片 → 多模态模型（OpenAI 兼容 `/chat/completions`，异步 httpx）。
 
-    与素材打标的同步实现保持同样的消息形状（system = 01+03，user = 02+04+05 + 图片 content 元素），
+    与素材打标使用相同消息形状（system = 01/03/04/05，user = 02 + 图片 content 元素），
     但**不重试**：`[vision]` 段没有重试预算，失败即抛 `VisionError` 由调用方折成 502——
     用户点「重解析」就是显式重试，成本也可见。
     """
@@ -244,6 +254,11 @@ class AsyncImageClient:
                 "cache_miss_tokens": result.cache_miss_tokens,
                 "cost_cny": (result.prompt_tokens * self.cfg.price_in_per_m
                              + result.completion_tokens * self.cfg.price_out_per_m) / 1_000_000}
+            try:
+                ensure_safe_output(result.text, system=rendered.system)
+            except UnsafeModelOutput as exc:
+                terminal.update(status="failed", error=True)
+                raise VisionError(str(exc), completion=result) from None
             return result
         except asyncio.CancelledError:
             terminal["status"] = "interrupted"
@@ -257,18 +272,17 @@ class AsyncImageClient:
             response = await self.client.post(f"{self.base_url}/chat/completions", json=payload,
                                               headers=headers, timeout=self.cfg.timeout_s)
         except httpx.HTTPError as exc:
-            raise VisionError(f"{type(exc).__name__}: {exc}") from exc
+            raise VisionError(f"图片模型请求失败（{type(exc).__name__}）") from None
         if response.status_code >= 400:
-            detail = response.text[:300]
-            raise VisionError(f"HTTP {response.status_code}: {detail or response.reason_phrase}")
+            raise VisionError(f"图片模型请求失败（HTTP {response.status_code}）")
         try:
             body = response.json()
-        except ValueError as exc:
-            raise VisionError(f"返回不是 JSON：{response.text[:200]}") from exc
+        except ValueError:
+            raise VisionError("图片模型返回的内容不是有效 JSON") from None
         try:
             text = body["choices"][0]["message"]["content"]
-        except (KeyError, IndexError, TypeError) as exc:
-            raise VisionError(f"返回结构异常：{str(body)[:200]}") from exc
+        except (KeyError, IndexError, TypeError):
+            raise VisionError("图片模型返回结构异常") from None
         if not text:
             raise VisionError("返回内容为空")
         usage = body.get("usage") if isinstance(body, dict) else None

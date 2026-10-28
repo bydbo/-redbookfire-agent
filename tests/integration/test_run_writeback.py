@@ -181,7 +181,7 @@ class TestWriteBack:
         assert run.prompt_tokens == 300 and run.completion_tokens == 150
         assert float(run.cost_cny) == pytest.approx(0.0003)
         assert run.latency_ms >= 0
-        assert run.prompt_versions == {"hotspot_clue": 1, "material_select": 1, "copy_draft": 2}
+        assert run.prompt_versions == {"hotspot_clue": 2, "material_select": 2, "copy_draft": 3}
         assert run.error is None
 
         run_hotspot = await _single_run_hotspot(db_session, run_id)
@@ -232,7 +232,7 @@ class TestWriteBack:
         assert result.status == "succeeded"
         assert provider.tasks == ["material_select", "copy_draft"]   # 拆解被跳过
         assert "hotspot_clue" not in result.prompt_versions
-        assert result.prompt_versions == {"material_select": 1, "copy_draft": 2}
+        assert result.prompt_versions == {"material_select": 2, "copy_draft": 3}
         assert await _match_count(db_session, second) == 3
 
     async def test_topk_from_run_row_truncates_matches(self, db_session: AsyncSession,

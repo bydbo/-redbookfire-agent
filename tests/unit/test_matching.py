@@ -54,25 +54,69 @@ class TestElementRelevance:
         assert hits == []
         assert [element.value for element in missing] == ["羽毛球运动"]
 
-    def test_element_evidence_is_used_as_surface(self, make_material):
+    def test_known_type_synonym_has_its_own_evidence(self, make_material):
         clue = HotspotClue(hotspot_raw="某明星挥拍", match_keywords=[],
                            elements=[Element(type="topic", value="羽毛球", evidence="挥拍")])
         _relevance, hits, _missing = matching.element_relevance(
             clue, make_material(title="球场挥拍集锦"))
-        assert [hit.hit_value for hit in hits] == ["关键词「挥拍」命中"]
+        assert [hit.hit_value for hit in hits] == ["同类型词典「挥拍」命中"]
 
-    def test_keyword_hit_is_not_type_aware(self, make_clue, make_material):
-        """已知行为（不是期望行为）：命中关键词会给**每个**线索要素加 0.9 相似度。
-
-        于是「素材只提到羽毛球」也会让 IP 要素「顶流明星」算作已命中，覆盖度随之偏高。
-        是否收紧属于排序口径变更，需要单独评估（会改动检索契约里的打分结果）。
-        """
+    def test_global_keyword_does_not_prove_other_elements(self, make_clue, make_material):
+        """召回关键词不能把素材的羽毛球标签升级成“顶流明星”证据。"""
         clue = make_clue(elements=[("topic", "羽毛球"), ("ip", "顶流明星")])
         assert clue.match_keywords == ["羽毛球", "顶流明星"]
         _relevance, hits, missing = matching.element_relevance(
             clue, make_material(tags=["羽毛球"]))
-        assert [hit.clue_value for hit in hits] == ["羽毛球", "顶流明星"]
+        assert [hit.clue_value for hit in hits] == ["羽毛球"]
+        assert [item.value for item in missing] == ["顶流明星"]
+
+    @pytest.mark.parametrize("kind,value", [
+        ("topic", "羽毛球"), ("scene", "球场"), ("ip", "明星艺人"),
+        ("format", "路人随手拍"), ("conflict", "身份反差"), ("visual", "挥拍侧影"),
+    ])
+    def test_outdoor_surface_cannot_prove_unrelated_element(self, make_material, kind, value):
+        clue = HotspotClue(
+            hotspot_raw="户外游山玩水", match_keywords=["户外"],
+            elements=[Element(type=kind, value=value, evidence="户外")],
+        )
+        _relevance, hits, missing = matching.element_relevance(
+            clue, make_material(tags=["桨板", "湖泊", "绿植", "多人", "户外"],
+                                title="多人划桨板游湖", description="六人在碧绿湖面上划桨板"))
+        assert hits == []
+        assert [item.value for item in missing] == [value]
+
+    def test_evidence_sentence_does_not_transfer_another_concept(self, make_material):
+        clue = HotspotClue(
+            hotspot_raw="户外骑行", match_keywords=[],
+            elements=[Element(type="topic", value="羽毛球", evidence="户外骑行")],
+        )
+        _relevance, hits, missing = matching.element_relevance(
+            clue, make_material(title="户外骑行"))
+        assert hits == []
+        assert [item.value for item in missing] == ["羽毛球"]
+
+    @pytest.mark.parametrize("kind,value,material_text", [
+        ("topic", "跑步", "公园晨跑训练"),
+        ("topic", "夜跑", "公园晨跑训练"),
+        ("scene", "户外山野", "湖边户外划桨板"),
+        ("topic", "桨板", "桨板"),
+    ])
+    def test_direct_value_and_exact_typed_alias_still_match(
+            self, make_material, kind, value, material_text):
+        clue = HotspotClue(hotspot_raw=value, match_keywords=[],
+                           elements=[Element(type=kind, value=value, evidence="输入未提供")])
+        _relevance, hits, missing = matching.element_relevance(
+            clue, make_material(title=material_text))
+        assert [hit.clue_value for hit in hits] == [value]
         assert missing == []
+
+    def test_dictionary_mapping_cannot_cross_element_type(self, make_material):
+        clue = HotspotClue(hotspot_raw="羽毛球", match_keywords=[],
+                           elements=[Element(type="ip", value="羽毛球", evidence="挥拍")])
+        _relevance, hits, missing = matching.element_relevance(
+            clue, make_material(title="挥拍"))
+        assert hits == []
+        assert [item.type for item in missing] == ["ip"]
 
 
 class TestRecencyBonus:
@@ -104,7 +148,7 @@ class TestExplainAndDedupe:
 
         matching.explain_candidates(clue, [candidate])
         assert candidate.reasons[0].startswith("命中主题：羽毛球")
-        assert "关键词「羽毛球」命中" in candidate.reasons[0]
+        assert "同类型词典「羽毛球」命中" in candidate.reasons[0]
         assert candidate.usage == ("可用作羽毛球的实拍素材，建议放在开头 3 秒或作为过程画面"
                                    "（时长 15.0 秒）")
         assert candidate.finalize() is candidate

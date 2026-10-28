@@ -245,7 +245,7 @@ class TestTaskBody:
 
         run = await session.get(Run, uuid.UUID(body["run_id"]))
         assert run.status == "succeeded" and run.error is None
-        assert run.llm_calls == 3 and run.prompt_versions["hotspot_clue"] == 1
+        assert run.llm_calls == 3 and run.prompt_versions["hotspot_clue"] == 2
 
         run_hotspot = (await session.execute(
             select(RunHotspot).where(RunHotspot.run_id == run.id))).scalar_one()

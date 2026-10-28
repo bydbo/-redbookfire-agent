@@ -82,7 +82,7 @@ class TestExtractClue:
     async def test_returns_validated_clue_with_version(self):
         outcome = await extract_clue("某明星打羽毛球", caller())
         assert outcome.task_id == "hotspot_clue"
-        assert outcome.version == 1
+        assert outcome.version == 2
         assert outcome.value.hotspot_raw == "某明星打羽毛球"  # 用输入，不信模型改写
         assert outcome.value.element_values == ["羽毛球"]
         assert outcome.value.provider == "fake" and outcome.value.model == "fake-1"
@@ -104,7 +104,7 @@ class TestExplainCandidates:
         clue = (await extract_clue("热点", caller())).value
         outcome = await explain_candidates(clue, [candidate()], caller())
         updated = outcome.value[0]
-        assert outcome.version == 1
+        assert outcome.version == 2
         assert updated.reasons == ["模型理由：命中主题「羽毛球」"]
         assert updated.usage == "模型用法：放开头 3 秒"
         assert updated.rank == 1                      # 排序不动
@@ -184,7 +184,7 @@ class TestWriteDraft:
         clue = (await extract_clue("热点", caller())).value
         outcome = await write_draft(clue, material().to_dict(), caller())
         draft = outcome.value
-        assert outcome.version == 2
+        assert outcome.version == 3
         assert draft.material_id == MATERIAL_ID
         assert draft.hotspot_key == clue.hotspot_key
         assert draft.body.startswith("最近羽毛球刷屏")

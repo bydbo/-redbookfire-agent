@@ -12,12 +12,7 @@ DAY = 86400.0
 
 
 def bare_clue(elements, *, raw: str = "某明星打羽毛球", **overrides) -> HotspotClue:
-    """显式清空 `match_keywords` 的线索。
-
-    `matching` 有一条已知行为：线索级 `match_keywords` 命中会给**每个**要素加 0.9 相似度、
-    不区分要素类型（见 `tests/unit/test_matching.py::test_keyword_hit_is_not_type_aware`）。
-    要单独验证「要素类型对齐」这条路径时，必须先把关键词清空。
-    """
+    """显式清空召回关键词，独立验证逐要素评分路径。"""
     return HotspotClue(hotspot_raw=raw,
                        elements=[Element(type=etype, value=value) for etype, value in elements],
                        match_keywords=[], **overrides)
@@ -211,6 +206,33 @@ class TestRankCandidates:
         second, second_coverage = retrieval.rank_candidates(clue, materials, ranks, params(), now=NOW)
         assert [item.to_dict() for item in first] == [item.to_dict() for item in second]
         assert first_coverage.to_dict() == second_coverage.to_dict()
+
+
+def test_outdoor_recall_does_not_create_sports_hits_or_full_coverage(make_material):
+    """截图回归：七个误拆要素不能因共享“户外”一词全绿并得到91分。"""
+    clue = HotspotClue(
+        hotspot_raw="户外游山玩水", match_keywords=["户外"],
+        elements=[Element(type=kind, value=value, weight=1, confidence=1, evidence="户外")
+                  for kind, value in [
+                      ("topic", "羽毛球"), ("scene", "球场"), ("conflict", "身份反差"),
+                      ("format", "路人随手拍"), ("visual", "挥拍侧影"), ("ip", "明星艺人"),
+                      ("topic", "户外游山玩水"),
+                  ]],
+    )
+    material = make_material("lake", title="多人划桨板游湖",
+                             description="六人在碧绿湖面上各自乘坐桨板",
+                             tags=["微信图片", "桨板", "湖泊", "绿植", "多人", "户外"])
+    candidates, coverage = retrieval.rank_candidates(
+        clue, [material], {"literal": {"lake": 1}, "vector": {"lake": 1}},
+        params(), now=NOW)
+    assert len(candidates) == 1
+    candidate = candidates[0]
+    assert candidate.hits == []
+    assert [element.value for element in candidate.missing] == clue.element_values
+    assert candidate.score < 0.5
+    assert candidate.reasons == ["没有明显命中，只是兜底候选"]
+    assert coverage.ratio == 0
+    assert coverage.covered == []
 
 
 class TestKeywordBaseline:

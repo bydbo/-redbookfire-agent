@@ -101,6 +101,7 @@ files = [
     "src/xhs_agent/tools/retrieval.py",
     "src/xhs_agent/tools/embedding.py",
     "src/xhs_agent/tools/prompt.py",
+    "src/xhs_agent/tools/output_guard.py",
     # S3.5 把模型调用层与 agents 改成异步 httpx——对外错误与重试口径的核心
     "src/xhs_agent/tools/llm.py",
     "src/xhs_agent/tools/http.py",

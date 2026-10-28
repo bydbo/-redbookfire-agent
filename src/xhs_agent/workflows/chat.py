@@ -43,6 +43,7 @@ from ..core import budget as budget_tool
 from ..core import ledger as ledger_projection
 from ..core import progress as progress_tool
 from ..core.budget import BudgetDecision, BudgetPolicy
+from ..core.errors import public_error_message
 from ..core.progress import error_category as error_category_of
 from ..services import chat_tools
 from ..services.chat_tools import ToolOutcome
@@ -629,7 +630,7 @@ async def run_turn(
             unknown += 1
         return ChatTurn(
             status="failed",
-            error=f"{type(exc).__name__}: {exc}",
+            error=public_error_message(exc),
             error_category=error_category_of(exc),
             latency_ms=int((time.monotonic() - started) * 1000),
             tool_calls=tool_calls,

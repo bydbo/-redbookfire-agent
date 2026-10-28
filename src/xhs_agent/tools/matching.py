@@ -1,6 +1,6 @@
 """热点线索 <-> 素材 的要素级匹配与规则解释。
 
-用途：只做确定性判断——把线索要素逐条对到素材上（类型对齐 + 文案/关键词兜底），给出加权
+用途：只做确定性判断——把线索要素逐条对到素材上（类型对齐 + 直接文案与同类型词典），给出加权
       相关度、命中/缺口，以及规则版解释；**排序与终分在 `tools/retrieval.py`**。
 输入：`HotspotClue` + `Material`，以及可选的要素类型权重与**时间基准** `now`。
 输出：`ElementMatch` 列表 / `(relevance, hits, missing)` / 时效加减分 / 原地补齐候选的
@@ -24,6 +24,7 @@ from ..schemas import (
     Material,
 )
 from ..util import normalize_text, text_similarity
+from .lexicon import LEXICON
 
 HIT_THRESHOLD = 0.5
 FRESH_DAYS = 30
@@ -47,11 +48,25 @@ class ElementMatch:
     contribution: float
 
 
+def _element_surfaces(element: Element) -> list[str]:
+    """只取该类型、该词条的表面词，不把整条线索关键词或 evidence 当要素别名。
+
+    value 须等于规范值或一个完整别名；包含多个概念的句子不据此扩写同义词。
+    词典按既定顺序匹配，表面词等长时按字典序，保证命中证据稳定。
+    """
+    value = normalize_text(element.value)
+    surfaces: set[str] = set()
+    for entry in LEXICON.get(element.type, []):
+        if value and value in entry["surfaces"]:
+            surfaces.update(surface for surface in entry["surfaces"] if len(surface) >= 2)
+    return sorted(surfaces, key=lambda surface: (-len(surface), surface))
+
+
 def match_elements(clue: HotspotClue, material: Material,
                    type_weights: dict | None = None) -> list[ElementMatch]:
     """逐要素比对，返回每条线索要素的最佳匹配（顺序与 `clue.elements` 一致）。
 
-    输入：`clue`（线索要素 + 命中关键词）、`material`（标签/标题/描述/要素）、
+    输入：`clue`（线索要素）、`material`（标签/标题/描述/要素）、
     `type_weights`（覆盖默认要素类型权重，可选）。
     输出：`ElementMatch` 列表——`weight = element.score_weight × 类型权重`，
     `contribution = weight × similarity`。**不做命中阈值过滤**，让调用方按自己的阈值判定
@@ -60,7 +75,7 @@ def match_elements(clue: HotspotClue, material: Material,
     weights = dict(DEFAULT_TYPE_WEIGHTS)
     weights.update(type_weights or {})
     corpus = material_text(material)
-    # 归一化与循环无关，提到循环外只算一次（原先每个 surface 都重算）
+    # 同义词只能归属于当前类型和当前要素，不能用全局召回词证明所有要素。
     corpus_norm = normalize_text(corpus)
     material_elements = material.elements or []
 
@@ -82,14 +97,10 @@ def match_elements(clue: HotspotClue, material: Material,
         if text_sim > best_sim:
             best_sim, best_value = text_sim, "素材文案命中"
 
-        for surface in [element.evidence] + list(clue.match_keywords or []):
-            surface = (surface or "").strip()
-            if len(surface) < 2:
-                continue
-            surface_norm = normalize_text(surface)
-            if surface_norm and surface_norm in corpus_norm:
+        for surface in _element_surfaces(element):
+            if surface in corpus_norm:
                 if best_sim < 0.9:
-                    best_sim, best_value = 0.9, f"关键词「{surface}」命中"
+                    best_sim, best_value = 0.9, f"同类型词典「{surface}」命中"
                 break
 
         contribution = weight * best_sim

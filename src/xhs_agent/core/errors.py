@@ -10,6 +10,8 @@ from __future__ import annotations
 
 from typing import Any
 
+from .budget import BudgetError
+
 # 契约错误码（docs/contracts/openapi.yaml 的「错误码」表）
 BAD_REQUEST = "bad_request"
 VALIDATION_ERROR = "validation_error"
@@ -122,3 +124,20 @@ class InternalError(ApiError):
     """未分类的内部错误（500）。"""
 
     code = INTERNAL_ERROR
+
+
+def public_error_message(exc: BaseException) -> str:
+    """用于消息、任务和报告的错误说明；普通异常正文可能含请求或模型原文。
+
+    ApiError 是业务主动构造的公开文案，保留其可行动说明；预算错误按稳定原因
+    映射，避免历史结构校验把模型生成的工具参数带出。其他异常仅暴露类别名。
+    """
+    if isinstance(exc, ApiError):
+        return exc.message
+    if isinstance(exc, BudgetError):
+        if exc.reason == "required_context_overflow":
+            return "当前问题的必需上下文超出模型请求预算，请缩小范围后重试"
+        return "对话上下文不完整，请新建会话后重试"
+    if isinstance(exc, TimeoutError):
+        return "处理超时，请稍后重试（TimeoutError）"
+    return f"处理失败，请稍后重试（{type(exc).__name__}）"

@@ -124,8 +124,8 @@ class TestWorkflowSmoke:
                                     caller=StructuredCaller(provider=provider))
 
         assert result.status == "succeeded"
-        assert result.prompt_versions == {"hotspot_clue": 1, "material_select": 1,
-                                          "copy_draft": 2}
+        assert result.prompt_versions == {"hotspot_clue": 2, "material_select": 2,
+                                          "copy_draft": 3}
         assert provider.tasks == ["hotspot_clue", "material_select", "copy_draft"]
 
         entry = result.hotspots[0]
@@ -158,7 +158,7 @@ class TestWorkflowSmoke:
                                     embedder=FakeEmbedder(),
                                     caller=StructuredCaller(provider=provider))
         assert result.status == "succeeded"
-        assert result.prompt_versions == {"hotspot_clue": 1}    # 没候选就不调解释与撰稿
+        assert result.prompt_versions == {"hotspot_clue": 2}    # 没候选就不调解释与撰稿
         assert provider.tasks == ["hotspot_clue"]
         entry = result.hotspots[0]
         assert entry["candidates"] == [] and entry["draft"] is None

@@ -154,10 +154,8 @@ def _coverage(clue: HotspotClue, coverage_map: Mapping[tuple[str, str], float],
               hit_threshold: float) -> Coverage:
     """覆盖度 = 命中要素权重之和 ÷ 全部线索要素权重之和（§七）。
 
-    命中相似度沿用 `matching.element_relevance`，因此「线索级 `match_keywords` 命中不区分
-    要素类型」这一**已知行为**会同期体现在覆盖度上——该行为已记在
-    `tests/unit/test_matching.py::test_keyword_hit_is_not_type_aware`，收紧它属于排序口径变更，
-    需单独评估（会改动检索契约里的打分结果）。
+    命中相似度沿用 `matching.element_relevance` 的逐要素直接匹配与同类型词典映射；
+    全局 `match_keywords` 只参与召回，不替各个要素制造命中。覆盖度与候选明细共用证据。
     """
     covered, gaps, covered_weight, total_weight = [], [], 0.0, 0.0
     for element in clue.elements or []:

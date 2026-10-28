@@ -126,6 +126,23 @@ def _fill_vision_usage(
     fields.metadata["usage_status"] = str(completion.usage_status or "estimated")
 
 
+def _public_vision_error(exc: VisionError, fields: Any, cfg: AppConfig,
+                         rendered: prompt_tool.RenderedPrompt) -> UpstreamError:
+    """错误只携带安全说明和已知用量，不丢弃被拦截输出的实际消费。"""
+    fields.level = LEVEL_ERROR
+    fields.status_message = "llm_error"
+    fields.metadata["usage_status"] = "unknown"
+    detail: dict[str, Any] = {"error_type": type(exc).__name__}
+    if exc.completion is not None:
+        completion = exc.completion
+        _fill_vision_usage(fields, cfg, completion)
+        detail.update(usage={"prompt_tokens": completion.prompt_tokens,
+            "completion_tokens": completion.completion_tokens,
+            "cost_cny": _cost_cny(cfg, completion), "usage_status": completion.usage_status},
+            prompt_versions={rendered.task_id: rendered.version})
+    return UpstreamError("图片解析失败，请稍后重试。", detail)
+
+
 @asynccontextmanager
 async def _client_or_stack(
     cfg: AppConfig, http: httpx.AsyncClient | None
@@ -165,13 +182,7 @@ async def parse_image_clue(
             try:
                 completion = await api.complete(rendered, data, mime)
             except VisionError as exc:
-                # R3（OBS-06 / OBS-02）：调用已发出、用量未知；错误只发安全类别
-                fields.level = LEVEL_ERROR
-                fields.status_message = "llm_error"
-                fields.metadata["usage_status"] = "unknown"
-                raise UpstreamError(
-                    f"图片解析失败：{exc}", {"detail": str(exc)[:200]}
-                ) from exc
+                raise _public_vision_error(exc, fields, cfg, rendered) from None
             _fill_vision_usage(fields, cfg, completion)
 
     return _decode_completion(cfg, completion, rendered.task_id, rendered.version)
@@ -205,8 +216,8 @@ def _validated_completion(cfg: AppConfig, completion: ImageCompletion, task_id: 
         raise UpstreamError("图片解析失败：返回里缺少 clue 对象")
     try:
         clue = HotspotClue.from_dict(clue_payload, hotspot_raw=raw_text)
-    except SchemaError as exc:
-        raise UpstreamError(f"图片解析失败：线索结构不合契约（{exc}）") from exc
+    except SchemaError:
+        raise UpstreamError("图片解析失败：线索结构不合契约") from None
     if not clue.elements:
         # 没有要素的"热点"检索不出任何素材，按上游失败处理（不返回半成品）
         raise UpstreamError("图片解析失败：模型没有给出任何爆点要素")
@@ -267,12 +278,7 @@ async def parse_image_clue_multi(
             try:
                 completion = await api.complete_many(rendered, images)
             except VisionError as exc:
-                fields.level = LEVEL_ERROR
-                fields.status_message = "llm_error"
-                fields.metadata["usage_status"] = "unknown"
-                raise UpstreamError(
-                    f"图片解析失败：{exc}", {"detail": str(exc)[:200]}
-                ) from exc
+                raise _public_vision_error(exc, fields, cfg, rendered) from None
             _fill_vision_usage(fields, cfg, completion)
 
     return _decode_completion(cfg, completion, rendered.task_id, rendered.version, multi=True)
@@ -297,8 +303,8 @@ def _parse_payload(text: str) -> dict[str, Any]:
     """从模型输出里抠出 JSON 对象；不是对象就按上游失败处理。"""
     try:
         parsed = extract_json(text)
-    except ValueError as exc:
-        raise UpstreamError(f"图片解析失败：返回不是 JSON（{exc}）") from exc
+    except ValueError:
+        raise UpstreamError("图片解析失败：返回不是有效 JSON") from None
     if not isinstance(parsed, dict):
         raise UpstreamError("图片解析失败：返回的不是 JSON 对象")
     return parsed

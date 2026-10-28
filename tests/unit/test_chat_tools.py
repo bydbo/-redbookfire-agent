@@ -289,7 +289,7 @@ class TestClueCache:
         assert (
             first.prompt_tokens > 0 and second.prompt_tokens == 0
         )  # S7.10：用量只在第一次记
-        assert first.version == 1 and second.version == 1
+        assert first.version == 2 and second.version == 2
         assert third.cost_cny > 0
         assert first.usage_status == "actual"  # R5：真实调用带口径
         assert second.usage_status == "cached"  # 缓存命中：本轮无新增消费
@@ -759,7 +759,7 @@ class TestRevisePaths:
         assert outcome.payload["revised"]["body"] == "改后的正文"
         assert outcome.payload["revised"]["material_id"] == "11111111-1111-1111-1111-111111111111"
         assert outcome.payload["cost_cny"] > 0
-        assert outcome.prompt_versions == {"copy_revise": 2}
+        assert outcome.prompt_versions == {"copy_revise": 3}
         assert provider.calls == 1
 
     @pytest.mark.asyncio
@@ -777,7 +777,7 @@ class TestRevisePaths:
         assert outcome.payload["refused"] is True
         assert "肖像" in outcome.payload["reason"]
         assert "revised" not in outcome.payload
-        assert outcome.prompt_versions == {"copy_revise": 2}
+        assert outcome.prompt_versions == {"copy_revise": 3}
 
     @pytest.mark.asyncio
     async def test_missing_run_is_reported(

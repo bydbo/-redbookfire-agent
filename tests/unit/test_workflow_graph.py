@@ -230,8 +230,8 @@ class TestRunAnalysis:
         assert tracer.finished["status"] == "succeeded"
         assert tracer.finished["totals"]["llm_calls"] == 6
         assert tracer.finished["run_id"] == result.run_id
-        assert tracer.finished["prompt_versions"] == {"hotspot_clue": 1, "material_select": 1,
-                                                     "copy_draft": 2}
+        assert tracer.finished["prompt_versions"] == {"hotspot_clue": 2, "material_select": 2,
+                                                     "copy_draft": 3}
         assert tracer.flushes == 1
 
     @pytest.mark.asyncio
@@ -242,8 +242,8 @@ class TestRunAnalysis:
         result = await run_analysis(["某明星打羽毛球"], cfg=cfg, session=None,
                                     caller=StructuredCaller(provider=FakeProvider()))
         assert result.status == "succeeded"
-        assert result.prompt_versions == {"hotspot_clue": 1, "material_select": 1,
-                                          "copy_draft": 2}
+        assert result.prompt_versions == {"hotspot_clue": 2, "material_select": 2,
+                                          "copy_draft": 3}
 
     @pytest.mark.asyncio
     async def test_walks_five_nodes_and_collects_prompt_versions(self, cfg, monkeypatch):
@@ -255,8 +255,8 @@ class TestRunAnalysis:
                                     caller=StructuredCaller(provider=provider))
 
         assert result.status == "succeeded"
-        assert result.prompt_versions == {"hotspot_clue": 1, "material_select": 1,
-                                          "copy_draft": 2}
+        assert result.prompt_versions == {"hotspot_clue": 2, "material_select": 2,
+                                          "copy_draft": 3}
         assert retrieve.calls == ["某明星打羽毛球"]
         assert retrieve.topks == [None]        # 没传 run_id / topk 时不做覆盖
         assert len(result.hotspots) == 1
@@ -302,8 +302,8 @@ class TestRunAnalysis:
         assert len(result.hotspots) == 2
         markdown = Path(result.report_paths["markdown"]).read_text(encoding="utf-8")
         assert "热点一" in markdown and "热点二" in markdown
-        assert result.prompt_versions == {"hotspot_clue": 1, "material_select": 1,
-                                          "copy_draft": 2}
+        assert result.prompt_versions == {"hotspot_clue": 2, "material_select": 2,
+                                          "copy_draft": 3}
 
     @pytest.mark.asyncio
     async def test_without_candidates_skips_explain_and_draft(self, cfg, monkeypatch):
@@ -313,7 +313,7 @@ class TestRunAnalysis:
         result = await run_analysis(["冷门热点"], cfg=cfg, session=None,
                                     caller=StructuredCaller(provider=provider))
         assert result.status == "succeeded"
-        assert result.prompt_versions == {"hotspot_clue": 1}   # 未调用就不出现
+        assert result.prompt_versions == {"hotspot_clue": 2}   # 未调用就不出现
         assert provider.tasks == ["hotspot_clue"]
         entry = result.hotspots[0]
         assert entry["draft"] is None
@@ -353,6 +353,25 @@ class TestRunAnalysis:
         with pytest.raises(ValueError):
             await run_analysis(["   "], cfg=cfg, session=None,
                                caller=StructuredCaller(provider=FakeProvider()))
+
+    @pytest.mark.asyncio
+    async def test_failed_report_does_not_echo_model_or_schema_exception(self, cfg, monkeypatch):
+        private = "PRIVATE_MODEL_REQUEST_SENTINEL"
+
+        async def fail_clue(*_args, **_kwargs):
+            raise SchemaError(private)
+
+        monkeypatch.setattr(workflow, "extract_clue", fail_clue)
+        result = await run_analysis(
+            ["热点一"], cfg=cfg, session=None,
+            caller=StructuredCaller(provider=FakeProvider()), retry_policy=FAST_RETRY,
+        )
+        assert result.status == "failed"
+        assert "SchemaError" in result.hotspots[0]["error"]
+        assert private not in json.dumps(result.errors)
+        assert private not in json.dumps(result.hotspots)
+        for path in result.report_paths.values():
+            assert private not in Path(path).read_text(encoding="utf-8")
 
     @pytest.mark.asyncio
     async def test_injected_store_is_reused(self, cfg, monkeypatch, tmp_path):

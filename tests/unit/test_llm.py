@@ -168,7 +168,7 @@ class TestStructuredCaller:
         caller = StructuredCaller(provider=FailingProvider([]))
         with pytest.raises(LLMError) as info:
             await caller.call("task", "system", "user", parse=lambda data: data)
-        assert "连接失败" in str(info.value)
+        assert "模型调用失败" in str(info.value)
 
 
 class TestOpenAICompatibleProvider:
@@ -503,8 +503,8 @@ class TestToolCalling:
                         stream=True),
             on_delta=on_delta)
 
-        assert seen == ["前半"]            # 已经吐出去的字不重试、不重复
-        assert result.text == "前半"
+        assert seen == []              # 未完整验证的半截内容不得发给页面
+        assert result.text == ""
         assert result.error != ""
         assert result.attempts == 1
         assert len(api.calls) == 1

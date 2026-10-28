@@ -53,6 +53,50 @@ function hotspot(overrides: Partial<HotspotResultData> = {}): HotspotResultData 
 }
 
 describe('HotspotResult（E8 历史依据）', () => {
+  it('素材标签与保存的命中要素分开，并显示命中依据而不重算旧结果', async () => {
+    const historical = hotspot({ candidates: [candidate({
+      score: 0.908,
+      material: { ...candidate().material, title: '多人划桨板游湖', tags: ['桨板', '户外'] },
+      hits: [{ element_type: 'topic', clue_value: '羽毛球', hit_value: '关键词「户外」命中',
+        similarity: 0.9, contribution: 0.4 }],
+    })] })
+    const original = JSON.stringify(historical)
+    const wrapper = mount(HotspotResult, {
+      props: { hotspot: historical, runId: 'r-1', position: 1 },
+    })
+    const materialTags = wrapper.get('[data-testid="material-tags"]')
+    const matched = wrapper.get('[data-testid="matched-elements"]')
+    expect(materialTags.text()).toContain('素材标签')
+    expect(materialTags.text()).toContain('桨板')
+    expect(materialTags.text()).not.toContain('羽毛球')
+    expect(matched.text()).toContain('命中热点要素')
+    expect(matched.text()).toContain('主题 · 羽毛球')
+    expect(matched.text()).toContain('依据：关键词「户外」命中')
+    expect(wrapper.text()).toContain('91 分')
+    expect(JSON.stringify(historical)).toBe(original)
+
+    await wrapper.setProps({ hotspot: hotspot({ candidates: [candidate({
+      material: { ...candidate().material, tags: ['夜跑'] },
+      hits: [{ element_type: 'topic', clue_value: '跑步', hit_value: '同类型词典「夜跑」命中',
+        similarity: 0.9, contribution: 0.4 }],
+    })] }) })
+    expect(wrapper.get('[data-testid="material-tags"]').text()).toContain('夜跑')
+    expect(wrapper.get('[data-testid="matched-elements"]').text()).toContain('主题 · 跑步')
+    expect(wrapper.get('[data-testid="matched-elements"]').text()).not.toContain('羽毛球')
+  })
+
+  it('标签或命中依据缺失时明确显示未知', () => {
+    const wrapper = mount(HotspotResult, {
+      props: { hotspot: hotspot({ candidates: [candidate({
+        material: null,
+        hits: [{ element_type: 'topic', clue_value: '跑步', hit_value: '',
+          similarity: 0.9, contribution: 0.4 }],
+      })] }), runId: 'r-1', position: 1 },
+    })
+    expect(wrapper.get('[data-testid="material-tags"]').text()).toContain('未记录素材标签')
+    expect(wrapper.get('[data-testid="matched-elements"]').text()).toContain('未记录命中依据')
+  })
+
   it('删除后保留历史文字，标记当前不可用，不请求当前素材预览', () => {
     const wrapper = mount(HotspotResult, {
       props: {

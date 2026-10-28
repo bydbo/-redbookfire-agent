@@ -10,7 +10,7 @@
 - OpenAICompatibleProvider：任何兼容 /chat/completions 的国内模型都能接
   （DeepSeek、通义千问、智谱、Kimi、SiliconFlow…）
 - StructuredCaller：强制模型返回结构化 JSON，解析失败自动修复重试
-- `complete_with_tools`：带 `tools` 的调用（`tool_choice=auto`），`stream=True` 时逐分片回吐正文
+- `complete_with_tools`：带 `tools` 的调用；流式先缓冲检查，安全通过后逐分片回吐正文
 
 传输层用 httpx 异步客户端（S3.5）：客户端由调用方按「一次运行一个」注入，本模块不自持；
 重试口径不变（`max_retries + 1` 次、退避见 `tools/http.py`、400/401/403 不重试）。
@@ -34,6 +34,7 @@ from ..config import LLM_PROVIDERS, AppConfig, LLMConfig
 from ..core import model_attempts
 from ..util import extract_json
 from .http import backoff_seconds
+from .output_guard import UnsafeModelOutput, ensure_safe_output
 
 T = TypeVar("T")
 
@@ -305,7 +306,7 @@ class BaseProvider:
     ) -> LLMResult:  # pragma: no cover - 接口定义
         """带工具调用（可选流式）的一次调用（S7.1）。
 
-        `on_delta` 只在 `call.stream=True` 时被逐段调用（真 token 增量）；返回的
+        `on_delta` 只在 `call.stream=True` 且整份输出通过检查后逐段调用；返回的
         `LLMResult.tool_calls` 是"模型要求调用的工具"清单，为空表示这一轮是普通回答。
         不支持的实现直接抛 `NotImplementedError`——不做静默降级。
         """
@@ -381,7 +382,7 @@ class OpenAICompatibleProvider(BaseProvider):
             hit, miss, cache_status = None, None, "incomplete"
         cost = (prompt_tokens / 1_000_000 * self.cfg.price_in_per_m
                 + completion_tokens / 1_000_000 * self.cfg.price_out_per_m)
-        return LLMResult(
+        result = LLMResult(
             text=text,
             provider=self.name,
             model=self.cfg.model,
@@ -399,6 +400,23 @@ class OpenAICompatibleProvider(BaseProvider):
             ttft_ms=ttft_ms,
             attempts_detail=list(attempts_detail or []),
         )
+        system = call.system
+        if call.messages:
+            # 后续 system 消息含用户约束的动态状态，不能把复述用户需求当成泄露。
+            system = next((str(message.get("content") or "") for message in call.messages
+                           if message.get("role") == "system"), "")
+        try:
+            ensure_safe_output(text, system=system, tool_calls=tool_calls)
+        except UnsafeModelOutput as exc:
+            result.error = str(exc)
+            if attempts_detail:
+                attempts_detail[-1].update(status="failed", error=result.error)
+                result.attempts_detail = [dict(item) for item in attempts_detail]
+        if result.error:
+            # 已消费用量继续记账，未通过检查的正文/工具参数不能离开模型边界。
+            result.text = ""
+            result.tool_calls = []
+        return result
 
     async def complete(self, call: LLMCall) -> LLMResult:
         """一次调用（不带工具、不流式）。与 `complete_with_tools` 共用同一实现路径。"""
@@ -411,8 +429,8 @@ class OpenAICompatibleProvider(BaseProvider):
         """带工具调用的一次调用，可选真 token 流式（S7.1）。
 
         重试口径与原来一致（`max_retries + 1` 次、退避见 `tools/http.py`、400/401/403 不重试）。
-        唯一的例外：**流式已经开始回吐正文就不再重试**——重试会让下游（和用户）看到重复文本，
-        此时把已吐出的半截文本连同 `error` 一起返回，由调用方决定怎么收尾。
+        流式正文先缓冲，完整检查正文和工具参数后释放。收到部分正文后失败不自动重试，
+        且不返回未经完整检查的半截文本；TTFT 仍记录供应商首个正文增量的到达时间。
 
         E7 第六批（S7.28）：每次**实际传输**都记一条 `attempts_detail`（状态 / 用量 / 缓存分项 /
         TTFT / 耗时），重试不覆盖前一次——报告按传输次数统计，不只看最后成功那次。
@@ -473,10 +491,14 @@ class OpenAICompatibleProvider(BaseProvider):
                     attempts.append(_attempt_row(
                         attempt=attempt, status="succeeded", usage=usage, text=text,
                         error="", ttft_ms=sink.get("ttft_ms"), at=attempt_started))
-                    return self._result(call, text=text, tool_calls=tool_calls, usage=usage,
-                                        attempt=attempt, started=started,
-                                        ttft_ms=sink.get("ttft_ms"),
-                                        attempts_detail=attempts)
+                    result = self._result(call, text=text, tool_calls=tool_calls, usage=usage,
+                                          attempt=attempt, started=started,
+                                          ttft_ms=sink.get("ttft_ms"),
+                                          attempts_detail=attempts)
+                    if not result.error and on_delta is not None:
+                        for piece in sink.get("pieces", []):
+                            await on_delta(piece)
+                    return result
                 response = await self.client.post(url, json=payload, headers=headers,
                                                   timeout=self.cfg.timeout_s)
                 if response.status_code < 400:
@@ -492,9 +514,7 @@ class OpenAICompatibleProvider(BaseProvider):
                                         usage=usage,
                                         attempt=attempt, started=started,
                                         attempts_detail=attempts)
-                detail = response.text[:300]
-                last_error = (f"HTTP {response.status_code}: "
-                              f"{detail or response.reason_phrase}")
+                last_error = f"模型服务请求失败（HTTP {response.status_code}）"
                 attempts.append(_attempt_row(
                     attempt=attempt, status="failed", usage=None, text="", error=last_error,
                     ttft_ms=None, at=attempt_started))
@@ -512,7 +532,7 @@ class OpenAICompatibleProvider(BaseProvider):
                                         attempt=attempt, started=started, error=last_error,
                                         ttft_ms=sink.get("ttft_ms"), attempts_detail=attempts)
             except (httpx.HTTPError, json.JSONDecodeError) as exc:
-                last_error = f"{type(exc).__name__}: {exc}"
+                last_error = f"模型服务请求失败（{type(exc).__name__}）"
                 attempts.append(_attempt_row(
                     attempt=attempt, status="failed", usage=None, text=sink.get("text", ""),
                     error=last_error, ttft_ms=sink.get("ttft_ms"), at=attempt_started))
@@ -542,7 +562,7 @@ class OpenAICompatibleProvider(BaseProvider):
         self, url: str, payload: dict[str, Any], headers: dict[str, str],
         on_delta: Callable[[str], Awaitable[None]] | None, sink: dict[str, Any],
     ) -> tuple[str, list[dict[str, Any]], dict[str, Any] | None]:
-        """读 `text/event-stream`：正文增量回调 `on_delta`，工具调用增量按 `index` 拼接。
+        """读 `text/event-stream` 并缓冲正文，工具调用增量按 `index` 拼接。
 
         返回 `(正文, tool_calls, usage)`；`usage` 只有供应商在分片里给了才有。
         """
@@ -554,10 +574,8 @@ class OpenAICompatibleProvider(BaseProvider):
         async with self.client.stream("POST", url, json=payload, headers=headers,
                                       timeout=self.cfg.timeout_s) as response:
             if response.status_code >= 400:
-                body = (await response.aread()).decode("utf-8", "replace")[:300]
                 raise _StreamHTTPError(response.status_code,
-                                       f"HTTP {response.status_code}: "
-                                       f"{body or response.reason_phrase}")
+                                       f"模型服务请求失败（HTTP {response.status_code}）")
             async for line in response.aiter_lines():
                 if not line.startswith("data:"):
                     continue
@@ -582,8 +600,7 @@ class OpenAICompatibleProvider(BaseProvider):
                         sink["ttft_ms"] = int((first_delta_at - stream_started) * 1000)
                     text_parts.append(piece)
                     sink["text"] = "".join(text_parts)
-                    if on_delta is not None:
-                        await on_delta(piece)
+                    sink["pieces"] = text_parts
                 for raw in delta.get("tool_calls") or []:
                     index = int(raw.get("index") or 0)
                     slot = calls.setdefault(index, {"id": "", "name": "", "arguments": ""})
@@ -615,8 +632,8 @@ def _first_message(data: dict[str, Any]) -> dict[str, Any]:
     """取 `choices[0].message`；结构异常时抛 `LLMError`（与 S7.1 之前同一套错误）。"""
     try:
         choices = data["choices"]
-    except (KeyError, TypeError) as exc:
-        raise LLMError(f"返回结构异常：{str(data)[:200]}") from exc
+    except (KeyError, TypeError):
+        raise LLMError("模型服务返回结构异常") from None
     if not choices:
         raise LLMError("返回 choices 为空")
     message = choices[0].get("message")
@@ -704,15 +721,24 @@ class StructuredCaller:
             if self.before_request is not None:
                 await self.before_request(call)
             result = await self.provider.complete(call)
-            self.records.append(result.record(task))
             if result.error:
+                # provider 的原始错误可能包含请求/响应体，不回灌或对外传播。
+                result.error = "模型调用失败，请稍后重试。"
+                self.records.append(result.record(task))
                 last_error = result.error
                 break
+            try:
+                ensure_safe_output(result.text, system=system, tool_calls=result.tool_calls)
+            except UnsafeModelOutput as exc:
+                result.error = str(exc)
+                self.records.append(result.record(task))
+                raise LLMError(str(exc)) from None
+            self.records.append(result.record(task))
             try:
                 payload = extract_json(result.text)
                 return parse(payload), result
             except Exception as exc:  # SchemaError / ValueError
-                last_error = f"{type(exc).__name__}: {exc}"
+                last_error = f"输出未符合规定的 JSON 结构（{type(exc).__name__}）"
                 prompt = (
                     f"{user}\n\n"
                     f"上一次输出无法被解析，错误是：{last_error}。\n"

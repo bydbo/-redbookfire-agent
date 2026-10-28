@@ -123,7 +123,7 @@ async def test_invalid_vision_schema_keeps_actual_usage_on_failed_tool(tmp_path,
     assert usage["usage_status"] == "actual"
     assert (usage["prompt_tokens"], usage["completion_tokens"]) == (100, 20)
     assert usage["cost_cny"] > 0
-    assert chat_tools._failed_image_versions(info.value) == {"image_hotspot_clue": 4}
+    assert chat_tools._failed_image_versions(info.value) == {"image_hotspot_clue": 5}
 
 
 class TestSniffImageMime:
@@ -160,7 +160,7 @@ class TestParseImageClue:
 
         assert parsed.raw_text == CLUE_PAYLOAD["raw_text"]
         assert parsed.clue.elements[0].value == "夜晚跑道"
-        assert parsed.prompt_versions == {"image_hotspot_clue": 4}
+        assert parsed.prompt_versions == {"image_hotspot_clue": 5}
 
         payload = capture["payload"]
         assert capture["url"].endswith("/chat/completions")
@@ -195,7 +195,8 @@ class TestParseImageClue:
         ) as client:
             with pytest.raises(UpstreamError) as info:
                 await parse_image_clue(cfg, JPEG, "image/jpeg", http=client)
-        assert "HTTP 500" in info.value.message
+        assert info.value.message == "图片解析失败，请稍后重试。"
+        assert "模型炸了" not in info.value.message
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
@@ -290,7 +291,7 @@ class TestParseImageClueMulti:
 
         assert parsed.raw_text == MULTI_CLUE_PAYLOAD["raw_text"]
         assert parsed.clue.elements[0].value == "球拍特写"
-        assert parsed.prompt_versions == {"image_hotspot_clue_multi": 3}
+        assert parsed.prompt_versions == {"image_hotspot_clue_multi": 4}
         assert parsed.prompt_tokens > 0 and parsed.cost_cny >= 0
 
         payload = capture["payload"]
@@ -350,7 +351,8 @@ class TestParseImageClueMulti:
         ) as client:
             with pytest.raises(UpstreamError) as info:
                 await parse_image_clue_multi(cfg, [(JPEG, "image/jpeg")], http=client)
-        assert "HTTP 500" in info.value.message
+        assert info.value.message == "图片解析失败，请稍后重试。"
+        assert "模型炸了" not in info.value.message
 
 
 class FakeVisionClient:
@@ -411,7 +413,7 @@ class TestImageClueEndpoint:
         assert response.status_code == 200, response.text
         body = response.json()
         assert set(body) == {"raw_text", "clue", "prompt_versions"}
-        assert body["prompt_versions"] == {"image_hotspot_clue": 4}
+        assert body["prompt_versions"] == {"image_hotspot_clue": 5}
         assert body["clue"]["elements"][0]["type"] == "scene"
         assert fake.calls == 1
 
