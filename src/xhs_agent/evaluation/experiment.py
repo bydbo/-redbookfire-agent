@@ -78,6 +78,9 @@ async def index_dataset(session: AsyncSession, cfg: AppConfig, dataset: Dataset,
     missing = sorted(expected - actual)
     if missing:
         raise ValueError(f"索引缺少数据集素材：{missing[:5]}")
+    extra = sorted(actual - expected)
+    if extra:
+        raise ValueError(f"隔离库含数据集之外素材：{extra[:5]}；请使用空库或重建")
     payload = {
         "materials_count": len(rows),
         "digest": library_digest(rows),
