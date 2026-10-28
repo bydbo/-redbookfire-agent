@@ -1,0 +1,23 @@
+{
+  "case_id": "dev-text-001",
+  "group_id": "g-event-001",
+  "split": "dev",
+  "input_type": "text",
+  "natural_input": {
+    "text": "用户自然写下的需求，不得根据检索结果改写",
+    "images": []
+  },
+  "expectation": {
+    "answerable": true,
+    "summary": "任务预期；无答案任务写清应输出缺口而不是硬凑",
+    "constraints": ["保留用户限制", "不得跨会话引用"],
+    "checks": ["候选素材与理由一致", "无答案时明确缺口"]
+  },
+  "oracle": {
+    "elements": [{"type": "topic", "value": "人工确认的要素"}],
+    "match_keywords": ["人工确认的关键词"]
+  },
+  "scenario_tags": ["natural_naming"],
+  "e2e": false,
+  "notes": "标注理由和争议处理记录"
+}

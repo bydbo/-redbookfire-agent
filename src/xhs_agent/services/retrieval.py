@@ -27,7 +27,7 @@ from sqlalchemy import Text, bindparam, select, text
 from sqlalchemy.dialects.postgresql import ARRAY
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from ..config import AppConfig
+from ..config import AppConfig, ConfigError
 from ..core.progress import error_category as error_category_of
 from ..core.tracing import LEVEL_ERROR, NullTracer, Tracer
 from ..db.models import EMBEDDING_DIM
@@ -186,12 +186,31 @@ async def _embed_query(client: EmbeddingClient, clue: HotspotClue,
         return result
 
 
+def _channels(cfg: AppConfig, channels: tuple[str, ...] | None) -> tuple[bool, bool]:
+    """把显式通道或生产默认解析成 `(literal?, vector?)`，非法组合直接失败。"""
+    if channels is None:
+        return True, bool(cfg.embedding.enabled)
+    allowed = {retrieval_tool.LITERAL, retrieval_tool.VECTOR}
+    unknown = [name for name in channels if name not in allowed]
+    if unknown:
+        raise ValueError(f"未知召回通道：{unknown}")
+    use_literal = retrieval_tool.LITERAL in channels
+    use_vector = retrieval_tool.VECTOR in channels
+    if use_vector and not cfg.embedding.enabled:
+        raise ConfigError(
+            "显式请求 vector 通道，但 [embedding].enabled = false",
+            "启用 embedding，或改用 literal 通道")
+    return use_literal, use_vector
+
+
 async def retrieve_candidates(session: AsyncSession, cfg: AppConfig, clue: HotspotClue, *,
                               embedder: EmbeddingClient | None = None,
                               now: float | None = None,
                               topk: int | None = None,
                               http: httpx.AsyncClient | None = None,
-                              tracer: Tracer | None = None) -> RetrievalOutcome:
+                              tracer: Tracer | None = None,
+                              channels: tuple[str, ...] | None = None,
+                              query_vector: list[float] | None = None) -> RetrievalOutcome:
     """一次检索：双通道召回 → 映射成内存素材 → 融合排序 → 返回结果。
 
     输入：`session`、`cfg`（读 `[retrieval]` / `[match]` / `[embedding]`）、`clue`；
@@ -200,27 +219,41 @@ async def retrieve_candidates(session: AsyncSession, cfg: AppConfig, clue: Hotsp
     `http`（可选 httpx 客户端：`embedder` 未注入时用它造向量客户端，让一次运行复用同一个
     连接池；None = 这里临时起一个）。
     `tracer`（可选，S7.20）：只给「查询向量化」子步加 span 与耗时，不改变召回 / 排序结果。
-    异常：向量召回已启用但查询向量化失败时抛 `EmbeddingError`（不降级）。
+    `channels`（可选，E9）：显式指定召回通道，`("literal",)` / `("vector",)` /
+    `("literal", "vector")`；None = 沿用生产默认（启用 embedding 时双通道）。
+    `query_vector`（可选，E9）：复用已计算的查询向量；提供后不再调用 embedding。只允许在
+    显式包含 vector 通道时使用，便于 oracle 与三种真实拆解共享同一次向量化费用。
+    异常：显式请求向量通道但 embedding 未启用时抛 `ConfigError`；查询向量化失败时抛
+    `EmbeddingError`（不降级）。
     """
     params = retrieval_tool.RetrievalParams.from_config(cfg)
     if topk is not None:
         params = replace(params, topk=int(topk))   # RetrievalParams 是 frozen dataclass
+    use_literal, use_vector = _channels(cfg, channels)
+    if query_vector is not None:
+        if not use_vector:
+            raise ValueError("提供了 query_vector，但本次没有启用 vector 通道")
+        if len(query_vector) != cfg.embedding.dim:
+            raise ValueError(f"查询向量维度 {len(query_vector)} != {cfg.embedding.dim}")
     # 查询向量先准备：外部模型等待不能占住素材库的一致性读事务。
-    query_vector: list[float] | None = None
-    if cfg.embedding.enabled:
-        # 注入的 embedder 用自己的生命周期；没注入时起一个短生命周期客户端（独立调用路径）。
-        async with AsyncExitStack() as stack:
-            client: EmbeddingClient | None = embedder
-            if client is None:
-                shared = http
-                if shared is None:
-                    shared = await stack.enter_async_context(
-                        build_http_client(cfg.embedding.timeout_s))
-                client = build_embedder(cfg, client=shared)
-            if client is None:  # pragma: no cover - enabled 为真时 build_embedder 不会返回 None
-                raise RuntimeError("向量召回已启用但没有可用的 embedding 客户端")
-            embedded = await _embed_query(client, clue, tracer=tracer)
-        query_vector = embedded.vectors[0]
+    prepared_vector: list[float] | None = None
+    if use_vector:
+        if query_vector is not None:
+            prepared_vector = list(query_vector)
+        else:
+            # 注入的 embedder 用自己的生命周期；没注入时起一个短生命周期客户端（独立调用路径）。
+            async with AsyncExitStack() as stack:
+                client: EmbeddingClient | None = embedder
+                if client is None:
+                    shared = http
+                    if shared is None:
+                        shared = await stack.enter_async_context(
+                            build_http_client(cfg.embedding.timeout_s))
+                    client = build_embedder(cfg, client=shared)
+                if client is None:  # pragma: no cover - enabled 为真时 build_embedder 不会返回 None
+                    raise RuntimeError("向量召回已启用但没有可用的 embedding 客户端")
+                embedded = await _embed_query(client, clue, tracer=tracer)
+            prepared_vector = embedded.vectors[0]
 
     # 独立会话避免继承调用方 READ COMMITTED 事务或 identity-map 中的陈旧 ORM 对象。
     # 调用方的未提交写入不属于已发布素材库，也不会被本方法擅自提交。
@@ -229,12 +262,12 @@ async def retrieve_candidates(session: AsyncSession, cfg: AppConfig, clue: Hotsp
             await read_session.execute(text(
                 "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY"))
             outcome = RetrievalOutcome(vector_coverage=await vector_coverage(read_session, cfg))
-            literal_hits = await literal_recall(
+            literal_hits = [] if not use_literal else await literal_recall(
                 read_session, retrieval_tool.literal_query_keywords(clue),
                 limit=params.recall_limit, threshold=params.similarity_threshold)
             outcome.literal_recalled = len(literal_hits)
-            vector_hits = [] if query_vector is None else await vector_recall(
-                read_session, query_vector, cfg.embedding.model,
+            vector_hits = [] if prepared_vector is None else await vector_recall(
+                read_session, prepared_vector, cfg.embedding.model,
                 limit=params.recall_limit, max_distance=params.max_cosine_distance)
             outcome.vector_recalled = len(vector_hits)
             channel_ranks: dict[str, dict[str, int]] = {}

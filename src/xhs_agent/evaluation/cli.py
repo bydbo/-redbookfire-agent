@@ -1,0 +1,516 @@
+"""E9 统一命令行：校验、估算、评分、报告与三类检查。
+
+退出码固定（协议 §5.5）：0 通过；2 质量 / 收益未达标；3 环境、配置或数据无效；
+4 依赖、预算、执行或人工评分未完成。默认命令不发起外部模型请求。
+"""
+
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import hashlib
+import json
+import subprocess
+import sys
+from collections.abc import Sequence
+from pathlib import Path
+from typing import Any
+
+from ..config import PROJECT_ROOT, AppConfig, load_config
+from .budget import BudgetError, PriceTable, price_table_from_config
+from .dataset import ValidationReport, load_and_validate
+from .decisions import benefit_gate, evidence_gate, quality_gate
+from .metrics import aggregate, case_deltas, paired_bootstrap
+from .models import STRATEGIES, Attempt, Dataset, Experiment, HumanScore
+
+EXIT_OK = 0
+EXIT_QUALITY = 2
+EXIT_INVALID = 3
+EXIT_INCOMPLETE = 4
+STRATEGY_NAMES = tuple(STRATEGIES)
+
+
+class CliError(RuntimeError):
+    def __init__(self, message: str, code: int = EXIT_INVALID) -> None:
+        super().__init__(message)
+        self.code = code
+
+
+def _print_errors(report: ValidationReport) -> None:
+    for item in report.errors:
+        print(f"ERROR: {item}", file=sys.stderr)
+    for item in report.warnings:
+        print(f"WARN: {item}", file=sys.stderr)
+
+
+def _load(root: Path, *, require_frozen: bool) -> tuple[Dataset, ValidationReport]:
+    dataset, report = load_and_validate(root, require_frozen=require_frozen)
+    if dataset is None:
+        _print_errors(report)
+        raise CliError("数据包结构无效")
+    return dataset, report
+
+
+def _results_dir(root: Path) -> Path:
+    return root / "results"
+
+
+def read_attempts(root: Path) -> list[Attempt]:
+    path = _results_dir(root) / "attempts.jsonl"
+    if not path.is_file():
+        return []
+    attempts: list[Attempt] = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        if line.strip():
+            attempts.append(Attempt.model_validate(json.loads(line)))
+    return attempts
+
+
+def write_attempts(root: Path, attempts: Sequence[Attempt]) -> Path:
+    path = _results_dir(root) / "attempts.jsonl"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("".join(item.model_dump_json() + "\n" for item in attempts),
+                    encoding="utf-8")
+    return path
+
+
+def read_human_scores(root: Path) -> list[HumanScore]:
+    path = _results_dir(root) / "human_scores.json"
+    if not path.is_file():
+        return []
+    data = json.loads(path.read_text(encoding="utf-8"))
+    rows = data.get("scores", []) if isinstance(data, dict) else data
+    return [HumanScore.model_validate(item) for item in rows]
+
+
+def _read_experiment(root: Path) -> Experiment | None:
+    path = root / "experiment.json"
+    if not path.is_file():
+        return None
+    return Experiment.model_validate(json.loads(path.read_text(encoding="utf-8")))
+
+
+def _git_commit() -> str:
+    try:
+        result = subprocess.run(["git", "rev-parse", "HEAD"], cwd=PROJECT_ROOT,
+                                capture_output=True, text=True, check=False, timeout=10)
+        return result.stdout.strip() if result.returncode == 0 else ""
+    except (OSError, subprocess.SubprocessError):
+        return ""
+
+
+def _config_snapshot(cfg: AppConfig) -> dict[str, Any]:
+    return {
+        "llm": {"model": cfg.llm.model, "provider": cfg.llm.provider,
+                "max_tokens": cfg.llm.max_tokens,
+                "price_in_per_m": cfg.llm.price_in_per_m,
+                "price_out_per_m": cfg.llm.price_out_per_m},
+        "vision": {"enabled": cfg.vision.enabled, "model": cfg.vision.model,
+                   "price_in_per_m": cfg.vision.price_in_per_m,
+                   "price_out_per_m": cfg.vision.price_out_per_m},
+        "embedding": {"enabled": cfg.embedding.enabled, "model": cfg.embedding.model,
+                      "dim": cfg.embedding.dim,
+                      "price_in_per_m": cfg.embedding.price_in_per_m},
+        "retrieval": cfg.retrieval.model_dump(),
+        "match": cfg.match.model_dump(),
+    }
+
+
+def _price_table(cfg: AppConfig, path: str | None) -> PriceTable:
+    if path:
+        data = json.loads(Path(path).read_text(encoding="utf-8"))
+        table = PriceTable.from_mapping(data)
+        if not table.verified_at or not table.source:
+            raise CliError("价格快照必须包含 source 与 verified_at")
+        return table
+    return price_table_from_config(cfg)
+
+
+def cmd_validate(args: argparse.Namespace) -> int:
+    root = Path(args.experiment)
+    dataset, report = load_and_validate(
+        root, require_frozen=not args.allow_draft)
+    if dataset is None:
+        _print_errors(report)
+        return EXIT_INVALID
+    if args.json:
+        print(json.dumps({"counts": report.counts, "errors": report.errors,
+                          "warnings": report.warnings}, ensure_ascii=False, indent=2))
+    else:
+        print(f"数据版本：{dataset.manifest.version}（{dataset.manifest.status}）")
+        print(f"计数：{json.dumps(report.counts, ensure_ascii=False)}")
+        _print_errors(report)
+        if report.ok:
+            print("校验通过")
+    return EXIT_OK if report.ok else EXIT_INVALID
+
+
+def cmd_estimate(args: argparse.Namespace) -> int:
+    root = Path(args.experiment)
+    dataset, report = _load(root, require_frozen=False)
+    if not report.ok:
+        _print_errors(report)
+        return EXIT_INVALID
+    cfg = load_config()
+    table = _price_table(cfg, args.prices)
+    cases = len(dataset.cases)
+    materials = len(dataset.materials)
+    material_tokens = int(args.material_tokens)
+    # 估算按“预期 token”算，不拿发送前保守预留上界冒充账单；账本仍按上界预留。
+    emb_price = cfg.embedding.price_in_per_m
+    index = round(materials * material_tokens * emb_price / 1_000_000, 8)
+    text_per_call = (1500 * cfg.llm.price_in_per_m
+                     + 1000 * cfg.llm.price_out_per_m) / 1_000_000
+    decompositions = round(cases * 3 * text_per_call, 8)
+    query_vectors = round(cases * 4 * 64 * emb_price / 1_000_000, 8)
+    vision_per_call = (3000 * cfg.vision.price_in_per_m
+                       + 500 * cfg.vision.price_out_per_m) / 1_000_000
+    e2e = round(32 * (text_per_call + vision_per_call
+                      + 512 * emb_price / 1_000_000), 8)
+    subtotal = index + decompositions + query_vectors + e2e
+    total = round(subtotal * 1.2, 8)  # 20% 重试 / 结构修复余量
+    budget = float(args.budget)
+    print(json.dumps({
+        "dataset": dataset.manifest.version,
+        "status": dataset.manifest.status,
+        "cases": cases,
+        "materials": materials,
+        "price_source": table.source,
+        "price_verified_at": table.verified_at,
+        "line_items": {
+            "index_embedding": index,
+            "150_decompositions": decompositions,
+            "query_vectors": query_vectors,
+            "32_e2e_attempts": e2e,
+            "retry_and_repair_margin": round(total - subtotal, 8),
+        },
+        "basis": "expected tokens（账本仍按保守上界预留）",
+        "total_cny": total,
+        "budget_cny": budget,
+        "within_budget": total <= budget,
+    }, ensure_ascii=False, indent=2))
+    if total > budget:
+        print(f"估算 {total} 超过预算 {budget}", file=sys.stderr)
+        return EXIT_INVALID
+    return EXIT_OK
+
+
+def cmd_freeze_candidate(args: argparse.Namespace) -> int:
+    root = Path(args.experiment)
+    dataset, report = _load(root, require_frozen=True)
+    if not report.ok:
+        _print_errors(report)
+        return EXIT_INVALID
+    target = root / "experiment.json"
+    if target.exists() and not args.force:
+        raise CliError(f"{target} 已存在；候选冻结后不能原地覆盖")
+    cfg = load_config()
+    index_path = _results_dir(root) / "index.json"
+    index_digest = ""
+    if index_path.is_file():
+        index_digest = str(json.loads(index_path.read_text(encoding="utf-8")).get("digest", ""))
+    params = _config_snapshot(cfg)
+    payload = {
+        "experiment_id": args.experiment_id or root.name,
+        "data_version": dataset.manifest.version,
+        "index_digest": index_digest,
+        "candidate_digest": hashlib.sha256(
+            json.dumps(params, sort_keys=True, ensure_ascii=False).encode("utf-8")).hexdigest(),
+        "code_commit": _git_commit(),
+        "model": cfg.llm.model,
+        "prompt_version": "e8-frozen",
+        "params": params,
+        "time_baseline": dt.datetime.now(dt.UTC).isoformat(timespec="seconds"),
+        "budget_id": args.budget_id,
+    }
+    experiment = Experiment.model_validate(payload)
+    target.write_text(experiment.model_dump_json(indent=2) + "\n", encoding="utf-8")
+    print(f"候选已冻结：{target}")
+    return EXIT_OK
+
+
+def cmd_score(args: argparse.Namespace) -> int:
+    root = Path(args.experiment)
+    source = Path(args.import_file)
+    if not source.is_file():
+        raise CliError(f"人工评分文件不存在：{source}")
+    data = json.loads(source.read_text(encoding="utf-8"))
+    rows = data.get("scores", []) if isinstance(data, dict) else data
+    scores = [HumanScore.model_validate(item) for item in rows]
+    target = _results_dir(root) / "human_scores.json"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(json.dumps({"scores": [item.model_dump() for item in scores]},
+                                 ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    print(f"已导入 {len(scores)} 条人工评分 → {target}")
+    return EXIT_OK
+
+
+def _metrics_for(dataset: Dataset, attempts: Sequence[Attempt], *, split: str,
+                 strategy: str, clue_mode: str, repeats: int) -> dict[str, Any]:
+    cases = [case for case in dataset.cases if case.split == split]
+    selected = [attempt for attempt in attempts
+                if attempt.strategy == strategy and attempt.clue_mode == clue_mode]
+    return aggregate(cases, dataset.qrels, selected, repeats=repeats)
+
+
+def _fmt(value: Any, digits: int = 3) -> str:
+    if value is None:
+        return "—"
+    if isinstance(value, float):
+        return f"{value:.{digits}f}"
+    return str(value)
+
+
+def render_report(dataset: Dataset, attempts: Sequence[Attempt],
+                  experiment: Experiment | None) -> str:
+    lines = [
+        "# E9 真实效果评测报告",
+        "",
+        f"- 数据版本：`{dataset.manifest.version}`（{dataset.manifest.status}）",
+        f"- 任务 / 素材：{len(dataset.cases)} / {len(dataset.materials)}",
+        f"- 尝试记录：{len(attempts)}",
+        f"- 实验候选：`{experiment.experiment_id if experiment else '未冻结'}`",
+        "",
+    ]
+    if not attempts:
+        lines += ["## 状态", "", "**not_run**：没有尝试记录，不能报告质量或收益。", ""]
+        return "\n".join(lines)
+    lines += ["## 检索指标", "",
+              "| 线索 | 分区 | 策略 | 任务 | 技术完成 | Top-1 | Hit@5 | nDCG@5 | "
+              "误推荐率 | 正确空结果 | P50 ms | P95 ms |",
+              "| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |"]
+    for mode, repeats in (("oracle", 1), ("real", 3)):
+        for split in ("dev", "holdout"):
+            for strategy in STRATEGY_NAMES:
+                metrics = _metrics_for(dataset, attempts, split=split, strategy=strategy,
+                                       clue_mode=mode, repeats=repeats)
+                lines.append(
+                    f"| {mode} | {split} | {strategy} | {metrics['cases']} | "
+                    f"{_fmt(metrics['technical_completion'])} | {_fmt(metrics['top1'])} | "
+                    f"{_fmt(metrics['hit5'])} | {_fmt(metrics['ndcg'])} | "
+                    f"{_fmt(metrics['false_recommendation_rate'])} | "
+                    f"{_fmt(metrics['correct_empty_rate'])} | "
+                    f"{_fmt(metrics['latency_p50_ms'], 1)} | "
+                    f"{_fmt(metrics['latency_p95_ms'], 1)} |")
+    lines += ["", "## 说明", "",
+              "- 表格只汇总已执行的尝试；缺失任务在技术完成率与检查器里单独报。",
+              "- oracle 每任务 1 次；real 每任务 3 次，重复先在任务内平均。",
+              "- 未执行 `score` 人工评分、未通过 S8.3 / S7.29 前置时，不得宣称完整实验。",
+              ""]
+    return "\n".join(lines)
+
+
+def cmd_report(args: argparse.Namespace) -> int:
+    root = Path(args.experiment)
+    dataset, report = _load(root, require_frozen=False)
+    if not report.ok:
+        _print_errors(report)
+        return EXIT_INVALID
+    attempts = read_attempts(root)
+    experiment = _read_experiment(root)
+    markdown = render_report(dataset, attempts, experiment)
+    out = Path(args.out) if args.out else root
+    out.mkdir(parents=True, exist_ok=True)
+    md_path = out / "report.md"
+    json_path = out / "report.json"
+    md_path.write_text(markdown, encoding="utf-8")
+    json_path.write_text(json.dumps({
+        "dataset": dataset.manifest.version,
+        "attempts": len(attempts),
+        "experiment": experiment.model_dump() if experiment else None,
+    }, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    print(f"报告：{md_path}")
+    return EXIT_OK
+
+
+def _prerequisites(root: Path) -> dict[str, Any]:
+    path = root / "prerequisites.json"
+    if not path.is_file():
+        return {}
+    data = json.loads(path.read_text(encoding="utf-8"))
+    return data if isinstance(data, dict) else {}
+
+
+def _prereq_ok(root: Path, key: str) -> bool:
+    item = _prerequisites(root).get(key, {})
+    return bool(isinstance(item, dict) and item.get("complete"))
+
+
+def _evidence(root: Path, dataset: Dataset, attempts: Sequence[Attempt],
+              require_human: bool) -> tuple[int, list[str]]:
+    if dataset.manifest.status != "frozen":
+        return EXIT_INCOMPLETE, ["数据未冻结"]
+    missing: list[str] = []
+    for mode, repeats in (("oracle", 1), ("real", 3)):
+        selected = [attempt for attempt in attempts if attempt.clue_mode == mode]
+        decision = evidence_gate(
+            dataset.cases, selected, dataset.qrels, frozen=True, repeats=repeats,
+            strategies=STRATEGY_NAMES,
+            human_scores=read_human_scores(root), require_human=require_human)
+        missing.extend(decision.missing)
+    return (EXIT_OK if not missing else EXIT_INCOMPLETE), missing
+
+
+def _retrieval_gate(root: Path, dataset: Dataset, attempts: Sequence[Attempt],
+                    gate: str) -> tuple[int, list[str], dict[str, Any]]:
+    if not attempts:
+        return EXIT_INCOMPLETE, ["没有检索尝试记录"], {}
+    experiment = _read_experiment(root)
+    baseline_strategy = "keyword"
+    if experiment is not None:
+        baseline_strategy = str(experiment.params.get("baseline_strategy", "keyword"))
+    hybrid = _metrics_for(dataset, attempts, split="holdout", strategy="hybrid",
+                          clue_mode="real", repeats=3)
+    baseline = _metrics_for(dataset, attempts, split="holdout", strategy=baseline_strategy,
+                            clue_mode="real", repeats=3)
+    if gate == "quality":
+        decision = quality_gate(hybrid)
+        return (EXIT_OK if decision.status == "pass"
+                else EXIT_QUALITY if decision.status == "fail"
+                else EXIT_INCOMPLETE), decision.reasons, decision.metrics
+    holdout = [case for case in dataset.cases
+               if case.split == "holdout" and case.expectation.answerable]
+    hybrid_rows = {row["case_id"]: row for row in hybrid["rows"]}
+    base_rows = {row["case_id"]: row for row in baseline["rows"]}
+    missing = [case.case_id for case in holdout
+               if case.case_id not in hybrid_rows or case.case_id not in base_rows
+               or not hybrid_rows[case.case_id]["complete"]
+               or not base_rows[case.case_id]["complete"]
+               or hybrid_rows[case.case_id]["ndcg"] is None
+               or base_rows[case.case_id]["ndcg"] is None]
+    if missing:
+        return EXIT_INCOMPLETE, [f"缺少对照任务：{missing[:5]}"], {}
+    groups, base_values, hybrid_values = case_deltas(
+        holdout,
+        {case.case_id: float(base_rows[case.case_id]["ndcg"]) for case in holdout},
+        {case.case_id: float(hybrid_rows[case.case_id]["ndcg"]) for case in holdout})
+    bootstrap = paired_bootstrap(groups, base_values, hybrid_values)
+    decision = benefit_gate(hybrid, baseline, bootstrap)
+    return (EXIT_OK if decision.status == "pass"
+            else EXIT_QUALITY if decision.status == "fail"
+            else EXIT_INCOMPLETE), decision.reasons, decision.metrics
+
+
+def cmd_check(args: argparse.Namespace) -> int:
+    root = Path(args.experiment)
+    dataset, report = _load(root, require_frozen=args.gate != "evidence")
+    if not report.ok:
+        _print_errors(report)
+        return EXIT_INVALID
+    attempts = read_attempts(root)
+    if args.gate == "evidence":
+        code, reasons = _evidence(root, dataset, attempts, args.require_human)
+    elif args.gate in ("quality", "benefit"):
+        code, reasons, metrics = _retrieval_gate(root, dataset, attempts, args.gate)
+        if metrics:
+            print(json.dumps(metrics, ensure_ascii=False, indent=2))
+    else:
+        raise CliError(f"未知检查门：{args.gate}")
+    for reason in reasons:
+        print(f"{args.gate.upper()}: {reason}", file=sys.stderr)
+    print(f"{args.gate} 检查退出码：{code}")
+    return code
+
+
+def _live_gate(root: Path, dataset: Dataset, *, stage: str) -> list[str]:
+    missing: list[str] = []
+    if dataset.manifest.status != "frozen":
+        missing.append("数据未冻结")
+    if stage in ("retrieval", "e2e") and not _prereq_ok(root, "s8_3_formal_cutover"):
+        missing.append("S8.3 正式切换未完成 / 未记录")
+    if stage == "e2e" and not _prereq_ok(root, "s7_29_signed"):
+        missing.append("S7.29 未签收")
+    return missing
+
+
+def cmd_live_stage(args: argparse.Namespace) -> int:
+    if not args.live:
+        print("默认模式禁止外部模型请求；需要显式 --live 并通过数据 / 预算 / 运行检查",
+              file=sys.stderr)
+        return EXIT_INVALID
+    if args.stage == "retrieval" and args.sweep and args.split == "holdout":
+        print("留出集禁止调参：--sweep 只能用于开发集", file=sys.stderr)
+        return EXIT_INVALID
+    root = Path(args.experiment)
+    dataset, report = _load(root, require_frozen=True)
+    if not report.ok:
+        _print_errors(report)
+        return EXIT_INVALID
+    missing = _live_gate(root, dataset, stage=args.stage)
+    if missing:
+        for item in missing:
+            print(f"BLOCKED: {item}", file=sys.stderr)
+        return EXIT_INCOMPLETE
+    print(f"{args.stage} live runner 尚未接入隔离容器 / 转发服务；"
+          "本命令不会在未完成依赖时伪造结果", file=sys.stderr)
+    return EXIT_INCOMPLETE
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="E9 真实效果评测")
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    validate = sub.add_parser("validate", help="校验数据包、hash、分区和 qrel")
+    validate.add_argument("--experiment", required=True)
+    validate.add_argument("--allow-draft", action="store_true")
+    validate.add_argument("--json", action="store_true")
+    validate.set_defaults(func=cmd_validate)
+
+    estimate = sub.add_parser("estimate", help="离线估算 10 元预算")
+    estimate.add_argument("--experiment", required=True)
+    estimate.add_argument("--prices", default=None)
+    estimate.add_argument("--budget", type=float, default=10.0)
+    estimate.add_argument("--material-tokens", type=int, default=512)
+    estimate.set_defaults(func=cmd_estimate)
+
+    freeze = sub.add_parser("freeze-candidate", help="冻结候选代码 / 参数 / 模型")
+    freeze.add_argument("--experiment", required=True)
+    freeze.add_argument("--experiment-id", default="")
+    freeze.add_argument("--budget-id", default="e9-local")
+    freeze.add_argument("--force", action="store_true")
+    freeze.set_defaults(func=cmd_freeze_candidate)
+
+    score = sub.add_parser("score", help="导入人工评分")
+    score.add_argument("--experiment", required=True)
+    score.add_argument("--import", dest="import_file", required=True)
+    score.set_defaults(func=cmd_score)
+
+    report = sub.add_parser("report", help="生成阶段报告")
+    report.add_argument("--experiment", required=True)
+    report.add_argument("--out", default=None)
+    report.set_defaults(func=cmd_report)
+
+    check = sub.add_parser("check", help="证据 / 质量 / 收益检查")
+    check.add_argument("--experiment", required=True)
+    check.add_argument("--gate", choices=("evidence", "quality", "benefit"), required=True)
+    check.add_argument("--require-human", action="store_true")
+    check.set_defaults(func=cmd_check)
+
+    for name, stage in (("index", "index"), ("retrieval", "retrieval"), ("e2e", "e2e")):
+        command = sub.add_parser(name, help=f"{name}（live 受控）")
+        command.add_argument("--experiment", required=True)
+        command.add_argument("--live", action="store_true")
+        command.add_argument("--split", choices=("dev", "holdout"), default="dev")
+        command.add_argument("--sweep", action="store_true")
+        command.set_defaults(func=cmd_live_stage, stage=stage)
+    return parser
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    try:
+        return int(args.func(args))
+    except CliError as exc:
+        print(f"E_E9: {exc}", file=sys.stderr)
+        return exc.code
+    except (BudgetError, ValueError) as exc:
+        print(f"E_E9: {exc}", file=sys.stderr)
+        return EXIT_INVALID
+    except Exception as exc:  # 配置 / 网络 / 数据库失败统一失败，不伪造结果
+        print(f"E_E9: {type(exc).__name__}: {exc}", file=sys.stderr)
+        return EXIT_INVALID
+
+
+if __name__ == "__main__":  # pragma: no cover
+    raise SystemExit(main())

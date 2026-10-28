@@ -10,7 +10,7 @@ import pytest_asyncio
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
 
-from xhs_agent.config import AppConfig, load_config
+from xhs_agent.config import AppConfig, ConfigError, load_config
 from xhs_agent.db import Base
 from xhs_agent.db.models import EMBEDDING_DIM
 from xhs_agent.schemas import Element, HotspotClue
@@ -323,3 +323,56 @@ class TestVectorCoverageAndFailures:
         assert outcome.coverage.ratio == 0.0
         assert [e.value for e in outcome.coverage.gaps] == ["羽毛球"]
         assert outcome.candidates_considered == 0
+
+
+class TestExplicitE9Channels:
+    async def test_literal_channel_does_not_embed(self, db_session: AsyncSession,
+                                                  tmp_path: Path) -> None:
+        hit = await seed_hit(db_session, "m/a.mp4", embedding=E0)
+        failure = FailingEmbedder()
+        outcome = await retrieve_candidates(
+            db_session, write_config(tmp_path),
+            clue_with([("topic", "羽毛球")], keywords=["羽毛球", "球场"]),
+            embedder=failure, channels=("literal",))
+        assert [c.material_id for c in outcome.candidates] == [hit]
+        assert outcome.vector_recalled == 0
+        assert failure.calls == 0
+
+    async def test_vector_channel_reuses_precomputed_query(self, db_session: AsyncSession,
+                                                           tmp_path: Path) -> None:
+        hit = await seed_miss(db_session, "m/c.mp4", embedding=E0)
+        failure = FailingEmbedder()
+        outcome = await retrieve_candidates(
+            db_session, write_config(tmp_path),
+            clue_with([("topic", "羽毛球")]), embedder=failure,
+            channels=("vector",), query_vector=list(E0))
+        assert [c.material_id for c in outcome.candidates] == [hit]
+        assert outcome.literal_recalled == 0
+        assert failure.calls == 0
+
+    async def test_hybrid_with_precomputed_query_skips_embedding(
+            self, db_session: AsyncSession, tmp_path: Path) -> None:
+        both = await seed_hit(db_session, "m/d.mp4", embedding=E0)
+        failure = FailingEmbedder()
+        outcome = await retrieve_candidates(
+            db_session, write_config(tmp_path),
+            clue_with([("topic", "羽毛球")], keywords=["羽毛球", "球场"]),
+            embedder=failure, channels=("literal", "vector"), query_vector=list(E0))
+        assert [c.material_id for c in outcome.candidates] == [both]
+        assert outcome.candidates[0].recall_sources == ["literal", "vector"]
+        assert failure.calls == 0
+
+    async def test_vector_channel_requires_enabled_embedding(self, db_session: AsyncSession,
+                                                             tmp_path: Path) -> None:
+        with pytest.raises(ConfigError):
+            await retrieve_candidates(
+                db_session, write_config(tmp_path, embedding={"enabled": False}),
+                clue_with([("topic", "羽毛球")]), channels=("vector",),
+                query_vector=list(E0))
+
+    async def test_query_vector_without_vector_channel_is_rejected(
+            self, db_session: AsyncSession, tmp_path: Path) -> None:
+        with pytest.raises(ValueError, match="query_vector"):
+            await retrieve_candidates(
+                db_session, write_config(tmp_path), clue_with([("topic", "羽毛球")]),
+                channels=("literal",), query_vector=list(E0))

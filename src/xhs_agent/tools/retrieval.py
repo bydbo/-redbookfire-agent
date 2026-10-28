@@ -11,12 +11,14 @@
 
 from __future__ import annotations
 
+import os
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any
 
 from ..config import AppConfig
 from ..schemas import Coverage, HotspotClue, MatchCandidate, Material
+from ..util import normalize_text
 from . import matching
 
 LITERAL = "literal"
@@ -62,6 +64,34 @@ def vector_query_text(clue: HotspotClue) -> str:
         _push(parts, mechanism.name)
         _push(parts, mechanism.explain)
     return " ".join(parts)
+
+
+def keyword_patterns(clue: HotspotClue) -> list[str]:
+    """关键词基线模式：`match_keywords` + 全部要素值（去重去空）。"""
+    parts: list[str] = []
+    for value in [*list(clue.match_keywords or []),
+                  *(element.value for element in clue.elements or [])]:
+        _push(parts, value)
+    return parts
+
+
+def keyword_substring_rank(clue: HotspotClue, materials: list[Material],
+                           topk: int) -> list[Material]:
+    """纯关键词子串基线：文件名 + 标签 / 标题 / 描述，按命中模式数降序、path 升序。
+
+    这是 E9 `keyword` 策略，不参与 RRF 或要素重排；仅用于固定素材库上的对照。
+    """
+    patterns = [normalize_text(value) for value in keyword_patterns(clue)]
+    patterns = [value for value in patterns if value]
+    scored: list[tuple[int, Material]] = []
+    for material in materials:
+        corpus = normalize_text(
+            f"{os.path.basename(material.path)} {matching.material_text(material)}")
+        hits = sum(1 for pattern in patterns if pattern in corpus)
+        if hits:
+            scored.append((hits, material))
+    scored.sort(key=lambda item: (-item[0], item[1].path))
+    return [material for _hits, material in scored[:max(0, int(topk))]]
 
 
 def rrf_scores(channel_ranks: Mapping[str, Mapping[str, int]], k: int) -> dict[str, float]:

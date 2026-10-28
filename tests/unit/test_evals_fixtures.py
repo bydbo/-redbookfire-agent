@@ -74,12 +74,12 @@ class TestManifest:
                   if path.is_file() and path.name not in {".gitkeep", "manifest.json"}
                   # evals/reports/ 是评测输出、evals/chat/ 是对话层用例集（自带 chat-vN 版本），
                   # 两者都不入 manifest、不属于 v1 冻结资产，见 docs/评测集.md §六
-                  # context-repair-v1/ 是 E7CTX 修复的独立冻结协议（自带 manifest），
-                  # 与检索评测集 v1 分开管理，见 docs/评测集.md §六与 evals/context-repair-v1/
+                  # context-repair-v1/、e9-v1/ 是独立版本（各自带 manifest），与检索 v1 分开管理
                   and not path.relative_to(EVALS_DIR).as_posix().startswith(("reports/",
                                                                              "chat/",
                                                                              "context-repair-v1/",
-                                                                             "context-repair-v2/"))}
+                                                                             "context-repair-v2/",
+                                                                             "e9-v1/"))}
         unexpected = sorted(actual - registered)
         assert not unexpected, f"这些文件没登记进 manifest：{unexpected}"
 

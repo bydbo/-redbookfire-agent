@@ -236,6 +236,12 @@ uv run python -m xhs_agent.probe
 #     结果落 evals/reports/retrieval-v1-<日期>.md；需要 Docker 与真实 DASHSCOPE_API_KEY
 uv run python scripts/eval_retrieval.py
 
+# 10b. E9 真实效果评测（当前数据是 draft，不能 live）：
+#      先校验数据包、离线估算 10 元预算；正式实验还受 S8.3 切换 / S7.29 签收 / 人工标注约束。
+uv run python scripts/eval_e9.py validate --experiment evals/e9-v1 --allow-draft
+uv run python scripts/eval_e9.py estimate --experiment evals/e9-v1
+#      协议见 docs/E9评测协议.md；live 失败会返回 3/4，不伪造结果。
+
 # 11. 起 Celery worker（S3.4b：消费 POST /api/analyze 投递的 job）
 #     （走容器全栈时跳过这一步——compose 的 worker 服务已经在跑）
 uv run celery -A xhs_agent.tasks.worker:app worker --loglevel=info

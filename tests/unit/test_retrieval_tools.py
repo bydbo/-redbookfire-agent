@@ -211,3 +211,28 @@ class TestRankCandidates:
         second, second_coverage = retrieval.rank_candidates(clue, materials, ranks, params(), now=NOW)
         assert [item.to_dict() for item in first] == [item.to_dict() for item in second]
         assert first_coverage.to_dict() == second_coverage.to_dict()
+
+
+class TestKeywordBaseline:
+    def test_ranks_by_number_of_patterns_then_path(self, make_clue, make_material):
+        clue = make_clue(elements=[("topic", "alpha"), ("scene", "beta")])
+        rich = make_material("m2", path="D:/m/b.mp4", title="alpha beta")
+        thin = make_material("m1", path="D:/m/a.mp4", title="alpha")
+        ranked = retrieval.keyword_substring_rank(clue, [thin, rich], 5)
+        assert [item.id for item in ranked] == ["m2", "m1"]
+
+    def test_filename_participates_in_match(self, make_clue, make_material):
+        clue = make_clue(elements=[("topic", "alpha")])
+        material = make_material("m1", path="D:/m/alpha-clip.mp4")
+        assert retrieval.keyword_substring_rank(clue, [material], 5) == [material]
+
+    def test_no_match_returns_empty(self, make_clue, make_material):
+        clue = make_clue(elements=[("topic", "alpha")])
+        material = make_material("m1", path="D:/m/other.mp4", title="beta")
+        assert retrieval.keyword_substring_rank(clue, [material], 5) == []
+
+    def test_topk_is_respected(self, make_clue, make_material):
+        clue = make_clue(elements=[("topic", "alpha")])
+        materials = [make_material(f"m{i}", path=f"D:/m/{i}.mp4", title="alpha")
+                     for i in range(3)]
+        assert len(retrieval.keyword_substring_rank(clue, materials, 2)) == 2

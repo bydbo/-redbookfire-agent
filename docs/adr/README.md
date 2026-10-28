@@ -63,3 +63,4 @@
 
 | [0017](0017-material-root-relative-identity.md) | 素材根相对身份与可审计合并 | 已采纳 |
 | [0018](0018-historical-evidence-snapshots.md) | 历史依据采用不可变证据快照，删除素材不级联历史候选 | 已采纳 |
+| [0019](0019-e9-evaluation-package.md) | E9 评测逻辑独立成内部包，不进入产品 API / 数据表 | 已采纳 |

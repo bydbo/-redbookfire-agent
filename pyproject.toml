@@ -114,6 +114,8 @@ files = [
     "src/xhs_agent/core",
     # S3.4b 的 Celery 任务层：投递、重试与失败路径都在这里，类型错误代价高
     "src/xhs_agent/tasks",
+    # E9 评测内部包：指标、预算账本、转发与判定；生产不 import，但错误会直接污染实验结论
+    "src/xhs_agent/evaluation",
 ]
 
 # Celery / kombu 都没有 py.typed（也没有官方 stubs），严格模式下只能放行"缺类型"，

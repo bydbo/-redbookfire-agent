@@ -1,0 +1,16 @@
+{
+  "version": "e9-v1",
+  "protocol_version": "1",
+  "dataset_kind": "e9",
+  "status": "draft",
+  "frozen_at": "",
+  "produced_by": "E9 S9.1 脚手架",
+  "usage": "只在用户确认 100 素材 / 50 任务 / 全库 qrel 后冻结；不得用合成样本冒充效果数据",
+  "counts": {
+    "cases": 0,
+    "materials": 0,
+    "dev": 0,
+    "holdout": 0
+  },
+  "files": {}
+}

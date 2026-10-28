@@ -1,0 +1,3 @@
+case_id,repeats,has_followup,has_rewrite,notes
+holdout-text-001,0,false,false,
+holdout-text-002,2,true,false,稳定性重复并带追问
