@@ -26,9 +26,9 @@
 | `uv run pytest -q` | 1509 passed / 3 skipped / 401 deselected |
 | `uv run ruff check .` | 通过（退出码 0；仅对用户遗留的受限目录打印权限警告） |
 | `uv run mypy` | 通过（80 个 source files） |
-| `uv run pytest --cov=xhs_agent --cov-fail-under=0` | 单测覆盖率 66% |
-| `uv run python scripts/check_coverage.py` | 单测 1504 + 集成 401 全通过；**联合覆盖率 85% ≥ 78%** |
-| `uv run pytest -m integration` | **401 passed**（真实 Postgres / Redis 容器；含 E9 Alembic + 索引 + oracle 四策略 1 条） |
+| `uv run pytest --cov=xhs_agent --cov-fail-under=0` | 单测覆盖率 69% |
+| `uv run python scripts/check_coverage.py` | 单测 1509 + 集成 401 全通过；**联合覆盖率 85% ≥ 78%** |
+| `uv run pytest -m integration` | **401 passed**（真实 Postgres / Redis 容器；含 E9 Alembic + 索引 + oracle 四策略 + 15 点 sweep 1 条） |
 | `uv run python scripts/eval_e9.py validate --experiment evals/e9-v1 --allow-draft` | 退出 0，提示 draft |
 | `... validate`（严格） | 退出 3：数据未冻结，符合预期 |
 | `... estimate --experiment evals/e9-v1` | 退出 0；按预期 token 估算约 **0.9844 元**（含 20% 重试余量）；价格来源为未核验的配置默认值 |
