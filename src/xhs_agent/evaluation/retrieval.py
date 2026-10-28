@@ -132,9 +132,11 @@ async def run_retrieval(session: AsyncSession, cfg: AppConfig, dataset: Dataset,
                         total_latency_ms=embed_ms))
                     continue
                 try:
+                    use_vector = strategy in ("vector_only", "hybrid")
                     outcome = await retrieve_candidates(
                         session, cfg, clue, embedder=embedder, now=now,
-                        channels=STRATEGY_CHANNELS[strategy], query_vector=vector)
+                        channels=STRATEGY_CHANNELS[strategy],
+                        query_vector=vector if use_vector else None)
                     keys = _map_candidates(outcome.candidates, id_to_key)
                     elapsed = int((time.perf_counter() - start) * 1000)
                     attempts.append(Attempt(

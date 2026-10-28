@@ -23,7 +23,7 @@
 
 | 命令 | 结果 |
 |---|---|
-| `uv run pytest -q` | 1492 passed / 3 skipped / 400 deselected |
+| `uv run pytest -q` | 1495 passed / 3 skipped / 400 deselected |
 | `uv run ruff check .` | 通过（退出码 0；仅对用户遗留的受限目录打印权限警告） |
 | `uv run mypy` | 通过（80 个 source files） |
 | `uv run pytest --cov=xhs_agent --cov-fail-under=0` | 单测覆盖率 66%；**不是联合门槛**，集成未跑 |
@@ -32,6 +32,7 @@
 | `... validate`（严格） | 退出 3：数据未冻结，符合预期 |
 | `... estimate --experiment evals/e9-v1` | 退出 0；按预期 token 估算约 **0.9844 元**（含 20% 重试余量）；价格来源为未核验的配置默认值 |
 | `... retrieval --experiment evals/e9-v1 --live` | 退出 4：S8.3 未完成，拒绝 live |
+| `... e2e --experiment evals/e9-v1` | 退出 4：没有 `results/e2e.json`，拒绝空证据通过 |
 | `git diff --check` | 通过 |
 
 **没有执行任何付费模型调用。** E9 账本支出 0 元、未知占用 0 元、剩余 10 元。
@@ -65,7 +66,7 @@
 | `scripts/e9_browser_attempt.py` | 单任务真实 UI 提交、刷新与证据记录 |
 | `scripts/e9_seal_dataset.py` | 人工确认后的数据封存 |
 | `docs/e9/s9.4/` | 真人试用执行包 |
-| `tests/unit/test_e9_*.py` | 59 个 E9 离线用例（含预算 / 代理 / 数据 / 判定 / 四策略映射） |
+| `tests/unit/test_e9_*.py` | 62 个 E9 离线用例（含预算 / 代理 / 数据 / 判定 / 四策略编排） |
 | `runs/_e9/`（忽略） | 本报告验证日志、覆盖率、估算输出 |
 
 ## 五、风险与后续
