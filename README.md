@@ -239,6 +239,7 @@ uv run python scripts/eval_retrieval.py
 # 10b. E9 真实效果评测（当前数据是 draft，不能 live）：
 #      先校验数据包、离线估算 10 元预算；正式实验还受 S8.3 切换 / S7.29 签收 / 人工标注约束。
 uv run python scripts/eval_e9.py validate --experiment evals/e9-v1 --allow-draft
+uv run python scripts/e9_labels.py export --experiment evals/e9-v1 --out labels.csv
 uv run python scripts/eval_e9.py estimate --experiment evals/e9-v1
 #      协议见 docs/E9评测协议.md；live 失败会返回 3/4，不伪造结果。
 
