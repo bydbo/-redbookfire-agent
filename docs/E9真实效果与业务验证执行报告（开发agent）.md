@@ -26,7 +26,8 @@
 | `uv run pytest -q` | 1504 passed / 3 skipped / 400 deselected |
 | `uv run ruff check .` | 通过（退出码 0；仅对用户遗留的受限目录打印权限警告） |
 | `uv run mypy` | 通过（80 个 source files） |
-| `uv run pytest --cov=xhs_agent --cov-fail-under=0` | 单测覆盖率 66%；**不是联合门槛**，集成未跑 |
+| `uv run pytest --cov=xhs_agent --cov-fail-under=0` | 单测覆盖率 66% |
+| `uv run python scripts/check_coverage.py` | 单测 1504 + 集成 401 全通过；**联合覆盖率 85% ≥ 78%** |
 | `uv run pytest -m integration` | **401 passed**（真实 Postgres / Redis 容器；含 E9 Alembic + 索引 + oracle 四策略 1 条） |
 | `uv run python scripts/eval_e9.py validate --experiment evals/e9-v1 --allow-draft` | 退出 0，提示 draft |
 | `... validate`（严格） | 退出 3：数据未冻结，符合预期 |
@@ -45,8 +46,8 @@
 3. **S7.29 未签收**：S9.3 正式实验依赖真实多轮专项；不能用 E9 自测替代。
 4. **预算与代理未取得真实价格 / 上游凭据**：配置默认单价不是账单价格；live 必须先保存
    官方价格快照，并通过转发服务的端点与跨进程测试。
-5. **集成测试环境失败**：本机 Docker 不可用，无法跑真实 Postgres / Redis / worker 路径；
-   按 AGENTS 记录为“未执行”，不静默跳过。
+5. **真实供应商 / 真实拆解未执行**：集成测试已用真实 Postgres / Redis 容器和 fake embedder
+   验证索引与 oracle 编排；这不等于真实模型效果。真实价格快照、上游凭据和正式 live 仍未就绪。
 
 因此本轮没有“Top-1 / Hit@5 / nDCG / 成功率”真实数字，也不判断混合策略是否优于简单基线。
 负面或正面结论都必须等正式实验。
