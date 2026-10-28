@@ -109,3 +109,13 @@ def test_holdout_sweep_is_rejected(tmp_path: Path) -> None:
     _pack(tmp_path)
     assert main(["retrieval", "--experiment", str(tmp_path), "--live",
                  "--split", "holdout", "--sweep"]) == 3
+
+
+def test_e2e_without_evidence_is_incomplete(tmp_path: Path) -> None:
+    _pack(tmp_path)
+    assert main(["e2e", "--experiment", str(tmp_path)]) == 4
+
+
+def test_e2e_live_is_blocked_by_prerequisites(tmp_path: Path) -> None:
+    _pack(tmp_path)
+    assert main(["e2e", "--experiment", str(tmp_path), "--live"]) == 4

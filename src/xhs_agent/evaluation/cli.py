@@ -20,6 +20,7 @@ from ..config import PROJECT_ROOT, AppConfig, load_config
 from .budget import BudgetError, PriceTable, price_table_from_config
 from .dataset import ValidationReport, load_and_validate
 from .decisions import benefit_gate, evidence_gate, quality_gate
+from .e2e import E2EResult, validate_e2e
 from .metrics import aggregate, case_deltas, paired_bootstrap
 from .models import STRATEGIES, Attempt, Dataset, Experiment, HumanScore
 
@@ -446,6 +447,41 @@ def cmd_live_stage(args: argparse.Namespace) -> int:
     return EXIT_INCOMPLETE
 
 
+def _load_e2e(root: Path, path_value: str) -> E2EResult | None:
+    path = Path(path_value)
+    if not path.is_absolute():
+        path = root / path
+    if not path.is_file():
+        return None
+    return E2EResult.model_validate(json.loads(path.read_text(encoding="utf-8")))
+
+
+def cmd_e2e(args: argparse.Namespace) -> int:
+    """离线校验已有 32 次证据；live 模式先过前置门，未接入 runner 时返回 4。"""
+    root = Path(args.experiment)
+    dataset, report = _load(root, require_frozen=False)
+    if not report.ok:
+        _print_errors(report)
+        return EXIT_INVALID
+    if args.live:
+        missing = _live_gate(root, dataset, stage="e2e")
+        if missing:
+            for item in missing:
+                print(f"BLOCKED: {item}", file=sys.stderr)
+            return EXIT_INCOMPLETE
+        print("e2e live runner 尚未接入浏览器 / worker；不伪造尝试记录", file=sys.stderr)
+        return EXIT_INCOMPLETE
+    result = _load_e2e(root, args.results)
+    if result is None:
+        print(f"没有 E2E 证据：{args.results}", file=sys.stderr)
+        return EXIT_INCOMPLETE
+    decision = validate_e2e(dataset, result)
+    print(json.dumps(decision.model_dump(), ensure_ascii=False, indent=2))
+    if decision.status == "pass":
+        return EXIT_OK
+    return EXIT_QUALITY if decision.status == "fail" else EXIT_INCOMPLETE
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="E9 真实效果评测")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -486,13 +522,19 @@ def build_parser() -> argparse.ArgumentParser:
     check.add_argument("--require-human", action="store_true")
     check.set_defaults(func=cmd_check)
 
-    for name, stage in (("index", "index"), ("retrieval", "retrieval"), ("e2e", "e2e")):
+    for name, stage in (("index", "index"), ("retrieval", "retrieval")):
         command = sub.add_parser(name, help=f"{name}（live 受控）")
         command.add_argument("--experiment", required=True)
         command.add_argument("--live", action="store_true")
         command.add_argument("--split", choices=("dev", "holdout"), default="dev")
         command.add_argument("--sweep", action="store_true")
         command.set_defaults(func=cmd_live_stage, stage=stage)
+
+    e2e = sub.add_parser("e2e", help="校验 20 任务 / 32 次 E2E 证据（--live 受前置门控制）")
+    e2e.add_argument("--experiment", required=True)
+    e2e.add_argument("--live", action="store_true")
+    e2e.add_argument("--results", default="results/e2e.json")
+    e2e.set_defaults(func=cmd_e2e)
     return parser
 
 
