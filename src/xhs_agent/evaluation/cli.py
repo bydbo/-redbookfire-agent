@@ -7,11 +7,14 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 import datetime as dt
 import hashlib
 import json
+import os
 import subprocess
 import sys
+import time
 from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
@@ -424,27 +427,152 @@ def _live_gate(root: Path, dataset: Dataset, *, stage: str) -> list[str]:
     return missing
 
 
-def cmd_live_stage(args: argparse.Namespace) -> int:
+def _require_database(args: argparse.Namespace) -> str:
+    url = str(getattr(args, "database_url", "") or "").strip()
+    if not url:
+        raise CliError("必须显式提供 --database-url，禁止默认写真实库")
+    os.environ["DATABASE_URL"] = url
+    return url
+
+
+def _migrate(database_url: str) -> bool:
+    env = {**os.environ, "DATABASE_URL": database_url, "PYTHONIOENCODING": "utf-8"}
+    result = subprocess.run([sys.executable, "-m", "alembic", "upgrade", "head"],
+                            cwd=PROJECT_ROOT, env=env, capture_output=True, text=True,
+                            encoding="utf-8", errors="replace", check=False)
+    if result.returncode:
+        print((result.stderr or result.stdout or "")[-1200:], file=sys.stderr)
+        return False
+    return True
+
+
+async def _index_async(cfg: AppConfig, dataset: Dataset, root: Path,
+                       embedder_factory: Any) -> dict[str, Any]:
+    from ..db.session import create_engine_from_config, create_session_factory
+    from ..tools.http import build_http_client
+
+    engine = create_engine_from_config(cfg)
+    try:
+        factory = create_session_factory(engine)
+        async with build_http_client(cfg.embedding.timeout_s) as http:
+            embedder = embedder_factory(http)
+            async with factory() as session:
+                from .experiment import index_dataset
+                return await index_dataset(session, cfg, dataset, root, embedder,
+                                           root / "results")
+    finally:
+        await engine.dispose()
+
+
+def cmd_index(args: argparse.Namespace) -> int:
     if not args.live:
-        print("默认模式禁止外部模型请求；需要显式 --live 并通过数据 / 预算 / 运行检查",
-              file=sys.stderr)
-        return EXIT_INVALID
-    if args.stage == "retrieval" and args.sweep and args.split == "holdout":
-        print("留出集禁止调参：--sweep 只能用于开发集", file=sys.stderr)
+        print("默认模式禁止外部模型请求；需要显式 --live", file=sys.stderr)
         return EXIT_INVALID
     root = Path(args.experiment)
     dataset, report = _load(root, require_frozen=True)
     if not report.ok:
         _print_errors(report)
         return EXIT_INVALID
-    missing = _live_gate(root, dataset, stage=args.stage)
+    missing = _live_gate(root, dataset, stage="index")
     if missing:
         for item in missing:
             print(f"BLOCKED: {item}", file=sys.stderr)
         return EXIT_INCOMPLETE
-    print(f"{args.stage} live runner 尚未接入隔离容器 / 转发服务；"
-          "本命令不会在未完成依赖时伪造结果", file=sys.stderr)
-    return EXIT_INCOMPLETE
+    _require_database(args)
+    cfg = load_config()
+    if not cfg.embedding.enabled:
+        print("index 需要 [embedding].enabled = true", file=sys.stderr)
+        return EXIT_INVALID
+    if not _migrate(os.environ["DATABASE_URL"]):
+        return EXIT_INVALID
+    from ..tools.embedding import build_embedder
+
+    payload = asyncio.run(_index_async(
+        cfg, dataset, root,
+        lambda http: build_embedder(cfg, client=http)))
+    print(json.dumps(payload, ensure_ascii=False, indent=2))
+    return EXIT_OK
+
+
+async def _retrieval_async(cfg: AppConfig, dataset: Dataset, root: Path,
+                           split: str, modes: tuple[str, ...],
+                           embedder_factory: Any) -> tuple[list[Any], dict[str, Any]]:
+    from ..db.session import create_engine_from_config, create_session_factory
+    from ..tools.http import build_http_client
+    from ..tools.llm import StructuredCaller, build_provider
+
+    engine = create_engine_from_config(cfg)
+    try:
+        factory = create_session_factory(engine)
+        async with build_http_client(cfg.llm.timeout_s) as http:
+            embedder = embedder_factory(http)
+            caller = (StructuredCaller(provider=build_provider(cfg, client=http))
+                      if "real" in modes else None)
+            async with factory() as session:
+                from .experiment import run_split
+                return await run_split(
+                    session, cfg, dataset, root, list(dataset.cases), split=split,
+                    embedder=embedder, http=http, caller=caller, modes=modes,
+                    now=time.time())
+    finally:
+        await engine.dispose()
+
+
+def _merge_attempts(root: Path, dataset: Dataset, split: str,
+                    new_attempts: list[Any]) -> None:
+    existing = read_attempts(root)
+    case_ids = {case.case_id for case in dataset.cases if case.split == split}
+    kept = [item for item in existing if item.case_id not in case_ids]
+    write_attempts(root, [*kept, *new_attempts])
+
+
+def cmd_retrieval(args: argparse.Namespace) -> int:
+    if not args.live:
+        print("默认模式禁止外部模型请求；需要显式 --live", file=sys.stderr)
+        return EXIT_INVALID
+    if args.sweep and args.split == "holdout":
+        print("留出集禁止调参：--sweep 只能用于开发集", file=sys.stderr)
+        return EXIT_INVALID
+    if args.sweep:
+        print("--sweep 尚未接入；先运行固定参数，避免用未经验证的网格冒充选参",
+              file=sys.stderr)
+        return EXIT_INCOMPLETE
+    root = Path(args.experiment)
+    dataset, report = _load(root, require_frozen=True)
+    if not report.ok:
+        _print_errors(report)
+        return EXIT_INVALID
+    missing = _live_gate(root, dataset, stage="retrieval")
+    if missing:
+        for item in missing:
+            print(f"BLOCKED: {item}", file=sys.stderr)
+        return EXIT_INCOMPLETE
+    if not (_results_dir(root) / "index.json").is_file():
+        print("缺少 results/index.json；先运行 index", file=sys.stderr)
+        return EXIT_INCOMPLETE
+    _require_database(args)
+    cfg = load_config()
+    if not cfg.embedding.enabled:
+        print("retrieval 需要 [embedding].enabled = true", file=sys.stderr)
+        return EXIT_INVALID
+    modes = (("oracle", "real") if args.clue == "both" else (args.clue,))
+    from ..tools.embedding import build_embedder
+
+    attempts, index = asyncio.run(_retrieval_async(
+        cfg, dataset, root, args.split, modes,
+        lambda http: build_embedder(cfg, client=http)))
+    _merge_attempts(root, dataset, args.split, attempts)
+    summary = {
+        "split": args.split,
+        "clue_modes": list(modes),
+        "attempts": len(attempts),
+        "index": index,
+        "generated_at": dt.datetime.now(dt.UTC).isoformat(timespec="seconds"),
+    }
+    (_results_dir(root) / "retrieval.json").write_text(
+        json.dumps(summary, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    print(json.dumps(summary, ensure_ascii=False, indent=2))
+    return EXIT_OK
 
 
 def _load_e2e(root: Path, path_value: str) -> E2EResult | None:
@@ -522,13 +650,21 @@ def build_parser() -> argparse.ArgumentParser:
     check.add_argument("--require-human", action="store_true")
     check.set_defaults(func=cmd_check)
 
-    for name, stage in (("index", "index"), ("retrieval", "retrieval")):
-        command = sub.add_parser(name, help=f"{name}（live 受控）")
-        command.add_argument("--experiment", required=True)
-        command.add_argument("--live", action="store_true")
-        command.add_argument("--split", choices=("dev", "holdout"), default="dev")
-        command.add_argument("--sweep", action="store_true")
-        command.set_defaults(func=cmd_live_stage, stage=stage)
+    index = sub.add_parser("index", help="在隔离库索引 E9 素材（--live 受控）")
+    index.add_argument("--experiment", required=True)
+    index.add_argument("--live", action="store_true")
+    index.add_argument("--database-url", default="")
+    index.add_argument("--max-vision-items", type=int, default=0)
+    index.set_defaults(func=cmd_index)
+
+    retrieval = sub.add_parser("retrieval", help="开发集 / 留出集检索对照（--live 受控）")
+    retrieval.add_argument("--experiment", required=True)
+    retrieval.add_argument("--live", action="store_true")
+    retrieval.add_argument("--database-url", default="")
+    retrieval.add_argument("--split", choices=("dev", "holdout"), default="dev")
+    retrieval.add_argument("--sweep", action="store_true")
+    retrieval.add_argument("--clue", choices=("oracle", "real", "both"), default="both")
+    retrieval.set_defaults(func=cmd_retrieval)
 
     e2e = sub.add_parser("e2e", help="校验 20 任务 / 32 次 E2E 证据（--live 受前置门控制）")
     e2e.add_argument("--experiment", required=True)

@@ -98,6 +98,7 @@ def test_score_import_writes_scores(tmp_path: Path) -> None:
 def test_live_command_requires_live_flag(tmp_path: Path) -> None:
     _pack(tmp_path)
     assert main(["retrieval", "--experiment", str(tmp_path)]) == 3
+    assert main(["index", "--experiment", str(tmp_path)]) == 3
 
 
 def test_live_command_is_blocked_by_prerequisites(tmp_path: Path) -> None:

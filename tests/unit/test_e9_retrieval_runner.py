@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+import datetime as dt
+import uuid
 from types import SimpleNamespace
 from typing import Any
 
 import pytest
 
 import xhs_agent.evaluation.retrieval as runner
+from xhs_agent.evaluation.experiment import library_digest
 from xhs_agent.evaluation.models import Case, Dataset, DatasetManifest, MaterialAsset
 from xhs_agent.schemas import Material
 from xhs_agent.tools.embedding import EmbeddingResult
@@ -72,3 +75,14 @@ async def test_oracle_shares_one_vector_across_vector_and_hybrid(monkeypatch) ->
     vectors = [c[1] for c in calls if c[1] is not None]
     assert len(vectors) == 2 and vectors[0] == vectors[1]
     assert index == {"digest": "idx"}
+
+
+def test_library_digest_is_stable_and_sensitive_to_identity() -> None:
+    material_id = uuid.uuid4()
+    row = SimpleNamespace(id=material_id, path="assets/a.jpg", fingerprint="fp",
+                          indexed_at=dt.datetime(2026, 10, 28, tzinfo=dt.UTC),
+                          embedding_model="m", embedding=[0.1])
+    first = library_digest([row])
+    assert first == library_digest([row])
+    row.path = "assets/b.jpg"
+    assert library_digest([row]) != first
