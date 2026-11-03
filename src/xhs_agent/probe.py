@@ -1,4 +1,4 @@
-"""启动前置检查（preflight）：《配置契约》第四节的 7 步。
+"""启动前置检查（preflight）：《配置契约》第四节的 8 步。
 
 按顺序执行，**任一步失败即中止启动**：
 
@@ -11,14 +11,18 @@
 | 5 | 数据库迁移版本处于 Alembic head | 3 |
 | 6 | Redis 可连接（`PING`） | 3 |
 | 7 | `[frontend].serve = true` 时 `frontend/dist` 存在且非空 | 2 |
+| 8 | `[web].enabled = true` 时 `search_url` 已配且 SearXNG 的 JSON 输出可用 | 2 |
 
 **模型服务不在启动时探测**：启动即调用模型会产生费用，也容易被网络抖动误判；模型可用性由
 `GET /api/health` 按需探测，不计入启动成败。
 
+**搜索能力在第 8 步真探一次**：`[web].enabled = true` 时对 `search_url` 打一次
+`/search?q=test&format=json`（不让模型参与，无模型费用），失败即配置错误（退出码 2）。
+
 用法：
 
     uv run python -m xhs_agent.probe      # 退出码 0 = 可以启动，2 = 配置错误，3 = 依赖不可用
-    uv run python -m xhs_agent.serve      # 推荐启动入口：先查这 7 步，再交给 uvicorn
+    uv run python -m xhs_agent.serve      # 推荐启动入口：先查这 8 步，再交给 uvicorn
 
 退出码边界：`python -m xhs_agent.probe` 与 `python -m xhs_agent.serve` 给精确的 2/3；
 `uvicorn xhs_agent.api.main:app` 这条路径只保证"检查不过就不启动"——uvicorn 自己在 lifespan
@@ -34,6 +38,7 @@ import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 
+import httpx
 import redis.asyncio as aioredis
 from alembic.config import Config as AlembicConfig
 from alembic.script import ScriptDirectory
@@ -65,6 +70,8 @@ E_DB_EXTENSION = "E_DB_EXTENSION"
 E_DB_MIGRATION = "E_DB_MIGRATION"
 E_REDIS_UNAVAILABLE = "E_REDIS_UNAVAILABLE"
 E_FRONTEND_DIST_MISSING = "E_FRONTEND_DIST_MISSING"
+E_WEB_SEARCH_URL_MISSING = "E_WEB_SEARCH_URL_MISSING"
+E_WEB_SEARCH_UNAVAILABLE = "E_WEB_SEARCH_UNAVAILABLE"
 
 _STAGE_RANK = {"P1": 1, "P2": 2, "P3": 3}
 
@@ -87,9 +94,13 @@ ALEMBIC_INI = str(Path(PROJECT_ROOT) / "alembic.ini")
 
 REDIS_PROBE_TIMEOUT_S = 2.0
 
+# 契约 §四 第 8 步：SearXNG 默认只吐 HTML，JSON 要靠 search.formats 显式打开
+SEARXNG_JSON_FIX = ("检查 SearXNG 的 search.formats 是否包含 json"
+                    "（settings.yml 里 formats: [html, json]），改完重启实例")
+
 USAGE = """用法：uv run python -m xhs_agent.probe
 
-打印脱敏配置摘要，并执行启动前置检查（《配置契约》第四节第 1–7 步）。
+打印脱敏配置摘要，并执行启动前置检查（《配置契约》第四节第 1–8 步）。
 退出码：0 = 通过，可以启动；2 = 配置错误；3 = 依赖不可用。
 """
 
@@ -202,6 +213,12 @@ def preflight(cfg: AppConfig, env: EnvView | None = None,
     if any(values.values()) and not all(values.values()):
         missing = "、".join(name for name in _LANGFUSE_NAMES if not values[name])
         report.warnings.append(f"调用追踪已关闭：{missing} 未配置，LANGFUSE_* 需要三者齐全")
+
+    # 5) 网页搜索密钥：不给也只告警（公开 SearXNG 实例允许无鉴权，不视为启用前提）
+    if cfg.web.enabled and not env.get(cfg.web.api_key_env):
+        report.warnings.append(
+            f"[web].enabled = true 但 {cfg.web.api_key_env} 为空：搜索请求不带鉴权头"
+            "（自建实例无需密钥时忽略本提示）")
 
     return report
 
@@ -322,8 +339,55 @@ def check_frontend(cfg: AppConfig) -> Problem | None:
         FRONTEND_FIX_HINT, step=7, kind="config")
 
 
+async def check_web(cfg: AppConfig, client: httpx.AsyncClient | None = None) -> Problem | None:
+    """第 8 步：`[web].enabled = true` 时 `search_url` 已配，且 SearXNG 的 JSON 输出可用。
+
+    只做一次 `/search?q=test&format=json` 的存在性探活——这不是抓取逻辑，也不走模型。
+    `client` 可注入（测试用 `httpx.MockTransport`），不传时按 `[web].search_timeout_s` 自建。
+    """
+    web = cfg.web
+    if not web.enabled:
+        return None
+    url = (web.search_url or "").strip()
+    if not url:
+        return Problem(
+            E_WEB_SEARCH_URL_MISSING, "web.search_url",
+            "启用 [web] 后必须配置 search_url（SearXNG 实例地址）",
+            "在 config/config.toml 的 [web] 段填 search_url（例：http://127.0.0.1:8888），"
+            "或把 [web].enabled 改回 false", step=8, kind="config")
+    endpoint = f"{url.rstrip('/')}/search"
+    own_client = client is None
+    probe_client = client or httpx.AsyncClient(timeout=web.search_timeout_s)
+    try:
+        response = await probe_client.get(endpoint, params={"q": "test", "format": "json"})
+    except Exception as exc:      # 连不上 / 超时 / DNS 失败都算这一步没过
+        return Problem(
+            E_WEB_SEARCH_UNAVAILABLE, "web.search_url",
+            f"SearXNG 连不上：{endpoint}（{type(exc).__name__}: {exc}）",
+            f"确认 search_url 指向可访问的实例（当前：{url}）；自建实例先起服务再重试",
+            step=8, kind="config")
+    finally:
+        if own_client:
+            await probe_client.aclose()
+    if response.status_code != 200:
+        return Problem(
+            E_WEB_SEARCH_UNAVAILABLE, "web.search_url",
+            f"SearXNG 的 JSON 输出不可用：HTTP {response.status_code}"
+            f"（GET {endpoint}?q=test&format=json）",
+            SEARXNG_JSON_FIX, step=8, kind="config")
+    try:
+        response.json()
+    except ValueError:
+        # 200 但不是 JSON：多是反向代理 / 实例仍只吐 HTML，同样属于 formats 没开
+        return Problem(
+            E_WEB_SEARCH_UNAVAILABLE, "web.search_url",
+            f"SearXNG 返回的不是 JSON（HTTP 200）：GET {endpoint}?q=test&format=json",
+            SEARXNG_JSON_FIX, step=8, kind="config")
+    return None
+
+
 async def run_startup_checks(cfg: AppConfig) -> PreflightReport:
-    """按契约 §四 顺序跑 7 步；**任一失败即停**（第 1–2 步的配置问题一次列全）。"""
+    """按契约 §四 顺序跑 8 步；**任一失败即停**（第 1–2 步的配置问题一次列全）。"""
     report = preflight(cfg)
     if not report.ok:
         return report
@@ -347,6 +411,10 @@ async def run_startup_checks(cfg: AppConfig) -> PreflightReport:
         report.problems.append(problem)
         return report
     problem = check_frontend(cfg)
+    if problem is not None:
+        report.problems.append(problem)
+        return report
+    problem = await check_web(cfg)
     if problem is not None:
         report.problems.append(problem)
     return report
@@ -388,7 +456,7 @@ def report_lines(report: PreflightReport, *, include_warnings: bool = True) -> l
 
 
 def main(argv: list[str] | None = None) -> int:
-    """命令行入口：打印脱敏摘要 + 7 步检查结果，返回精确退出码（0/2/3）。"""
+    """命令行入口：打印脱敏摘要 + 8 步检查结果，返回精确退出码（0/2/3）。"""
     args = list(sys.argv[1:] if argv is None else argv)
     if args:
         if args[0] in {"-h", "--help"}:

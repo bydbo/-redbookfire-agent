@@ -384,6 +384,64 @@ class ChatConfig(_Section):
     turn_stale_seconds: int = Field(300, ge=30, le=86400)
 
 
+class WebConfig(_Section):
+    """网页工具（搜索 / 抓取）。默认值 / 取值范围见《配置契约》§3.14。
+
+    只放配置：具体适配器在 `tools/` 层，本段不含任何 HTTP 调用。
+    `api_key` 不是字段——密钥只经 `api_key_env` 从 EnvView（环境变量 > `.env`）解析，
+    写进 config.toml 会被 `extra="forbid"` 直接拒绝。
+    """
+
+    # 总开关：关闭时两个网页工具都不注册给对话 agent（默认关闭）
+    enabled: bool = False
+    # SearXNG 实例地址；启用时必填，预检第 8 步会真探一次
+    search_url: str = ""
+    # 逗号分隔的引擎列表；空 = 不传 engines=，用实例自己的默认引擎
+    engines: str = ""
+    # 搜索接口密钥所在的环境变量名（公开实例可留空，不视为启用前提）
+    api_key_env: str = "XHS_WEB_SEARCH_API_KEY"
+    search_timeout_s: int = Field(15, ge=1, le=120)
+    # 一次搜索最多取几条结果（交给模型的片段条数上限）
+    max_results: int = Field(8, ge=1, le=20)
+    # 每条结果的摘要最多保留多少字符（超出截断，不整段塞给模型）
+    snippet_chars: int = Field(240, ge=40, le=1000)
+    # 抓取工具的独立开关：关掉只留搜索
+    fetch_enabled: bool = True
+    fetch_timeout_s: int = Field(30, ge=1, le=120)
+    # 单次抓取的响应体上限（字节）：超了直接失败，不做静默截断
+    fetch_max_bytes: int = Field(2_000_000, ge=65536, le=10485760)
+    # 单次抓取交给模型的正文字符上限（超出截断并在结果里说明）
+    fetch_max_chars: int = Field(20_000, ge=1000, le=50000)
+    fetch_max_redirects: int = Field(2, ge=0, le=5)
+    # robots.txt 是礼貌约定：默认遵守
+    check_robots_txt: bool = True
+    # 一轮对话里两个网页工具合计最多几次调用（与 [chat].max_tool_rounds 分别生效）
+    max_calls_per_turn: int = Field(3, ge=1, le=10)
+    # 仅测试用：放行私网地址（默认禁止，防 SSRF）
+    allow_private_ips: bool = False
+    # 自主调用与用户点名调用用不同 UA，便于站点侧区分与追责
+    user_agent_autonomous: str = "xhs-agent/1.0 (Autonomous)"
+    user_agent_manual: str = "xhs-agent/1.0 (User-Specified)"
+
+    _env: EnvView = PrivateAttr(default_factory=EnvView)
+
+    @field_validator("user_agent_autonomous", "user_agent_manual", mode="before")
+    @classmethod
+    def _non_empty(cls, value: Any) -> str:
+        text = str(value or "").strip()
+        if not text:
+            raise ValueError("不能为空")
+        return text
+
+    @property
+    def api_key(self) -> str:
+        """搜索接口密钥：按 `api_key_env` 解析（视图由 `load_config` 注入，与 `AppConfig.env_view` 同一份）。
+
+        取不到返回空串；**空密钥不视为启用前提**（公开 SearXNG 实例允许无鉴权）。
+        """
+        return self._env.get(self.api_key_env)
+
+
 class ContextConfig(_Section):
     """上下文可靠性与缓存度量（E7 第六批，S7.23–S7.28）。契约见《配置契约》§3.13。
 
@@ -492,7 +550,7 @@ class ContextConfig(_Section):
 
 
 class AppConfig(_Section):
-    """工程配置全量视图：11 个段与契约 §3 一一对应。"""
+    """工程配置全量视图：13 个段与契约 §3 一一对应。"""
 
     llm: LLMConfig = Field(default_factory=LLMConfig)
     vision: VisionConfig = Field(default_factory=VisionConfig)
@@ -506,6 +564,7 @@ class AppConfig(_Section):
     upload: UploadConfig = Field(default_factory=UploadConfig)
     chat: ChatConfig = Field(default_factory=ChatConfig)
     context: ContextConfig = Field(default_factory=ContextConfig)
+    web: WebConfig = Field(default_factory=WebConfig)
     log_level: str = "INFO"
     log_format: str = "console"
 
@@ -770,7 +829,7 @@ def load_config(path: str | None = None, *, env_file: str | None = None) -> AppC
 
     cfg._config_path = config_path
     cfg._env = env_view
-    for section in (cfg.llm, cfg.vision, cfg.embedding):
+    for section in (cfg.llm, cfg.vision, cfg.embedding, cfg.web):
         section._env = env_view
     return cfg
 

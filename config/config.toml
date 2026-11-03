@@ -136,3 +136,24 @@ price_cache_hit_per_m = 0.36
 price_cache_miss_per_m = 2.16
 price_cache_currency = "CNY"
 price_cache_version = "deepseek-2026-10"
+
+[web]
+# 网页工具（搜索 / 抓取）。默认关闭；要打开就得先填 search_url——preflight 第 8 步会真探一次
+# 实例的 JSON 输出（GET <search_url>/search?q=test&format=json），不通即启动失败。
+enabled = false
+search_url = ""                        # SearXNG 实例地址（enabled = true 时必填）
+engines = ""                           # 逗号分隔引擎列表，如 "google,bing"；留空 = 不传 engines=，用实例默认引擎
+api_key_env = "XHS_WEB_SEARCH_API_KEY"  # 密钥所在的环境变量名；公开实例可留空（空只告警、不阻断启动）
+search_timeout_s = 15                   # 单次搜索超时（秒），1–120
+max_results = 8                         # 一次搜索最多几条结果，1–20
+snippet_chars = 240                     # 每条结果摘要保留多少字符，40–1000
+fetch_enabled = true                    # 抓取工具的独立开关：关掉只留搜索
+fetch_timeout_s = 30                    # 单次抓取超时（秒），1–120
+fetch_max_bytes = 2000000               # 响应体上限（字节）：超了直接失败，不静默截断，65536–10485760
+fetch_max_chars = 20000                 # 交给模型的正文字符上限，1000–50000
+fetch_max_redirects = 2                 # 最多跟几次重定向，0–5
+check_robots_txt = true                 # 遵守 robots.txt（礼貌约定，默认遵守）
+max_calls_per_turn = 3                  # 一轮对话里两个网页工具合计最多几次调用，1–10
+allow_private_ips = false               # 仅测试用：放行私网地址（默认禁止，防 SSRF）
+user_agent_autonomous = "xhs-agent/1.0 (Autonomous)"      # 自主调用时的 UA（非空）
+user_agent_manual = "xhs-agent/1.0 (User-Specified)"      # 用户点名调用时的 UA（非空）
