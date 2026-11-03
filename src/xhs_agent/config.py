@@ -680,7 +680,8 @@ class AppConfig(_Section):
             },
             "web": {
                 "enabled": self.web.enabled,
-                "search_url": self.web.search_url,
+                # 地址里可能内嵌凭据（http://user:pass@host），脱敏口径同 database_url / redis_url
+                "search_url": _mask_dsn(self.web.search_url),
                 "fetch_enabled": self.web.fetch_enabled,
                 "max_calls_per_turn": self.web.max_calls_per_turn,
                 "api_key_env": self.web.api_key_env,

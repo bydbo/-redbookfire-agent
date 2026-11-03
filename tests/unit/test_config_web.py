@@ -21,6 +21,7 @@ from xhs_agent.config import (
     load_config,
 )
 from xhs_agent.probe import (
+    E_CONFIG_INVALID,
     E_WEB_SEARCH_UNAVAILABLE,
     E_WEB_SEARCH_URL_MISSING,
     PreflightReport,
@@ -195,11 +196,23 @@ class TestWebDescribe:
         assert described["web"]["has_api_key"] is True
         assert "sk-web-secret" not in json.dumps(described, ensure_ascii=False)
 
-    def test_web_block_is_last_section_present_in_snapshot(self, tmp_path):
+    def test_web_block_appears_in_config_snapshot(self, tmp_path):
         # config_to_dict 走 model_dump：web 段作为字段之一必须出现，且不含密钥
         snapshot = config_to_dict(load_config(write_web_config(tmp_path)))
         assert snapshot["web"]["enabled"] is True
         assert "api_key" not in snapshot["web"]
+
+    def test_describe_masks_credentials_in_search_url(self, tmp_path):
+        """URL 里内嵌的凭据不能进摘要（脱敏口径同 database_url / redis_url）。"""
+        cfg = load_config(write_web_config(
+            tmp_path, search_url="http://user:s3cret-pw@searxng.test:8888"))
+        described = cfg.describe()
+        assert described["web"]["search_url"] == "http://user:***@searxng.test:8888"
+        assert "s3cret-pw" not in json.dumps(described, ensure_ascii=False)
+
+    def test_plain_search_url_is_shown_as_is(self, tmp_path):
+        cfg = load_config(write_web_config(tmp_path))
+        assert cfg.describe()["web"]["search_url"] == SEARXNG
 
 
 class TestPreflightWebStep:
@@ -280,6 +293,93 @@ class TestPreflightWebStep:
         finally:
             await client.aclose()
         assert str(calls[0].url).startswith(f"{SEARXNG}/search?")
+
+    @pytest.mark.asyncio
+    async def test_search_url_without_scheme_is_a_config_problem(self, tmp_path):
+        """缺协议头（新手最典型笔误）是配置错误（2），且根本不该发请求。"""
+        calls: list[httpx.Request] = []
+        cfg = load_config(write_web_config(tmp_path, search_url="127.0.0.1:8888"))
+        client = httpx.AsyncClient(transport=transport(200, calls=calls))
+        try:
+            problem = await check_web(cfg, client)
+        finally:
+            await client.aclose()
+        assert problem is not None
+        assert (problem.code, problem.step, problem.kind) == (E_CONFIG_INVALID, 8, "config")
+        assert "127.0.0.1:8888" in problem.message
+        assert 'http://127.0.0.1:8888' in problem.fix      # 直接给出照抄的写法
+        assert PreflightReport(problems=[problem]).exit_code == 2
+        assert calls == []                                # 没发请求
+
+    @pytest.mark.asyncio
+    async def test_schemeless_url_with_credentials_is_masked(self, tmp_path):
+        """非法地址也要脱敏：不能为了排障把 user:pass 打进日志。"""
+        cfg = load_config(write_web_config(
+            tmp_path, search_url="user:s3cret-pw@searxng.test:8888"))
+        client = httpx.AsyncClient(transport=transport(200))
+        try:
+            problem = await check_web(cfg, client)
+        finally:
+            await client.aclose()
+        assert problem is not None and problem.kind == "config"
+        assert "s3cret-pw" not in problem.message and "s3cret-pw" not in problem.fix
+        assert "user:***@searxng.test:8888" in problem.message
+
+    @pytest.mark.asyncio
+    async def test_wrong_scheme_is_a_config_problem(self, tmp_path):
+        calls: list[httpx.Request] = []
+        cfg = load_config(write_web_config(tmp_path, search_url="ftp://searxng.test"))
+        client = httpx.AsyncClient(transport=transport(200, calls=calls))
+        try:
+            problem = await check_web(cfg, client)
+        finally:
+            await client.aclose()
+        assert problem is not None and problem.kind == "config"
+        assert problem.code == E_CONFIG_INVALID
+        assert calls == []
+
+    @pytest.mark.asyncio
+    async def test_invalid_port_is_a_config_problem(self, tmp_path):
+        """httpx 的 InvalidURL（端口非法）也属配置错误，别落进依赖不可用。"""
+        cfg = load_config(write_web_config(tmp_path, search_url="http://searxng.test:notaport"))
+        client = httpx.AsyncClient(transport=transport(200))
+        try:
+            problem = await check_web(cfg, client)
+        finally:
+            await client.aclose()
+        assert problem is not None
+        assert (problem.code, problem.kind) == (E_CONFIG_INVALID, "config")
+        assert PreflightReport(problems=[problem]).exit_code == 2
+
+    @pytest.mark.asyncio
+    async def test_redirect_status_hints_to_https(self, tmp_path):
+        """http→https 的 301/302 也是非 200，fix 之外还要在 message 里点明改 https。"""
+        cfg = load_config(write_web_config(tmp_path))
+        client = httpx.AsyncClient(transport=transport(301))
+        try:
+            problem = await check_web(cfg, client)
+        finally:
+            await client.aclose()
+        assert problem is not None
+        assert "301" in problem.message
+        assert "301/302" in problem.message and "https" in problem.message
+
+    @pytest.mark.asyncio
+    async def test_problem_text_does_not_leak_url_credentials(self, tmp_path):
+        """地址里内嵌的凭据不能出现在预检文案里（§八：密钥不进日志）。"""
+        def boom(request: httpx.Request) -> httpx.Response:
+            raise httpx.ConnectError("connection refused", request=request)
+
+        cfg = load_config(write_web_config(
+            tmp_path, search_url="http://user:s3cret-pw@searxng.test:8888"))
+        client = httpx.AsyncClient(transport=httpx.MockTransport(boom))
+        try:
+            problem = await check_web(cfg, client)
+        finally:
+            await client.aclose()
+        assert problem is not None
+        assert "s3cret-pw" not in problem.message and "s3cret-pw" not in problem.fix
+        assert "user:***@" in problem.message
 
     @pytest.mark.asyncio
     async def test_unreachable_instance_is_a_dependency_problem(self, tmp_path):

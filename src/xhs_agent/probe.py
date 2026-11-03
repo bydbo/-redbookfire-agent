@@ -38,6 +38,7 @@ import os
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
+from urllib.parse import urlparse
 
 import httpx
 import redis.asyncio as aioredis
@@ -225,8 +226,23 @@ def preflight(cfg: AppConfig, env: EnvView | None = None,
 
 
 # ---------------------------------------------------------------------------
-# 第 3–7 步：依赖与产物检查（每个函数返回 Problem | None，方便单独测）
+# 第 3–8 步：依赖与产物检查（每个函数返回 Problem | None，方便单独测）
 # ---------------------------------------------------------------------------
+
+
+def _shown_url(url: str) -> str:
+    """地址对外展示：内嵌凭据一律换成 ***，其余原样给出（便于照抄修复）。
+
+    有协议头时直接用 `_mask_dsn`（与 database_url / redis_url 同一口径）；没协议头的非法地址
+    只处理 `user:pass@host` 这一段——`_mask_dsn` 对无 `://` 的串会整串变 ***，反而失去排障信息。
+    """
+    if "://" in url:
+        return _mask_dsn(url)
+    userinfo, at, host = url.rpartition("@")
+    if not at:
+        return url
+    user, colon, _pwd = userinfo.partition(":")
+    return f"{user}:***@{host}" if colon else f"***@{host}"
 
 
 def _version_tuple(value: str) -> tuple[int, ...]:
@@ -346,8 +362,9 @@ async def check_web(cfg: AppConfig, client: httpx.AsyncClient | None = None) -> 
     只做一次 `/search?q=test&format=json` 的存在性探活——这不是抓取逻辑，也不走模型。
     `client` 可注入（测试用 `httpx.MockTransport`），不传时按 `[web].search_timeout_s` 自建。
 
-    失败分工（契约 §四）：缺 `search_url`、非 200（含 403）、响应不是 JSON 都是**配置错误**
-    （退出码 2，实例部署不对）；连不上 / 超时是**依赖不可用**（退出码 3，与数据库、Redis 同口径）。
+    失败分工（契约 §四）：缺 `search_url`、地址不是 http(s)、非 200（含 403）、响应不是 JSON
+    都是**配置错误**（退出码 2，地址或实例部署不对）；连不上 / 超时是**依赖不可用**（退出码 3，
+    与数据库、Redis 同一口径）。地址里可能内嵌凭据，所有对外文案走 `_mask_dsn`。
     """
     web = cfg.web
     if not web.enabled:
@@ -359,25 +376,43 @@ async def check_web(cfg: AppConfig, client: httpx.AsyncClient | None = None) -> 
             "启用 [web] 后必须配置 search_url（SearXNG 实例地址）",
             "在 config/config.toml 的 [web] 段填 search_url（例：http://127.0.0.1:8888），"
             "或把 [web].enabled 改回 false", step=8, kind="config")
+    shown = _shown_url(url)                   # 地址里可能内嵌凭据，进日志前先脱敏
+    parsed = urlparse(url)
+    if parsed.scheme.lower() not in ("http", "https") or not parsed.netloc:
+        # 缺协议头（`127.0.0.1:8888`）是最常见的笔误：属于配置错误，别把人引去重启实例
+        hint = (f"补全协议头：search_url = \"http://{shown}\"" if "://" not in url
+                else "search_url 只能是 http:// 或 https:// 地址（含主机与端口）")
+        return Problem(
+            E_CONFIG_INVALID, "web.search_url",
+            f"search_url 不是合法的 http(s) 地址：{shown}",
+            hint, step=8, kind="config")
     endpoint = f"{url.rstrip('/')}/search"
     own_client = client is None
     probe_client = client or httpx.AsyncClient(timeout=web.search_timeout_s)
     try:
         response = await probe_client.get(endpoint, params={"q": "test", "format": "json"})
-    except Exception as exc:      # 连不上 / 超时 / DNS 失败 = 外部依赖不可用（退出码 3）
+    except httpx.InvalidURL as exc:    # 端口非法等：地址写法问题（配置错误）
+        return Problem(
+            E_CONFIG_INVALID, "web.search_url",
+            f"search_url 不是合法的 http(s) 地址：{shown}（{type(exc).__name__}: {exc}）",
+            "检查 search_url 的主机名与端口写法（例：http://127.0.0.1:8888）",
+            step=8, kind="config")
+    except httpx.HTTPError as exc:     # 连不上 / 超时 / DNS 失败 = 外部依赖不可用（退出码 3）
         return Problem(
             E_WEB_SEARCH_UNAVAILABLE, "web.search_url",
-            f"SearXNG 连不上：{endpoint}（{type(exc).__name__}: {exc}）",
-            f"确认 search_url 指向可访问的实例（当前：{url}）；自建实例先起服务再重试",
+            f"SearXNG 连不上：{shown}/search（{type(exc).__name__}: {exc}）",
+            f"确认 search_url 指向可访问的实例（当前：{shown}）；自建实例先起服务再重试",
             step=8, kind="dependency")
     finally:
         if own_client:
             await probe_client.aclose()
     if response.status_code != 200:
+        redirect_hint = ("；若状态码是 301/302，先把 search_url 改成 https"
+                         if response.status_code in (301, 302, 303, 307, 308) else "")
         return Problem(
             E_WEB_SEARCH_UNAVAILABLE, "web.search_url",
             f"SearXNG 的 JSON 输出不可用：HTTP {response.status_code}"
-            f"（GET {endpoint}?q=test&format=json）",
+            f"（GET {endpoint}?q=test&format=json）{redirect_hint}",
             SEARXNG_JSON_FIX, step=8, kind="config")
     try:
         response.json()
