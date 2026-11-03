@@ -26,6 +26,7 @@ dependencies = [
     "redis>=8,<9",
     "sqlalchemy[asyncio]>=2.0,<2.1",
     "structlog>=26.1,<27",
+    "trafilatura>=2.3,<3",
     "uvicorn>=0.54.0",
 ]
 
@@ -105,6 +106,10 @@ files = [
     # S3.5 把模型调用层与 agents 改成异步 httpx——对外错误与重试口径的核心
     "src/xhs_agent/tools/llm.py",
     "src/xhs_agent/tools/http.py",
+    # 网页工具（SearXNG 搜索 / 网页正文抓取）：SSRF 校验、robots、原始字节上限，
+    # 安全边界与对外错误语义都在这里，纳入严格范围
+    "src/xhs_agent/tools/websearch.py",
+    "src/xhs_agent/tools/webreader.py",
     # S6.6 把 vision 的异步图片客户端与 magic bytes 校验放进来：图片入口的边界都在这里
     "src/xhs_agent/tools/vision.py",
     "src/xhs_agent/agents",
