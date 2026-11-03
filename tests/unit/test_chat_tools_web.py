@@ -11,10 +11,16 @@ handler（handler 在 Task 6），所以两条网页 schema 放在 `TOOLS` 之�
 
 from __future__ import annotations
 
-from typing import Any
+import re
+from pathlib import Path
+from typing import Any, cast
 
-from xhs_agent.config import AppConfig, EnvView, WebConfig
+import pytest
+
+from xhs_agent.config import PROJECT_ROOT, AppConfig, EnvView, WebConfig
+from xhs_agent.services import chat_tools
 from xhs_agent.services.chat_tools import (
+    HANDLERS,
     TOOL_FETCH_URL,
     TOOL_SCHEMA_FETCH_URL,
     TOOL_SCHEMA_SEARCH_HOTSPOTS,
@@ -22,11 +28,14 @@ from xhs_agent.services.chat_tools import (
     TOOLS,
     WEB_MAX_TOOL_ROUNDS,
     ToolCache,
+    ToolContext,
     effective_max_rounds,
     tool_names,
     tools_for,
     web_enabled,
 )
+from xhs_agent.tools.webreader import FetchedPage, WebFetchError
+from xhs_agent.tools.websearch import SearchHit, SearchResult, WebSearchError
 
 
 def make_cfg(**web: Any) -> AppConfig:
@@ -214,3 +223,308 @@ class TestToolCacheWebFields:
         assert second.pages == {}
         assert second.robots == {}
         assert second.web_calls == 0
+
+# ---------- Task 6：handler 行为 ----------
+
+CONTRACT = Path(PROJECT_ROOT) / "docs" / "contracts" / "数据契约.md"
+
+
+def make_ctx(**web: Any) -> ToolContext:
+    """离线工具上下文：只带配置与一张轮内缓存，session 用 None（handler 不碰库）。"""
+    return ToolContext(cfg=make_cfg(**web), session=cast(Any, None))
+
+
+def hit(url: str, *, title: str = "一条热点", snippet: str = "摘要",
+        published: str | None = None) -> SearchHit:
+    return SearchHit(title=title, url=url, snippet=snippet, published_date=published)
+
+
+class FakeSearch:
+    """假搜索适配器：记录入参，按预设返回或抛错（handler 不该认识 httpx）。"""
+
+    def __init__(
+        self,
+        hits: list[SearchHit] | None = None,
+        unresponsive: list[list[str]] | None = None,
+        error: Exception | None = None,
+    ) -> None:
+        self.calls: list[dict[str, Any]] = []
+        self.hits = list(hits or [])
+        self.unresponsive = [list(item) for item in (unresponsive or [])]
+        self.error = error
+
+    async def __call__(self, client: Any, cfg: Any, query: str, *,
+                       count: int) -> SearchResult:
+        self.calls.append({"client": client, "query": query, "count": count})
+        if self.error is not None:
+            raise self.error
+        return SearchResult(hits=list(self.hits), unresponsive=self.unresponsive)
+
+
+def make_page(**overrides: Any) -> FetchedPage:
+    values: dict[str, Any] = {
+        "final_url": "https://example.test/a",
+        "title": "示例标题",
+        "text": "正文" * 120,
+        "char_count": 240,
+        "truncated": False,
+        "next_start_index": None,
+    }
+    values.update(overrides)
+    return FetchedPage(**values)
+
+
+class FakeFetch:
+    """假抓取适配器：把 `autonomous` / `start_index` 这些**接线参数**原样留证。"""
+
+    def __init__(self, page: FetchedPage | None = None,
+                 error: Exception | None = None) -> None:
+        self.calls: list[dict[str, Any]] = []
+        self.page = page or make_page()
+        self.error = error
+
+    async def __call__(
+        self,
+        client: Any,
+        cfg: Any,
+        url: str,
+        *,
+        autonomous: bool,
+        start_index: int = 0,
+        max_length: int | None = None,
+        robots_cache: dict[str, Any] | None = None,
+    ) -> FetchedPage:
+        self.calls.append(
+            {"client": client, "url": url, "autonomous": autonomous,
+             "start_index": start_index, "max_length": max_length,
+             "robots_cache": robots_cache}
+        )
+        if self.error is not None:
+            raise self.error
+        return self.page
+
+
+def contract_fields(tool: str) -> tuple[set[str], set[str]]:
+    """从《数据契约》登记表读回（必定出现的字段，缓存命中追加字段），整行匹配。"""
+    for line in CONTRACT.read_text(encoding="utf-8").splitlines():
+        if not line.startswith(f"| `{tool}` |"):
+            continue
+        columns = line.split("|")
+        return (
+            set(re.findall(r"`([^`]+)`", columns[2])),
+            set(re.findall(r"`([^`]+)`", columns[3])),
+        )
+    raise AssertionError(f"《数据契约》没有登记 {tool} 的 payload 形状")
+
+
+class TestSearchHotspotsHandler:
+    @pytest.mark.asyncio
+    async def test_search_hotspots_rejects_empty_query(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """空 query 不能发请求：文案要说清「传什么」，不是「参数错误」。"""
+        search = FakeSearch([hit("https://example.test/a")])
+        monkeypatch.setattr(chat_tools, "search_web", search)
+        outcome = await chat_tools.search_hotspots(make_ctx(enabled=True), {"query": "   "})
+        assert outcome.status == "failed"
+        assert "query" in outcome.error
+        assert "80" in outcome.error
+        assert search.calls == []
+
+    @pytest.mark.asyncio
+    async def test_search_payload_shape(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        search = FakeSearch([hit("https://example.test/a", title="露营", snippet="摘要",
+                                 published="2026-10-18")])
+        monkeypatch.setattr(chat_tools, "search_web", search)
+        outcome = await chat_tools.search_hotspots(
+            make_ctx(enabled=True), {"query": "最近的露营热点", "count": 3}
+        )
+        assert outcome.status == "succeeded"
+        assert set(outcome.payload) == {"query", "count", "results", "note"}
+        assert outcome.payload["query"] == "最近的露营热点"
+        assert outcome.payload["count"] == 1
+        assert outcome.payload["results"] == [
+            {"title": "露营", "url": "https://example.test/a", "snippet": "摘要",
+             "published_date": "2026-10-18"}
+        ]
+        assert search.calls[0]["client"] is None   # 不借共享 client（交接坑 3）
+        assert search.calls[0]["count"] == 3
+
+    @pytest.mark.asyncio
+    async def test_unresponsive_engines_lands_in_note(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """0 条命中时唯一的健康信号在 unresponsive：必须写进给人看的 note。"""
+        search = FakeSearch([], unresponsive=[["google", "timeout"]])
+        monkeypatch.setattr(chat_tools, "search_web", search)
+        outcome = await chat_tools.search_hotspots(make_ctx(enabled=True), {"query": "露营"})
+        assert outcome.status == "succeeded"
+        note = outcome.payload["note"]
+        assert "google" in note and "timeout" in note
+        assert "结果可能不完整" in note
+
+    @pytest.mark.asyncio
+    async def test_cache_hit_does_not_increment_counter(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """缓存命中不增加 `web_calls`：同一 query 本轮只付一次。"""
+        search = FakeSearch([hit("https://example.test/a")])
+        monkeypatch.setattr(chat_tools, "search_web", search)
+        ctx = make_ctx(enabled=True)
+        first = await chat_tools.search_hotspots(ctx, {"query": "露营"})
+        second = await chat_tools.search_hotspots(ctx, {"query": "露营"})
+        assert len(search.calls) == 1
+        assert ctx.cache.web_calls == 1
+        assert "cached" not in first.payload
+        assert second.payload["cached"] is True
+        assert second.payload["results"] == first.payload["results"]
+
+
+class TestFetchUrlHandler:
+    @pytest.mark.asyncio
+    async def test_fetch_url_rejects_non_http_url(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        fetch = FakeFetch()
+        monkeypatch.setattr(chat_tools, "fetch_readable", fetch)
+        ctx = make_ctx(enabled=True)
+        for bad in ("", "   ", "file:///etc/passwd", "ftp://example.test/a", "example.test/a"):
+            outcome = await chat_tools.fetch_url(ctx, {"url": bad})
+            assert outcome.status == "failed", bad
+            assert "http" in outcome.error, bad
+        assert fetch.calls == []
+
+    @pytest.mark.asyncio
+    async def test_fetch_payload_shape(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        page = make_page(final_url="https://example.test/final", title="标题",
+                         text="正文段", char_count=900, truncated=True,
+                         next_start_index=20000)
+        fetch = FakeFetch(page)
+        monkeypatch.setattr(chat_tools, "fetch_readable", fetch)
+        outcome = await chat_tools.fetch_url(
+            make_ctx(enabled=True), {"url": "https://example.test/a", "start_index": 20000}
+        )
+        assert outcome.status == "succeeded"
+        assert outcome.payload == {
+            "url": "https://example.test/a",
+            "final_url": "https://example.test/final",
+            "title": "标题",
+            "text": "正文段",
+            "char_count": 900,
+            "truncated": True,
+            "next_start_index": 20000,
+        }
+        assert fetch.calls[0]["start_index"] == 20000
+        assert fetch.calls[0]["client"] is None
+
+    @pytest.mark.asyncio
+    async def test_search_records_seen_urls_then_fetch_is_autonomous(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """关键接线：搜到的 url 记进 `seen_urls`，再抓它就是自主调用（换 UA + 走 robots）。"""
+        search = FakeSearch([hit("https://example.test/a"), hit("https://example.test/b")])
+        fetch = FakeFetch()
+        monkeypatch.setattr(chat_tools, "search_web", search)
+        monkeypatch.setattr(chat_tools, "fetch_readable", fetch)
+        ctx = make_ctx(enabled=True)
+        await chat_tools.search_hotspots(ctx, {"query": "露营"})
+        assert ctx.cache.seen_urls == {"https://example.test/a", "https://example.test/b"}
+        await chat_tools.fetch_url(ctx, {"url": "https://example.test/a"})
+        await chat_tools.fetch_url(ctx, {"url": "https://user-pasted.test/x"})
+        assert [call["autonomous"] for call in fetch.calls] == [True, False]
+        # robots 缓存就是这一轮同一份 dict（Task 5 定的形状）
+        assert fetch.calls[0]["robots_cache"] is ctx.cache.robots
+
+    @pytest.mark.asyncio
+    async def test_fetch_page_cache_key_includes_start_index(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """缓存键是 (url, start_index)：只用 url 会让第二页永远读到第一页。"""
+        fetch = FakeFetch(make_page(text="第一段"))
+        monkeypatch.setattr(chat_tools, "fetch_readable", fetch)
+        ctx = make_ctx(enabled=True)
+        first = await chat_tools.fetch_url(ctx, {"url": "https://example.test/a"})
+        second = await chat_tools.fetch_url(
+            ctx, {"url": "https://example.test/a", "start_index": 20000}
+        )
+        assert len(fetch.calls) == 2          # 续读是一次新的 web_calls
+        assert ctx.cache.web_calls == 2
+        assert "cached" not in second.payload
+        again = await chat_tools.fetch_url(
+            ctx, {"url": "https://example.test/a", "start_index": 20000}
+        )
+        assert len(fetch.calls) == 2          # 同一页同一位置才命中
+        assert ctx.cache.web_calls == 2
+        assert again.payload["cached"] is True
+        assert again.payload["text"] == second.payload["text"]
+        assert first.payload["text"] == "第一段"
+
+
+class TestWebToolFailurePaths:
+    @pytest.mark.asyncio
+    async def test_turn_limit_returns_failed_with_actionable_text(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """配额用完是 failed + 一句能直接用的话，且不再发请求。"""
+        search = FakeSearch([hit("https://example.test/a")])
+        fetch = FakeFetch()
+        monkeypatch.setattr(chat_tools, "search_web", search)
+        monkeypatch.setattr(chat_tools, "fetch_readable", fetch)
+        ctx = make_ctx(enabled=True)
+        ctx.cache.web_calls = ctx.cfg.web.max_calls_per_turn
+        searched = await chat_tools.search_hotspots(ctx, {"query": "露营"})
+        fetched = await chat_tools.fetch_url(ctx, {"url": "https://example.test/a"})
+        for outcome in (searched, fetched):
+            assert outcome.status == "failed"
+            assert "本轮网页工具已用完" in outcome.error
+        assert search.calls == [] and fetch.calls == []
+        assert ctx.cache.web_calls == ctx.cfg.web.max_calls_per_turn
+
+    @pytest.mark.asyncio
+    async def test_adapter_error_maps_to_failed_not_raise(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """适配器抛错一律映射成 failed：抛出会触发节点重试，重复付费。"""
+        monkeypatch.setattr(
+            chat_tools, "search_web", FakeSearch(error=WebSearchError("timeout", "15s"))
+        )
+        monkeypatch.setattr(
+            chat_tools, "fetch_readable",
+            FakeFetch(error=WebFetchError("robots", "Disallow: /")),
+        )
+        ctx = make_ctx(enabled=True)
+        searched = await chat_tools.search_hotspots(ctx, {"query": "露营"})
+        fetched = await chat_tools.fetch_url(ctx, {"url": "https://example.test/a"})
+        assert searched.status == "failed" and "超时" in searched.error
+        assert fetched.status == "failed" and "robots.txt" in fetched.error
+        assert ctx.cache.web_calls == 2        # 请求已经发出去了，配额照记
+
+
+class TestWebToolContract:
+    @pytest.mark.asyncio
+    async def test_payload_matches_data_contract(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """payload 的键集合与《数据契约》登记的字段逐项相等（契约文本是权威）。"""
+        monkeypatch.setattr(
+            chat_tools, "search_web", FakeSearch([hit("https://example.test/a")])
+        )
+        monkeypatch.setattr(chat_tools, "fetch_readable", FakeFetch())
+        ctx = make_ctx(enabled=True)
+
+        search_required, search_cached = contract_fields(TOOL_SEARCH_HOTSPOTS)
+        searched = await chat_tools.search_hotspots(ctx, {"query": "露营"})
+        assert set(searched.payload) == search_required
+        assert search_cached == {"cached"}
+        again = await chat_tools.search_hotspots(ctx, {"query": "露营"})
+        assert set(again.payload) == search_required | search_cached
+
+        fetch_required, fetch_cached = contract_fields(TOOL_FETCH_URL)
+        fetched = await chat_tools.fetch_url(ctx, {"url": "https://example.test/a"})
+        assert set(fetched.payload) == fetch_required
+        assert fetch_cached == {"cached"}
+        refetched = await chat_tools.fetch_url(ctx, {"url": "https://example.test/a"})
+        assert set(refetched.payload) == fetch_required | fetch_cached
+
+    def test_web_handlers_are_registered(self) -> None:
+        """分发表里有这两条：Task 7 的图按名字查 HANDLERS，查不到就永远调不动。"""
+        assert HANDLERS[TOOL_SEARCH_HOTSPOTS] is chat_tools.search_hotspots
+        assert HANDLERS[TOOL_FETCH_URL] is chat_tools.fetch_url

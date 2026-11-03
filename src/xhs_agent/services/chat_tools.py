@@ -63,6 +63,7 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Protocol
+from urllib.parse import urlparse
 
 import httpx
 from sqlalchemy import func, select
@@ -78,6 +79,7 @@ from ..core import context_rules
 from ..core import progress as progress_tool
 from ..core.errors import ApiError, BadRequestError, ConflictError, public_error_message
 from ..core.observations import record as record_observation
+from ..core.tracing import LEVEL_ERROR, get_tracer
 from ..db.models import ChatArtifactVersion, ChatMessage
 from ..schemas import TYPE_LABELS, Element, HotspotClue, SchemaError
 from ..services import artifact_versions, context_state, image_cache
@@ -99,6 +101,8 @@ from ..tools.embedding import EmbeddingError
 from ..tools.gaps import gap_advice
 from ..tools.llm import LLMError, StructuredCaller
 from ..tools.vision import sniff_image_mime
+from ..tools.webreader import WebFetchError, fetch_readable
+from ..tools.websearch import WebSearchError, search_web
 from .material_identity import canonical_id, current_material
 
 
@@ -259,6 +263,14 @@ TAG_PREVIEW_LIMIT = 6
 HIT_PREVIEW_LIMIT = 3
 # 网页能力开启后一轮最多几次工具调用：搜 → 读 → 接着读，`[chat]` 的默认 3 轮不够
 WEB_MAX_TOOL_ROUNDS = 8
+# 搜索方向的一句话上限、一次搜索的默认 / 最大条数（与 `TOOL_SCHEMA_SEARCH_HOTSPOTS` 同口径）
+MAX_QUERY_CHARS = 80
+DEFAULT_SEARCH_COUNT = 5
+MAX_SEARCH_COUNT = 10
+# 本轮网页工具配额用完时的统一文案：直接回给用户也说得通，模型看了会收手
+TURN_LIMIT_MESSAGE = "本轮网页工具已用完，请用现有结果作答"
+# 只放行 http(s)：file:// / javascript: 之类在进适配器之前就该拒（与两个适配器同口径）
+WEB_URL_SCHEMES = ("http", "https")
 
 # 给模型的**默认**工具清单（OpenAI 兼容的 function schema）。默认清单的唯一来源，别在别处再
 # 抄一份；网页两件默认不下发，schema 在下面 `TOOL_SCHEMA_*`，由 `tools_for` 按开关追加。
@@ -731,6 +743,70 @@ def _check_topk(raw: Any, default: int) -> tuple[int, str]:
     if not 1 <= topk <= MAX_TOPK:
         return 0, f"topk 必须在 1–{MAX_TOPK} 之间，收到 {topk}"
     return topk, ""
+
+
+def _check_query(args: dict[str, Any]) -> tuple[str, str]:
+    """校验 `query` 参数；返回（去掉首尾空白的搜索方向，错误文案）。"""
+    text = str(args.get("query") or "").strip()
+    if not text:
+        return "", (
+            "缺少 query：请把用户想找的热点方向整理成一句话传进来（"
+            f"1–{MAX_QUERY_CHARS} 字）"
+        )
+    if len(text) > MAX_QUERY_CHARS:
+        return text, (
+            f"query 超过 {MAX_QUERY_CHARS} 字，请让用户压缩到 {MAX_QUERY_CHARS} 字以内再试"
+        )
+    return text, ""
+
+
+def _check_count(raw: Any) -> tuple[int, str]:
+    """校验 `count` 参数；返回（条数，错误文案）。缺省 = `DEFAULT_SEARCH_COUNT`。"""
+    if raw is None:
+        return DEFAULT_SEARCH_COUNT, ""
+    try:
+        count = int(raw)
+    except (TypeError, ValueError):
+        return 0, f"count 必须是 1–{MAX_SEARCH_COUNT} 的整数，收到 {raw!r}"
+    if not 1 <= count <= MAX_SEARCH_COUNT:
+        return 0, f"count 必须在 1–{MAX_SEARCH_COUNT} 之间，收到 {count}"
+    return count, ""
+
+
+def _check_url(args: dict[str, Any]) -> tuple[str, str]:
+    """校验 `url` 参数；返回（原样地址，错误文案）。
+
+    只放行 http(s)：`file://` / `javascript:` 之类在进入适配器前就拒掉，
+    文案要告诉模型「从哪拿链接」，不是「参数错误」。
+    """
+    text = str(args.get("url") or "").strip()
+    if not text:
+        return "", "缺少 url：请把要读的网页地址完整传进来（http:// 或 https:// 开头）"
+    hint = "请从搜索结果或用户消息里原样取链接，不要自己拼"
+    try:
+        parsed = urlparse(text)
+    except ValueError:
+        return "", f"url 不是合法的网页地址，收到 {text[:80]!r}；{hint}"
+    if parsed.scheme.lower() not in WEB_URL_SCHEMES:
+        return "", f"url 必须以 http:// 或 https:// 开头，收到 {text[:80]!r}；{hint}"
+    if not parsed.hostname:
+        return "", f"url 里没有主机名，收到 {text[:80]!r}；{hint}"
+    return text, ""
+
+
+def _check_start_index(raw: Any) -> tuple[int, str]:
+    """校验 `start_index` 参数；返回（起点，错误文案）。缺省 = 从头读。"""
+    if raw is None:
+        return 0, ""
+    try:
+        start = int(raw)
+    except (TypeError, ValueError):
+        return 0, f"start_index 必须是 0 或正整数，收到 {raw!r}"
+    if start < 0:
+        return 0, (
+            f"start_index 不能是负数（收到 {start}）：要从正文开头读就传 0，或者干脆不传"
+        )
+    return start, ""
 
 
 async def _clue_for(ctx: ToolContext, text: str) -> ClueRecord:
@@ -2558,6 +2634,248 @@ def _run_summary(detail: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+# ---------- 网页两件（PR2） ----------
+# 适配器在 `tools/`（`websearch.search_web` / `webreader.fetch_readable`），本段只做「配额 →
+# 缓存 → 追踪 → 错误映射」。两条铁律：① 任何失败都只是 `failed` + 中文原因，绝不抛出
+# （抛出会触发节点重试，重复付费）；② 只有真正发出请求才 `web_calls += 1`，缓存命中不计数。
+
+
+def _quota_left(ctx: ToolContext) -> bool:
+    """这一轮还能不能再发网页请求（与 `[chat].max_tool_rounds` 分别生效）。"""
+    return ctx.cache.web_calls < int(ctx.cfg.web.max_calls_per_turn)
+
+
+async def _web_stage(
+    steps: list[dict[str, Any]], on_progress: ProgressFn | None, stage: str
+) -> None:
+    """工具过程里的一步：既记进 `outcome.steps`，也推给前端（三参旧实现照样能收）。"""
+    _step(steps, stage)
+    if on_progress is not None:
+        await on_progress(stage)
+
+
+def _engine_failures(unresponsive: list[list[str]]) -> list[tuple[str, str]]:
+    """`unresponsive_engines` →（引擎名，原因）；结构异常的元素丢掉，不为它整次失败。"""
+    failures: list[tuple[str, str]] = []
+    for entry in unresponsive or []:
+        parts = [str(part) for part in entry] if isinstance(entry, list) else []
+        if not parts or not parts[0]:
+            continue
+        failures.append((parts[0], parts[1] if len(parts) > 1 else "无响应"))
+    return failures
+
+
+def _search_note(count: int, unresponsive: list[list[str]]) -> str:
+    """搜索结果的「人话补充」：只在有引擎没响应或 0 条命中时非空，其余留空串。"""
+    pieces: list[str] = []
+    failures = _engine_failures(unresponsive)
+    if failures:
+        shown = "、".join(f"{name}（{reason}）" for name, reason in failures[:5])
+        pieces.append(f"{len(failures)} 个搜索引擎没有返回结果：{shown}，结果可能不完整")
+    if not count:
+        pieces.append("没搜到结果：换个说法或换个方向再试，不要拿这批结果编造热点")
+    return "；".join(pieces)
+
+
+# 适配器错误 reason → 能直接回给用户、也能指导模型下一步的一句中文（不做静默降级）
+_SEARCH_ERROR_TEXT = {
+    "config": "搜索实例没配好（地址或 JSON 输出没开），请联系管理员检查 [web] 配置",
+    "timeout": "搜索超时了，先按现有结果作答，稍后再试",
+    "http": "搜索实例没能正常响应（网络或服务异常），先按现有结果作答",
+    "schema": "搜索实例返回的结构不对（多半是没开 JSON 输出），先按现有结果作答",
+}
+
+_FETCH_ERROR_TEXT = {
+    "scheme": "只支持 http(s) 开头的完整链接，请从搜索结果或用户消息里原样取",
+    "blocked_host": "这个地址指向内网，出于安全考虑不抓取",
+    "dns": "域名解析不出来，可能链接写错了",
+    "robots": "目标站点在 robots.txt 里禁止抓取，换一个来源再试",
+    "timeout": "读取超时了，先按现有结果作答，稍后再试",
+    "http": "站点报错或连不上，换一个来源再试",
+    "too_large": "页面太大（超出单次上限），换一个来源或让用户说明要点",
+    "content_type": "这个链接不是网页正文（可能是 PDF / 图片），读不了",
+    "insufficient_text": "页面没抽到正文（可能需要 JS 渲染），换一个来源再试",
+}
+
+
+def _search_error(exc: WebSearchError) -> str:
+    """`WebSearchError` → 一句中文原因（reason 白名单外的值也给出可执行的退路）。"""
+    return "搜索失败：" + _SEARCH_ERROR_TEXT.get(
+        exc.reason, "搜索实例出错，先按现有结果作答"
+    )
+
+
+def _fetch_error(exc: WebFetchError) -> str:
+    """`WebFetchError` → 一句中文原因（reason 白名单外的值也给出可执行的退路）。"""
+    return "读取网页失败：" + _FETCH_ERROR_TEXT.get(
+        exc.reason, "页面没能处理，先按现有结果作答"
+    )
+
+
+async def search_hotspots(
+    ctx: ToolContext,
+    args: dict[str, Any],
+    *,
+    attachments: list[dict[str, Any]] | None = None,
+    on_progress: ProgressFn | None = None,
+) -> ToolOutcome:
+    """「搜热点」工具（PR2）：一次搜索 → 候选标题 / 链接 / 摘要；只读、不花钱。
+
+    顺序是**校验 → 配额 → 缓存 → 请求**：配额用完连缓存也不再给（模型据此收手，用现有
+    结果作答）。缓存键是 `query`（Task 5 定），命中只回放、不增加 `web_calls`。
+    """
+    steps: list[dict[str, Any]] = []
+    query, invalid = _check_query(args)
+    if invalid:
+        return ToolOutcome(status="failed", steps=steps, error=invalid)
+    count, invalid_count = _check_count(args.get("count"))
+    if invalid_count:
+        return ToolOutcome(status="failed", steps=steps, error=invalid_count)
+    if not _quota_left(ctx):
+        return ToolOutcome(status="failed", steps=steps, error=TURN_LIMIT_MESSAGE)
+
+    cached = ctx.cache.searches.get(query)
+    if cached is not None:
+        results = [dict(item) for item in cached[:count]]
+        _step(steps, "命中缓存")
+        return ToolOutcome(
+            status="succeeded",
+            steps=steps,
+            payload={
+                "query": query,
+                "count": len(results),
+                "results": results,
+                "note": _search_note(len(results), []),
+                "cached": True,
+            },
+        )
+
+    ctx.cache.web_calls += 1
+    await _web_stage(steps, on_progress, "搜索热点")
+    active = get_tracer(ctx.cfg)
+    try:
+        with active.node(
+            name="tool.web_search", metadata={"stage": "web_search"}
+        ) as fields:
+            try:
+                found = await search_web(None, ctx.cfg, query, count=count)
+            except BaseException as exc:   # 先把安全类别写进 span，再交给下面的映射
+                fields.level = LEVEL_ERROR
+                fields.status_message = progress_tool.error_category(exc)
+                raise
+    except WebSearchError as exc:
+        return ToolOutcome(status="failed", steps=steps, error=_search_error(exc))
+    except Exception as exc:  # noqa: BLE001 - 工具层不抛异常（抛出会触发节点重试）
+        logger.warning("搜索工具失败：%s", type(exc).__name__)
+        return ToolOutcome(
+            status="failed",
+            steps=steps,
+            error="搜索失败：搜索实例返回了无法处理的结果，先按现有结果作答",
+        )
+
+    results = [
+        {
+            "title": item.title,
+            "url": item.url,
+            "snippet": item.snippet,
+            "published_date": item.published_date,
+        }
+        for item in found.hits
+    ]
+    ctx.cache.searches[query] = [dict(item) for item in results]
+    # 本任务的关键接线：搜到的 url 记进 `seen_urls`，之后抓它就是「自主调用」
+    ctx.cache.seen_urls.update(str(item["url"]) for item in results)
+    return ToolOutcome(
+        status="succeeded",
+        steps=steps,
+        payload={
+            "query": query,
+            "count": len(results),
+            "results": [dict(item) for item in results],
+            "note": _search_note(len(results), found.unresponsive),
+        },
+    )
+
+
+async def fetch_url(
+    ctx: ToolContext,
+    args: dict[str, Any],
+    *,
+    attachments: list[dict[str, Any]] | None = None,
+    on_progress: ProgressFn | None = None,
+) -> ToolOutcome:
+    """「读网页」工具（PR2）：打开一个公网页 → 正文 + 分页游标；只读、不落盘。
+
+    `autonomous` 由 **`url in ctx.cache.seen_urls`** 决定：本轮搜到的才走自主 UA 与
+    robots.txt，用户直接贴的链接按人工调用处理。缓存键是 `(url, start_index)`：只用 url
+    会让第二页永远读到第一页，续读（`start_index > 0`）算一次新的 `web_calls`。
+    """
+    steps: list[dict[str, Any]] = []
+    url, invalid = _check_url(args)
+    if invalid:
+        return ToolOutcome(status="failed", steps=steps, error=invalid)
+    start_index, invalid_start = _check_start_index(args.get("start_index"))
+    if invalid_start:
+        return ToolOutcome(status="failed", steps=steps, error=invalid_start)
+    if not _quota_left(ctx):
+        return ToolOutcome(status="failed", steps=steps, error=TURN_LIMIT_MESSAGE)
+
+    cached = ctx.cache.pages.get((url, start_index))
+    if cached is not None:
+        _step(steps, "命中缓存")
+        return ToolOutcome(
+            status="succeeded", steps=steps, payload={**cached, "cached": True}
+        )
+
+    ctx.cache.web_calls += 1
+    await _web_stage(steps, on_progress, "读取网页")
+    autonomous = url in ctx.cache.seen_urls
+    active = get_tracer(ctx.cfg)
+    try:
+        with active.node(
+            name="tool.web_fetch",
+            metadata={
+                "stage": "web_fetch",
+                "autonomous": autonomous,
+                "start_index": start_index,
+            },
+        ) as fields:
+            try:
+                page = await fetch_readable(
+                    None,
+                    ctx.cfg,
+                    url,
+                    autonomous=autonomous,
+                    start_index=start_index,
+                    robots_cache=ctx.cache.robots,
+                )
+            except BaseException as exc:   # 先把安全类别写进 span，再交给下面的映射
+                fields.level = LEVEL_ERROR
+                fields.status_message = progress_tool.error_category(exc)
+                raise
+    except WebFetchError as exc:
+        return ToolOutcome(status="failed", steps=steps, error=_fetch_error(exc))
+    except Exception as exc:  # noqa: BLE001 - 工具层不抛异常（抛出会触发节点重试）
+        logger.warning("抓取工具失败：%s", type(exc).__name__)
+        return ToolOutcome(
+            status="failed",
+            steps=steps,
+            error="读取网页失败：页面没能处理，先按现有结果作答",
+        )
+
+    payload = {
+        "url": url,
+        "final_url": page.final_url,
+        "title": page.title,
+        "text": page.text,
+        "char_count": page.char_count,
+        "truncated": page.truncated,
+        "next_start_index": page.next_start_index,
+    }
+    ctx.cache.pages[(url, start_index)] = dict(payload)
+    return ToolOutcome(status="succeeded", steps=steps, payload=payload)
+
+
 def tool_result_note(outcome: ToolOutcome) -> str:
     """给日志/调试用的一句话（不含正文）。"""
     if outcome.status == "succeeded":
@@ -2582,6 +2900,8 @@ HANDLERS: dict[str, ToolHandler] = {
     TOOL_READ_RUN: read_run,
     TOOL_PREVIEW_COVERAGE: preview_element_coverage,
     TOOL_REVISE_DRAFT: revise_draft,
+    TOOL_SEARCH_HOTSPOTS: search_hotspots,
+    TOOL_FETCH_URL: fetch_url,
 }
 
 

@@ -14,7 +14,7 @@ from typing import Any, cast
 
 import pytest
 
-from xhs_agent.config import AppConfig, load_config
+from xhs_agent.config import AppConfig, WebConfig, load_config
 from xhs_agent.schemas import Coverage, Element, HotspotClue
 from xhs_agent.services import chat_tools
 from xhs_agent.services.chat_tools import (
@@ -123,7 +123,11 @@ class TestToolSchema:
             TOOL_PREVIEW_COVERAGE,
             TOOL_REVISE_DRAFT,
         }
-        assert set(HANDLERS) == names
+        # PR2：网页两件的 schema 在 TOOLS 外面（按 [web] 开关追加），但 handler 常驻分发表，
+        # 所以「一一对上」的等号右边取**开启态**清单；关闭态下发的仍是 TOOLS 本身。
+        web_on = AppConfig()
+        web_on.web = WebConfig(enabled=True)
+        assert set(HANDLERS) == tool_names(web_on)
 
     def test_required_arguments_are_declared(self) -> None:
         by_name = {
