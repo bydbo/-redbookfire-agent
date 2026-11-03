@@ -8,7 +8,7 @@ import httpx
 import pytest
 
 from xhs_agent.config import EnvView, LLMConfig, VisionConfig
-from xhs_agent.tools import prompt
+from xhs_agent.tools import output_guard, prompt
 from xhs_agent.tools.llm import (
     LLMCall,
     LLMError,
@@ -39,6 +39,36 @@ def test_public_reply_and_normal_clue_are_allowed():
     rendered = prompt.render("chat_supervisor", capabilities=prompt.render_capabilities())
     example = prompt.load("chat_supervisor").sections["examples"].split("例 2", 1)[0]
     ensure_safe_output(example.split("- 你：", 1)[1], system=rendered.system)
+
+
+def test_web_clause_reply_is_whitelisted_like_the_other_fixed_replies():
+    """开启态那一段话术也是让模型「照原样说」的，必须同样算公开话术。
+
+    白名单来源只看 `categories[*].reply` 时，漏掉 `web_clause.reply_append` 的后果是
+    「清单让它照说、输出检查转头把它拦掉」。这里按**窗口集合**钉死：只跑一遍原样输出
+    是不够的——今天那段文本与受保护正文的窗口恰好零重叠，黑盒跑一次也能过，测不出缺口。
+    """
+    append = prompt.load_capabilities()["web_clause"]["reply_append"]
+    windows = output_guard._windows(output_guard._normalise(append))
+    assert windows, "话术太短会得到空窗口集合，本用例就退化成永真"
+    assert windows <= set(output_guard._public_windows())
+    ensure_safe_output(append)
+
+
+def test_web_clause_reply_wins_over_the_private_rule_guard(monkeypatch):
+    """把 `web_clause.reply_append` 读成受保护正文时它仍应放行——证明来源真的接上了。"""
+    fragment = prompt.load("chat_supervisor").sections["constraints"][:120]
+    payload = dict(prompt.load_capabilities())
+    payload["web_clause"] = {"judge_append": "判定说明", "reply_append": fragment}
+    monkeypatch.setattr(prompt, "load_capabilities", lambda: payload)
+    output_guard._public_windows.cache_clear()
+    try:
+        ensure_safe_output(fragment)
+        # 守卫没被改松：换个不受白名单保护的片段照样拦
+        with pytest.raises(UnsafeModelOutput):
+            ensure_safe_output(prompt.load("hotspot_clue").sections["constraints"])
+    finally:
+        output_guard._public_windows.cache_clear()
 
 
 def test_tool_arguments_and_custom_system_rules_are_checked():

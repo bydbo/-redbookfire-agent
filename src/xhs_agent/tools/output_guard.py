@@ -101,7 +101,14 @@ def _static_windows() -> frozenset[str]:
 
 @lru_cache(maxsize=1)
 def _public_windows() -> frozenset[str]:
-    replies = [str(category["reply"]) for category in prompt.load_capabilities()["categories"]]
+    payload = prompt.load_capabilities()
+    replies = [str(category["reply"]) for category in payload["categories"]]
+    # 清单里凡是要求模型「照原样说」的槽都算公开话术：开启态的网页能力段落同样要原样说出来，
+    # 不纳入白名单就会「清单让它说、这里转头把它拦掉」。它是静态资产，关闭态不会渲染，
+    # 多说一句可公开话术没有副作用。
+    clause = payload.get("web_clause")
+    if isinstance(clause, dict) and str(clause.get("reply_append") or "").strip():
+        replies.append(str(clause["reply_append"]))
     # 只有能力介绍范例明确属于公开回答；带假想素材身份的其他范例仍保护。
     example = prompt.load("chat_supervisor").sections["examples"].split("例 2", 1)[0]
     if "- 你：" in example:
