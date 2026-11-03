@@ -11,13 +11,14 @@
 | 5 | 数据库迁移版本处于 Alembic head | 3 |
 | 6 | Redis 可连接（`PING`） | 3 |
 | 7 | `[frontend].serve = true` 时 `frontend/dist` 存在且非空 | 2 |
-| 8 | `[web].enabled = true` 时 `search_url` 已配且 SearXNG 的 JSON 输出可用 | 2 |
+| 8 | `[web].enabled = true` 时 `search_url` 已配且 SearXNG 的 JSON 输出可用 | 2 / 3 |
 
 **模型服务不在启动时探测**：启动即调用模型会产生费用，也容易被网络抖动误判；模型可用性由
 `GET /api/health` 按需探测，不计入启动成败。
 
 **搜索能力在第 8 步真探一次**：`[web].enabled = true` 时对 `search_url` 打一次
-`/search?q=test&format=json`（不让模型参与，无模型费用），失败即配置错误（退出码 2）。
+`/search?q=test&format=json`（不让模型参与，无模型费用）。失败分工：缺 `search_url`、非 200（含 403）、响应不是 JSON
+属配置错误（退出码 2）；连不上 / 超时属依赖不可用（退出码 3，与数据库、Redis 同一口径）。
 
 用法：
 
@@ -344,6 +345,9 @@ async def check_web(cfg: AppConfig, client: httpx.AsyncClient | None = None) -> 
 
     只做一次 `/search?q=test&format=json` 的存在性探活——这不是抓取逻辑，也不走模型。
     `client` 可注入（测试用 `httpx.MockTransport`），不传时按 `[web].search_timeout_s` 自建。
+
+    失败分工（契约 §四）：缺 `search_url`、非 200（含 403）、响应不是 JSON 都是**配置错误**
+    （退出码 2，实例部署不对）；连不上 / 超时是**依赖不可用**（退出码 3，与数据库、Redis 同口径）。
     """
     web = cfg.web
     if not web.enabled:
@@ -360,12 +364,12 @@ async def check_web(cfg: AppConfig, client: httpx.AsyncClient | None = None) -> 
     probe_client = client or httpx.AsyncClient(timeout=web.search_timeout_s)
     try:
         response = await probe_client.get(endpoint, params={"q": "test", "format": "json"})
-    except Exception as exc:      # 连不上 / 超时 / DNS 失败都算这一步没过
+    except Exception as exc:      # 连不上 / 超时 / DNS 失败 = 外部依赖不可用（退出码 3）
         return Problem(
             E_WEB_SEARCH_UNAVAILABLE, "web.search_url",
             f"SearXNG 连不上：{endpoint}（{type(exc).__name__}: {exc}）",
             f"确认 search_url 指向可访问的实例（当前：{url}）；自建实例先起服务再重试",
-            step=8, kind="config")
+            step=8, kind="dependency")
     finally:
         if own_client:
             await probe_client.aclose()

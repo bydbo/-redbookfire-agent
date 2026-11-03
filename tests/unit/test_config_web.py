@@ -6,11 +6,20 @@
 
 from __future__ import annotations
 
+import json
+
 import httpx
 import pytest
 from pydantic import ValidationError
 
-from xhs_agent.config import AppConfig, ConfigError, EnvView, WebConfig, load_config
+from xhs_agent.config import (
+    AppConfig,
+    ConfigError,
+    EnvView,
+    WebConfig,
+    config_to_dict,
+    load_config,
+)
 from xhs_agent.probe import (
     E_WEB_SEARCH_UNAVAILABLE,
     E_WEB_SEARCH_URL_MISSING,
@@ -149,8 +158,7 @@ class TestWebApiKey:
         cfg = load_config(write_config(tmp_path, "[web]\nenabled = true\n"))
         assert cfg.web.api_key == "sk-web-secret"
 
-    def test_api_key_is_empty_when_env_missing(self, tmp_path, clean_contract_env):
-        clean_contract_env.delenv(WEB_ENV_KEY, raising=False)
+    def test_api_key_is_empty_when_env_missing(self, tmp_path):
         cfg = load_config(write_config(tmp_path, "[web]\nenabled = true\n"))
         assert cfg.web.api_key == ""
 
@@ -166,6 +174,32 @@ class TestWebApiKey:
 
     def test_default_web_config_has_empty_key(self):
         assert WebConfig().api_key == ""
+
+
+class TestWebDescribe:
+    """脱敏摘要要能看出 web 开关状态，但不出现密钥本身（口径同 [llm] 的 has_api_key）。"""
+
+    def test_describe_exposes_web_block(self, tmp_path):
+        cfg = load_config(write_web_config(tmp_path))
+        block = cfg.describe()["web"]
+        assert block["enabled"] is True
+        assert block["search_url"] == SEARXNG
+        assert block["max_calls_per_turn"] == 3
+        assert block["api_key_env"] == WEB_ENV_KEY
+        assert block["has_api_key"] is False      # 没配密钥
+
+    def test_describe_reports_key_presence_only(self, tmp_path, clean_contract_env):
+        clean_contract_env.setenv(WEB_ENV_KEY, "sk-web-secret")
+        cfg = load_config(write_web_config(tmp_path))
+        described = cfg.describe()
+        assert described["web"]["has_api_key"] is True
+        assert "sk-web-secret" not in json.dumps(described, ensure_ascii=False)
+
+    def test_web_block_is_last_section_present_in_snapshot(self, tmp_path):
+        # config_to_dict 走 model_dump：web 段作为字段之一必须出现，且不含密钥
+        snapshot = config_to_dict(load_config(write_web_config(tmp_path)))
+        assert snapshot["web"]["enabled"] is True
+        assert "api_key" not in snapshot["web"]
 
 
 class TestPreflightWebStep:
@@ -248,7 +282,8 @@ class TestPreflightWebStep:
         assert str(calls[0].url).startswith(f"{SEARXNG}/search?")
 
     @pytest.mark.asyncio
-    async def test_unreachable_instance_is_a_preflight_problem(self, tmp_path):
+    async def test_unreachable_instance_is_a_dependency_problem(self, tmp_path):
+        """连不上 / 超时 = 外部依赖不可用（退出码 3），与数据库、Redis 同一口径。"""
         def boom(request: httpx.Request) -> httpx.Response:
             raise httpx.ConnectError("connection refused", request=request)
 
@@ -260,12 +295,26 @@ class TestPreflightWebStep:
             await client.aclose()
         assert problem is not None
         assert (problem.code, problem.step, problem.kind) == (
-            E_WEB_SEARCH_UNAVAILABLE, 8, "config")
+            E_WEB_SEARCH_UNAVAILABLE, 8, "dependency")
         assert SEARXNG in problem.message         # 连不上也要指明是哪个地址
-        assert PreflightReport(problems=[problem]).exit_code == 2
+        assert PreflightReport(problems=[problem]).exit_code == 3
 
-    def test_missing_api_key_only_warns(self, tmp_path, clean_contract_env):
-        clean_contract_env.delenv(WEB_ENV_KEY, raising=False)
+    @pytest.mark.asyncio
+    async def test_timeout_is_also_a_dependency_problem(self, tmp_path):
+        """超时同属依赖不可用（第 8 步耗时受 search_timeout_s 约束）。"""
+        def slow(request: httpx.Request) -> httpx.Response:
+            raise httpx.ReadTimeout("timed out", request=request)
+
+        cfg = load_config(write_web_config(tmp_path))
+        client = httpx.AsyncClient(transport=httpx.MockTransport(slow))
+        try:
+            problem = await check_web(cfg, client)
+        finally:
+            await client.aclose()
+        assert problem is not None and problem.kind == "dependency"
+
+    def test_missing_api_key_only_warns(self, tmp_path):
+        # 环境变量由 conftest 的 clean_contract_env 统一清空，无需用例自己 delenv
         cfg = load_config(write_web_config(tmp_path))
         report = preflight(cfg, env=ready_env())
         assert report.ok                          # 无密钥不阻断启动
@@ -277,8 +326,7 @@ class TestPreflightWebStep:
         report = preflight(cfg, env=ready_env(**{WEB_ENV_KEY: "sk-web"}))
         assert report.ok and report.warnings == []
 
-    def test_disabled_web_does_not_warn_about_the_key(self, tmp_path, clean_contract_env):
-        clean_contract_env.delenv(WEB_ENV_KEY, raising=False)
+    def test_disabled_web_does_not_warn_about_the_key(self, tmp_path):
         cfg = load_config(write_config(tmp_path, "[web]\nenabled = false\n"))
         report = preflight(cfg, env=ready_env())
         assert report.ok and report.warnings == []

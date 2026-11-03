@@ -678,6 +678,14 @@ class AppConfig(_Section):
                 "image_cache_ttl_days": self.context.image_cache_ttl_days,
                 "observation_retention_days": self.context.observation_retention_days,
             },
+            "web": {
+                "enabled": self.web.enabled,
+                "search_url": self.web.search_url,
+                "fetch_enabled": self.web.fetch_enabled,
+                "max_calls_per_turn": self.web.max_calls_per_turn,
+                "api_key_env": self.web.api_key_env,
+                "has_api_key": bool(self.web.api_key),
+            },
             "paths": {
                 "materials_dir": self.materials_dir(),
                 "runs_dir": self.runs_dir(),
