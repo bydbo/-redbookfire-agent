@@ -189,7 +189,8 @@ class TestTurn:
         assert turn.prompt_versions == {TASK_ID: SUPERVISOR_VERSION}
         assert turn.cost_cny == pytest.approx(0.001)
         assert len(provider.calls) == 1
-        assert provider.calls[0].tools == TOOLS  # 第一轮带着工具清单
+        # 第一轮带着工具清单：内容由 [web] 开关决定（PR2），关闭态与旧 TOOLS 逐项相等
+        assert provider.calls[0].tools == chat_tools.tools_for(cfg)
         assert runner.calls == []
 
     @pytest.mark.asyncio
@@ -451,7 +452,15 @@ class TestDispatchIsDataDriven:
 
     def test_graph_source_contains_no_tool_name(self) -> None:
         source = Path(str(chat_workflow.__file__)).read_text(encoding="utf-8")
-        for name in chat_tools.tool_names():
+        # 扫描范围 = 默认名 ∪ 网页两名：网页 schema 不在 TOOLS 里，只扫 tool_names()
+        # 会让「将来有人在 chat.py 里写死 search_hotspots」漏过去。
+        default_names = chat_tools.tool_names()
+        scanned = default_names | {
+            chat_tools.TOOL_SEARCH_HOTSPOTS,
+            chat_tools.TOOL_FETCH_URL,
+        }
+        assert scanned > default_names  # 防范围退化：网页两名不该混进默认清单
+        for name in sorted(scanned):
             assert name not in source, f"workflows/chat.py 里写死了工具名：{name}"
 
     @pytest.mark.asyncio
@@ -506,6 +515,156 @@ class TestDispatchIsDataDriven:
 
         assert runner.calls == [] and len(provider.calls) == 1
         assert turn.tool_calls[0]["error"] == "模型要调一个不存在的工具"
+
+
+# ---------- PR2 · Task 7：清单按开关下发、轮次预算按开关抬高 ----------
+
+
+def write_web_config(
+    tmp_path: Path, *, enabled: bool = True, fetch_enabled: bool = True
+) -> AppConfig:
+    """带 [web] 段的配置（其余默认）：下发的清单只由这两个开关决定。"""
+    return write_config(
+        tmp_path,
+        "[web]\n"
+        f"enabled = {str(enabled).lower()}\n"
+        'search_url = "http://127.0.0.1:8080"\n'
+        f"fetch_enabled = {str(fetch_enabled).lower()}\n",
+    )
+
+
+class TestToolsWiring:
+    """PR2 · Task 7：_build_graph 收本轮清单，未知工具判定与轮次预算各按各的口径。
+
+    D5：remaining==0 时下发改空，但「认识哪些工具」不跟着变；
+    D4：[chat].max_tool_rounds 的代码默认值仍是 3，网页开启时取
+        effective_max_rounds(cfg)（至少 8），显式 max_rounds 实参优先。
+    """
+
+    @pytest.mark.asyncio
+    async def test_tools_disabled_matches_legacy_list(self, tmp_path: Path) -> None:
+        """关闭态下发的清单与旧 TOOLS **逐项相等**：默认能力不被悄悄改动。"""
+        cfg = write_web_config(tmp_path, enabled=False)
+        _turn, provider, _runner = await run(cfg, steps=[{"text": "好的"}])
+
+        assert provider.calls[0].tools == TOOLS
+
+    @pytest.mark.asyncio
+    async def test_tools_enabled_appends_web_tools(self, tmp_path: Path) -> None:
+        """开启态按 tools_for(cfg) 下发：网页两件追加在老工具之后。"""
+        cfg = write_web_config(tmp_path)
+        _turn, provider, _runner = await run(cfg, steps=[{"text": "好的"}])
+
+        names = [item["function"]["name"] for item in provider.calls[0].tools or []]
+        assert names == [
+            item["function"]["name"] for item in chat_tools.tools_for(cfg)
+        ]
+        assert names[: len(TOOLS)] == [item["function"]["name"] for item in TOOLS]
+        assert names[len(TOOLS):] == [
+            chat_tools.TOOL_SEARCH_HOTSPOTS,
+            chat_tools.TOOL_FETCH_URL,
+        ]
+
+    @pytest.mark.asyncio
+    async def test_tools_are_omitted_when_rounds_exhausted(self, tmp_path: Path) -> None:
+        """到上限的最后一次调用不带工具（网页开启也不带）——逼模型收尾。"""
+        cfg = write_web_config(tmp_path)
+        _turn, provider, runner = await run(
+            cfg,
+            max_rounds=1,
+            steps=[
+                {"text": "", "tool_calls": [tool_call()]},
+                {"text": "按现有结果收尾"},
+            ],
+        )
+
+        assert len(runner.calls) == 1
+        assert provider.calls[1].tools is None
+
+    @pytest.mark.asyncio
+    async def test_hallucinated_disabled_tool_falls_into_unknown_branch(
+        self, tmp_path: Path
+    ) -> None:
+        """停用的工具被模型点名：走既有「未知工具」分支，落 failed 记录并收尾。"""
+        cfg = write_web_config(tmp_path, enabled=False)
+        turn, provider, runner = await run(
+            cfg,
+            steps=[
+                {
+                    "text": "",
+                    "tool_calls": [
+                        tool_call(
+                            name=chat_tools.TOOL_SEARCH_HOTSPOTS,
+                            arguments='{"query": "夜跑"}',
+                        )
+                    ],
+                },
+                {"text": "这个能力还没开，先用现有素材吧。"},
+            ],
+        )
+
+        assert runner.calls == []  # 没下发的工具不会被真的执行
+        assert [item["tool"] for item in turn.tool_calls] == [
+            chat_tools.TOOL_SEARCH_HOTSPOTS
+        ]
+        assert turn.tool_calls[0]["status"] == "failed"
+        assert turn.tool_calls[0]["error"] == "模型要调一个不存在的工具"
+        assert len(provider.calls) == 1  # 不再回头问模型
+        assert turn.reply  # 但必须给用户一句话，不能空回复
+
+    @pytest.mark.asyncio
+    async def test_registered_set_stays_full_when_rounds_exhausted(
+        self, tmp_path: Path
+    ) -> None:
+        """D5：到上限后「认识哪些工具」不跟着下发改空，已知工具不被误判成未知。"""
+        cfg = write_web_config(tmp_path)
+        provider = ScriptedProvider(
+            [
+                {"text": "", "tool_calls": [tool_call(call_id="call-a")]},
+                # 这一跳 remaining==0：工具已经不给了，模型却还是点了已知工具
+                {"text": "", "tool_calls": [tool_call(call_id="call-b")]},
+                {"text": "按现有结果收尾"},
+            ]
+        )
+        turn, _provider, runner = await run(cfg, provider=provider, max_rounds=1)
+
+        assert len(runner.calls) == 1  # 到上限就不再执行
+        # 只有真实执行过的那条记录：若拿被裁空的清单判定，这里会多一条 failed
+        assert [(item["tool"], item["status"]) for item in turn.tool_calls] == [
+            (TOOL_RUN_ANALYSIS, "succeeded")
+        ]
+
+    @pytest.mark.asyncio
+    async def test_web_enabled_raises_the_round_budget(self, tmp_path: Path) -> None:
+        """D4：网页开启时轮次预算取 effective_max_rounds(cfg)（默认 3 → 至少 8）。"""
+        cfg = write_web_config(tmp_path)
+        provider = ScriptedProvider(
+            [{"text": "", "tool_calls": [tool_call()]} for _ in range(20)]
+        )
+        _turn, provider, runner = await run(cfg, provider=provider)
+
+        assert len(runner.calls) == chat_tools.WEB_MAX_TOOL_ROUNDS
+        assert provider.calls[chat_tools.WEB_MAX_TOOL_ROUNDS].tools is None
+
+    @pytest.mark.asyncio
+    async def test_explicit_max_rounds_wins_over_web_default(
+        self, tmp_path: Path
+    ) -> None:
+        """D4：显式传入的 max_rounds 优先于 effective_max_rounds(cfg)。"""
+        cfg = write_web_config(tmp_path)  # 网页开启 → 不传实参时会到 8 轮
+        _turn, provider, runner = await run(
+            cfg,
+            max_rounds=2,
+            steps=[
+                {"text": "", "tool_calls": [tool_call()]},
+                {"text": "", "tool_calls": [tool_call(call_id="call-2")]},
+                {"text": "收尾"},
+            ],
+        )
+
+        assert len(runner.calls) == 2
+        assert provider.calls[2].tools is None
+        assert len(provider.calls) == 3
 
 
 class TestStructuredWorkerProgress:

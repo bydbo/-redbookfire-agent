@@ -382,8 +382,14 @@ class TestA11PromptVersionMerge:
             history_max_messages = 10
             history_token_budget = 10_000
 
+        class _Web:
+            # PR2：run_turn 现在按 [web] 开关现算清单与轮次预算，假配置也要给这一段
+            enabled = False
+            fetch_enabled = True
+
         class _Cfg:
             chat = _Chat()
+            web = _Web()
 
         ledger: dict[str, Any] = {
             "records": [{"task": "context_extract", "prompt_tokens": 100,

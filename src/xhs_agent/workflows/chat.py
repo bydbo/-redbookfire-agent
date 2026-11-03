@@ -8,11 +8,13 @@
 
 口径：
 
-- **轮次上限**：`[chat].max_tool_rounds`（默认 3）。到上限后最后一次调用**不带工具**，
-  逼模型用现有结果作答——用户永远能拿到一段话，而不是"工具调不停"；
-- **工具清单与分派都不在这里**（S7.7a）：本文件不出现任何具体工具名，已知/未知按
-  `services/chat_tools.py::TOOLS` 的名字集合动态划分，执行由运行器查 `HANDLERS`——
-  加工具只改 `chat_tools.py` 一处；
+- **轮次上限**：`[chat].max_tool_rounds`（默认 3）；网页能力开启时取
+  `chat_tools.effective_max_rounds(cfg)`（至少 8 轮），显式传入的 `max_rounds` 优先。
+  到上限后最后一次调用**不带工具**，逼模型用现有结果作答——用户永远能拿到一段话，
+  而不是"工具调不停"；
+- **工具清单与分派都不在这里**（S7.7a）：本文件不出现任何具体工具名。清单由
+  `chat_tools.tools_for(cfg)` 按 `[web]` 开关给出（PR2），已知/未知按**这份本轮清单**的
+  名字动态划分，执行由运行器查 `HANDLERS`——加工具只改 `chat_tools.py` 一处；
 - **prompt 版本**：这一轮用过的 prompt 版本（supervisor 自己 + 工具内部的拆解/改写）
   汇总成 `ChatTurn.prompt_versions`，落 `chat_messages.prompt_versions`；
 - **轮级用量**：`prompt_tokens` / `completion_tokens` = 本轮 supervisor 各次调用 + 各工具
@@ -139,16 +141,24 @@ def _build_graph(
     stream: bool,
     version: int,
     ledger: dict[str, Any],
+    tools: list[dict[str, Any]] | None = None,
     budget_policy: BudgetPolicy | None = None,
     on_budget: BudgetFn | None = None,
 ) -> Any:
     """按这一轮的实际依赖构图（provider / 工具执行器都是闭包注入，便于离线测试）。
+
+    `tools` 是**本轮**要下发的完整清单（`chat_tools.tools_for(cfg)`）；不给则回退默认清单
+    `chat_tools.TOOLS`，旧调用方零改动。
 
     S7.26：`budget_policy.enforce` 时**每次 supervisor 调用前**做完整预算判定（含工具返回后的
     再检查）；超限抛 `BudgetError`（类别 `required_context_overflow`），不发请求。
     `shadow` 只记录判定，不改变执行。
     """
     policy = budget_policy or BudgetPolicy()
+    # 本轮完整清单：下发按 `remaining` 裁剪，**未知工具判定始终用它**（D5）——
+    # 到上限时下发改空，但"认识哪些工具"不能跟着变，否则模型在那一次调用里点名的
+    # 已知工具会被误判成"不存在的工具"（与全量 `tool_names()` 的旧行为不一致）。
+    enabled_tools = list(tools) if tools is not None else list(chat_tools.TOOLS)
     # 调用身份注入（E7OBS4-01）：一次签名检查决定是否给 runner 传内部 `meta`；
     # 旧测试 runner 天然兼容，**不**用"捕获 TypeError 再重跑工具"来试探签名。
     try:
@@ -188,7 +198,8 @@ def _build_graph(
         rounds = int(state.get("tool_rounds") or 0)
         attempt = rounds + 1  # 第几轮决策（多轮决策不等于重试）
         remaining = max(0, int(max_rounds) - rounds)
-        tools = chat_tools.TOOLS if remaining > 0 else []  # 到上限就不给工具，逼出正文
+        # 到上限就不给工具，逼模型用现有结果作答
+        tools = enabled_tools if remaining > 0 else []
         messages = list(state.get("messages") or [])
         # S7.26：工具返回后、下一次调用前重新检查（mutation 不绕过预算入口）
         if policy.enforces:
@@ -260,9 +271,10 @@ def _build_graph(
         # R3（OBS-10）：稳定边界账目——图异常时已完成的调用记录仍能带出（状态可能拿不到）
         ledger["records"].append(turn.record)
         # 已知 / 未知**按工具清单动态划分**（S7.7a）：这里不写任何具体工具名，
-        # 加工具只改 `services/chat_tools.py` 一处。清单读模块属性而不是导入时快照，
-        # 用例注册一个假工具也能被认出来。
-        registered = chat_tools.tool_names()
+        # 加工具只改 `services/chat_tools.py` 一处。清单读的是**本轮完整**清单
+        # （`enabled_tools`），不是上面被 `remaining` 裁空的那个变量——到上限那次调用里
+        # 下发的空列表不能拿来做判定（D5）。
+        registered = {str(item["function"]["name"]) for item in enabled_tools}
         known = [call for call in turn.tool_calls if call["name"] in registered]
         unknown = [call for call in turn.tool_calls if call["name"] not in registered]
 
@@ -565,9 +577,16 @@ async def run_turn(
 
     S7.24 / S7.26：`state_text` 是服务端验证过的有效状态（放固定前缀之后）；`grouped`
     启用完整轮次组裁剪；`budget_policy` 非 off 时每次实际请求前做完整预算判定。
+
+    PR2：工具清单按 `[web]` 开关现算（`chat_tools.tools_for(cfg)`）；`max_rounds` 不传时
+    取 `chat_tools.effective_max_rounds(cfg)`（网页开启至少 8 轮）。
     """
     started = time.monotonic()
-    rounds = int(max_rounds if max_rounds is not None else cfg.chat.max_tool_rounds)
+    # D4：代码默认值仍在 `[chat].max_tool_rounds`（3）；网页能力开启时由
+    # `effective_max_rounds` 抬到至少 8 轮（搜完再读、读完接着读），显式实参优先。
+    rounds = int(
+        max_rounds if max_rounds is not None else chat_tools.effective_max_rounds(cfg)
+    )
     rendered, messages = initial_messages(
         history,
         user_text,
@@ -598,6 +617,8 @@ async def run_turn(
         stream=stream,
         version=rendered.version,
         ledger=ledger,
+        # PR2：本轮清单按 `[web]` 开关现算（深拷贝），图不改模块级 schema
+        tools=chat_tools.tools_for(cfg),
         budget_policy=budget_policy,
         on_budget=on_budget,
     )
