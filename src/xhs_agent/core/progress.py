@@ -52,6 +52,9 @@ STAGE_LABELS: dict[str, str] = {
     "draft": "撰稿",
     "report": "报告",
     "final_reply": "整理回复",
+    # PR3 网页工具：tracing span 为 tool.web_search / tool.web_fetch
+    "web_search": "搜索热点",
+    "web_fetch": "读取网页",
 }
 
 STAGE_STATUSES: tuple[str, ...] = (
@@ -80,6 +83,8 @@ PROGRESS_LABEL_KEYS: dict[str, str] = {
     "检索素材": "retrieve",
     "素材同步": "material_sync",
     "向量回填": "embedding_backfill",
+    "搜索热点": "web_search",
+    "读取网页": "web_fetch",
 }
 
 ERROR_CATEGORIES: tuple[str, ...] = (

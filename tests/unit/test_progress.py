@@ -398,3 +398,29 @@ class TestStageInstanceIdentity:
             stage_instance_id=f"src-{progress.MAX_NODES + 4}:draft:1", source_seq=3,
         )
         assert again["started_at"] == snapshot["started_at"]
+
+
+class TestWebToolProgressLabels:
+    """PR3 · Task 10：网页工具的进度标签（后端权威口径）。
+
+    handler 里报的是中文标签（`on_progress("搜索热点")`），tracing span 是
+    `tool.web_search` / `tool.web_fetch`；两份映射必须同时登记，否则前端会退回英文键。
+    """
+
+    def test_stage_labels_carry_web_tool_keys(self):
+        assert progress.STAGE_LABELS["web_search"] == "搜索热点"
+        assert progress.STAGE_LABELS["web_fetch"] == "读取网页"
+
+    def test_progress_label_keys_map_web_labels_back_to_stage_keys(self):
+        assert progress.PROGRESS_LABEL_KEYS["搜索热点"] == "web_search"
+        assert progress.PROGRESS_LABEL_KEYS["读取网页"] == "web_fetch"
+
+    def test_handler_labels_round_trip_through_stage_keys(self):
+        assert progress.key_for_label("搜索热点") == "web_search"
+        assert progress.key_for_label("读取网页") == "web_fetch"
+        assert progress.label_for("web_search") == "搜索热点"
+        assert progress.label_for("web_fetch") == "读取网页"
+
+    def test_progress_label_keys_are_backed_by_stage_labels(self):
+        # 同步约束：PROGRESS_LABEL_KEYS 的值必须都是 STAGE_LABELS 的键，否则 key_for_label 会漏
+        assert set(progress.PROGRESS_LABEL_KEYS.values()) <= set(progress.STAGE_LABELS)

@@ -246,6 +246,13 @@ describe('useChatStore', () => {
     expect(toolLabel('brand_new_tool')).toBe('brand_new_tool')
   })
 
+  it('网页工具有中文名，阶段标签也认得这两个阶段的键（PR3 · Task 10）', () => {
+    expect(toolLabel('search_hotspots')).toBe('搜索热点')
+    expect(toolLabel('fetch_url')).toBe('读取网页')
+    expect(stageLabel('web_search')).toBe('搜索热点')
+    expect(stageLabel('web_fetch')).toBe('读取网页')
+  })
+
   it('阶段与错误类别有中文标签（未登记原样回落）', () => {
     expect(stageLabel('material_sync')).toBe('素材同步')
     expect(stageLabel('final_reply')).toBe('整理回复')

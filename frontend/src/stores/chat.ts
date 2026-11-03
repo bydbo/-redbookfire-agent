@@ -45,6 +45,8 @@ export const TOOL_LABELS: Record<string, string> = {
   read_run: '读历史运行',
   preview_element_coverage: '预览爆点要素',
   revise_draft: '改写文案',
+  search_hotspots: '搜索热点',
+  fetch_url: '读取网页',
 }
 
 export function toolLabel(name: string): string {
@@ -66,6 +68,8 @@ export const STAGE_LABELS: Record<string, string> = {
   draft: '撰稿',
   report: '报告',
   final_reply: '整理回复',
+  web_search: '搜索热点',
+  web_fetch: '读取网页',
 }
 
 export function stageLabel(key: string): string {

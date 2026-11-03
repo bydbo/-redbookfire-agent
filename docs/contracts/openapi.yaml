@@ -2537,7 +2537,7 @@ components:
       properties:
         stage:
           type: string
-          description: 阶段键（supervisor / image_parse / submit_analysis / queue_wait / material_sync / embedding_backfill / clue / retrieve / gaps / draft / report / final_reply）；final_reply 只出现在成功轮次，覆盖写库与终态整理区间，不代表回复生成耗时（生成区间看对应 supervisor 尝试）
+          description: 阶段键（supervisor / image_parse / submit_analysis / queue_wait / material_sync / embedding_backfill / clue / retrieve / gaps / draft / report / final_reply / web_search / web_fetch）；web_search / web_fetch 是网页工具内部的进度阶段（PR3，对应 tracing span tool.web_search / tool.web_fetch）；final_reply 只出现在成功轮次，覆盖写库与终态整理区间，不代表回复生成耗时（生成区间看对应 supervisor 尝试）
         label:
           type: string
           description: 中文标签
