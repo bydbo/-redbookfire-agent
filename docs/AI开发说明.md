@@ -89,7 +89,7 @@ uv run python -m xhs_agent.probe
 1. **不要单独移动 `src/`、`config/`、`data/`、`runs/` 中的任何一个。** 工程根是靠 `src/xhs_agent/config.py` 上溯三层算出来的，拆开之后不会报错，只会静默用错路径。
 2. **示例素材包放 `evals/fixtures/demo_pack/`，不要放 `data/materials/`。** 后者整个目录被忽略规则挡住，放进去了也不会进版本库。
 3. **`tests/unit/` 已有契约、配置与前置检查用例**，`uv run pytest` 应全绿；新增能力必须带用例（`tools/` 的行为回归见 `docs/backlog.md` 的 S1.4）。
-4. **加依赖要论证，不为省几行代码加，也不为凑简历关键词加。** 企业级组件（FastAPI、LangGraph、pgvector、Celery、Langfuse、OpenTelemetry 等）已按 `docs/技术栈.md` 第四节分阶段**落地完毕**，当前运行时依赖 18 项、开发依赖 12 项。再加任何依赖仍走 `AGENTS.md` 第 6 节流程。
+4. **加依赖要论证，不为省几行代码加，也不为凑简历关键词加。** 企业级组件（FastAPI、LangGraph、pgvector、Celery、Langfuse、OpenTelemetry 等）已按 `docs/技术栈.md` 第四节分阶段**落地完毕**，当前运行时依赖 19 项、开发依赖 9 项。再加任何依赖仍走 `AGENTS.md` 第 6 节流程。
 5. **项目不做运行时降级。** 缺 API 密钥、连不上数据库或队列时启动直接失败并报错——遇到“没密钥就跑不起来”不是 bug。
 6. **Docker Desktop 必须先启动**，数据库与队列都跑在容器里；C 盘只剩约 33 GB，建议把 Docker 镜像存储位置迁到 D 盘。
 7. **代理会拦截本地 HTTP，导致集成测试假失败。** 若本机开着代理工具（TUN/透明模式），跑 `uv run pytest -m integration` 时 `tests/integration/test_http_pool.py` 的 2 条用例会拿到 `502 Bad Gateway`（服务端收到请求数为 0）——透明代理解析了 loopback 的 HTTP，而 Postgres / Redis 这类裸 TCP 不受影响。**处置**：给代理加 loopback 直连规则，或跑集成本地 HTTP 用例前暂时关闭代理；判据是"沙箱内同一脚本返回 200、真实终端返回 502"。

@@ -31,7 +31,7 @@ AGENTS.md §6 要求每个依赖都回答这个问题，这里的答案很直接
 | 方案 | 优点 | 代价 |
 | --- | --- | --- |
 | 自写 `html.parser` / 正则清洗 | 零依赖、完全可控 | 只剔得掉语义标签噪声；评论区、推荐位、cookie 横幅剔不掉；每个站点单独写规则，维护成本无上限。抽取质量决定 `fetch_url` 是否可用，这一环最不能省 |
-| `readabilipy` 0.3.0 | MIT；Readability 启发式的 Python 侧封装，声明依赖只有 4 个 | 硬依赖 `beautifulsoup4` + `html5lib` + `lxml` + `regex`——`lxml` 这个 C 扩展照样躲不掉。**更要紧的是它默认那条路径要跑 Mozilla 的 `Readability.js`，而那是 Node.js 外部依赖**：官方要求 Node 14+，且「装包前先装 Node 才会把 Readability.js 一起装上」；它不进 `uv.lock`、不受 `uv sync` 管，装了就用、没装就**静默退化成纯 Python 移植版**，部署侧漏装不会有任何报错。发行版停在 0.3.0，而 trafilatura 已迭代到 2.3.1；另外它只做正文抽取，没有多语言与精确模式这些现成开关 |
+| `readabilipy` 0.3.0 | MIT；Readability 启发式的 Python 侧封装，声明依赖只有 4 个 | 硬依赖 `beautifulsoup4` + `html5lib` + `lxml` + `regex`——`lxml` 这个 C 扩展照样躲不掉。**更要紧的是它自带的 `Readability.js` 路径要靠 Node.js 14+ 的外部安装**：CLI 默认走这条路，但 **Python API 默认走纯 Python 移植版**，要显式 `use_readability=True` 才切到 `Readability.js`——本项目正是 import 库用法。Node 不进 `uv.lock`、不受 `uv sync` 管，装了不会自动生效、没装也不会报错，两条路径的质量差异在部署侧完全静默。发行版停在 0.3.0，而 trafilatura 已迭代到 2.3.1；另外它只做正文抽取，没有多语言与精确模式这些现成开关 |
 | **`trafilatura` 2.3.1** | 纯 Python wheel（`py3-none-any`）；正文抽取、元数据、样板剔除都是现成的；`favor_precision` 能应付 JS 空壳页；社区活跃；Apache-2.0 | 闭包 18 个包（见下）；引入 `lxml` C 扩展，但有预编译 wheel |
 
 ## 决策
