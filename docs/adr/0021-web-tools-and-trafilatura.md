@@ -31,8 +31,8 @@ AGENTS.md §6 要求每个依赖都回答这个问题，这里的答案很直接
 | 方案 | 优点 | 代价 |
 | --- | --- | --- |
 | 自写 `html.parser` / 正则清洗 | 零依赖、完全可控 | 只剔得掉语义标签噪声；评论区、推荐位、cookie 横幅剔不掉；每个站点单独写规则，维护成本无上限。抽取质量决定 `fetch_url` 是否可用，这一环最不能省 |
-| `readabilipy` 0.3.0 | MIT；Readability 启发式的 Python 侧封装 | 查 PyPI 元数据：硬依赖 `beautifulsoup4` + `html5lib` + `lxml` + `regex`——`lxml` 这个 C 扩展照样躲不掉，闭包不比 trafilatura 小；发行版停在 0.3.0，而 trafilatura 已迭代到 2.3.1；只做正文抽取，没有多语言与精确模式这些现成开关 |
-| **`trafilatura` 2.3.1** | 纯 Python wheel（`py3-none-any`）；正文抽取、元数据、样板剔除都是现成的；`favor_precision` 能应付 JS 空壳页；社区活跃；Apache-2.0 | 闭包 17 个包（见下）；引入 `lxml` C 扩展，但有预编译 wheel |
+| `readabilipy` 0.3.0 | MIT；Readability 启发式的 Python 侧封装，声明依赖只有 4 个 | 硬依赖 `beautifulsoup4` + `html5lib` + `lxml` + `regex`——`lxml` 这个 C 扩展照样躲不掉。**更要紧的是它默认那条路径要跑 Mozilla 的 `Readability.js`，而那是 Node.js 外部依赖**：官方要求 Node 14+，且「装包前先装 Node 才会把 Readability.js 一起装上」；它不进 `uv.lock`、不受 `uv sync` 管，装了就用、没装就**静默退化成纯 Python 移植版**，部署侧漏装不会有任何报错。发行版停在 0.3.0，而 trafilatura 已迭代到 2.3.1；另外它只做正文抽取，没有多语言与精确模式这些现成开关 |
+| **`trafilatura` 2.3.1** | 纯 Python wheel（`py3-none-any`）；正文抽取、元数据、样板剔除都是现成的；`favor_precision` 能应付 JS 空壳页；社区活跃；Apache-2.0 | 闭包 18 个包（见下）；引入 `lxml` C 扩展，但有预编译 wheel |
 
 ## 决策
 
@@ -54,10 +54,10 @@ AGENTS.md §6 要求每个依赖都回答这个问题，这里的答案很直接
 
 **负面（代价，均为实测）**
 
-- **闭包 17 个包**：`trafilatura` 本身 + **7 个声明硬依赖**（`certifi` / `charset_normalizer` / `courlan` / `htmldate` / `justext` / `lxml` / `urllib3`）+ **9 个传递依赖**（`babel` / `dateparser` / `python-dateutil` / `pytz` / `regex` / `six` / `tld` / `tzdata` / `tzlocal`）。`uv.lock` 因此从 117 个包涨到 128 个，其中 6 个本来就在。
+- **闭包 18 个包**：`trafilatura` 本身 + **7 个声明硬依赖**（`certifi` / `charset-normalizer` / `courlan` / `htmldate` / `justext` / `lxml` / `urllib3`）+ **10 个传递依赖**（`babel` / `dateparser` / `lxml-html-clean` / `python-dateutil` / `pytz` / `regex` / `six` / `tld` / `tzdata` / `tzlocal`）。其中 `lxml-html-clean` 由 `justext` 要求的 `lxml[html_clean]` 带入、`six` 由 `python-dateutil` 带入，两条都要算。`uv.lock` 因此从 117 个包涨到 128 个：新增 11 条，另外 7 个本来就在。
 - **冷缓存安装约 15.7s**，热缓存约 2s——瓶颈是下载，不是编译。
 - 引入 `lxml` 6.1.3 这个 C 扩展。**但它有预编译 wheel**（实测 cp311 / cp312 的 win_amd64，以及 manylinux / macOS 各平台），**不需要 MSVC 或任何构建工具链**。这一点决定了它没有破坏「`uv sync` 一把过」的安装体验。
-- 依赖面变大：以后每次 `uv lock` 升级都要顺带看一眼这 17 个包的安全公告。
+- 依赖面变大：以后每次 `uv lock` 升级都要顺带看一眼这 18 个包的安全公告。
 
 **后续**
 
