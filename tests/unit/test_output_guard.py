@@ -41,6 +41,17 @@ def test_public_reply_and_normal_clue_are_allowed():
     ensure_safe_output(example.split("- 你：", 1)[1], system=rendered.system)
 
 
+def _reset_guard_caches() -> None:
+    """两个缓存必须一起清。
+
+    `_static_windows()` 内部已经 `difference_update(_public_windows())` 并把结果留在缓存里，
+    只清 `_public_windows` 会让临时放行的正文在本进程内**永久失去保护**——一条防守卫被改松的
+    用例，自己就把守卫改松了。
+    """
+    output_guard._public_windows.cache_clear()
+    output_guard._static_windows.cache_clear()
+
+
 def test_web_clause_reply_is_whitelisted_like_the_other_fixed_replies():
     """开启态那一段话术也是让模型「照原样说」的，必须同样算公开话术。
 
@@ -56,19 +67,26 @@ def test_web_clause_reply_is_whitelisted_like_the_other_fixed_replies():
 
 
 def test_web_clause_reply_wins_over_the_private_rule_guard(monkeypatch):
-    """把 `web_clause.reply_append` 读成受保护正文时它仍应放行——证明来源真的接上了。"""
+    """把 `web_clause.reply_append` 读成受保护正文时它仍应放行——证明来源真的接上了。
+
+    这条用例临时把受保护正文放进白名单，所以收尾必须把**两个**缓存还原并复验。
+    """
     fragment = prompt.load("chat_supervisor").sections["constraints"][:120]
     payload = dict(prompt.load_capabilities())
     payload["web_clause"] = {"judge_append": "判定说明", "reply_append": fragment}
     monkeypatch.setattr(prompt, "load_capabilities", lambda: payload)
-    output_guard._public_windows.cache_clear()
+    _reset_guard_caches()
     try:
         ensure_safe_output(fragment)
         # 守卫没被改松：换个不受白名单保护的片段照样拦
         with pytest.raises(UnsafeModelOutput):
             ensure_safe_output(prompt.load("hotspot_clue").sections["constraints"])
     finally:
-        output_guard._public_windows.cache_clear()
+        monkeypatch.undo()
+        _reset_guard_caches()
+    # 恢复后同一片段重新受保护：不留任何缓存副作用
+    with pytest.raises(UnsafeModelOutput):
+        ensure_safe_output(fragment)
 
 
 def test_tool_arguments_and_custom_system_rules_are_checked():
