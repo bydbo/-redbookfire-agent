@@ -66,12 +66,33 @@ class TestToolsFor:
         assert TOOL_FETCH_URL not in names_of(TOOLS)
 
     def test_tools_for_returns_a_fresh_list(self) -> None:
-        """每次现算：调用方改返回值（或 monkeypatch 模块 `TOOLS`）不许串味。"""
+        """每次现算：往返回值里多加一条，不许活到下一次调用。"""
         first = tools_for(make_cfg(enabled=True))
         first.append({"type": "function", "function": {"name": "fake"}})
-        assert TOOL_FETCH_URL and "fake" not in names_of(
-            tools_for(make_cfg(enabled=True))
-        )
+        assert names_of(tools_for(make_cfg(enabled=True))) == [
+            *names_of(TOOLS),
+            TOOL_SEARCH_HOTSPOTS,
+            TOOL_FETCH_URL,
+        ]
+
+    def test_tools_for_deep_copies_schemas(self) -> None:
+        """就地改返回值里的**嵌套**字段，不许回流到模块常量（下一轮必须还是原值）。
+
+        `TOOLS` 的元素与 `TOOL_SCHEMA_*` 都是模块级 dict：浅拷贝等于把全局清单借给调用方。
+        """
+        original = TOOLS[0]["function"]["description"]
+        tools = tools_for(make_cfg(enabled=True))
+        tools[0]["function"]["description"] = "被调用方改坏了"
+        tools[-1]["function"]["parameters"]["properties"]["url"]["description"] = "被调用方改坏了"
+        off = tools_for(None)
+        off[0]["function"]["description"] = "被调用方改坏了"
+        assert TOOLS[0]["function"]["description"] == original
+        assert tools_for(make_cfg(enabled=True)) == [
+            *TOOLS,
+            TOOL_SCHEMA_SEARCH_HOTSPOTS,
+            TOOL_SCHEMA_FETCH_URL,
+        ]
+        assert tools_for(None) == list(TOOLS)
 
 
 class TestToolNames:

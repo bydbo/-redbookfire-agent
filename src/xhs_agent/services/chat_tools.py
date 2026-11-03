@@ -9,15 +9,16 @@
 
 口径：
 
-- **工具定义（`TOOLS`）是唯一来源，执行分派（`HANDLERS`）也在本文件**（S7.7a）：给模型的
-  function schema 与 name → handler 映射都集中在这里，`workflows/chat.py` 里不出现任何具体
-  工具名——「新增一个工具只改 `chat_tools.py` 一处」。prompt 契约管的是 `prompts/` 下的
-  prompt 正文；工具的 name/description/参数属于 API 协议，随代码走，不抄一份进 prompt；
+- **工具定义都在本文件，执行分派（`HANDLERS`）也在本文件**（S7.7a）：给模型的 function
+  schema 与 name → handler 映射都集中在这里——`TOOLS` 是默认清单，网页两件的 schema 是
+  下面的 `TOOL_SCHEMA_*`。`workflows/chat.py` 里不出现任何具体工具名——「新增一个工具只改
+  `chat_tools.py` 一处」。prompt 契约管的是 `prompts/` 下的 prompt 正文；工具的
+  name/description/参数属于 API 协议，随代码走，不抄一份进 prompt；
 - **清单按开关下发**（PR2）：`TOOLS` 是**默认清单**——`[web].enabled=false` 时 `tools_for(cfg)`
   返回的清单与它**逐项相等**，网页能力开启才追加；因此网页两件的 schema 放在 `TOOLS` 外面。
   `tool_names(cfg)` 跟着同一份清单走（图按它划分已知 / 未知工具），
-  `effective_max_rounds(cfg)` 在网页能力开启时把工具轮次抬到 `WEB_MAX_TOOL_ROUNDS`
-  ——「搜完再读、读完接着读」不是 3 轮能完成的；
+  `effective_max_rounds(cfg)` 在网页能力开启时把工具轮次提到**至少** `WEB_MAX_TOOL_ROUNDS`
+  （取 `max`：用户自己设得更大就按用户的）——「搜完再读、读完接着读」不是 3 轮能完成的；
 - **只读的有哪些**：`parse_image_clue`（图片只在内存里变成模型输入，不落盘不入库）、
   `search_materials`（只检索）、`read_run`（只读、不花钱）、`preview_element_coverage`
   （不调 embedding、不写稿、不落 runs）、`search_hotspots`（只发一次搜索请求，不花钱、
@@ -52,6 +53,7 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import json
 import logging
 import os
@@ -258,7 +260,8 @@ HIT_PREVIEW_LIMIT = 3
 # 网页能力开启后一轮最多几次工具调用：搜 → 读 → 接着读，`[chat]` 的默认 3 轮不够
 WEB_MAX_TOOL_ROUNDS = 8
 
-# 给模型的工具清单（OpenAI 兼容的 function schema）。**唯一来源**，别在别处再抄一份。
+# 给模型的**默认**工具清单（OpenAI 兼容的 function schema）。默认清单的唯一来源，别在别处再
+# 抄一份；网页两件默认不下发，schema 在下面 `TOOL_SCHEMA_*`，由 `tools_for` 按开关追加。
 # description 里写"什么时候用它"——prompt 的 03 Constraints 只写"能不能调、边界在哪"（prompt 契约 §一）。
 TOOLS: list[dict[str, Any]] = [
     {
@@ -2594,15 +2597,16 @@ def web_enabled(cfg: AppConfig) -> bool:
 def tools_for(cfg: AppConfig | None = None) -> list[dict[str, Any]]:
     """本轮下发给模型的工具清单：关闭态与 `TOOLS` **逐项相等**，开启才追加网页工具。
 
-    `cfg=None`（离线评测 / 还没接线的调用方）与关闭态同义。每次现算并返回新列表：
-    调用方改返回值、或用例 monkeypatch 模块 `TOOLS`，都不许串味。
+    `cfg=None`（离线评测 / 还没接线的调用方）与关闭态同义。每次现算并**深拷贝**：
+    `TOOLS` 的元素与 `TOOL_SCHEMA_*` 都是模块级 dict，浅拷贝等于把全局清单借给调用方
+    （就地改嵌套字段会回流，下一轮就发错了）。每轮一次 deepcopy 是微秒级成本。
     """
-    tools = list(TOOLS)
+    tools = copy.deepcopy(TOOLS)
     if cfg is None or not web_enabled(cfg):
         return tools
-    tools.append(TOOL_SCHEMA_SEARCH_HOTSPOTS)
+    tools.append(copy.deepcopy(TOOL_SCHEMA_SEARCH_HOTSPOTS))
     if cfg.web.fetch_enabled:
-        tools.append(TOOL_SCHEMA_FETCH_URL)
+        tools.append(copy.deepcopy(TOOL_SCHEMA_FETCH_URL))
     return tools
 
 
@@ -2615,7 +2619,7 @@ def tool_names(cfg: AppConfig | None = None) -> set[str]:
 
 
 def effective_max_rounds(cfg: AppConfig) -> int:
-    """一轮对话最多几次工具调用：网页能力开启时抬到 `WEB_MAX_TOOL_ROUNDS`，否则按 `[chat]`。
+    """一轮对话最多几次工具调用：网页能力开启时**至少** `WEB_MAX_TOOL_ROUNDS`，否则按 `[chat]`。
 
     取 `max(...)` 而不是写死 8：用户把 `[chat].max_tool_rounds` 调得更大时不许被压回去。
     """
