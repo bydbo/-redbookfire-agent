@@ -528,3 +528,70 @@ class TestWebToolContract:
         """分发表里有这两条：Task 7 的图按名字查 HANDLERS，查不到就永远调不动。"""
         assert HANDLERS[TOOL_SEARCH_HOTSPOTS] is chat_tools.search_hotspots
         assert HANDLERS[TOOL_FETCH_URL] is chat_tools.fetch_url
+
+class TestWebToolUnexpectedAdapterErrors:
+    """审查 I1：外层兜底 `except Exception` 是「绝不抛异常」在**非适配器异常**上的唯一实现。
+
+    dispatcher 对这些工具调用**不设 try**（`chat_turns.py` 只记 span 再 re-raise），
+    异常一旦逃逸就打到 `RetryPolicy(max_attempts=3)` 上重复付费——正是设计要防的事。
+    """
+
+    @pytest.mark.asyncio
+    async def test_unexpected_search_error_maps_to_failed(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(
+            chat_tools, "search_web", FakeSearch(error=RuntimeError("boom"))
+        )
+        ctx = make_ctx(enabled=True)
+        outcome = await chat_tools.search_hotspots(ctx, {"query": "露营"})
+        assert outcome.status == "failed"
+        assert "搜索失败" in outcome.error
+        assert ctx.cache.web_calls == 1        # 请求已经发出去了，配额照记
+        assert "露营" not in outcome.error      # 错误文案不带用户原文
+
+    @pytest.mark.asyncio
+    async def test_unexpected_fetch_error_maps_to_failed(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(
+            chat_tools, "fetch_readable", FakeFetch(error=RuntimeError("boom"))
+        )
+        ctx = make_ctx(enabled=True)
+        outcome = await chat_tools.fetch_url(ctx, {"url": "https://example.test/a"})
+        assert outcome.status == "failed"
+        assert "读取网页失败" in outcome.error
+        assert ctx.cache.web_calls == 1
+        assert outcome.payload == {}           # 失败不交半份 payload
+
+
+class TestWebToolArgumentBounds:
+    """审查 I1：参数边界分支（越界 / 负数）也要钉住，文案必须给出下一步。"""
+
+    @pytest.mark.asyncio
+    async def test_search_hotspots_rejects_out_of_range_count(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        search = FakeSearch([hit("https://example.test/a")])
+        monkeypatch.setattr(chat_tools, "search_web", search)
+        ctx = make_ctx(enabled=True)
+        for bad in (0, 11, "很多"):
+            outcome = await chat_tools.search_hotspots(ctx, {"query": "露营", "count": bad})
+            assert outcome.status == "failed", bad
+            assert "count" in outcome.error and "10" in outcome.error, bad
+        assert search.calls == []
+
+    @pytest.mark.asyncio
+    async def test_fetch_url_rejects_negative_start_index(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        fetch = FakeFetch()
+        monkeypatch.setattr(chat_tools, "fetch_readable", fetch)
+        ctx = make_ctx(enabled=True)
+        outcome = await chat_tools.fetch_url(
+            ctx, {"url": "https://example.test/a", "start_index": -1}
+        )
+        assert outcome.status == "failed"
+        assert "start_index" in outcome.error
+        assert "0" in outcome.error
+        assert fetch.calls == []
