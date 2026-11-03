@@ -30,7 +30,7 @@ Handler = Callable[[httpx.Request], httpx.Response]
 def make_cfg(**overrides) -> AppConfig:
     """默认 AppConfig + 指向假实例的 [web] 段；用例只覆盖自己关心的字段。"""
     cfg = AppConfig()
-    cfg.web = WebConfig(search_url=SEARXNG, **overrides)
+    cfg.web = WebConfig(**{"search_url": SEARXNG, **overrides})
     return cfg
 
 
@@ -199,10 +199,11 @@ class TestErrors:
 
     @pytest.mark.asyncio
     async def test_200_with_html_body_maps_to_schema_reason(self):
-        # 非法 format 名会 200 + HTML 静默降级：只判状态码会把空结果当成功
+        # 非法 format 名会 200 + HTML 静默降级。这里故意让 body 是**可解析的 JSON**：
+        # 只有 content-type 那道闸能拦住它——否则会被当成正常结果静默返回 0 命中
         client = client_for(
             lambda _request: httpx.Response(
-                200, text="<html><body>search</body></html>",
+                200, content=b'{"results": []}',
                 headers={"content-type": "text/html; charset=utf-8"}))
         try:
             with pytest.raises(WebSearchError) as excinfo:
@@ -210,6 +211,19 @@ class TestErrors:
         finally:
             await client.aclose()
         assert excinfo.value.reason == "schema"
+
+    @pytest.mark.asyncio
+    async def test_blank_search_url_maps_to_config_reason(self):
+        # WebConfig.search_url 默认就是空串：默认配置下最可能走到的一条路径，且不该发请求
+        calls: list[httpx.Request] = []
+        client = client_for(respond(payload()), calls)
+        try:
+            with pytest.raises(WebSearchError) as excinfo:
+                await search_web(client, make_cfg(search_url=""), "羽毛球", count=3)
+        finally:
+            await client.aclose()
+        assert excinfo.value.reason == "config"
+        assert calls == []
 
     @pytest.mark.asyncio
     async def test_bad_json_maps_to_schema_reason(self):
