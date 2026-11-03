@@ -56,7 +56,9 @@ proposal_id，供后续页显式撤回 / 替换；服务端保持候选待确认
 1. §02 Task 必须把它们写成**条件式**——「如果本轮工具清单里有搜索 / 读取类工具」才走搜索 / 读取
    这两步，清单里没有就跳过；**禁止**在正文里无条件断言这两个工具存在（关闭态下模型会去调一个
    本轮根本没收到的工具）。跳过后流程必须有出口：没有搜索类工具、用户也没给出具体热点时，问一句
-   「你想蹭哪条热点」，不得答成能力范围外；
+   「你想蹭哪条热点」，不得答成能力范围外；**§03.1 的"不在这套工具的能力范围内"是引号固定话术，
+   优先级高于叙述，触发条件又正好是"清单里没有对应工具"，所以必须在那里显式开例外**（「缺一个
+   可选工具」不算越界），否则固定话术会反噬 §02 的禁令；
 2. §03 的**轮次预算不写死数字**——实际值随开关变（`[chat].max_tool_rounds` 默认 3，网页开启时
    `chat_tools.effective_max_rounds` 至少 8），正文只写「以本轮系统说明为准」。
 
@@ -185,7 +187,7 @@ user   消息 = 具名 02 Task（渲染后，仅当前任务与数据）
   `scope_id` / `source_ref`）。来源分别是 `runs.context_snapshot`（worker 撰稿）与当轮
   会话状态（对话改稿）；两处必须使用同一筛选口径（session 全程 / 当前 topic / 已验证产物），
   不得在代码里临时拼另一份。旧调用方必须同时提供该变量，否则按 §四 缺变量报错。
-- **2026-10-28 输入边界修复**：统一升级十项 prompt 版本；当前资产版本为 `hotspot_clue` v2、`material_select` v2、`copy_draft` v3、`chat_supervisor` v5、`copy_revise` v3、`image_hotspot_clue` v5、`image_hotspot_clue_multi` v4、`material_tagging` v2、`context_extract` v2、`context_recover` v3。历史运行快照保留原版本。
+- **2026-10-28 输入边界修复**：统一升级十项 prompt 版本；该次升级后的资产版本为 `hotspot_clue` v2、`material_select` v2、`copy_draft` v3、`chat_supervisor` v5、`copy_revise` v3、`image_hotspot_clue` v5、`image_hotspot_clue_multi` v4、`material_tagging` v2、`context_extract` v2、`context_recover` v3。历史运行快照保留原版本。
 - **2026-11-03 网页工具条件式（`chat_supervisor` v5 → v6）**：§02 Task 第 1 条改成五步决策流程
   （已有热点文本 / 图片 → 直接走原有工具；笼统要热点且清单里有搜索类工具 → `search_hotspots`；
   只有候选摘要或用户贴了链接且清单里有读取类工具 → `fetch_url` 最多 2 次；选定一条 →
@@ -196,6 +198,8 @@ user   消息 = 具名 02 Task（渲染后，仅当前任务与数据）
   要让它按 §03 第 5 条问一句「你想蹭哪条热点」，并明确禁止答成「这件事不在这套工具的能力范围内」
   ——默认关闭下这是最高频的一句输入，缺了这个分支整条决策流程没有出口。同轮还校正了两处措辞：
   「选定一条热点」写明主语（用户点明的 / 用户认可的），以及删掉关闭态下并不存在的"候选"对象。
+  审阅又发现 §03.1 的固定话术会反噬 §02 的禁令（同一个触发条件、且引号话术粘性更强），已在该条
+  后补"唯一的例外是缺一个可选工具"，让「帮我找热点」继续走问句。
   不涉及占位符、段结构与能力清单，评测按 §六 的对话口径（`scripts/eval_chat_tools.py`）对
   `[web].enabled` 两臂各跑一遍归档。
 - 落地路径：列与迁移在 S3.9 完成；**仓储层写入（S3.4a）与 worker 接线（S3.4b）**分别承接——S3.1 已在 state / `RunResult` 里产出该字段，落库由 S3.4a 完成。

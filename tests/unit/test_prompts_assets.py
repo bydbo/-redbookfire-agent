@@ -190,6 +190,13 @@ class TestSupervisorWebToolWording:
         assert "你想蹭哪条热点" in task           # 走 §03.5 的问句，而不是拒绝
         assert "不要答成" in task                 # 明确禁止落到"不在这套工具的能力范围内"
 
+    def test_fixed_refusal_phrase_carves_out_the_missing_optional_tool(self) -> None:
+        """§03.1 固定话术的触发条件正是"清单里没有对应工具"——必须给关闭态留例外，否则反噬 §02。"""
+        constraints = prompt_tool.load("chat_supervisor").sections["constraints"]
+        assert "不在这套工具的能力范围内" in constraints      # 固定话术还在
+        assert "唯一的例外" in constraints
+        assert "缺一个可选工具" in constraints                # 少一个工具 ≠ 越界
+
     def test_no_phantom_candidate_reference(self) -> None:
         """关闭态根本没有候选，不能指示模型去转述一个不存在的对象。"""
         constraints = prompt_tool.load("chat_supervisor").sections["constraints"]
