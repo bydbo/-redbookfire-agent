@@ -500,7 +500,10 @@ def pass_metrics(cases: Sequence[dict[str, Any]]) -> dict[str, Any]:
     """一节用例的 `pass@1` / `pass@k`（k = `--repeat`）。
 
     `pass@1` = 至少成功 1 次的用例比例；`pass@k` = k 次全成功的用例比例。`repeat=1` 时两者
-    相等，等于改造前的通过率（历史报告可以直接对比）。空节不给 0%，由调用方决定要不要写。
+    相等，等于改造前的通过率（历史报告可以直接对比）。
+
+    **空输入返回 0%**（`_rate` 的口径），所以「这一节没跑」不能用它表达：调用方必须自己判空
+    （`main()` 用 `if items:` 挡掉，报告里就不出现这一段），否则报告会凭空多出一行 0%。
     """
     return {
         "cases": len(cases),
@@ -732,21 +735,25 @@ def judge(baseline: Sequence[dict[str, Any]], candidate: Sequence[dict[str, Any]
                          ("改写合规", _unstable(revise))):
         if names:
             findings.append(f"{label}重复跑结果不稳定（{', '.join(names)}）")
-    if not findings:
-        parts: list[str] = []
-        if baseline or candidate:
-            parts.append(f"工具选择 {cand_rate * 100:.0f}%")
-        if boundary:
-            parts.append(f"越界话术 {sum(1 for item in boundary if item['ok'])}/{len(boundary)}")
-        if multiturn:
-            parts.append(f"多轮 {sum(1 for item in multiturn if item['ok'])}/{len(multiturn)}")
-        if revise:
-            parts.append(f"改写合规 {sum(1 for item in revise if item['ok'])}/{len(revise)}")
-        tail = (f"每条用例重复 {repeat} 次、结果都稳定（pass@{repeat} 全过）。"
-                if repeat > 1 else "")
-        return ("**通过**：" + "、".join(parts) +
-                f"，轮级成本均在 {COST_LIMIT_CNY} 元/轮以内。" + tail)
-    return "**不达门槛 / 回退**：" + "；".join(findings) + "。"
+    if findings:
+        return "**不达门槛 / 回退**：" + "；".join(findings) + "。"
+    parts: list[str] = []
+    if baseline or candidate:
+        parts.append(f"工具选择 {cand_rate * 100:.0f}%")
+    if boundary:
+        parts.append(f"越界话术 {sum(1 for item in boundary if item['ok'])}/{len(boundary)}")
+    if multiturn:
+        parts.append(f"多轮 {sum(1 for item in multiturn if item['ok'])}/{len(multiturn)}")
+    if revise:
+        parts.append(f"改写合规 {sum(1 for item in revise if item['ok'])}/{len(revise)}")
+    if not parts:
+        # 一条用例都没跑：不许给绿色结论，更不许声明「结果都稳定」
+        return ("**未跑任何节**：没有任何一节产出用例结果，本次不给结论"
+                "（检查 `--suite` 与 `--skip-multiturn` 的组合）。")
+    tail = (f"每条用例重复 {repeat} 次、结果都稳定（pass@{repeat} 全过）。"
+            if repeat > 1 else "")
+    return ("**通过**：" + "、".join(parts) +
+            f"，轮级成本均在 {COST_LIMIT_CNY} 元/轮以内。" + tail)
 
 
 async def main() -> int:
@@ -767,9 +774,18 @@ async def main() -> int:
     if args.repeat < 1:
         print(f"[环境] --repeat 必须 ≥ 1（收到 {args.repeat}）", file=sys.stderr)
         return 1
+    if args.limit is not None and args.limit < 1:
+        print(f"[环境] --limit 必须 ≥ 1（收到 {args.limit}）；不要用 0 表示「不限」，不传就是跑全量",
+              file=sys.stderr)
+        return 1
     suites = selected_suites(args.suite)
     if args.skip_multiturn:
         suites.discard("multiturn")
+    if not suites:
+        # 例子：`--suite multiturn --skip-multiturn`。一条用例都不会跑，绝不能落一份「通过」报告
+        print("[环境] --suite 与 --skip-multiturn 组合下来没有可跑的节，本次不跑也不写报告",
+              file=sys.stderr)
+        return 1
 
     try:
         cfg: AppConfig = load_config()

@@ -192,6 +192,46 @@ class TestJudge:
         assert "**通过**" in verdict
 
 
+class TestCliGuards:
+    """参数组合不成立时必须报错退出，不能落一份看着"通过"的报告。"""
+
+    @pytest.mark.asyncio
+    async def test_empty_suites_exits_without_report(self, ev: Any,
+                                                     monkeypatch: pytest.MonkeyPatch,
+                                                     tmp_path: Path) -> None:
+        # `--suite multiturn --skip-multiturn` = 一节都不跑；跑之前就该退出
+        monkeypatch.setattr(sys, "argv", ["eval_chat_tools.py", "--suite", "multiturn",
+                                          "--skip-multiturn", "--out", str(tmp_path)])
+
+        assert await ev.main() == 1
+        assert list(tmp_path.iterdir()) == []      # 不写报告，才有机会被人发现
+
+    @pytest.mark.asyncio
+    async def test_repeat_below_one_exits(self, ev: Any,
+                                          monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(sys, "argv", ["eval_chat_tools.py", "--repeat", "0"])
+
+        assert await ev.main() == 1
+
+    @pytest.mark.asyncio
+    async def test_limit_zero_exits_instead_of_running_everything(self, ev: Any,
+                                                                  monkeypatch: pytest.MonkeyPatch) -> None:
+        # 改造前 `--limit 0` 被当成「不限」跑全量（再叠 --repeat 就是全量 ×N）
+        monkeypatch.setattr(sys, "argv", ["eval_chat_tools.py", "--limit", "0"])
+
+        assert await ev.main() == 1
+
+
+class TestJudgeWhenNothingRan:
+    def test_judge_does_not_claim_pass_without_results(self, ev: Any) -> None:
+        """四节全空 = 一条用例都没跑：不许给绿色结论，更不许说"结果都稳定"。"""
+        verdict = ev.judge([], [], [], [], [], repeat=3)
+
+        assert "**未跑任何节**" in verdict
+        assert "**通过**" not in verdict
+        assert "稳定" not in verdict
+
+
 class TestSuiteSelection:
     def test_all_expands_to_every_section(self, ev: Any) -> None:
         assert ev.selected_suites("all") == {"selection", "boundary", "multiturn", "revise"}
