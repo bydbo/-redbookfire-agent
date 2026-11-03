@@ -635,6 +635,24 @@ class TestToolsWiring:
         ]
 
     @pytest.mark.asyncio
+    async def test_disabled_web_keeps_the_configured_round_budget(
+        self, tmp_path: Path
+    ) -> None:
+        """D4 的另一半：网页**关闭**且不传实参时预算严格等于 [chat].max_tool_rounds（3）。"""
+        cfg = write_web_config(tmp_path, enabled=False)
+        assert chat_tools.effective_max_rounds(cfg) == 3  # 接线要跟随这个值，不能无条件 8
+        provider = ScriptedProvider(
+            [{"text": "", "tool_calls": [tool_call()]} for _ in range(4)]
+            + [{"text": "按现有结果收尾"}]
+        )
+        turn, provider, runner = await run(cfg, provider=provider)
+
+        assert len(runner.calls) == 3  # 第 4 次不再执行工具
+        assert provider.calls[3].tools is None  # 第 4 次调用已经不带工具
+        assert len(provider.calls) == 4
+        assert turn.reply  # 到上限也要给用户一段话
+
+    @pytest.mark.asyncio
     async def test_web_enabled_raises_the_round_budget(self, tmp_path: Path) -> None:
         """D4：网页开启时轮次预算取 effective_max_rounds(cfg)（默认 3 → 至少 8）。"""
         cfg = write_web_config(tmp_path)
