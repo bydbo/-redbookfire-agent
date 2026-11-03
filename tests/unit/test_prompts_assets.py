@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 import pytest
@@ -16,7 +17,7 @@ ALL_TASKS = (*AGENT_TASKS, "material_tagging", "image_hotspot_clue",
 PLACEHOLDER_MARKERS = ("待 S3.1 填写", "待填写")
 # 版本号只随内容变更递增（prompt 契约 §三 / §六）——钉住当前值，顺手改正文却忘了升版本会被挡下
 EXPECTED_VERSIONS = {"hotspot_clue": 2, "material_select": 2, "copy_draft": 3,
-                     "chat_supervisor": 5, "copy_revise": 3,
+                     "chat_supervisor": 6, "copy_revise": 3,
                      "image_hotspot_clue_multi": 4, "image_hotspot_clue": 5,
                      "material_tagging": 2, "context_extract": 2, "context_recover": 3}
 CONTRACT_PATH = (Path(__file__).resolve().parents[2]
@@ -146,3 +147,50 @@ class TestMultiImagePrompt:
     def test_output_schema_points_at_the_image_number(self):
         schema = prompt_tool.load("image_hotspot_clue_multi").sections["output_schema"]
         assert "图N" in schema and "evidence" in schema and "3–8" in schema
+
+class TestSupervisorWebToolWording:
+    """Task 8：v6 把网页工具写成条件式——`[web].enabled` 默认关闭，措辞必须与开关无关。"""
+
+    WEB_TOOL_NAMES = (chat_tools.TOOL_SEARCH_HOTSPOTS, chat_tools.TOOL_FETCH_URL)
+    # 提到网页工具的那一句必须自带条件词：否则关闭态下模型会去调一个清单里没有的工具
+    CONDITION_MARKERS = ("如果", "若", "即便", "清单里", "本轮工具", "没有这类工具")
+    _SENTENCE_RE = re.compile(r"[^。！？；]+")
+    _LIST_ITEM_RE = re.compile(r"^\s*(?:[（(]?\d+[)）.、]|\d+\.|[-*])\s")
+
+    def _text(self) -> str:
+        loaded = prompt_tool.load("chat_supervisor")
+        return "\n".join(loaded.sections[key] for key in prompt_tool.SECTION_KEYS)
+
+    def _sentences(self, text: str) -> list[str]:
+        """按句子切：markdown 的硬折行先接回上一行，只有列表项才算新起一句。"""
+        lines: list[str] = []
+        for line in text.splitlines():
+            if line.strip() and lines and lines[-1] and not self._LIST_ITEM_RE.match(line):
+                lines[-1] += line.strip()
+            else:
+                lines.append(line.strip())
+        return [chunk.strip() for chunk in self._SENTENCE_RE.findall("\n".join(lines))
+                if chunk.strip()]
+
+    def test_chat_supervisor_version_is_v6(self) -> None:
+        assert prompt_tool.load("chat_supervisor").version == 6
+
+    def test_prompt_mentions_web_tools_conditionally(self) -> None:
+        assert "如果本轮工具清单里" in self._text()
+        for sentence in self._sentences(self._text()):
+            if not any(name in sentence for name in self.WEB_TOOL_NAMES):
+                continue
+            assert any(marker in sentence for marker in self.CONDITION_MARKERS), \
+                f"这句无条件断言了网页工具：{sentence}"
+
+    def test_prompt_has_no_hardcoded_round_budget(self) -> None:
+        constraints = prompt_tool.load("chat_supervisor").sections["constraints"]
+        assert "以本轮系统说明为准" in constraints
+        for hardcoded in ("默认 3 次", "默认3次", "8 次", "8次", "3 轮", "8 轮"):
+            assert hardcoded not in self._text(), f"轮次预算写死了：{hardcoded}"
+
+    def test_v6_documents_the_three_web_tool_constraints(self) -> None:
+        constraints = prompt_tool.load("chat_supervisor").sections["constraints"]
+        assert "候选" in constraints and "不是事实" in constraints   # 搜索只是候选，不是事实
+        assert "不得自行构造 URL" in constraints                     # 不许自己拼链接
+        assert "天气" in constraints                                 # 通用查询不归网页工具

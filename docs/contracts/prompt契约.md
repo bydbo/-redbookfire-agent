@@ -50,6 +50,19 @@ proposal_id，供后续页显式撤回 / 替换；服务端保持候选待确认
 | `preview_element_coverage` | 要素拆解 + 字面通道覆盖估算与补拍建议 | 无（只读库、不调 embedding、不落 `runs`） | `hotspot_clue` | 要素、覆盖率、缺口与补拍建议 |
 | `revise_draft` | 按用户要求改写某次运行已产出的初稿（`run_id` 可省：默认本会话最近一次运行） | **有**：花一次模型钱；**不写库**（run 的初稿快照不动） | `copy_revise` | `refused` + 理由，或改后初稿 |
 
+**网页工具的条件式口径（`chat_supervisor` v6 起）**：`search_hotspots` / `fetch_url` 是否随本轮
+`tools` 下发由开关 `[web].enabled` 决定（**默认关闭**），而 prompt 只有一份。所以这两条规则同时成立：
+
+1. §02 Task 必须把它们写成**条件式**——「如果本轮工具清单里有搜索 / 读取类工具」才走搜索 / 读取
+   这两步，清单里没有就跳过；**禁止**在正文里无条件断言这两个工具存在（关闭态下模型会去调一个
+   本轮根本没收到的工具）；
+2. §03 的**轮次预算不写死数字**——实际值随开关变（`[chat].max_tool_rounds` 默认 3，网页开启时
+   `chat_tools.effective_max_rounds` 至少 8），正文只写「以本轮系统说明为准」。
+
+本口径只**点名**工具，不复制 schema（schema 仍只在 `services/chat_tools.py`）。措辞由
+`tests/unit/test_prompts_assets.py::TestSupervisorWebToolWording` 钉住；开关两臂的对照按 §六 的
+对话评测（`scripts/eval_chat_tools.py`）跑，不靠单元测试代替真模型效果证据。
+
 **工具类 prompt 的控制字段（S7.8 起）**：工具类 prompt 允许在最外层带**控制字段**——用来表达
 "这次不产出领域对象"（例如 `copy_revise` 的 `refused` / `reason`）。领域字段仍必须引用数据契约 /
 API 契约里的既有 schema，不得自造字段（§二 05 Output Schema 与 §五 的"不新造字段"说的是这一层）。
@@ -171,7 +184,14 @@ user   消息 = 具名 02 Task（渲染后，仅当前任务与数据）
   `scope_id` / `source_ref`）。来源分别是 `runs.context_snapshot`（worker 撰稿）与当轮
   会话状态（对话改稿）；两处必须使用同一筛选口径（session 全程 / 当前 topic / 已验证产物），
   不得在代码里临时拼另一份。旧调用方必须同时提供该变量，否则按 §四 缺变量报错。
-- **2026-10-28 输入边界修复**：统一升级十项 prompt 版本；当前资产版本为 `hotspot_clue` v2、`material_select` v2、`copy_draft` v3、`chat_supervisor` v5、`copy_revise` v3、`image_hotspot_clue` v5、`image_hotspot_clue_multi` v4、`material_tagging` v2、`context_extract` v2、`context_recover` v3。历史运行快照保留原版本。
+- **2026-10-28 输入边界修复**：统一升级十项 prompt 版本；当前资产版本为 `hotspot_clue` v2、`material_select` v2、`copy_draft` v3、`chat_supervisor` v6、`copy_revise` v3、`image_hotspot_clue` v5、`image_hotspot_clue_multi` v4、`material_tagging` v2、`context_extract` v2、`context_recover` v3。历史运行快照保留原版本。
+- **2026-11-03 网页工具条件式（`chat_supervisor` v5 → v6）**：§02 Task 第 1 条改成五步决策流程
+  （已有热点文本 / 图片 → 直接走原有工具；笼统要热点且清单里有搜索类工具 → `search_hotspots`；
+  只有候选摘要或用户贴了链接且清单里有读取类工具 → `fetch_url` 最多 2 次；选定一条 →
+  `run_hotspot_analysis`，要微调 → `revise_draft`；结论够用就直接作答），两个网页工具一律带条件；
+  §03 新增三条约束（搜索结果只是候选不是事实、通用信息查询不归网页工具、不得自行构造 URL），并把
+  轮次预算改成「以本轮系统说明为准」。不涉及占位符、段结构与能力清单，评测按 §六 的对话口径
+  （`scripts/eval_chat_tools.py`）对 `[web].enabled` 两臂各跑一遍归档。
 - 落地路径：列与迁移在 S3.9 完成；**仓储层写入（S3.4a）与 worker 接线（S3.4b）**分别承接——S3.1 已在 state / `RunResult` 里产出该字段，落库由 S3.4a 完成。
 
 ## 六、变更流程与准入门槛
