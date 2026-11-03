@@ -20,7 +20,7 @@ from typing import Any
 
 import pytest
 
-from xhs_agent.config import AppConfig, WebConfig
+from xhs_agent.config import AppConfig, ConfigError, WebConfig
 from xhs_agent.services import chat_tools
 from xhs_agent.services.chat_tools import TOOL_FETCH_URL, TOOL_SEARCH_HOTSPOTS, TOOLS
 
@@ -328,6 +328,13 @@ class TestRender:
 
         assert "evals/chat/cases-v2.json" in markdown
 
+    def test_render_without_cases_key_still_works(self, ev: Any) -> None:
+        """`cases` 是本次新加的字段：加字段之前落盘的报告 JSON 没有它，二次渲染不许 KeyError。"""
+        report = self.make_report(ev, repeat=1)
+        del report["cases"]
+
+        assert "evals/chat/cases.json" in ev.render_markdown(report)
+
 
 class TestCasesV2:
     """v2 用例集：v1 的 28 条**逐字**保留 + 新增 5 条（v1 文件按 AGENTS.md §2.3 冻结不动）。"""
@@ -376,6 +383,40 @@ class TestCasesFlag:
         """相对路径按工程根解析（脚本里其它 git 操作也是这个口径）。"""
         assert ev.resolve_cases_path("evals/chat/cases-v2.json") == CASES_V2_PATH
         assert ev.resolve_cases_path(str(CASES_V2_PATH)) == CASES_V2_PATH
+
+    def test_cases_flag_rejects_empty_path(self, ev: Any) -> None:
+        """`--cases ""` 不许静默回落 v1：分不清是「要默认」还是「变量没展开」。"""
+        with pytest.raises(ConfigError, match="空路径"):
+            ev.resolve_cases_path("")
+
+    @pytest.mark.asyncio
+    async def test_main_rejects_empty_cases_path(self, ev: Any,
+                                                 monkeypatch: pytest.MonkeyPatch,
+                                                 tmp_path: Path) -> None:
+        def boom(path: Path) -> Any:
+            raise AssertionError("空路径应该在读用例之前就被拒绝")
+
+        monkeypatch.setattr(ev, "load_config", lambda: SimpleNamespace(
+            llm=SimpleNamespace(resolved_key=lambda: "fake-key")))
+        monkeypatch.setattr(ev, "load_cases", boom)
+        monkeypatch.setattr(sys, "argv", ["eval_chat_tools.py", "--out", str(tmp_path),
+                                          "--cases", ""])
+
+        assert await ev.main() == 1
+        assert list(tmp_path.iterdir()) == []
+
+
+class TestLoadCasesErrors:
+    """`--cases` 之后输入面变大：坏路径一律给 `[环境] …` + 退出码 1，不抛原始 OSError。"""
+
+    def test_missing_file_becomes_config_error(self, ev: Any) -> None:
+        with pytest.raises(ConfigError, match="找不到"):
+            ev.load_cases(EVALS_CHAT_DIR / "nope.json")
+
+    def test_directory_becomes_config_error(self, ev: Any) -> None:
+        """指到目录时 Windows 抛 PermissionError、Linux 抛 IsADirectoryError，都是 OSError。"""
+        with pytest.raises(ConfigError, match="读不了"):
+            ev.load_cases(EVALS_CHAT_DIR)
 
     @pytest.mark.asyncio
     async def test_main_reads_the_given_cases_file(self, ev: Any,

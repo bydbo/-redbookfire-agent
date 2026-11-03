@@ -192,7 +192,7 @@ class ReviseCase:
 
 @dataclass
 class ChatCases:
-    """`evals/chat/cases.json` 的解析结果。"""
+    """对话用例集的解析结果（默认 `evals/chat/cases.json`，或 `--cases` 指定的文件）。"""
 
     version: str = ""
     selection: list[SelectionCase] = field(default_factory=list)
@@ -202,13 +202,19 @@ class ChatCases:
 
 
 def resolve_cases_path(value: str | None) -> Path:
-    """`--cases` 的取值 → 用例集路径；不传就是 v1。
+    """`--cases` 的取值 → 用例集路径；不传（None）就是默认的 v1。
 
     相对路径按**工程根**解析——与脚本里其它 git 操作（`cwd=PROJECT_ROOT`）同一口径，
     这样在哪个目录下跑都读同一份用例，不会被 cwd 悄悄换掉。
+
+    **空串报错而不是回落默认值**：`--cases "$VAR"` 里变量没展开时，静默跑默认用例集等于
+    让人以为跑了 v2、实际跑的是 v1——报告会给出错误的版本结论。
     """
-    if not value:
+    if value is None:
         return CASES_PATH
+    if not value.strip():
+        raise ConfigError("--cases 收到空路径",
+                          "不传 --cases 就用默认用例集；要用别的就写明确路径")
     path = Path(value)
     return path if path.is_absolute() else PROJECT_ROOT / path
 
@@ -220,6 +226,9 @@ def load_cases(path: Path = CASES_PATH) -> ChatCases:
     except FileNotFoundError as exc:
         raise ConfigError(f"找不到对话用例集：{path}",
                           "确认该用例文件已入库（默认 evals/chat/cases.json）") from exc
+    except OSError as exc:      # 指到目录（Windows: PermissionError）/ 没读权限
+        raise ConfigError(f"读不了对话用例集：{path}（{exc.strerror or exc}）",
+                          "--cases 要指向一个 .json 文件") from exc
     except ValueError as exc:
         raise ConfigError(f"对话用例集不是合法 JSON：{exc}", str(path)) from exc
     if not isinstance(payload, dict):
@@ -690,7 +699,8 @@ def render_markdown(report: dict[str, Any]) -> str:
         f"# 对话层回归评测 · {report['date']}",
         "",
         prompt_line,
-        f"- 用例集：`{report['cases']}`（{report['cases_version']}）",
+        f"- 用例集：`{report.get('cases') or 'evals/chat/cases.json'}`"
+        f"（{report['cases_version']}）",
         f"- 范围：`--suite {report.get('suite') or 'all'}`，每条用例重复 {repeat} 次",
         f"- 说明：{report['note'] or '（未填写）'}",
         f"- 模型：`{report['model']}`；轮级成本门槛 ≤ {report['cost_limit']} 元/轮（含一次分析）",
@@ -820,8 +830,8 @@ async def main() -> int:
         print(f"[环境] 缺少文本模型密钥（{cfg.llm.api_key_env}），把密钥写进 config/.env 再跑",
               file=sys.stderr)
         return 1
-    cases_path = resolve_cases_path(args.cases)
     try:
+        cases_path = resolve_cases_path(args.cases)
         cases = load_cases(cases_path)
     except ConfigError as exc:
         print(f"[环境] {exc.message}", file=sys.stderr)
