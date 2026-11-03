@@ -183,6 +183,24 @@ class TestSupervisorWebToolWording:
             assert any(marker in sentence for marker in self.CONDITION_MARKERS), \
                 f"这句无条件断言了网页工具：{sentence}"
 
+    def test_off_state_branch_asks_instead_of_refusing(self) -> None:
+        """关闭态（`[web].enabled` 默认关）下「帮我找热点」必须有落点：问一句，别答成能力范围外。"""
+        task = prompt_tool.load("chat_supervisor").sections["task"]
+        assert "清单里没有这类工具" in task
+        assert "你想蹭哪条热点" in task           # 走 §03.5 的问句，而不是拒绝
+        assert "不要答成" in task                 # 明确禁止落到"不在这套工具的能力范围内"
+
+    def test_no_phantom_candidate_reference(self) -> None:
+        """关闭态根本没有候选，不能指示模型去转述一个不存在的对象。"""
+        constraints = prompt_tool.load("chat_supervisor").sections["constraints"]
+        assert "看到这几条候选" not in constraints
+        assert "当候选转述" in constraints        # 换成依附于"真有搜索结果"的表述
+
+    def test_selected_hotspot_has_an_explicit_subject(self) -> None:
+        """决策流程第 (4) 步的"已经选定"要写明是谁选定的，不能让模型自选后直接开跑。"""
+        task = prompt_tool.load("chat_supervisor").sections["task"]
+        assert "用户认可" in task
+
     def test_prompt_has_no_hardcoded_round_budget(self) -> None:
         constraints = prompt_tool.load("chat_supervisor").sections["constraints"]
         assert "以本轮系统说明为准" in constraints
