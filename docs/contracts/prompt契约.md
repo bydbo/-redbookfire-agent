@@ -91,20 +91,34 @@ API 契约里的既有 schema，不得自造字段（§二 05 Output Schema 与 
 
 **能力清单（S7.11 / v2）**：`prompts/chat_capabilities.json` 是越界处理的**唯一来源**，三类边界按固定
 顺序 `in_scope`（能力内）/ `out_of_scope_guidable`（边界外可引导）/ `compliance_red_line`（合规红线），
-每类含 `title` / `judge` / `reply`（固定话术）。`version` 是**数字**（当前 `2`），渲染时拼成 `v2`。
+每类含 `title` / `judge` / `reply`（固定话术）。`version` 是**数字**（当前 `2`），渲染时拼成 `v2`——
+写回字符串 `"v1"` 会渲染成 `vv1`，所以类型本身也被测试钉住。
 顶层另有 `web_clause`（`judge_append` / `reply_append`）：网页能力的那一段，**只在 `[web].enabled`
 开启时渲染**，是叠加在「能力内」之上的一项额外能力，**不新增第四类边界**（编号恒为三项）。
 `render_capabilities(payload=None, *, web_enabled=False)` 的口径：关闭态的输出与「同一份清单去掉
 `web_clause`」逐字相等，除版本号外**不留任何网页工具痕迹**，标题保持「三类边界」；开启态标题改成
-能涵盖网页能力的措辞（当前「三类边界 + 网页能力」）并在三类之后追加 `web_clause`。`chat_supervisor`
-的 §01 System 声明"边界以本轮下发的《能力清单》为准"，§03 Constraints 只写"按清单三类分别处理"与
-红线口径（含**约束作用于用户指令本身**）；清单正文经 §02 Task 注入。清单与 prompt 的一致性由
+能涵盖网页能力的措辞（当前「三类边界 + 网页能力」）并在三类之后追加 `web_clause`。开启态但清单里
+没有可用的 `web_clause`（缺失或两个键有空值）属于**格式不合契约，直接抛 `PromptError`**，不静默
+降级成一行空的「判定：」——与 `load_capabilities` 同口径。`chat_supervisor` 的 §01 System 声明"边界
+以本轮下发的《能力清单》为准"，§03 Constraints 只写"按清单三类分别处理"与红线口径（含**约束作用于
+用户指令本身**）；清单正文经 §02 Task 注入。清单与 prompt 的一致性由
 `tests/unit/test_prompts_assets.py::TestCapabilityCatalog` 与 `::TestCapabilityCatalogV2` 钉住。
 
-**缺一个可选工具不算越界**：`intro` 和 `in_scope` / `out_of_scope_guidable` 的 `judge` 都写明「没有
-搜索类工具属于缺少一个可选工具，不归边界外」，`out_of_scope_guidable` 的 `reply` 也标了适用前提。
+**`intro` 当前不参与渲染（已知缺口）**：`render_capabilities` 只输出「标题 + categories + 可选
+`web_clause`」，`intro` 全仓没有任何读取点。也就是说**改 `intro` 不会改变模型看到的内容**，运行时
+口径只由 `judge` / `reply` / `web_clause` 承载；`intro` 目前只是给读资产的人看的自述。要让它生效
+必须单独改渲染（会同时改变两种开关态的输出），不在 v2 范围内。
+
+**缺一个可选工具不算越界**：口径写在 `in_scope` / `out_of_scope_guidable` 的 `judge` 里——「没有
+搜索类工具属于缺少一个可选工具，不归边界外」，且 `out_of_scope_guidable` 的 `judge` 额外写明
+「用户只是笼统地说『帮我找热点』、而这一轮又没有搜索类工具时不属于这类，不要套用下面的固定话术」。
 否则关闭态下用户只说「帮我找热点」时，固定话术「这件事不在这套工具的能力范围内」会**重新获得
 授权**，与 `chat_supervisor` §02 / §03 的禁令互相打架——两处口径必须一起改。
+
+**`reply` 只放说给用户的原话**：条件是判定的东西，一律写进 `judge`（`chat_supervisor` §02 要求模型
+照 `reply` 说，往这个槽塞内部口径会原样念给用户）。`reply` 同时是 `tools/output_guard.py` 的
+**公开话术白名单**来源（`_public_windows`），写进去的内部口径会被一并放行、不再被输出检查拦住。
+由 `::TestCapabilityCatalogV2::test_guidable_reply_is_pure_user_facing_text` 钉住。
 
 ## 二、五段结构
 

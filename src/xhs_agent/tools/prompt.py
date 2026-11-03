@@ -227,11 +227,19 @@ def render_capabilities(payload: dict[str, Any] | None = None, *,
     `web_enabled`（Task 9）只在本轮**下发了网页工具**时为真：标题改成能涵盖网页能力的措辞，
     并在三类边界之后追加 `web_clause`——它是叠加在「能力内」之上的一项额外能力，**不新增
     第四类边界**（编号恒为三项）。关闭态与「同一份清单去掉 `web_clause`」逐字相等，除版本号
-    外不留任何网页工具痕迹；标题也保持原样。
+    外不留任何网页工具痕迹；标题也保持原样。开启态但清单里没有可用的 `web_clause` 属于格式
+    不合契约，直接抛 `PromptError`（与 `load_capabilities` 同口径，不静默降级成空判定）。
     """
     data = payload if payload is not None else load_capabilities()
     clause = data.get("web_clause")
-    if not (web_enabled and isinstance(clause, dict)):
+    if web_enabled:
+        if not isinstance(clause, dict):
+            raise PromptError(
+                "能力清单缺少 web_clause：网页能力已开启时必须给出 judge_append / reply_append")
+        for key in ("judge_append", "reply_append"):
+            if not str(clause.get(key) or "").strip():
+                raise PromptError(f"能力清单的 web_clause 缺少 {key}")
+    else:
         clause = None
     suffix = " + 网页能力" if clause else ""
     lines = [f"【能力清单 v{data.get('version', '')} · 三类边界{suffix}】"]

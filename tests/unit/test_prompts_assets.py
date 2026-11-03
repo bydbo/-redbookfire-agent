@@ -138,6 +138,9 @@ class TestCapabilityCatalogV2:
     def test_capabilities_v2_has_web_clause(self):
         payload = prompt_tool.load_capabilities()
         assert payload["version"] == 2
+        # 必须是数字：写回 "v1" 会让标题渲染成 "vv1"
+        assert isinstance(payload["version"], int)
+        assert not isinstance(payload["version"], bool)
         clause = payload["web_clause"]
         assert clause["judge_append"].strip()
         assert clause["reply_append"].strip()
@@ -185,9 +188,36 @@ class TestCapabilityCatalogV2:
         assert "不归边界外" in guidable["judge"]
         # 新增内容：通用信息查询不属于热点搜索
         assert "通用信息查询即使能搜到，也不属于热点搜索" in guidable["judge"]
-        # 计分卡本身也要挡住：固定话术不许被用到「帮我找热点」上
-        assert "不要用这一句" in guidable["reply"]
-        assert "「帮我找热点」" in guidable["reply"]
+        # 适用前提必须落在 judge（判定槽），不许塞进固定话术
+        assert "「帮我找热点」" in guidable["judge"]
+        assert "不要套用下面的固定话术" in guidable["judge"]
+
+    def test_guidable_reply_is_pure_user_facing_text(self):
+        """固定话术只能放说给用户的原话。
+
+        它同时是 `output_guard` 的公开话术白名单来源——一旦把内部口径写进这里，
+        等于给这次泄漏开绿灯（白名单会一起放行）。
+        """
+        reply = next(item for item in prompt_tool.load_capabilities()["categories"]
+                     if item["id"] == "out_of_scope_guidable")["reply"]
+        for marker in ("〔", "judge", "判定", "不归边界外", "搜索类工具", "帮我找热点"):
+            assert marker not in reply, marker
+        # 原话术逐字保留（既有断言与 output_guard 白名单都依赖它）
+        assert reply.startswith("这件事不在这套工具的能力范围内。")
+        assert "我能做的是" in reply
+
+    def test_render_web_enabled_without_clause_raises(self):
+        """开启态但清单里没有可用的 web_clause：抛错，不静默降级成空的「判定：」。"""
+        payload = {key: value for key, value in prompt_tool.load_capabilities().items()
+                   if key != "web_clause"}
+        with pytest.raises(prompt_tool.PromptError):
+            prompt_tool.render_capabilities(payload, web_enabled=True)
+        blank = dict(prompt_tool.load_capabilities())
+        blank["web_clause"] = {"judge_append": "  ", "reply_append": "话术"}
+        with pytest.raises(prompt_tool.PromptError):
+            prompt_tool.render_capabilities(blank, web_enabled=True)
+        # 关闭态不受影响：同一份没有 web_clause 的清单照常渲染
+        assert "三类边界" in prompt_tool.render_capabilities(payload, web_enabled=False)
 
     def test_initial_messages_passes_web_enabled(self):
         from xhs_agent.agents.supervisor import initial_messages
