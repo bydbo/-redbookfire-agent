@@ -1,7 +1,8 @@
-"""对话可调用的工具（S7.3 起；S7.7 加只读三件，S7.7b 加拆解预览，S7.8 加改写）。
+"""对话可调用的工具（S7.3 起；S7.7 加只读三件，S7.7b 加拆解预览，S7.8 加改写；PR2 加网页两件）。
 
 用途：把「对话层能做的事」写成工具——跑完整分析（第一批）、解析图片 / 查素材库 / 读历史运行
-      （S7.7 只读三件）、预览爆点要素与缺口（S7.7b）、改写文案（S7.8）。
+      （S7.7 只读三件）、预览爆点要素与缺口（S7.7b）、改写文案（S7.8）、搜热点 / 读网页
+      （PR2 的 `search_hotspots` / `fetch_url`，默认不下发）。
 输入：`ToolContext`（配置 / 会话 / 投递器 / 文本模型 caller / 可注入的连接池与 sleep）+ 工具参数 dict。
 输出：`ToolOutcome`（status / payload / steps / error / prompt_versions / 用量）——payload 既喂回
       给模型，也落进 `chat_messages.tool_calls`。
@@ -12,10 +13,17 @@
   function schema 与 name → handler 映射都集中在这里，`workflows/chat.py` 里不出现任何具体
   工具名——「新增一个工具只改 `chat_tools.py` 一处」。prompt 契约管的是 `prompts/` 下的
   prompt 正文；工具的 name/description/参数属于 API 协议，随代码走，不抄一份进 prompt；
+- **清单按开关下发**（PR2）：`TOOLS` 是**默认清单**——`[web].enabled=false` 时 `tools_for(cfg)`
+  返回的清单与它**逐项相等**，网页能力开启才追加；因此网页两件的 schema 放在 `TOOLS` 外面。
+  `tool_names(cfg)` 跟着同一份清单走（图按它划分已知 / 未知工具），
+  `effective_max_rounds(cfg)` 在网页能力开启时把工具轮次抬到 `WEB_MAX_TOOL_ROUNDS`
+  ——「搜完再读、读完接着读」不是 3 轮能完成的；
 - **只读的有哪些**：`parse_image_clue`（图片只在内存里变成模型输入，不落盘不入库）、
   `search_materials`（只检索）、`read_run`（只读、不花钱）、`preview_element_coverage`
-  （不调 embedding、不写稿、不落 runs）。有副作用的只有 `run_hotspot_analysis`（投 job）
-  与 `revise_draft`（花一次模型钱，但**不写库**——run 的初稿快照不动）；
+  （不调 embedding、不写稿、不落 runs）、`search_hotspots`（只发一次搜索请求，不花钱、
+  不写库）、`fetch_url`（只读一个公网页，受 SSRF 校验与 robots 约束，不落盘）。
+  有副作用的只有 `run_hotspot_analysis`（投 job）与 `revise_draft`（花一次模型钱，
+  但**不写库**——run 的初稿快照不动）；
 - **一轮内不重复付费**：`ToolContext.cache` 按「热点原文」缓存拆解结果、按「附件路径」缓存
   图片解析结果，所以「先预览再检索」「先解析图片再跑分析」都只付一次模型钱；
 - **`run_id` 可省**（`read_run` / `revise_draft`）：不传就落到本会话**最近一次**运行产出的
@@ -37,7 +45,8 @@
   （S6.6 的「图片解析不计成本」临时口径作废，单价在 `[vision]`）；
   分析工具的用量取那次 run 的 `totals`；`read_run` 不花钱；
 - 参数不合法 / 上游失败一律返回 `status=failed` + 一句能直接回给用户的原因，不抛异常
-  （抛出去会触发节点重试，可能重复付费）。
+  （抛出去会触发节点重试，可能重复付费）。网页两件同口径：搜索实例不通、页面抓不到、
+  robots 拒绝、本轮调用次数用完，都只是 `failed` + 中文原因，既不抛也不静默降级。
 """
 
 from __future__ import annotations
@@ -228,6 +237,9 @@ TOOL_SEARCH_MATERIALS = "search_materials"
 TOOL_READ_RUN = "read_run"
 TOOL_PREVIEW_COVERAGE = "preview_element_coverage"
 TOOL_REVISE_DRAFT = "revise_draft"
+# 网页两件（PR2）：schema 在 `TOOLS` 之外，由 `tools_for` 按 `[web]` 开关追加
+TOOL_SEARCH_HOTSPOTS = "search_hotspots"
+TOOL_FETCH_URL = "fetch_url"
 
 logger = logging.getLogger("xhs_agent.chat_tools")
 
@@ -243,6 +255,8 @@ MAX_TOPK = 20
 CANDIDATE_PREVIEW_LIMIT = 8
 TAG_PREVIEW_LIMIT = 6
 HIT_PREVIEW_LIMIT = 3
+# 网页能力开启后一轮最多几次工具调用：搜 → 读 → 接着读，`[chat]` 的默认 3 轮不够
+WEB_MAX_TOOL_ROUNDS = 8
 
 # 给模型的工具清单（OpenAI 兼容的 function schema）。**唯一来源**，别在别处再抄一份。
 # description 里写"什么时候用它"——prompt 的 03 Constraints 只写"能不能调、边界在哪"（prompt 契约 §一）。
@@ -421,6 +435,69 @@ TOOLS: list[dict[str, Any]] = [
 ]
 
 
+# 网页工具的 function schema（PR2）：**默认不下发**，由 `tools_for(cfg)` 按 `[web].enabled` /
+# `fetch_enabled` 追加。放在 `TOOLS` 外面，是因为 `TOOLS` 就是「关闭态下发的清单」。
+# description 就是 prompt：模型靠它决定该不该调、越界时怎么拒。
+TOOL_SCHEMA_SEARCH_HOTSPOTS: dict[str, Any] = {
+    "type": "function",
+    "function": {
+        "name": TOOL_SEARCH_HOTSPOTS,
+        "description": (
+            "按方向搜当天的热点候选（返回标题 / 链接 / 摘要，不打开页面）。用户说「帮我找找最近"
+            "有什么能蹭的热点」「这个方向最近在聊什么」时调用它。只用于发现**可以蹭**的热点；"
+            "不用于天气、新闻、百科、股价等通用信息查询。搜索结果只是候选、不是事实：要写进"
+            "正文的标题与数字，得再用读网页的工具核过。"
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "搜索用的一句话（1–80 字）：用户想找什么方向的热点。整理用户"
+                    "原话即可，不要堆关键词，也不要自己编时间范围。",
+                },
+                "count": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 10,
+                    "description": "返回几条候选（1–10），默认 5。用户要「多看几条」时再改。",
+                },
+            },
+            "required": ["query"],
+        },
+    },
+}
+
+TOOL_SCHEMA_FETCH_URL: dict[str, Any] = {
+    "type": "function",
+    "function": {
+        "name": TOOL_FETCH_URL,
+        "description": (
+            "打开一个网页，取回正文（去掉导航 / 广告，超长会截断）。搜索摘要不足以判断、或用户"
+            "贴了链接想让你看内容时调用它。只读取搜索结果里给出的链接，或用户直接贴出的链接；"
+            "不要自己拼 URL。内容被截断时用 `start_index` 接着读。"
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "url": {
+                    "type": "string",
+                    "description": "要读的网页地址：必须是 `http://` 或 `https://` 开头的完整"
+                    "链接，从搜索结果或用户消息里原样取，不要拼接。",
+                },
+                "start_index": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "description": "从正文第几个字符开始读，默认 0。上一段结果标了截断"
+                    "（truncated）时，用它接着读后面那段。",
+                },
+            },
+            "required": ["url"],
+        },
+    },
+}
+
+
 class ProgressFn(Protocol):
     """工具进度回调：`(中文标签, done, total)`；R3 起可带结构化 `update`。
 
@@ -463,6 +540,12 @@ class ToolCache:
     clues: dict[str, ClueRecord] = field(default_factory=dict)
     image_clues: dict[str, tuple[ImageClueParse, int]] = field(default_factory=dict)
     image_generations: dict[str, str] = field(default_factory=dict)
+    # 网页两件（PR2）：命中缓存不重复请求、也不计调用次数（消费方见 Task 6 的 handler）
+    searches: dict[str, list[dict[str, Any]]] = field(default_factory=dict)  # 键：query
+    pages: dict[tuple[str, int], dict[str, Any]] = field(default_factory=dict)  # 键：(url, start_index)
+    seen_urls: set[str] = field(default_factory=set)  # 本轮搜到的 url：区分「用户点名」与「自主调用」
+    robots: dict[str, Any] = field(default_factory=dict)  # 键：host（robots 解析器）
+    web_calls: int = 0  # 本轮网页工具调用计数（缓存命中不算）
 
 
 @dataclass
@@ -2484,6 +2567,8 @@ def tool_result_note(outcome: ToolOutcome) -> str:
 
 # ---------- 分发表（S7.7a） ----------
 # **加工具只改这个文件**：① 上面 `TOOLS` 加一条 function schema；② 这里加一条 name → handler 映射。
+# 网页两件（PR2）是例外：schema 在 `TOOLS` 外面的 `TOOL_SCHEMA_*`（由 `tools_for` 按开关追加），
+# 但 name → handler 映射照常加在这张表里。
 # 对话图（`workflows/chat.py`）按 `tool_names()` 做已知/未知划分、按名字调 handler，
 # 自身不出现任何具体工具名——有源码扫描用例（`tests/unit/test_chat_graph.py`）钉住这条。
 
@@ -2497,6 +2582,44 @@ HANDLERS: dict[str, ToolHandler] = {
 }
 
 
-def tool_names() -> set[str]:
-    """`TOOLS` 里声明的工具名集合（每次现算：图里读模块属性，注册假工具也能被发现）。"""
-    return {str(item["function"]["name"]) for item in TOOLS}
+def web_enabled(cfg: AppConfig) -> bool:
+    """网页能力是否下发给对话 agent：**只看总开关，不看密钥**。
+
+    私有 SearXNG 无鉴权，密钥为空不影响功能（《配置契约》§3.14）；把密钥当启用前提会让
+    无鉴权实例永远开不起来。
+    """
+    return bool(cfg.web.enabled)
+
+
+def tools_for(cfg: AppConfig | None = None) -> list[dict[str, Any]]:
+    """本轮下发给模型的工具清单：关闭态与 `TOOLS` **逐项相等**，开启才追加网页工具。
+
+    `cfg=None`（离线评测 / 还没接线的调用方）与关闭态同义。每次现算并返回新列表：
+    调用方改返回值、或用例 monkeypatch 模块 `TOOLS`，都不许串味。
+    """
+    tools = list(TOOLS)
+    if cfg is None or not web_enabled(cfg):
+        return tools
+    tools.append(TOOL_SCHEMA_SEARCH_HOTSPOTS)
+    if cfg.web.fetch_enabled:
+        tools.append(TOOL_SCHEMA_FETCH_URL)
+    return tools
+
+
+def tool_names(cfg: AppConfig | None = None) -> set[str]:
+    """`tools_for(cfg)` 里声明的工具名集合（每次现算：图里读模块属性，注册假工具也能被发现）。
+
+    无参 = 全量 = `TOOLS` 的名字（S7.7a 起的旧口径）；传 `cfg` 时跟着开关走。
+    """
+    return {str(item["function"]["name"]) for item in tools_for(cfg)}
+
+
+def effective_max_rounds(cfg: AppConfig) -> int:
+    """一轮对话最多几次工具调用：网页能力开启时抬到 `WEB_MAX_TOOL_ROUNDS`，否则按 `[chat]`。
+
+    取 `max(...)` 而不是写死 8：用户把 `[chat].max_tool_rounds` 调得更大时不许被压回去。
+    """
+    rounds = int(cfg.chat.max_tool_rounds)
+    if web_enabled(cfg):
+        return max(rounds, WEB_MAX_TOOL_ROUNDS)
+    return rounds
