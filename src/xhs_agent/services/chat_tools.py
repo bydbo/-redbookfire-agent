@@ -16,7 +16,7 @@
   name/description/参数属于 API 协议，随代码走，不抄一份进 prompt；
 - **清单按开关下发**（PR2）：`TOOLS` 是**默认清单**——`[web].enabled=false` 时 `tools_for(cfg)`
   返回的清单与它**逐项相等**，网页能力开启才追加；因此网页两件的 schema 放在 `TOOLS` 外面。
-  `tool_names(cfg)` 跟着同一份清单走（图按它划分已知 / 未知工具），
+  `tool_names(cfg)` 跟着同一份清单走（图按**本轮完整清单**划分已知 / 未知工具），
   `effective_max_rounds(cfg)` 在网页能力开启时把工具轮次提到**至少** `WEB_MAX_TOOL_ROUNDS`
   （取 `max`：用户自己设得更大就按用户的）——「搜完再读、读完接着读」不是 3 轮能完成的；
 - **只读的有哪些**：`parse_image_clue`（图片只在内存里变成模型输入，不落盘不入库）、
@@ -2890,8 +2890,9 @@ def tool_result_note(outcome: ToolOutcome) -> str:
 # **加工具只改这个文件**：① 上面 `TOOLS` 加一条 function schema；② 这里加一条 name → handler 映射。
 # 网页两件（PR2）是例外：schema 在 `TOOLS` 外面的 `TOOL_SCHEMA_*`（由 `tools_for` 按开关追加），
 # 但 name → handler 映射照常加在这张表里。
-# 对话图（`workflows/chat.py`）按 `tool_names()` 做已知/未知划分、按名字调 handler，
-# 自身不出现任何具体工具名——有源码扫描用例（`tests/unit/test_chat_graph.py`）钉住这条。
+# 对话图（`workflows/chat.py`）按**本轮清单**（`tools_for(cfg)` 的结果）做已知/未知划分、
+# 按名字调 handler，自身不出现任何具体工具名——有源码扫描用例
+# （`tests/unit/test_chat_graph.py`）钉住这条，扫描范围是默认名 ∪ 网页两名。
 
 HANDLERS: dict[str, ToolHandler] = {
     TOOL_RUN_ANALYSIS: run_hotspot_analysis,
@@ -2931,9 +2932,12 @@ def tools_for(cfg: AppConfig | None = None) -> list[dict[str, Any]]:
 
 
 def tool_names(cfg: AppConfig | None = None) -> set[str]:
-    """`tools_for(cfg)` 里声明的工具名集合（每次现算：图里读模块属性，注册假工具也能被发现）。
+    """`tools_for(cfg)` 里声明的工具名集合（每次现算：读模块属性而不是导入时快照，
+    monkeypatch 换掉 `TOOLS` 也能被发现）。
 
-    无参 = 全量 = `TOOLS` 的名字（S7.7a 起的旧口径）；传 `cfg` 时跟着开关走。
+    图**只在构图时**读一次清单（`run_turn` 把 `tools_for(cfg)` 传给 `_build_graph`）；本函数
+    是给图外调用方（测试 / 评测 / 边界用例）用的同一口径。无参 = 全量 = `TOOLS` 的名字
+    （S7.7a 起的旧口径）；传 `cfg` 时跟着开关走。
     """
     return {str(item["function"]["name"]) for item in tools_for(cfg)}
 
