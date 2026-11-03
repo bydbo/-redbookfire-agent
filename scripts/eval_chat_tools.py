@@ -761,11 +761,11 @@ async def main() -> int:
     parser.add_argument("--baseline", default="HEAD",
                         help="基线臂的 git ref（默认 HEAD；取该 ref 的 chat_supervisor.md）")
     parser.add_argument("--limit", type=int, default=None,
-                        help="只跑前 N 条工具选择用例（冒烟用）")
+                        help="只跑前 N 条工具选择用例（冒烟用；必须 ≥ 1，不传 = 全量）")
     parser.add_argument("--suite", choices=("all", *SUITES), default="all",
                         help="只跑某一节（默认 all：四节都跑）")
     parser.add_argument("--repeat", type=int, default=1,
-                        help="每条用例重复跑 N 次（默认 1），报告给出 pass@1 / pass@N")
+                        help="每条用例重复跑 N 次（默认 1，必须 ≥ 1），报告给出 pass@1 / pass@N")
     parser.add_argument("--skip-multiturn", action="store_true",
                         help="跳过最贵的多轮那一节（等价于 --suite 里去掉 multiturn）")
     parser.add_argument("--out", default=str(REPORTS_DIR), help="报告输出目录")

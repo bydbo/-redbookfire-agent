@@ -192,14 +192,33 @@ class TestJudge:
         assert "**通过**" in verdict
 
 
+@pytest.fixture
+def config_never_loaded(ev: Any, monkeypatch: pytest.MonkeyPatch) -> None:
+    """让 `load_config()` 一旦被调用就炸：证明参数 guard 在加载配置**之前**就退出了。
+
+    这样钉是因为：CI 没有密钥，真 `load_config()` 后面的密钥检查同样会 `return 1`——不钉死"没走到配置"，
+    这些用例在 CI 里会**恒绿**，guard 被回滚也发现不了（本机有密钥时才红，等于靠环境运气）。
+    """
+
+    def _boom() -> Any:
+        raise AssertionError("参数 guard 应该在 load_config() 之前退出")
+
+    monkeypatch.setattr(ev, "load_config", _boom)
+
+
 class TestCliGuards:
-    """参数组合不成立时必须报错退出，不能落一份看着"通过"的报告。"""
+    """参数组合不成立时必须报错退出，不能落一份看着"通过"的报告。
+
+    三条用例都传 `--out tmp_path`：万一 guard 被回滚，最坏也只是在临时目录里跑，
+    绝不去写仓库的 `evals/reports/`（那里一旦被污染，diff 都难查）。
+    """
 
     @pytest.mark.asyncio
     async def test_empty_suites_exits_without_report(self, ev: Any,
                                                      monkeypatch: pytest.MonkeyPatch,
+                                                     config_never_loaded: None,
                                                      tmp_path: Path) -> None:
-        # `--suite multiturn --skip-multiturn` = 一节都不跑；跑之前就该退出
+        # `--suite multiturn --skip-multiturn` = 一节都不跑；跑到配置之前就该退出
         monkeypatch.setattr(sys, "argv", ["eval_chat_tools.py", "--suite", "multiturn",
                                           "--skip-multiturn", "--out", str(tmp_path)])
 
@@ -208,18 +227,26 @@ class TestCliGuards:
 
     @pytest.mark.asyncio
     async def test_repeat_below_one_exits(self, ev: Any,
-                                          monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setattr(sys, "argv", ["eval_chat_tools.py", "--repeat", "0"])
+                                          monkeypatch: pytest.MonkeyPatch,
+                                          config_never_loaded: None,
+                                          tmp_path: Path) -> None:
+        monkeypatch.setattr(sys, "argv", ["eval_chat_tools.py", "--repeat", "0",
+                                          "--out", str(tmp_path)])
 
         assert await ev.main() == 1
+        assert list(tmp_path.iterdir()) == []
 
     @pytest.mark.asyncio
-    async def test_limit_zero_exits_instead_of_running_everything(self, ev: Any,
-                                                                  monkeypatch: pytest.MonkeyPatch) -> None:
+    async def test_limit_zero_exits_instead_of_running_everything(
+        self, ev: Any, monkeypatch: pytest.MonkeyPatch, config_never_loaded: None,
+        tmp_path: Path,
+    ) -> None:
         # 改造前 `--limit 0` 被当成「不限」跑全量（再叠 --repeat 就是全量 ×N）
-        monkeypatch.setattr(sys, "argv", ["eval_chat_tools.py", "--limit", "0"])
+        monkeypatch.setattr(sys, "argv", ["eval_chat_tools.py", "--limit", "0",
+                                          "--out", str(tmp_path)])
 
         assert await ev.main() == 1
+        assert list(tmp_path.iterdir()) == []
 
 
 class TestJudgeWhenNothingRan:
