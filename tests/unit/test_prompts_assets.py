@@ -128,6 +128,77 @@ class TestCapabilityCatalog:
         assert "能力清单" in rendered.system
 
 
+class TestCapabilityCatalogV2:
+    """能力清单 v2（Task 9）：顶层 `web_clause` + 按 `[web]` 开关渲染。
+
+    关闭态**不追加** `web_clause`（判据见 brief 修正 1：与 v1 字面比必然红，且红得合法），
+    开启态把网页能力当作「叠加在能力内之上的一项额外能力」，不是第四类边界。
+    """
+
+    def test_capabilities_v2_has_web_clause(self):
+        payload = prompt_tool.load_capabilities()
+        assert payload["version"] == 2
+        clause = payload["web_clause"]
+        assert clause["judge_append"].strip()
+        assert clause["reply_append"].strip()
+
+    def test_render_web_disabled_matches_v2_without_clause(self):
+        """修正 1：关闭态 == 「v2 渲染但不追加 web_clause」，逐字相等。"""
+        payload = prompt_tool.load_capabilities()
+        without_clause = {key: value for key, value in payload.items()
+                          if key != "web_clause"}
+        assert prompt_tool.render_capabilities(payload, web_enabled=False) == \
+            prompt_tool.render_capabilities(without_clause, web_enabled=False)
+        # 修正 2：关闭态标题保持原样（含「三类边界」）
+        assert prompt_tool.render_capabilities().splitlines()[0] == "【能力清单 v2 · 三类边界】"
+
+    def test_render_web_disabled_has_no_web_trace(self):
+        text = prompt_tool.render_capabilities(web_enabled=False)
+        for marker in ("网页", "搜索热点", "读取网页", "search_hotspots",
+                       "fetch_url", "web_clause"):
+            assert marker not in text, marker
+
+    def test_render_web_enabled_appends_clause(self):
+        clause = prompt_tool.load_capabilities()["web_clause"]
+        text = prompt_tool.render_capabilities(web_enabled=True)
+        assert clause["judge_append"] in text
+        assert clause["reply_append"] in text
+        # 修正 2：追加了网页能力，标题必须涵盖它，不能仍旧只报「三类边界」
+        off_header = prompt_tool.render_capabilities().splitlines()[0]
+        on_header = text.splitlines()[0]
+        assert "三类边界" in off_header and "网页" not in off_header
+        assert "网页" in on_header and on_header != off_header
+
+    def test_render_web_enabled_is_not_a_fourth_category(self):
+        """自检口径：三项边界编号不变，网页能力是附加项，不凭空多出一类。"""
+        text = prompt_tool.render_capabilities(web_enabled=True)
+        numbered = [line for line in text.splitlines() if re.match(r"^\d+\. ", line)]
+        assert len(numbered) == 3
+
+    def test_missing_search_tool_is_not_out_of_scope(self):
+        """修正 3：缺一个可选工具不归边界外，否则那句被禁的话会重新获得授权。"""
+        payload = prompt_tool.load_capabilities()
+        by_id = {item["id"]: item for item in payload["categories"]}
+        guidable = by_id["out_of_scope_guidable"]
+        in_scope = by_id["in_scope"]
+        assert "缺少一个可选工具" in guidable["judge"] + in_scope["judge"]
+        assert "不归边界外" in guidable["judge"]
+        # 新增内容：通用信息查询不属于热点搜索
+        assert "通用信息查询即使能搜到，也不属于热点搜索" in guidable["judge"]
+        # 计分卡本身也要挡住：固定话术不许被用到「帮我找热点」上
+        assert "不要用这一句" in guidable["reply"]
+        assert "「帮我找热点」" in guidable["reply"]
+
+    def test_initial_messages_passes_web_enabled(self):
+        from xhs_agent.agents.supervisor import initial_messages
+
+        clause = prompt_tool.load_capabilities()["web_clause"]
+        off = initial_messages([], "帮我找热点")[0]
+        on = initial_messages([], "帮我找热点", web_enabled=True)[0]
+        assert clause["judge_append"] not in off.user
+        assert clause["judge_append"] in on.user
+
+
 class TestMultiImagePrompt:
     """多图合并口径（S7.15）：一次一份、共同优先、独特降权、`evidence` 必须指图。"""
 

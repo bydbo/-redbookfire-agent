@@ -220,11 +220,26 @@ def load_capabilities() -> dict[str, Any]:
     return payload
 
 
-def render_capabilities(payload: dict[str, Any] | None = None) -> str:
-    """把能力清单渲染成注入 §02 Task 的确定性文本（无模板引擎）。"""
+def render_capabilities(payload: dict[str, Any] | None = None, *,
+                        web_enabled: bool = False) -> str:
+    """把能力清单渲染成注入 §02 Task 的确定性文本（无模板引擎）。
+
+    `web_enabled`（Task 9）只在本轮**下发了网页工具**时为真：标题改成能涵盖网页能力的措辞，
+    并在三类边界之后追加 `web_clause`——它是叠加在「能力内」之上的一项额外能力，**不新增
+    第四类边界**（编号恒为三项）。关闭态与「同一份清单去掉 `web_clause`」逐字相等，除版本号
+    外不留任何网页工具痕迹；标题也保持原样。
+    """
     data = payload if payload is not None else load_capabilities()
-    lines = [f"【能力清单 v{data.get('version', '')} · 三类边界】"]
+    clause = data.get("web_clause")
+    if not (web_enabled and isinstance(clause, dict)):
+        clause = None
+    suffix = " + 网页能力" if clause else ""
+    lines = [f"【能力清单 v{data.get('version', '')} · 三类边界{suffix}】"]
     for index, item in enumerate(data.get("categories") or [], start=1):
         lines.append(f"{index}. {item['title']} —— 判定：{item['judge']}")
         lines.append(f"   固定话术：{item['reply']}")
+    if clause:
+        lines.append("附加能力（叠加在「能力内」上，不是第四类边界；本轮下发了网页工具才生效）"
+                     f"—— 判定：{clause.get('judge_append', '')}")
+        lines.append(f"   固定话术：{clause.get('reply_append', '')}")
     return "\n".join(lines)

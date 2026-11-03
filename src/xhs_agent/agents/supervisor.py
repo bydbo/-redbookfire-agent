@@ -15,7 +15,8 @@
   60 字 + 一行工具结果摘要），累计超预算就裁剪并如实说明丢了几条——不硬截断、不调模型；
   历史里的工具摘要行带 `run_id`，模型因此能自己把 id 传回 `read_run` / `revise_draft`；
 - **能力清单（S7.11）**：`prompts/chat_capabilities.json` 渲染进 §02 Task 的
-  `{{ capabilities }}`，三类边界与固定话术只有这一份来源（ADR 0016）；
+  `{{ capabilities }}`，三类边界与固定话术只有这一份来源（ADR 0016）；网页能力那一段
+  随 `[web].enabled` 开关渲染（Task 9），关闭态不出现在清单里；
 - `tool_calls` 里的 `arguments` 是原始 JSON 字符串；这里顺手解析成 `args`，解析失败不抛错，
   而是把 `args_error` 带上——由工具节点返回一句"参数没看懂"给模型，而不是整轮崩掉。
 """
@@ -60,10 +61,15 @@ def initial_messages(history: list[dict[str, Any]], user_text: str, *,
                      token_budget: int = DEFAULT_TOKEN_BUDGET,
                      grouped: bool = False,
                      state_text: str = "",
+                     web_enabled: bool = False,
                      ) -> tuple[prompt_tool.RenderedPrompt, list[dict[str, Any]]]:
-    """首轮消息：渲染 prompt（拿版本号）+ 组装 system / 任务说明 / 状态 / 历史 / 本轮用户消息。"""
-    rendered = prompt_tool.render(TASK_ID,
-                                  capabilities=prompt_tool.render_capabilities())
+    """首轮消息：渲染 prompt（拿版本号）+ 组装 system / 任务说明 / 状态 / 历史 / 本轮用户消息。
+
+    `web_enabled` 透传给 `render_capabilities`：开启态的能力清单多一项网页能力（Task 9）。
+    """
+    rendered = prompt_tool.render(
+        TASK_ID,
+        capabilities=prompt_tool.render_capabilities(web_enabled=web_enabled))
     return rendered, build_messages(rendered, history, user_text,
                                     attachment_note=attachment_note,
                                     keep_messages=keep_messages,

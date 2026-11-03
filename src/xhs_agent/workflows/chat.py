@@ -595,6 +595,8 @@ async def run_turn(
         token_budget=cfg.chat.history_token_budget,
         grouped=grouped,
         state_text=state_text,
+        # PR3：能力清单按 `[web]` 开关渲染（开启态才多一项网页能力）
+        web_enabled=chat_tools.web_enabled(cfg),
     )
     # R3（OBS-10）：轮内账目挂在**稳定边界**（闭包持有的 ledger）——图抛异常时，
     # 已完成的模型 / 工具调用记录仍能带出，失败轮次不丢已知消费与引用
