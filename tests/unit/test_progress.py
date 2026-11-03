@@ -7,6 +7,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
+from pathlib import Path
 
 from xhs_agent.core import progress
 
@@ -424,3 +426,42 @@ class TestWebToolProgressLabels:
     def test_progress_label_keys_are_backed_by_stage_labels(self):
         # 同步约束：PROGRESS_LABEL_KEYS 的值必须都是 STAGE_LABELS 的键，否则 key_for_label 会漏
         assert set(progress.PROGRESS_LABEL_KEYS.values()) <= set(progress.STAGE_LABELS)
+
+
+class TestFrontendLabelSync:
+    """跨语言同步守卫：后端权威映射 ↔ 前端展示映射（PR3 · Task 10 审查）。
+
+    前端的 `stores/chat.ts` 是手抄的第二份映射，跨语言没有编译期约束；改漏一侧的后果是
+    界面退回显示英文键（`web_search` / `fetch_url` 这类原始 key 直接露给用户）。
+    这里直接用正则从 `chat.ts` 抠字面量跟后端比——不引 TS parser，只要求"改漏一侧就会红"。
+    """
+
+    CHAT_TS = (
+        Path(__file__).resolve().parents[2] / "frontend" / "src" / "stores" / "chat.ts"
+    )
+
+    @classmethod
+    def _literal(cls, name: str) -> dict[str, str]:
+        """抠出 `export const <name>...= { ... }` 里的 `key: '中文'` 条目。"""
+        source = cls.CHAT_TS.read_text(encoding="utf-8")
+        block = re.search(
+            rf"export const {name}[^=]*=\s*\{{(?P<body>.*?)\n\}}", source, re.S
+        )
+        assert block is not None, f"chat.ts 里找不到 {name} 字面量（结构变了要修这条守卫）"
+        entries = re.findall(r"^\s*(\w+):\s*'([^']*)'", block.group("body"), re.M)
+        # 数量 > 0：正则失效时不许静默变成永真空转
+        assert entries, f"{name} 解析出 0 条，守卫已失效"
+        return dict(entries)
+
+    def test_frontend_stage_labels_match_backend(self):
+        frontend = self._literal("STAGE_LABELS")
+        assert set(frontend) == set(progress.STAGE_LABELS), (
+            "前端 STAGE_LABELS 与后端 core/progress.py::STAGE_LABELS 的键不一致"
+        )
+        assert frontend == progress.STAGE_LABELS, "同名阶段的展示文案不一致"
+
+    def test_frontend_tool_labels_parse_as_tool_names(self):
+        labels = self._literal("TOOL_LABELS")
+        # 后端没有「工具名 → 中文」表可比（单一来源是 services/chat_tools.py::TOOLS 的 schema），
+        # 这里只守住解析结果本身：键是英文工具名、值非空，避免正则抓错东西后空转通过。
+        assert all(key.isascii() and value for key, value in labels.items())
