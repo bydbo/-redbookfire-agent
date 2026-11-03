@@ -88,9 +88,14 @@ def client_for(handler: Handler,
     return httpx.AsyncClient(transport=httpx.MockTransport(wrapped))
 
 
-def deny_all_robots() -> httpx.Response:
-    return httpx.Response(200, text="User-agent: *\nDisallow: /\n",
+def robots_response(text: str, *, status: int = 200) -> httpx.Response:
+    """robots.txt 成功路径也是流式读取（与正文同一套 `aiter_raw()` 计数）。"""
+    return httpx.Response(status, stream=ChunkStream(text.encode("utf-8"), 1),
                           headers={"content-type": "text/plain"})
+
+
+def deny_all_robots() -> httpx.Response:
+    return robots_response("User-agent: *\nDisallow: /\n")
 
 
 @pytest.fixture(autouse=True)
@@ -133,6 +138,22 @@ class TestScheme:
         assert calls == []
 
 
+class TestUnmappableUrls:
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("bad_url", [
+        "http://example.com:abc/",          # urlparse 合法，httpx.InvalidURL 在 build_request 抛
+        "http://[::1/",                     # urlparse 自己抛 ValueError
+        "http://example.com/\x00x",        # 非可打印字符，httpx.InvalidURL
+    ])
+    async def test_malformed_urls_map_to_scheme(self, bad_url: str) -> None:
+        # 这些 URL 都来自模型输出：handler 只捕 WebFetchError，不许让 httpx.InvalidURL /
+        # ValueError 逃出去变成未处理异常
+        client = client_for(lambda _request: html_response(article_html()))
+        with pytest.raises(WebFetchError) as excinfo:
+            await fetch(client, url=bad_url, autonomous=False)
+        assert excinfo.value.reason == "scheme"
+
+
 class TestPrivateGuard:
     @pytest.mark.asyncio
     @pytest.mark.parametrize(("category", "ip"), [
@@ -141,6 +162,7 @@ class TestPrivateGuard:
         ("link_local", "169.254.10.10"),
         ("multicast", "224.0.0.1"),
         ("reserved", "240.0.0.1"),
+        ("cgnat", "100.64.0.1"),   # RFC 6598：六个 is_* 全 False，只能靠 not is_global 拦
         ("unspecified", "0.0.0.0"),
     ])
     async def test_blocks_private_destinations(self, fake_dns: dict[str, str],
@@ -220,6 +242,19 @@ class TestPrivateGuard:
         assert page.final_url == PAGE_URL
 
     @pytest.mark.asyncio
+    async def test_injected_client_is_left_unmodified(self) -> None:
+        client = client_for(lambda _request: html_response(article_html()))
+        cfg = make_cfg(fetch_max_redirects=2)
+        try:
+            for _ in range(2):      # 连调两次：钩子不能叠加
+                await fetch_readable(client, cfg, PAGE_URL, autonomous=False)
+        finally:
+            await client.aclose()
+        assert client.event_hooks["request"] == []   # 不留残留
+        assert client.follow_redirects is False      # 重定向语义没被改写
+        assert client.max_redirects == 20            # 已还原成 httpx 默认值
+
+    @pytest.mark.asyncio
     async def test_redirect_loop_maps_to_http(self) -> None:
         def handler(request: httpx.Request) -> httpx.Response:
             hop = int(request.url.params.get("n", "0"))
@@ -278,9 +313,7 @@ class TestRobots:
 
         def handler(request: httpx.Request) -> httpx.Response:
             if request.url.path == "/robots.txt":
-                return httpx.Response(
-                    200, text="User-agent: *\nDisallow: /private\n",
-                    headers={"content-type": "text/plain"})
+                return robots_response("User-agent: *\nDisallow: /private\n")
             return html_response(article_html())
 
         client = client_for(handler, calls)
@@ -337,13 +370,31 @@ class TestRobots:
         assert [r.url.path for r in calls] == ["/article"]
 
     @pytest.mark.asyncio
+    async def test_robots_over_byte_cap_is_unreachable(self) -> None:
+        calls: list[httpx.Request] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.url.path == "/robots.txt":
+                # 不提供 Content-Length，靠流式计数拦：200 KiB > 64 KiB 上限
+                return httpx.Response(200, stream=ChunkStream(b"x" * 1024, 200),
+                                      headers={"content-type": "text/plain"})
+            return html_response(article_html())
+
+        client = client_for(handler, calls)
+        with pytest.raises(WebFetchError) as excinfo:
+            await fetch(client, cfg=make_cfg(check_robots_txt=True,
+                                            fetch_max_bytes=65536),
+                        autonomous=True)
+        assert excinfo.value.reason == "robots"   # RFC 9309：超限视为不可达
+        assert [r.url.path for r in calls] == ["/robots.txt"]
+
+    @pytest.mark.asyncio
     async def test_robots_cached_per_host(self) -> None:
         calls: list[httpx.Request] = []
 
         def handler(request: httpx.Request) -> httpx.Response:
             if request.url.path == "/robots.txt":
-                return httpx.Response(200, text="User-agent: *\nAllow: /\n",
-                                      headers={"content-type": "text/plain"})
+                return robots_response("User-agent: *\nAllow: /\n")
             return html_response(article_html())
 
         client = client_for(handler, calls)
@@ -373,6 +424,16 @@ class TestContentType:
 
 
 class TestSizeAndEncoding:
+    @pytest.mark.asyncio
+    async def test_non_html_is_rejected_without_reading_body(self) -> None:
+        stream = ChunkStream(b"%PDF-1.7 binary", 3)
+        client = client_for(lambda _request: httpx.Response(
+            200, stream=stream, headers={"content-type": "application/pdf"}))
+        with pytest.raises(WebFetchError) as excinfo:
+            await fetch(client, autonomous=False)
+        assert excinfo.value.reason == "content_type"
+        assert stream.emitted == 0        # 一个字节都不该为 PDF 拉下来
+
     @pytest.mark.asyncio
     async def test_content_length_over_limit_maps_to_too_large(self) -> None:
         client = client_for(lambda _request: html_response(
@@ -487,6 +548,19 @@ class TestPagination:
         assert page.next_start_index is None
 
     @pytest.mark.asyncio
+    async def test_zero_max_length_still_advances(self) -> None:
+        client = client_for(lambda _request: html_response(article_html()))
+        try:
+            page = await fetch_readable(client, make_cfg(), PAGE_URL,
+                                        autonomous=False, start_index=10,
+                                        max_length=0)
+        finally:
+            await client.aclose()
+        assert page.text != ""                          # 至少给 1 个字符
+        assert page.next_start_index is not None
+        assert page.next_start_index > 10               # 游标不许原地踏步
+
+    @pytest.mark.asyncio
     async def test_whole_page_marks_not_truncated(self) -> None:
         client = client_for(lambda _request: html_response(article_html()))
         page = await fetch(client, autonomous=False)
@@ -501,6 +575,18 @@ class TestExtraction:
             self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setattr(webreader.trafilatura, "extract",
                             lambda *_args, **_kwargs: None)
+        client = client_for(lambda _request: html_response(article_html()))
+        with pytest.raises(WebFetchError) as excinfo:
+            await fetch(client, autonomous=False)
+        assert excinfo.value.reason == "insufficient_text"
+
+    @pytest.mark.asyncio
+    async def test_extract_crash_maps_to_insufficient_text(
+            self, monkeypatch: pytest.MonkeyPatch) -> None:
+        def boom(*_args: Any, **_kwargs: Any) -> None:
+            raise ValueError("lxml exploded")
+
+        monkeypatch.setattr(webreader.trafilatura, "extract", boom)
         client = client_for(lambda _request: html_response(article_html()))
         with pytest.raises(WebFetchError) as excinfo:
             await fetch(client, autonomous=False)
@@ -529,10 +615,14 @@ class TestExtraction:
 
 class TestTitle:
     @pytest.mark.asyncio
-    async def test_title_from_metadata(self) -> None:
-        client = client_for(lambda _request: html_response(article_html()))
+    async def test_title_from_metadata(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # HTML 的 <title> 与 metadata 的标题给**不同**字符串：否则这条用例分不清走的是哪条路
+        monkeypatch.setattr(webreader.trafilatura, "extract_metadata",
+                            lambda *_args, **_kwargs: SimpleNamespace(title="元数据标题"))
+        client = client_for(lambda _request: html_response(
+            article_html(title="HTML 里的标题")))
         page = await fetch(client, autonomous=False)
-        assert page.title == "羽毛球场地预订指南"
+        assert page.title == "元数据标题"
 
     @pytest.mark.asyncio
     async def test_title_falls_back_to_regex_when_metadata_title_is_none(

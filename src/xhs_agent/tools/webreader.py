@@ -106,26 +106,39 @@ async def fetch_readable(
 ) -> FetchedPage:
     """抓一个网页并抽出可读正文；失败抛 `WebFetchError`。
 
-    `client` 传 None 时自建（按 fetch_timeout_s）并在返回前关闭。注入的 client 只给单测
-    用：本函数会覆盖它的 `follow_redirects` / `max_redirects` / request 钩子，别在多处复用
-    同一个实例。`max_length` 缺省取 `fetch_max_chars`。
+    `client` 传 None 时自建（按 fetch_timeout_s）并在返回前关闭。注入的 client 只给单测用：
+    本函数只在调用期间借用它的重定向上限与 request 钩子，**结束一律还原**（不叠加、不残留），
+    重定向开关走 per-request 参数，不改 client 上的 `follow_redirects`。
+    `max_length` 缺省取 `fetch_max_chars`。
     """
     web = cfg.web
     target = _validate_target(url)                                   # 1. scheme
     user_agent = (web.user_agent_autonomous if autonomous          # 2. UA
                   else web.user_agent_manual)
     timeout = float(web.fetch_timeout_s)                             # 4. 客户端
+    max_redirects = int(web.fetch_max_redirects)
+    saved_hooks: dict[str, list[Any]] | None = None
+    saved_max_redirects: int | None = None
     own_client = client is None
-    http = client if client is not None else build_http_client(timeout)
-    http.follow_redirects = True
-    http.max_redirects = int(web.fetch_max_redirects)
+    if client is None:
+        http = build_http_client(timeout)
+        http.follow_redirects = True
+        http.max_redirects = max_redirects
+    else:
+        http = client
+        # 注入的 client 只在调用期间借用重定向上限（httpx 没有 per-request 的
+        # max_redirects），结束还原；重定向开关一律走 per-request 参数
+        saved_max_redirects = http.max_redirects
+        http.max_redirects = max_redirects
     if not web.allow_private_ips:
-        http.event_hooks = {**http.event_hooks,
-                            "request": [*http.event_hooks.get("request", []),
+        saved_hooks = http.event_hooks
+        http.event_hooks = {**saved_hooks,
+                            "request": [*saved_hooks.get("request", []),
                                         _reject_private_host]}
     try:
         if autonomous and web.check_robots_txt:                      # 3. robots
-            await _check_robots(http, target, user_agent, robots_cache, timeout)
+            await _check_robots(http, target, user_agent, robots_cache,
+                                timeout, int(web.fetch_max_bytes))
         body, final_url = await _download(http, target, user_agent, web)   # 5–7
         full = _extract_text(body, final_url)                        # 8. 抽取
         title = _extract_title(body, final_url)                      # 9. 标题
@@ -134,14 +147,25 @@ async def fetch_readable(
                          max_length=(web.fetch_max_chars if max_length is None
                                      else max_length))
     finally:
+        if saved_hooks is not None:
+            http.event_hooks = saved_hooks
+        if saved_max_redirects is not None:
+            http.max_redirects = saved_max_redirects
         if own_client:
             await http.aclose()
 
 
 def _validate_target(url: str) -> str:
-    """只放行 http(s) 且必须带主机名；其余（file:// / ftp:// / 空 host）判 `scheme`。"""
+    """只放行 http(s) 且必须带主机名；其余（file:// / ftp:// / 空 host）判 `scheme`。
+
+    `urlparse` 对 `http://[::1/` 这类畸形串自己就抛 ValueError——URL 来自模型输出，
+    必须在进入请求流程之前收成 `WebFetchError`，否则会漏成未处理异常。
+    """
     target = (url or "").strip()
-    parsed = urlparse(target)
+    try:
+        parsed = urlparse(target)
+    except ValueError as exc:
+        raise WebFetchError("scheme", "URL 不是合法的 http(s) 地址") from exc
     if parsed.scheme.lower() not in SAFE_URL_SCHEMES or not parsed.hostname:
         raise WebFetchError("scheme", "只支持 http(s) 且必须带主机名")
     return target
@@ -174,14 +198,19 @@ async def _reject_private_host(request: httpx.Request) -> None:
 
 
 def _is_blocked_ip(ip: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
-    """六类非公网地址：private / loopback / link_local / multicast / reserved / unspecified。"""
+    """非公网地址：六类 is_* 任一为真，**或**根本不是 global 地址。
+
+    光看六类会漏 RFC 6598 的 100.64.0.0/10（CGNAT / Tailscale / 部分云内网）：实测
+    `ip_address("100.64.0.1")` 六个属性全是 False，只有 `is_global` 是 False。
+    """
     if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped is not None:
         ip = ip.ipv4_mapped
-    return any(bool(getattr(ip, flag)) for flag in _BLOCKED_IP_FLAGS)
+    return not ip.is_global or any(bool(getattr(ip, flag)) for flag in _BLOCKED_IP_FLAGS)
 
 
 async def _check_robots(http: httpx.AsyncClient, url: str, user_agent: str,
-                        cache: dict[str, Any] | None, timeout: float) -> None:
+                        cache: dict[str, Any] | None, timeout: float,
+                        limit: int) -> None:
     """遵守 robots.txt（只在自主调用时生效）：不可达按拒绝处理，4xx 按放行处理。"""
     parsed = urlparse(url)
     host_key = parsed.netloc.lower()
@@ -192,7 +221,7 @@ async def _check_robots(http: httpx.AsyncClient, url: str, user_agent: str,
             parser = cached
     if parser is None:
         parser = await _load_robots(http, f"{parsed.scheme}://{parsed.netloc}",
-                                    user_agent, timeout)
+                                    user_agent, timeout, limit)
         if cache is not None:
             cache[host_key] = parser
     if not parser.can_fetch(user_agent, url):
@@ -200,27 +229,37 @@ async def _check_robots(http: httpx.AsyncClient, url: str, user_agent: str,
 
 
 async def _load_robots(http: httpx.AsyncClient, base: str, user_agent: str,
-                       timeout: float) -> RobotFileParser:
+                       timeout: float, limit: int) -> RobotFileParser:
     """拉一次 robots.txt 并解析。
 
-    5xx / 连接失败 → `robots` 拒绝（拿不到规则时不赌它允许）；4xx → 放行。
+    5xx / 连接失败 / **超过字节上限** → `robots` 拒绝（拿不到规则时不赌它允许；RFC 9309
+    把「超限」也当不可达）；4xx → 放行。字节上限与正文同一套：流式 `aiter_raw()` 计数，
+    不把整块 robots.txt 先读进内存（否则在正文闸口生效前就被一个大 robots.txt 打穿）。
     """
     robots_url = f"{base}{ROBOTS_PATH}"
     headers = {"User-Agent": user_agent, "Accept-Encoding": ACCEPT_ENCODING}
     try:
-        response = await http.get(robots_url, headers=headers, timeout=timeout)
+        async with http.stream("GET", robots_url, headers=headers, timeout=timeout,
+                               follow_redirects=True) as response:
+            status = response.status_code
+            if status >= 500:
+                raise WebFetchError("robots",
+                                    f"robots.txt 不可达（HTTP {status}）")
+            if 400 <= status < 500:
+                parser = RobotFileParser()
+                parser.parse(["User-agent: *", "Allow: /"])   # 没有 robots.txt：放行
+                return parser
+            raw = await _read_raw(response, limit, "robots")
+            text = _decode_content(raw, _content_encoding(response), limit)
     except httpx.TimeoutException as exc:
         raise WebFetchError("robots", "robots.txt 请求超时") from exc
+    except (httpx.InvalidURL, ValueError) as exc:
+        raise WebFetchError("scheme", "URL 非法，无法请求 robots.txt") from exc
     except httpx.HTTPError as exc:
         raise WebFetchError("robots",
                             f"robots.txt 不可达（{type(exc).__name__}）") from exc
-    if response.status_code >= 500:
-        raise WebFetchError("robots", f"robots.txt 不可达（HTTP {response.status_code}）")
     parser = RobotFileParser()
-    if 400 <= response.status_code < 500:
-        parser.parse(["User-agent: *", "Allow: /"])   # 没有 robots.txt：按惯例放行
-    else:
-        parser.parse(response.text.splitlines())
+    parser.parse(text.decode("utf-8", "replace").splitlines())
     return parser
 
 
@@ -231,21 +270,27 @@ async def _download(http: httpx.AsyncClient, url: str, user_agent: str,
     limit = int(web.fetch_max_bytes)
     try:
         async with http.stream("GET", url, headers=headers,
-                               timeout=float(web.fetch_timeout_s)) as response:
+                               timeout=float(web.fetch_timeout_s),
+                               follow_redirects=True) as response:
             _raise_for_status(response)
             declared = _content_length(response)                    # 5. 大小
             if declared is not None and declared > limit:
                 raise WebFetchError(
                     "too_large", f"Content-Length {declared} 超过上限 {limit} 字节")
+            # 6. 类型：先判再读，别为一个 2MB 的 PDF 把 body 全拉下来才知道它不能读
+            _check_media_type(response)
             raw = await _read_raw(response, limit)
-            body = _decode_content(raw, _content_encoding(response), limit)  # 6. 编码
-            _check_media_type(response)                             # 7. 类型
+            body = _decode_content(raw, _content_encoding(response), limit)  # 7. 编码
             return body, str(response.url)
     except httpx.TimeoutException as exc:
         raise WebFetchError("timeout", f"请求超时（{web.fetch_timeout_s}s）") from exc
     except httpx.TooManyRedirects as exc:
         raise WebFetchError("http",
                             f"重定向超过 {web.fetch_max_redirects} 次") from exc
+    except (httpx.InvalidURL, ValueError) as exc:
+        # InvalidURL 的 MRO 是 Exception（不是 HTTPError），单靠 HTTPError 兜不住；
+        # 这类畸形 URL 来自模型输出，一律按 scheme 失败上报
+        raise WebFetchError("scheme", "URL 无法发起请求（非法端口/字符）") from exc
     except httpx.HTTPError as exc:
         raise WebFetchError("http", f"请求失败（{type(exc).__name__}）") from exc
 
@@ -271,17 +316,19 @@ def _content_encoding(response: httpx.Response) -> str:
     return _header(response, "content-encoding").lower()
 
 
-async def _read_raw(response: httpx.Response, limit: int) -> bytes:
+async def _read_raw(response: httpx.Response, limit: int,
+                    reason: str = "too_large") -> bytes:
     """边读边数**原始字节**，超限立即中止（不等整块进内存）。
 
     必须 `aiter_raw()`：`aiter_bytes()` 会先把 gzip 解开再给，炸弹一次迭代就能吐出
-    4194304 字节，那时再判已经晚了。
+    4194304 字节，那时再判已经晚了。robots.txt 复用同一套计数，只是超限时按
+    RFC 9309 记为「不可达」（`reason="robots"`）。
     """
     buffer = bytearray()
     async for chunk in response.aiter_raw():
         buffer.extend(chunk)
         if len(buffer) > limit:
-            raise WebFetchError("too_large", f"响应体超过上限 {limit} 字节")
+            raise WebFetchError(reason, f"响应体超过上限 {limit} 字节")
     return bytes(buffer)
 
 
@@ -313,15 +360,18 @@ def _check_media_type(response: httpx.Response) -> None:
 
 def _extract_text(body: bytes, url: str) -> str:
     """抽正文；`None` / 全空白都判 `insufficient_text`（JS 空壳页就是这条路）。"""
-    text = trafilatura.extract(
-        body,                     # bytes 直接给：GBK/GB18030 由库自己探测
-        url=url,
-        output_format="markdown",
-        include_comments=False,
-        include_tables=False,
-        favor_precision=True,     # 只有 True 时 JS 空壳页才落 None
-        with_metadata=False,      # True 会让 date 字段凭空捏造
-    )
+    try:
+        text = trafilatura.extract(
+            body,                     # bytes 直接给：GBK/GB18030 由库自己探测
+            url=url,
+            output_format="markdown",
+            include_comments=False,
+            include_tables=False,
+            favor_precision=True,     # 只有 True 时 JS 空壳页才落 None
+            with_metadata=False,      # True 会让 date 字段凭空捏造
+        )
+    except Exception as exc:      # 畸形 HTML 让 lxml 抛异常时，别漏成未处理异常
+        raise WebFetchError("insufficient_text", "正文抽取失败") from exc
     if text is None or not text.strip():
         raise WebFetchError("insufficient_text", "没有抽出正文（可能是 JS 渲染页）")
     return text
@@ -358,7 +408,7 @@ def _paginate(full: str, *, final_url: str, title: str, start_index: int,
             "insufficient_text",
             f"正文仅 {char_count} 字符，少于 {MIN_TEXT_CHARS} 字符阈值")
     start = min(max(0, int(start_index)), char_count)
-    end = start + max(0, int(max_length))
+    end = start + max(1, int(max_length))      # 至少切 1 字符，否则游标不前进
     text = full[start:end]
     next_start = start + len(text)
     next_start_index = next_start if next_start < char_count else None
