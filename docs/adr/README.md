@@ -60,8 +60,8 @@
 | [0014](0014-material-task-progress-via-celery-backend.md) | 素材索引进度用 Celery 结果后端，分析任务显式 ignore_result | 已采纳 |
 | [0015](0015-native-function-calling.md) | 对话层用原生 function calling（不做 JSON 协议模拟） | 已采纳 |
 | [0016](0016-prompt-machine-readable-assets.md) | `prompts/` 携带机读数据资产（能力清单） | 已采纳 |
-
 | [0017](0017-material-root-relative-identity.md) | 素材根相对身份与可审计合并 | 已采纳 |
 | [0018](0018-historical-evidence-snapshots.md) | 历史依据采用不可变证据快照，删除素材不级联历史候选 | 已采纳 |
 | [0019](0019-e9-evaluation-package.md) | E9 评测逻辑独立成内部包，不进入产品 API / 数据表 | 已采纳 |
 | [0020](0020-prompt-trust-boundaries.md) | 提示词示例与当前输入隔离 | 已采纳 |
+| [0021](0021-web-tools-and-trafilatura.md) | 网页工具引入 trafilatura 抽取正文，SSRF 只防直连内网 | 已采纳 |
