@@ -1,18 +1,21 @@
-"""评测脚本 `scripts/eval_chat_tools.py` 的单测（Task 11：工具下发 / `--suite` / pass^k）。
+"""评测脚本 `scripts/eval_chat_tools.py` 的单测（Task 11：工具下发 / `--suite` / pass^k；Task 12：`--cases`）。
 
 只测**纯逻辑与下发清单**：模型调用一律换成假的（monkeypatch `supervise`），不联网、不需要密钥、
 不写真报告。真模型效果证据由 `scripts/eval_chat_tools.py --suite …` 跑出来（Task 13）。
 
-两条硬约束在这里落成断言：
+三条硬约束在这里落成断言：
 1. 关闭态（`[web].enabled=false`）下发的清单必须与旧模块常量 `TOOLS` 逐项相等——既有评测行为不变；
-2. pass^k 的判定口径只收紧不放宽：`ok` = **每次都过**，`pass@1` 只作为「至少过 1 次」的参考值。
+2. pass^k 的判定口径只收紧不放宽：`ok` = **每次都过**，`pass@1` 只作为「至少过 1 次」的参考值；
+3. v2 用例集必须逐字保留 v1 的 28 条（AGENTS.md §2.3：不原地改旧用例，只加版本）。
 """
 
 from __future__ import annotations
 
 import importlib.util
+import json
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -22,6 +25,22 @@ from xhs_agent.services import chat_tools
 from xhs_agent.services.chat_tools import TOOL_FETCH_URL, TOOL_SEARCH_HOTSPOTS, TOOLS
 
 SCRIPT_PATH = Path(__file__).resolve().parents[2] / "scripts" / "eval_chat_tools.py"
+EVALS_CHAT_DIR = Path(__file__).resolve().parents[2] / "evals" / "chat"
+CASES_V1_PATH = EVALS_CHAT_DIR / "cases.json"
+CASES_V2_PATH = EVALS_CHAT_DIR / "cases-v2.json"
+SECTIONS = ("selection", "boundary", "multiturn", "revise")
+# v2 新增的 5 条（Task 12 计划表）：message → 可接受的首跳工具
+NEW_V2_CASES: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("帮我找找今天有什么能蹭的热点", ("search_hotspots",)),
+    ("这个链接里讲的是什么热点 https://example.com/a", ("fetch_url",)),
+    ("先搜一下最近的运动热点，再挑一条跑分析", ("search_hotspots", "run_hotspot_analysis")),
+    ("明天上海天气怎么样", ()),
+    ("把刚才搜到的第一条跑一遍分析", ("run_hotspot_analysis",)),
+)
+
+
+def read_json(path: Path) -> dict[str, Any]:
+    return json.loads(path.read_text(encoding="utf-8"))
 
 
 @pytest.fixture(scope="module")
@@ -269,7 +288,8 @@ class TestSuiteSelection:
 
 class TestRender:
     @staticmethod
-    def make_report(ev: Any, repeat: int) -> dict[str, Any]:
+    def make_report(ev: Any, repeat: int,
+                    cases: str = "evals/chat/cases.json") -> dict[str, Any]:
         first = {"name": "co-01", "message": "m", "expect": [], "picked": [],
                  "no_tool_ok": False, "error": "", "why": ""}
         second = {"name": "co-02", "message": "m", "expect": ["run_analysis"],
@@ -279,7 +299,7 @@ class TestRender:
         return {
             "date": "2026-10-30", "task": "chat_supervisor", "model": "deepseek-chat",
             "baseline_ref": "HEAD", "versions": {"baseline": "5", "candidate": "6"},
-            "cases_version": "chat-v1", "cost_limit": 0.25, "note": "",
+            "cases": cases, "cases_version": "chat-v1", "cost_limit": 0.25, "note": "",
             "suite": "all", "repeat": repeat,
             "metrics": {"selection": ev.pass_metrics(selection)},
             "arms": {"baseline": {"selection": selection},
@@ -300,3 +320,80 @@ class TestRender:
 
         assert "pass@1" in markdown
         assert "等价于改造前的通过率" in markdown
+
+    def test_render_names_the_case_file(self, ev: Any) -> None:
+        """报告必须写明**实际用了哪个用例文件**：只写版本号，v1 / v2 两份对照不出来。"""
+        markdown = ev.render_markdown(
+            self.make_report(ev, repeat=1, cases="evals/chat/cases-v2.json"))
+
+        assert "evals/chat/cases-v2.json" in markdown
+
+
+class TestCasesV2:
+    """v2 用例集：v1 的 28 条**逐字**保留 + 新增 5 条（v1 文件按 AGENTS.md §2.3 冻结不动）。"""
+
+    def test_cases_v2_version_string(self, ev: Any) -> None:
+        assert ev.load_cases(CASES_V2_PATH).version == "chat-v2"
+
+    def test_cases_v2_keeps_v1_verbatim(self) -> None:
+        """v1 的四段 28 条必须逐字出现在 v2 里——靠测试守，不靠人眼比对。"""
+        v1, v2 = read_json(CASES_V1_PATH), read_json(CASES_V2_PATH)
+
+        for section in SECTIONS:
+            assert v2[section][:len(v1[section])] == v1[section], section
+        assert sum(len(v1[section]) for section in SECTIONS) == 28
+
+    def test_cases_v2_adds_five_cases(self) -> None:
+        v1, v2 = read_json(CASES_V1_PATH), read_json(CASES_V2_PATH)
+        added = v2["selection"][len(v1["selection"]):]
+
+        assert [(item["message"], sorted(item["expect"])) for item in added] == [
+            (message, sorted(expect)) for message, expect in NEW_V2_CASES]
+        assert all(item["why"].strip() for item in added)      # 新增的每条都要写清目的
+
+    def test_cases_v2_expectations_only_reference_registered_tools(self) -> None:
+        """新增用例点的工具名必须真实存在（网页两件只有开启态才下发）。"""
+        known = chat_tools.tool_names(make_cfg(enabled=True))
+
+        for item in read_json(CASES_V2_PATH)["selection"]:
+            assert set(item["expect"]) <= known, item["name"]
+
+    def test_cases_v2_parses_into_all_four_sections(self, ev: Any) -> None:
+        """四段都要非空：`main()` 的「用例集缺 X 段」guard 会拦住空段。"""
+        cases = ev.load_cases(CASES_V2_PATH)
+
+        assert [len(cases.selection), len(cases.boundary),
+                len(cases.multiturn), len(cases.revise)] == [15, 10, 5, 3]
+
+
+class TestCasesFlag:
+    """Task 12：`--cases` 读别的用例文件；不传仍读 v1。"""
+
+    def test_cases_flag_defaults_to_v1(self, ev: Any) -> None:
+        assert ev.resolve_cases_path(None) == CASES_V1_PATH
+
+    def test_cases_path_is_project_root_relative(self, ev: Any) -> None:
+        """相对路径按工程根解析（脚本里其它 git 操作也是这个口径）。"""
+        assert ev.resolve_cases_path("evals/chat/cases-v2.json") == CASES_V2_PATH
+        assert ev.resolve_cases_path(str(CASES_V2_PATH)) == CASES_V2_PATH
+
+    @pytest.mark.asyncio
+    async def test_main_reads_the_given_cases_file(self, ev: Any,
+                                                  monkeypatch: pytest.MonkeyPatch,
+                                                  tmp_path: Path) -> None:
+        """`--cases` 必须真被 `main()` 用上（不是加了个没人读的参数）。"""
+        seen: list[Path] = []
+
+        def fake_load_cases(path: Path = ev.CASES_PATH) -> Any:
+            seen.append(path)
+            return ev.ChatCases()       # 四段全空 → 缺段 guard 退出，不会去调模型
+
+        monkeypatch.setattr(ev, "load_config", lambda: SimpleNamespace(
+            llm=SimpleNamespace(resolved_key=lambda: "fake-key")))
+        monkeypatch.setattr(ev, "load_cases", fake_load_cases)
+        monkeypatch.setattr(sys, "argv", ["eval_chat_tools.py", "--out", str(tmp_path),
+                                          "--cases", "evals/chat/cases-v2.json"])
+
+        assert await ev.main() == 1
+        assert seen == [CASES_V2_PATH]
+        assert list(tmp_path.iterdir()) == []

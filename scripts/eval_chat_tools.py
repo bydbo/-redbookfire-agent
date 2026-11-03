@@ -12,8 +12,8 @@
    历史预算内、关键事实不丢；
 4. **改写路径的越界拒绝**：真调 `copy_revise`，越界要求必须 `refused=true`。
 
-用例集：`evals/chat/cases.json`（自带 `version`，当前 `chat-v1`；它不属于 evals v1 冻结资产，
-改动只升这个版本号）。
+用例集：默认 `evals/chat/cases.json`（自带 `version`，`chat-v1`）；`--cases` 换别的文件（如
+`evals/chat/cases-v2.json`，`chat-v2`）。它不属于 evals v1 冻结资产，改动只升这个版本号。
 
 基线臂 = `git show <ref>:src/xhs_agent/prompts/chat_supervisor.md` 的旧正文，只在工具层把
 `prompt_tool.load` 换成旧正文（与 `scripts/eval_prompts.py` 同一套做法）。
@@ -28,6 +28,7 @@
     uv run python scripts/eval_chat_tools.py --skip-multiturn     # 跳过最贵的一节
     uv run python scripts/eval_chat_tools.py --suite boundary     # 只跑越界话术那一节
     uv run python scripts/eval_chat_tools.py --repeat 3           # 每条跑 3 次，报 pass@1 / pass@3
+    uv run python scripts/eval_chat_tools.py --cases evals/chat/cases-v2.json   # 换用例集
 
 `--repeat N` 让每条用例重复跑 N 次：`pass@1` = 至少成功 1 次的用例比例，`pass@N` = N 次全成功的
 用例比例。**判定口径只收紧不放宽**——`ok` 仍表示"这条用例过没过"，重复跑时取"每次都过"。
@@ -200,12 +201,25 @@ class ChatCases:
     revise: list[ReviseCase] = field(default_factory=list)
 
 
+def resolve_cases_path(value: str | None) -> Path:
+    """`--cases` 的取值 → 用例集路径；不传就是 v1。
+
+    相对路径按**工程根**解析——与脚本里其它 git 操作（`cwd=PROJECT_ROOT`）同一口径，
+    这样在哪个目录下跑都读同一份用例，不会被 cwd 悄悄换掉。
+    """
+    if not value:
+        return CASES_PATH
+    path = Path(value)
+    return path if path.is_absolute() else PROJECT_ROOT / path
+
+
 def load_cases(path: Path = CASES_PATH) -> ChatCases:
     """读对话用例集；结构不合契约直接报错（不静默少跑几节）。"""
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
     except FileNotFoundError as exc:
-        raise ConfigError(f"找不到对话用例集：{path}", "确认 evals/chat/cases.json 已入库") from exc
+        raise ConfigError(f"找不到对话用例集：{path}",
+                          "确认该用例文件已入库（默认 evals/chat/cases.json）") from exc
     except ValueError as exc:
         raise ConfigError(f"对话用例集不是合法 JSON：{exc}", str(path)) from exc
     if not isinstance(payload, dict):
@@ -466,6 +480,14 @@ def _limit(items: Sequence[Any], limit: int | None) -> list[Any]:
     return list(items[:limit] if limit else items)
 
 
+def display_cases_path(path: Path) -> str:
+    """报告里怎么写用例集路径：工程内给相对路径，工程外保持原样。"""
+    try:
+        return path.resolve().relative_to(PROJECT_ROOT).as_posix()
+    except ValueError:
+        return str(path)
+
+
 def selected_suites(name: str) -> set[str]:
     """`--suite` 的取值展开成要跑的节；`all` = 四节都跑。"""
     return set(SUITES) if name == "all" else {name}
@@ -668,7 +690,7 @@ def render_markdown(report: dict[str, Any]) -> str:
         f"# 对话层回归评测 · {report['date']}",
         "",
         prompt_line,
-        f"- 用例集：`evals/chat/cases.json`（{report['cases_version']}）",
+        f"- 用例集：`{report['cases']}`（{report['cases_version']}）",
         f"- 范围：`--suite {report.get('suite') or 'all'}`，每条用例重复 {repeat} 次",
         f"- 说明：{report['note'] or '（未填写）'}",
         f"- 模型：`{report['model']}`；轮级成本门槛 ≤ {report['cost_limit']} 元/轮（含一次分析）",
@@ -768,6 +790,8 @@ async def main() -> int:
                         help="每条用例重复跑 N 次（默认 1，必须 ≥ 1），报告给出 pass@1 / pass@N")
     parser.add_argument("--skip-multiturn", action="store_true",
                         help="跳过最贵的多轮那一节（等价于 --suite 里去掉 multiturn）")
+    parser.add_argument("--cases", default=None,
+                        help="对话用例集路径（默认 evals/chat/cases.json；相对路径按工程根解析）")
     parser.add_argument("--out", default=str(REPORTS_DIR), help="报告输出目录")
     parser.add_argument("--note", default="", help="本次为什么改（写进报告）")
     args = parser.parse_args()
@@ -796,8 +820,9 @@ async def main() -> int:
         print(f"[环境] 缺少文本模型密钥（{cfg.llm.api_key_env}），把密钥写进 config/.env 再跑",
               file=sys.stderr)
         return 1
+    cases_path = resolve_cases_path(args.cases)
     try:
-        cases = load_cases()
+        cases = load_cases(cases_path)
     except ConfigError as exc:
         print(f"[环境] {exc.message}", file=sys.stderr)
         return 1
@@ -862,6 +887,7 @@ async def main() -> int:
         "model": cfg.llm.model,
         "baseline_ref": args.baseline,
         "versions": {"baseline": baseline_version, "candidate": candidate_version},
+        "cases": display_cases_path(cases_path),
         "cases_version": cases.version,
         "cost_limit": COST_LIMIT_CNY,
         "note": args.note,
