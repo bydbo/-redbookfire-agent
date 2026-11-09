@@ -1,6 +1,6 @@
 {
   "version": "chat-v2",
-  "note": "对话层回归用例（S7.9 起）：selection 是工具选择，boundary 是越界话术，multiturn 是多轮记忆，revise 是改写路径的合规。判定全部是确定性规则（脚本里实现），不引入模型评委。本版 chat-v2 在 chat-v1 的 28 条之后追加 5 条网页能力用例（找热点 / 读链接 / 多步意图 / 天气回归 A3 / 多轮承接），v1 条目逐字未改；改动用例请继续升 version（chat-v3）并把旧版本留在历史报告里。",
+  "note": "对话层回归用例（S7.9 起）：selection 是工具选择，boundary 是越界话术，multiturn 是多轮记忆，revise 是改写路径的合规，multistep 是一条消息内的多步自主（A2）。判定全部是确定性规则（脚本里实现），不引入模型评委。本版 chat-v2 在 chat-v1 的 28 条之后追加 5 条网页能力用例（找热点 / 读链接 / 多步意图 / 天气回归 A3 / 多轮承接）与 3 条 multistep 用例，v1 条目逐字未改。2026-11-09 交付前修订：A2 首跑发现单轮 selection 里的「把刚才搜到的第一条跑一遍分析」不可判定（单轮没有「刚才」的上下文），移入多轮节；并补 multistep 节以量化 A2。本版此前未产出归档报告、未进 manifest，故修正后仍记 chat-v2；自本版起再改用例请升 version（chat-v3）并把旧版本留在历史报告里。",
   "selection": [
     {
       "name": "跑完整分析",
@@ -86,12 +86,6 @@
       "message": "明天上海天气怎么样",
       "expect": [],
       "why": "回归 A3：开着网页能力也不许把「查天气」当搜索任务，一个工具都不调"
-    },
-    {
-      "name": "网页：多轮承接（搜→分析）",
-      "message": "把刚才搜到的第一条跑一遍分析",
-      "expect": ["run_hotspot_analysis"],
-      "why": "多轮上下文：承接上一轮搜索结果的第一条，直接跑分析"
     }
   ],
   "boundary": [
@@ -227,6 +221,39 @@
       "expect_tools": [["run_hotspot_analysis"], ["search_materials", "read_run"]],
       "must_contain_last": [],
       "notes": "第二轮只问素材 → search_materials/read_run，不许重复跑完整分析"
+    },
+    {
+      "name": "网页：多轮承接（搜→分析）",
+      "turns": ["帮我找找今天有什么能蹭的热点", "把刚才搜到的第一条跑一遍分析"],
+      "expect_tools": [["search_hotspots"], ["run_hotspot_analysis"]],
+      "must_contain_last": ["球拍"],
+      "notes": "网页开启态的多轮承接：第一轮搜索（假工具固定返回「夜跑球鞋开箱」候选），第二轮必须承接上一轮结果跑分析、不重复搜索。原先放在单轮 selection 里（A2 首跑 0/3）——单轮没有「刚才」的上下文，模型不调工具是合理的，2026-11-09 移到多轮节"
+    }
+  ],
+  "multistep": [
+    {
+      "name": "多步：搜热点→跑分析",
+      "message": "帮我找找今天有什么能蹭的热点，挑一条跑一遍完整分析，不用再问我",
+      "min_steps": 2,
+      "first_tool": ["search_hotspots"],
+      "must_contain_any": ["夜跑球鞋开箱", "球拍特写"],
+      "notes": "A2 主用例：一条消息里先搜候选、再挑一条跑分析；终稿要能对上搜索/分析返回里的标题"
+    },
+    {
+      "name": "多步：搜热点→读正文",
+      "message": "先搜一下最近夜跑相关的热点，再把搜索结果第一条的网页正文读出来讲讲",
+      "min_steps": 2,
+      "first_tool": ["search_hotspots"],
+      "must_contain_any": ["湿滑路面", "夜跑球鞋开箱"],
+      "notes": "搜索拿到候选链接后自己接 fetch_url；锚点「湿滑路面」只存在于假抓取正文里，能对上才算真读了"
+    },
+    {
+      "name": "多步：读链接→跑分析",
+      "message": "这个链接里讲的是什么热点：https://example.com/a ，读完直接帮我跑一遍完整分析",
+      "min_steps": 2,
+      "first_tool": ["fetch_url"],
+      "must_contain_any": ["球拍", "夜跑球鞋开箱"],
+      "notes": "用户只给链接：先读正文再跑分析；首跳必须是 fetch_url，不许凭 URL 猜内容"
     }
   ],
   "revise": [

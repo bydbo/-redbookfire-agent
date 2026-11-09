@@ -28,15 +28,17 @@ SCRIPT_PATH = Path(__file__).resolve().parents[2] / "scripts" / "eval_chat_tools
 EVALS_CHAT_DIR = Path(__file__).resolve().parents[2] / "evals" / "chat"
 CASES_V1_PATH = EVALS_CHAT_DIR / "cases.json"
 CASES_V2_PATH = EVALS_CHAT_DIR / "cases-v2.json"
+EVALS_REPORTS_DIR = Path(__file__).resolve().parents[2] / "evals" / "reports"
 SECTIONS = ("selection", "boundary", "multiturn", "revise")
-# v2 新增的 5 条（Task 12 计划表）：message → 可接受的首跳工具
-NEW_V2_CASES: tuple[tuple[str, tuple[str, ...]], ...] = (
+# v2 新增的网页用例：selection 4 条（message → 可接受的首跳工具）+ multiturn 1 条
+NEW_SELECTION_CASES: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("帮我找找今天有什么能蹭的热点", ("search_hotspots",)),
     ("这个链接里讲的是什么热点 https://example.com/a", ("fetch_url",)),
     ("先搜一下最近的运动热点，再挑一条跑分析", ("search_hotspots", "run_hotspot_analysis")),
     ("明天上海天气怎么样", ()),
-    ("把刚才搜到的第一条跑一遍分析", ("run_hotspot_analysis",)),
 )
+NEW_MULTITURN_NAME = "网页：多轮承接（搜→分析）"
+NEW_MULTISTEP_NAMES = ("多步：搜热点→跑分析", "多步：搜热点→读正文", "多步：读链接→跑分析")
 
 
 def read_json(path: Path) -> dict[str, Any]:
@@ -210,6 +212,23 @@ class TestJudge:
         assert "工具选择" not in verdict
         assert "**通过**" in verdict
 
+    def test_judge_flags_a2_below_target(self, ev: Any) -> None:
+        """A2 的目标是 70% / 50%，不是 prompt 回归的 100%——低于目标要明说。"""
+        items = [ev.merge_runs([{"name": f"m{index}", "ok": index < 1, "steps_ok": True}])
+                 for index in range(3)]
+
+        verdict = ev.judge([], [], [], [], [], multistep=items)
+
+        assert "A2 多步合格率 33% < 50%" in verdict
+
+    def test_judge_flags_a2_single_step(self, ev: Any) -> None:
+        items = [ev.merge_runs([{"name": f"m{index}", "ok": True, "steps_ok": index < 2}])
+                 for index in range(3)]
+
+        verdict = ev.judge([], [], [], [], [], multistep=items)
+
+        assert "A2 多步自主 67% < 70%" in verdict
+
 
 @pytest.fixture
 def config_never_loaded(ev: Any, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -280,7 +299,8 @@ class TestJudgeWhenNothingRan:
 
 class TestSuiteSelection:
     def test_all_expands_to_every_section(self, ev: Any) -> None:
-        assert ev.selected_suites("all") == {"selection", "boundary", "multiturn", "revise"}
+        assert ev.selected_suites("all") == {"selection", "boundary", "multiturn",
+                                             "revise", "multistep"}
 
     def test_single_suite(self, ev: Any) -> None:
         assert ev.selected_suites("boundary") == {"boundary"}
@@ -328,6 +348,27 @@ class TestRender:
 
         assert "evals/chat/cases-v2.json" in markdown
 
+    def test_render_multistep_a2_section(self, ev: Any) -> None:
+        """多步节要写出 A2 门槛与达标结论，并进 pass^k 汇总表。"""
+        report = self.make_report(ev, repeat=3)
+        item = ev.merge_runs([
+            {"name": "多步：搜热点→跑分析", "message": "m",
+             "picked": ["search_hotspots", "run_hotspot_analysis"], "steps": 2,
+             "steps_ok": True, "min_steps": 2, "first_ok": True,
+             "grounded": ["球拍特写"], "must_contain_any": ["球拍特写"],
+             "reply": "…球拍特写…", "cost_cny": 0.01, "latency_ms": 100,
+             "status": "succeeded", "error": "", "notes": "", "ok": True}
+            for _ in range(3)])
+        report["arms"]["candidate"]["multistep"] = [item]
+        report["metrics"]["multistep"] = ev.pass_metrics([item])
+
+        markdown = ev.render_markdown(report)
+
+        assert "## 五、多步" in markdown
+        assert "A2 门槛 ≥70% → 达标" in markdown
+        assert "多步（A2）" in markdown          # pass^k 汇总表里的行
+        assert "search_hotspots → run_hotspot_analysis" in markdown
+
     def test_render_without_cases_key_still_works(self, ev: Any) -> None:
         """`cases` 是本次新加的字段：加字段之前落盘的报告 JSON 没有它，二次渲染不许 KeyError。"""
         report = self.make_report(ev, repeat=1)
@@ -335,9 +376,121 @@ class TestRender:
 
         assert "evals/chat/cases.json" in ev.render_markdown(report)
 
+    def test_renders_the_oldest_historical_report(self, ev: Any) -> None:
+        """最老的归档报告（2026-10-11）没有 `cases_version` / `cost_limit`，也没有 boundary /
+        multiturn 两节——渲染器必须能读它，缺的节按「当时没跑」显示，不许 KeyError。"""
+        report = read_json(EVALS_REPORTS_DIR / "chat-tools-2026-10-11.json")
+
+        markdown = ev.render_markdown(report)
+
+        assert "# 对话层回归评测 · 2026-10-11" in markdown
+        assert "本节未运行" in markdown
+        assert "成本门槛 ≤ 0.25 元/轮" in markdown      # cost_limit 缺失时回落脚本当前门槛
+
+
+class TestMultistep:
+    """A2 多步节：步数 + 首跳 + 依据锚点 + 成本，四条缺一不可（只数调用次数不算成功）。"""
+
+    @staticmethod
+    def fake_turn(ev: Any, picked: list[str], reply: str, *,
+                  cost: float = 0.01, status: str = "succeeded") -> Any:
+        return SimpleNamespace(status=status, error="", reply=reply,
+                               tool_calls=[{"tool": name} for name in picked],
+                               cost_cny=cost, latency_ms=100)
+
+    @staticmethod
+    def case(ev: Any, **overrides: Any) -> Any:
+        values: dict[str, Any] = {
+            "name": "m", "message": "帮我找热点再跑分析",
+            "first_tool": frozenset({"search_hotspots"}),
+            "must_contain_any": ("球拍特写",),
+        }
+        values.update(overrides)
+        return ev.MultistepCase(**values)
+
+    @pytest.mark.asyncio
+    async def test_two_steps_with_grounding_pass(self, ev: Any,
+                                                 monkeypatch: pytest.MonkeyPatch) -> None:
+        async def fake_run_turn(cfg: Any, **kwargs: Any) -> Any:
+            return self.fake_turn(ev, ["search_hotspots", "run_hotspot_analysis"],
+                                  "搜到「夜跑球鞋开箱」，分析首选是「球拍特写」")
+
+        monkeypatch.setattr(ev, "run_turn", fake_run_turn)
+
+        result = await ev.run_multistep_case(SimpleNamespace(), provider=None, case=self.case(ev))
+
+        assert result["ok"] is True
+        assert result["steps"] == 2 and result["steps_ok"] is True
+        assert result["grounded"] == ["球拍特写"]
+
+    @pytest.mark.asyncio
+    async def test_single_step_fails(self, ev: Any,
+                                     monkeypatch: pytest.MonkeyPatch) -> None:
+        async def fake_run_turn(cfg: Any, **kwargs: Any) -> Any:
+            return self.fake_turn(ev, ["search_hotspots"], "球拍特写")
+
+        monkeypatch.setattr(ev, "run_turn", fake_run_turn)
+
+        result = await ev.run_multistep_case(SimpleNamespace(), provider=None, case=self.case(ev))
+
+        assert result["steps_ok"] is False and result["ok"] is False
+
+    @pytest.mark.asyncio
+    async def test_two_steps_without_grounded_fact_fails(self, ev: Any,
+                                                         monkeypatch: pytest.MonkeyPatch) -> None:
+        """调了两次工具但终稿没有工具返回里的事实 → 不算合格（§10 判定口径）。"""
+        async def fake_run_turn(cfg: Any, **kwargs: Any) -> Any:
+            return self.fake_turn(ev, ["search_hotspots", "run_hotspot_analysis"],
+                                  "这条热点可以蹭，我已经看完了")
+
+        monkeypatch.setattr(ev, "run_turn", fake_run_turn)
+
+        result = await ev.run_multistep_case(SimpleNamespace(), provider=None, case=self.case(ev))
+
+        assert result["steps_ok"] is True and result["grounded"] == []
+        assert result["ok"] is False
+
+    @pytest.mark.asyncio
+    async def test_wrong_first_tool_fails(self, ev: Any,
+                                         monkeypatch: pytest.MonkeyPatch) -> None:
+        async def fake_run_turn(cfg: Any, **kwargs: Any) -> Any:
+            return self.fake_turn(ev, ["fetch_url", "run_hotspot_analysis"], "球拍特写")
+
+        monkeypatch.setattr(ev, "run_turn", fake_run_turn)
+
+        result = await ev.run_multistep_case(SimpleNamespace(), provider=None, case=self.case(ev))
+
+        assert result["first_ok"] is False and result["ok"] is False
+
+    @pytest.mark.asyncio
+    async def test_over_cost_fails(self, ev: Any,
+                                   monkeypatch: pytest.MonkeyPatch) -> None:
+        async def fake_run_turn(cfg: Any, **kwargs: Any) -> Any:
+            return self.fake_turn(ev, ["search_hotspots", "run_hotspot_analysis"],
+                                  "球拍特写", cost=1.0)
+
+        monkeypatch.setattr(ev, "run_turn", fake_run_turn)
+
+        result = await ev.run_multistep_case(SimpleNamespace(), provider=None, case=self.case(ev))
+
+        assert result["ok"] is False
+
+    def test_steps_rate_requires_every_repeat(self, ev: Any) -> None:
+        """重复跑时 A2 主指标按「每次都 ≥2 步」算，与 `ok` 的严格口径一致。"""
+        flaky = ev.merge_runs([{"name": "a", "ok": True, "steps_ok": True},
+                               {"name": "a", "ok": True, "steps_ok": False}])
+        stable = ev.merge_runs([{"name": "b", "ok": True, "steps_ok": True},
+                                {"name": "b", "ok": True, "steps_ok": True}])
+
+        assert ev._steps_rate([flaky]) == 0.0
+        assert ev._steps_rate([stable]) == 1.0
+
 
 class TestCasesV2:
-    """v2 用例集：v1 的 28 条**逐字**保留 + 新增 5 条（v1 文件按 AGENTS.md §2.3 冻结不动）。"""
+    """v2 用例集：v1 的 28 条**逐字**保留 + 网页用例 5 条 + multistep 3 条。
+
+    （v1 文件按 AGENTS.md §2.3 冻结不动；v2 在产出归档报告前由 PR4 修正过一轮，见用例集 note。）
+    """
 
     def test_cases_v2_version_string(self, ev: Any) -> None:
         assert ev.load_cases(CASES_V2_PATH).version == "chat-v2"
@@ -350,27 +503,48 @@ class TestCasesV2:
             assert v2[section][:len(v1[section])] == v1[section], section
         assert sum(len(v1[section]) for section in SECTIONS) == 28
 
-    def test_cases_v2_adds_five_cases(self) -> None:
+    def test_cases_v2_adds_web_cases(self) -> None:
         v1, v2 = read_json(CASES_V1_PATH), read_json(CASES_V2_PATH)
         added = v2["selection"][len(v1["selection"]):]
 
         assert [(item["message"], sorted(item["expect"])) for item in added] == [
-            (message, sorted(expect)) for message, expect in NEW_V2_CASES]
+            (message, sorted(expect)) for message, expect in NEW_SELECTION_CASES]
         assert all(item["why"].strip() for item in added)      # 新增的每条都要写清目的
+        # 「把刚才搜到的第一条跑一遍分析」在单轮臂不可判定，已移到多轮节（A2 首跑 0/3 的修正）
+        new_turns = v2["multiturn"][len(v1["multiturn"]):]
+        assert [item["name"] for item in new_turns] == [NEW_MULTITURN_NAME]
+        assert len(new_turns[0]["turns"]) == len(new_turns[0]["expect_tools"]) == 2
+
+    def test_cases_v2_multistep_definitions_are_judgeable(self) -> None:
+        """A2 用例必须自带可机读判据：≥2 步、首跳白名单、依据锚点，缺一条就等于没测。"""
+        multistep = read_json(CASES_V2_PATH)["multistep"]
+
+        assert [item["name"] for item in multistep] == list(NEW_MULTISTEP_NAMES)
+        for item in multistep:
+            assert item["message"].strip() and item["notes"].strip(), item["name"]
+            assert item["min_steps"] >= 2, item["name"]
+            assert item["first_tool"], item["name"]
+            assert item["must_contain_any"], item["name"]
 
     def test_cases_v2_expectations_only_reference_registered_tools(self) -> None:
-        """新增用例点的工具名必须真实存在（网页两件只有开启态才下发）。"""
+        """用例里点的工具名必须真实存在（网页两件只有开启态才下发）。"""
         known = chat_tools.tool_names(make_cfg(enabled=True))
+        payload = read_json(CASES_V2_PATH)
 
-        for item in read_json(CASES_V2_PATH)["selection"]:
+        for item in payload["selection"]:
             assert set(item["expect"]) <= known, item["name"]
+        for item in payload["multiturn"]:
+            for group in item["expect_tools"]:
+                assert set(group) <= known, item["name"]
+        for item in payload["multistep"]:
+            assert set(item["first_tool"]) <= known, item["name"]
 
-    def test_cases_v2_parses_into_all_four_sections(self, ev: Any) -> None:
-        """四段都要非空：`main()` 的「用例集缺 X 段」guard 会拦住空段。"""
+    def test_cases_v2_parses_into_all_five_sections(self, ev: Any) -> None:
+        """五段都要非空；`main()` 的缺段 guard 只放过 v1 没有的 multistep。"""
         cases = ev.load_cases(CASES_V2_PATH)
 
-        assert [len(cases.selection), len(cases.boundary),
-                len(cases.multiturn), len(cases.revise)] == [15, 10, 5, 3]
+        assert [len(cases.selection), len(cases.boundary), len(cases.multiturn),
+                len(cases.revise), len(cases.multistep)] == [14, 10, 6, 3, 3]
 
 
 class TestCasesFlag:

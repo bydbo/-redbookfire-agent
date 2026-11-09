@@ -1,6 +1,6 @@
-"""对话层的回归评测（S7.9 起；S7.11 / S7.12 扩成四节）。
+"""对话层的回归评测（S7.9 起；S7.11 / S7.12 扩成四节，PR4 再加多步一节）。
 
-用途：`chat_supervisor` 的 prompt 变更回归——prompt 契约 §六 的**对话类口径**。四节：
+用途：`chat_supervisor` 的 prompt 变更回归——prompt 契约 §六 的**对话类口径**。五节：
 
 1. **工具选择**：把固定消息喂给 supervisor（带 `tools_for(cfg)` 下发的清单），看第一跳点了哪个
    工具——或者
@@ -10,7 +10,10 @@
    可引导类必须给出替代路径），不引入模型评委；
 3. **多轮**：假工具执行器 + 真模型跑 `workflows/chat.run_turn`，断言指代承接、不重复付费、
    历史预算内、关键事实不丢；
-4. **改写路径的越界拒绝**：真调 `copy_revise`，越界要求必须 `refused=true`。
+4. **改写路径的越界拒绝**：真调 `copy_revise`，越界要求必须 `refused=true`；
+5. **多步（A2）**：同样真模型 + 假工具，但只发一条用户消息，看模型是否自主走完 ≥2 步
+   （搜索 → 读取 → 分析），并断言终稿里的关键事实能对上工具返回（§10 的判定口径）——
+   "调了工具但结论没依据"不算成功。
 
 用例集：默认 `evals/chat/cases.json`（自带 `version`，`chat-v1`）；`--cases` 换别的文件（如
 `evals/chat/cases-v2.json`，`chat-v2`）。它不属于 evals v1 冻结资产，改动只升这个版本号。
@@ -27,6 +30,7 @@
     uv run python scripts/eval_chat_tools.py --limit 3            # 冒烟：selection 只跑前 3 条
     uv run python scripts/eval_chat_tools.py --skip-multiturn     # 跳过最贵的一节
     uv run python scripts/eval_chat_tools.py --suite boundary     # 只跑越界话术那一节
+    uv run python scripts/eval_chat_tools.py --suite multistep    # 只跑多步（A2）
     uv run python scripts/eval_chat_tools.py --repeat 3           # 每条跑 3 次，报 pass@1 / pass@3
     uv run python scripts/eval_chat_tools.py --cases evals/chat/cases-v2.json   # 换用例集
 
@@ -65,11 +69,13 @@ from xhs_agent.config import AppConfig, ConfigError, load_config
 from xhs_agent.schemas import HotspotClue
 from xhs_agent.services import chat_tools
 from xhs_agent.services.chat_tools import (
+    TOOL_FETCH_URL,
     TOOL_PARSE_IMAGE,
     TOOL_PREVIEW_COVERAGE,
     TOOL_READ_RUN,
     TOOL_REVISE_DRAFT,
     TOOL_RUN_ANALYSIS,
+    TOOL_SEARCH_HOTSPOTS,
     TOOL_SEARCH_MATERIALS,
     ToolOutcome,
 )
@@ -90,8 +96,11 @@ CASES_PATH = PROJECT_ROOT / "evals" / "chat" / "cases.json"
 MIN_PROMPT_CHARS = 200
 # 轮级成本门槛（prompt 契约 §六：≤ 0.25 元/轮，含一次分析）
 COST_LIMIT_CNY = 0.25
+# A2 目标（派单书 §10）：多步用例「自主 ≥2 步」比例 ≥ 70%；pass@k ≥ 50%
+A2_STEPS_TARGET = 0.70
+A2_PASS_TARGET = 0.50
 # 可以单跑的节（`--suite` 的取值里除 `all` 的部分）；元组顺序就是报告里的顺序
-SUITES: tuple[str, ...] = ("selection", "boundary", "multiturn", "revise")
+SUITES: tuple[str, ...] = ("selection", "boundary", "multiturn", "revise", "multistep")
 # 假工具的固定产出（评测不碰库、不起 Celery）；`球拍特写` / `抓地` 是多轮断言用的关键词
 FAKE_RUN_ID = "0f4d6f1e-6f2f-4b1a-9c3e-0d1a2b3c4d5e"
 FAKE_PAYLOADS: dict[str, dict[str, Any]] = {
@@ -134,6 +143,28 @@ FAKE_PAYLOADS: dict[str, dict[str, Any]] = {
                     "tags": ["#夜跑"], "cover_text": "夜跑两公里",
                     "first_3s": "鞋底特写", "shot_list": [], "compliance_notes": []},
         "cost_cny": 0.02, "prompt_tokens": 1500, "completion_tokens": 400,
+    },
+    # 网页两件的假返回（Task 13 的 multistep 节用）：形状对齐真实 payload，
+    # 里面的标题/正文是**判定用的锚点**——回复里必须能对上它们，才算"关键事实有依据"
+    TOOL_SEARCH_HOTSPOTS: {
+        "query": "夜跑球鞋", "count": 5,
+        "results": [
+            {"title": "夜跑球鞋开箱刷屏，湿滑路面实测成焦点",
+             "url": "https://example.com/a",
+             "snippet": "一双夜跑球鞋的开箱视频冲上热榜，评论区都在问湿滑路面的抓地表现。",
+             "published_date": "2026-11-03"},
+            {"title": "夜跑装备清单里，球鞋为什么排第一",
+             "url": "https://example.com/b",
+             "snippet": "夜跑装备讨论里球鞋的出场率最高。",
+             "published_date": None},
+        ],
+        "note": "",
+    },
+    TOOL_FETCH_URL: {
+        "url": "https://example.com/a", "final_url": "https://example.com/a",
+        "title": "夜跑球鞋开箱实测：湿滑路面抓地力",
+        "text": "这双夜跑球鞋在湿滑路面上的抓地表现是这次开箱的重点。鞋底纹路加深，落地更稳。",
+        "char_count": 1200, "truncated": False, "next_start_index": None,
     },
 }
 # 长历史用例的合成消息（每条约 400 字 → 30 条约 8k tokens，超过默认预算 6000）
@@ -190,6 +221,23 @@ class ReviseCase:
     expect_refused: bool
 
 
+@dataclass(frozen=True)
+class MultistepCase:
+    """一条多步用例（A2）：**同一轮**里模型是否自主走完 ≥2 步，且结论有工具依据。
+
+    与 `MultiTurnCase` 的区别：多轮是"用户再说一句"才走到第二步；多步是用户只发一条消息，
+    模型自己决定连着调搜索 → 读取 → 分析。`must_contain_any` 是判定锚点——终稿里至少出现一个
+    只可能来自工具返回的词，否则"调了工具但结论没依据"也算不过。
+    """
+
+    name: str
+    message: str
+    min_steps: int = 2
+    first_tool: frozenset[str] = frozenset()
+    must_contain_any: tuple[str, ...] = ()
+    notes: str = ""
+
+
 @dataclass
 class ChatCases:
     """对话用例集的解析结果（默认 `evals/chat/cases.json`，或 `--cases` 指定的文件）。"""
@@ -199,6 +247,7 @@ class ChatCases:
     boundary: list[BoundaryCase] = field(default_factory=list)
     multiturn: list[MultiTurnCase] = field(default_factory=list)
     revise: list[ReviseCase] = field(default_factory=list)
+    multistep: list[MultistepCase] = field(default_factory=list)
 
 
 def resolve_cases_path(value: str | None) -> Path:
@@ -263,6 +312,13 @@ def load_cases(path: Path = CASES_PATH) -> ChatCases:
         revise=[ReviseCase(name=str(item["name"]), request=str(item["request"]),
                            expect_refused=bool(item.get("expect_refused")))
                 for item in payload.get("revise") or []],
+        multistep=[MultistepCase(
+            name=str(item["name"]), message=str(item["message"]),
+            min_steps=int(item.get("min_steps") or 2),
+            first_tool=frozenset(str(x) for x in item.get("first_tool") or []),
+            must_contain_any=tuple(str(x) for x in item.get("must_contain_any") or []),
+            notes=str(item.get("notes") or ""))
+            for item in payload.get("multistep") or []],
     )
 
 
@@ -433,6 +489,37 @@ async def run_multiturn_case(cfg: AppConfig, provider: Any,
     return result
 
 
+async def run_multistep_case(cfg: AppConfig, provider: Any,
+                             case: MultistepCase) -> dict[str, Any]:
+    """跑一条多步用例：真模型 + 假工具，看模型在**一条用户消息**里自主走几步。
+
+    A2 口径（不放宽）：`status == succeeded`、工具调用 ≥ `min_steps`、首跳落在 `first_tool`
+    （给了的话）、终稿至少含一个只可能来自工具返回的锚点词、单轮成本 ≤ 门槛。只数调用次数不算
+    成功——"调了工具但结论没依据"与"没调"一样不合格。
+    """
+    tools = FakeTools()
+    turn = await run_turn(cfg, provider=provider, history=[], user_text=case.message,
+                          run_tool=tools, stream=False)
+    picked = [str(call["tool"]) for call in turn.tool_calls]
+    steps_ok = len(picked) >= case.min_steps
+    first_ok = not case.first_tool or bool(picked and picked[0] in case.first_tool)
+    grounded = [word for word in case.must_contain_any if word in turn.reply]
+    ok = (turn.status == "succeeded" and steps_ok and first_ok
+          and bool(grounded or not case.must_contain_any)
+          and turn.cost_cny <= COST_LIMIT_CNY)
+    result = {"name": case.name, "message": case.message, "picked": picked,
+              "steps": len(picked), "steps_ok": steps_ok, "min_steps": case.min_steps,
+              "first_ok": first_ok, "grounded": grounded,
+              "must_contain_any": list(case.must_contain_any),
+              "reply": turn.reply, "cost_cny": turn.cost_cny,
+              "latency_ms": turn.latency_ms, "status": turn.status,
+              "error": turn.error, "ok": ok, "notes": case.notes}
+    print(f"{'PASS' if ok else 'FAIL'} | {case.name} | {len(picked)} 步 "
+          f"{'→'.join(picked) or '(不调工具)'} | 依据 {grounded} | "
+          f"{turn.cost_cny:.4f} 元 | {turn.status} {turn.error}", flush=True)
+    return result
+
+
 CLUE = HotspotClue.from_dict({
     "hotspot_raw": "夜跑球鞋开箱",
     "why_it_works": ["夜里跑步的反差"],
@@ -485,6 +572,15 @@ def _rate(flags: Sequence[bool]) -> float:
     return round(sum(1 for flag in flags if flag) / len(flags), 4) if flags else 0.0
 
 
+def _steps_rate(cases: Sequence[dict[str, Any]]) -> float:
+    """多步用例里「每一次都自主走了 ≥min_steps 步」的比例（A2 的主指标）。
+
+    看每轮的原始记录而不是压平后的 `steps_ok`：重复跑时压平结果取的是第 1 轮。
+    """
+    return _rate([all(bool(run.get("steps_ok")) for run in (item.get("runs") or [item]))
+                  for item in cases])
+
+
 def _limit(items: Sequence[Any], limit: int | None) -> list[Any]:
     return list(items[:limit] if limit else items)
 
@@ -498,7 +594,7 @@ def display_cases_path(path: Path) -> str:
 
 
 def selected_suites(name: str) -> set[str]:
-    """`--suite` 的取值展开成要跑的节；`all` = 四节都跑。"""
+    """`--suite` 的取值展开成要跑的节；`all` = 全部节都跑（v1 没有 multistep 时自动跳过）。"""
     return set(SUITES) if name == "all" else {name}
 
 
@@ -590,7 +686,7 @@ def _render_selection(baseline: dict[str, Any], candidate: dict[str, Any],
         f" → 候选 {_rate([item['ok'] for item in candidate['selection']]) * 100:.0f}%",
         "",
         f"（`expect` 记为「不调工具也接受」的用例："
-        f"{', '.join(item['name'] for item in candidate['selection'] if item['no_tool_ok'])}）",
+        f"{', '.join(item['name'] for item in candidate['selection'] if item.get('no_tool_ok'))}）",
         "",
     ]
     return lines
@@ -662,14 +758,44 @@ def _render_revise(candidate: dict[str, Any], repeat: int) -> list[str]:
     return lines
 
 
+def _render_multistep(candidate: dict[str, Any], repeat: int) -> list[str]:
+    """第五节：多步自主（A2）——一条消息内模型自己走了几步、结论有没有工具依据。"""
+    title = "## 五、多步（真模型 + 假工具：一条消息内自主走几步）"
+    items = candidate["multistep"]
+    if not items:
+        return _not_run(title, "multistep")
+    lines = [title, "",
+             "| 用例 | 工具链 | 步数 | 首跳符合 | 依据锚点 | 成本（元） | 结论 |",
+             "| --- | --- | --- | --- | --- | --- | --- |"]
+    for item in items:
+        chain = " → ".join(item["picked"]) or "(不调工具)"
+        lines.append(f"| {item['name']} | {chain} | {item['steps']} | "
+                     f"{'✅' if item['first_ok'] else '❌'} | "
+                     f"{', '.join(item['grounded']) or '—'} | "
+                     f"{item['cost_cny']:.4f} | {_mark(item, repeat)} |")
+    steps_rate = _steps_rate(items)
+    ok_rate = _rate([item["ok"] for item in items])
+    lines += [
+        "",
+        f"**自主 ≥2 步**：{steps_rate * 100:.0f}%（A2 门槛 ≥70% → "
+        f"{'达标' if steps_rate >= 0.7 else '未达标'}）",
+        "",
+        f"**合格（步数 + 首跳 + 依据锚点 + 成本全过）**：{ok_rate * 100:.0f}%"
+        f"（{sum(1 for item in items if item['ok'])}/{len(items)}）",
+        "",
+    ]
+    return lines
+
+
 def _render_pass_metrics(metrics: dict[str, Any], repeat: int) -> list[str]:
-    """第五节：pass@1 / pass@k 的汇总表（k = `--repeat`）。"""
+    """第六节：pass@1 / pass@k 的汇总表（k = `--repeat`）。"""
     labels = {"selection_baseline": "工具选择（基线臂）", "selection": "工具选择（候选臂）",
-              "boundary": "越界话术", "multiturn": "多轮", "revise": "改写合规"}
+              "boundary": "越界话术", "multiturn": "多轮", "revise": "改写合规",
+              "multistep": "多步（A2）"}
     rows = [(labels.get(name, name), item) for name, item in metrics.items()]
     if not rows:
         return []
-    head = f"## 五、pass^k（k = {repeat}"
+    head = f"## 六、pass^k（k = {repeat}"
     head += f"，每条用例重复 {repeat} 次）" if repeat > 1 else "，本次未重复运行）"
     lines = [head, "",
              f"| 节 | 用例数 | pass@1（至少过 1 次） | pass@{repeat}（{repeat} 次全过） | 不稳定用例 |",
@@ -686,7 +812,28 @@ def _render_pass_metrics(metrics: dict[str, Any], repeat: int) -> list[str]:
     return lines
 
 
+def legacy_report_view(report: dict[str, Any]) -> dict[str, Any]:
+    """历史报告 JSON 的兼容视图：缺字段时给安全默认值，二次渲染不抛 KeyError。
+
+    报告的字段是逐年加的：`cases_version` / `cost_limit` 之前的报告没有它们，`boundary` /
+    `multiturn` 之前的报告连这些节都不存在。`evals/reports/` 里的历史 JSON 是长期资产，渲染器
+    必须能读最老的那一份——缺什么就按"当时没跑这一节"显示，不回填假数据。
+    """
+    view = dict(report)
+    view.setdefault("cases_version", "")
+    view.setdefault("cost_limit", COST_LIMIT_CNY)
+    arms = dict(view.get("arms") or {})
+    for arm_name in ("baseline", "candidate"):
+        arm = dict(arms.get(arm_name) or {})
+        for section in SUITES:
+            arm.setdefault(section, [])
+        arms[arm_name] = arm
+    view["arms"] = arms
+    return view
+
+
 def render_markdown(report: dict[str, Any]) -> str:
+    report = legacy_report_view(report)
     baseline, candidate = report["arms"]["baseline"], report["arms"]["candidate"]
     repeat = int(report.get("repeat") or 1)
     baseline_version = str(report["versions"]["baseline"] or "")
@@ -713,9 +860,10 @@ def render_markdown(report: dict[str, Any]) -> str:
     lines += _render_boundary(candidate, repeat)
     lines += _render_multiturn(candidate, repeat)
     lines += _render_revise(candidate, repeat)
+    lines += _render_multistep(candidate, repeat)
     lines += _render_pass_metrics(report.get("metrics") or {}, repeat)
     lines += [
-        "## 六、结论",
+        "## 七、结论",
         "",
         report["verdict"],
         "",
@@ -730,8 +878,11 @@ def render_markdown(report: dict[str, Any]) -> str:
 
 def judge(baseline: Sequence[dict[str, Any]], candidate: Sequence[dict[str, Any]],
           boundary: Sequence[dict[str, Any]], multiturn: Sequence[dict[str, Any]],
-          revise: Sequence[dict[str, Any]], repeat: int = 1) -> str:
-    """把四节的判定合成一段给人看的结论（任一不达标即写明回退/不达门槛）。
+          revise: Sequence[dict[str, Any]], repeat: int = 1,
+          multistep: Sequence[dict[str, Any]] = ()) -> str:
+    """把各节的判定合成一段给人看的结论（任一不达标即写明回退/不达门槛）。
+
+    `multistep` 走 A2 的门槛（≥70% 自主多步、pass@k ≥50%），不是 prompt 回归的 100% 口径。
 
     `--repeat > 1` 时 `ok` 已经是「每次都过」，所以「时过时不过」会直接表现成不达标；这里再把
     不稳定的用例单独点出来（同一个 prompt 跑两次结论不同本身就是问题）。
@@ -753,6 +904,15 @@ def judge(baseline: Sequence[dict[str, Any]], candidate: Sequence[dict[str, Any]
         findings.append(f"多轮未全过：{bad}")
     if revise and not all(item["ok"] for item in revise):
         findings.append("改写路径没能在越界要求上拒绝（或正常要求没给回初稿）")
+    if multistep:
+        steps_rate = _steps_rate(multistep)
+        if steps_rate < A2_STEPS_TARGET:
+            findings.append(f"A2 多步自主 {steps_rate * 100:.0f}% < "
+                            f"{A2_STEPS_TARGET * 100:.0f}%")
+        if _rate([item["ok"] for item in multistep]) < A2_PASS_TARGET:
+            findings.append(f"A2 多步合格率 "
+                            f"{_rate([item['ok'] for item in multistep]) * 100:.0f}% < "
+                            f"{A2_PASS_TARGET * 100:.0f}%")
     over = [(item["name"], turn["index"], turn["cost_cny"])
             for item in multiturn
             for run in (item.get("runs") or [item])     # 重复跑的每一轮都要看成本
@@ -778,6 +938,8 @@ def judge(baseline: Sequence[dict[str, Any]], candidate: Sequence[dict[str, Any]
         parts.append(f"多轮 {sum(1 for item in multiturn if item['ok'])}/{len(multiturn)}")
     if revise:
         parts.append(f"改写合规 {sum(1 for item in revise if item['ok'])}/{len(revise)}")
+    if multistep:
+        parts.append(f"多步自主 {_steps_rate(multistep) * 100:.0f}%")
     if not parts:
         # 一条用例都没跑：不许给绿色结论，更不许声明「结果都稳定」
         return ("**未跑任何节**：没有任何一节产出用例结果，本次不给结论"
@@ -837,10 +999,17 @@ async def main() -> int:
         print(f"[环境] {exc.message}", file=sys.stderr)
         return 1
     available = {"selection": cases.selection, "boundary": cases.boundary,
-                 "multiturn": cases.multiturn, "revise": cases.revise}
-    missing = [name for name in SUITES if name in suites and not available[name]]
+                 "multiturn": cases.multiturn, "revise": cases.revise,
+                 "multistep": cases.multistep}
+    # multistep 是 Web 能力专节，v1 用例集没有它：`--suite all` 跑 v1 时跳过而不是报错；
+    # 显式 `--suite multistep` 却没有该段才是配置错误。
+    missing = [name for name in SUITES if name in suites and not available[name]
+               and name != "multistep"]
     if missing:
         print(f"[环境] 用例集缺 {' / '.join(missing)} 段", file=sys.stderr)
+        return 1
+    if "multistep" in suites and not cases.multistep and args.suite == "multistep":
+        print("[环境] 用例集缺 multistep 段（它只存在于 chat-v2）", file=sys.stderr)
         return 1
 
     selection = _limit(cases.selection, args.limit)
@@ -859,6 +1028,7 @@ async def main() -> int:
     boundary: list[dict[str, Any]] = []
     multiturn: list[dict[str, Any]] = []
     revise: list[dict[str, Any]] = []
+    multistep: list[dict[str, Any]] = []
     async with build_http_client(cfg.llm.timeout_s) as client:
         provider = build_provider(cfg, client=client)
         if run_selection:
@@ -882,11 +1052,20 @@ async def main() -> int:
         if "revise" in suites:
             print("[候选] 改写路径的越界拒绝", flush=True)
             revise = await run_section(cases.revise, partial(run_revise_case, provider), args.repeat)
+        if "multistep" in suites:
+            if cases.multistep:
+                print("[候选] 多步（真模型 + 假工具）", flush=True)
+                multistep = await run_section(cases.multistep,
+                                              partial(run_multistep_case, cfg, provider),
+                                              args.repeat)
+            else:
+                print("[候选] 多步：用例集未定义 multistep 段，跳过", flush=True)
 
     metrics: dict[str, Any] = {}
     # 两臂都给 pass@k：基线自己也在抖时，"候选掉了"这个结论本身就不稳
     for name, items in (("selection_baseline", baseline), ("selection", candidate),
-                        ("boundary", boundary), ("multiturn", multiturn), ("revise", revise)):
+                        ("boundary", boundary), ("multiturn", multiturn), ("revise", revise),
+                        ("multistep", multistep)):
         if items:                       # 没跑的节不给 0%，免得看着像"跑挂了"
             metrics[name] = pass_metrics(items)
 
@@ -906,10 +1085,11 @@ async def main() -> int:
         "metrics": metrics,
         "arms": {"baseline": {"selection": baseline},
                  "candidate": {"selection": candidate, "boundary": boundary,
-                               "multiturn": multiturn, "revise": revise}},
+                               "multiturn": multiturn, "revise": revise,
+                               "multistep": multistep}},
     }
     report["verdict"] = judge(baseline, candidate, boundary, multiturn, revise,
-                              repeat=args.repeat)
+                              repeat=args.repeat, multistep=multistep)
 
     out_dir = Path(args.out)
     out_dir.mkdir(parents=True, exist_ok=True)
