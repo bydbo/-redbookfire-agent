@@ -17,7 +17,7 @@ ALL_TASKS = (*AGENT_TASKS, "material_tagging", "image_hotspot_clue",
 PLACEHOLDER_MARKERS = ("待 S3.1 填写", "待填写")
 # 版本号只随内容变更递增（prompt 契约 §三 / §六）——钉住当前值，顺手改正文却忘了升版本会被挡下
 EXPECTED_VERSIONS = {"hotspot_clue": 2, "material_select": 2, "copy_draft": 3,
-                     "chat_supervisor": 6, "copy_revise": 3,
+                     "chat_supervisor": 7, "copy_revise": 3,
                      "image_hotspot_clue_multi": 4, "image_hotspot_clue": 5,
                      "material_tagging": 2, "context_extract": 2, "context_recover": 3}
 CONTRACT_PATH = (Path(__file__).resolve().parents[2]
@@ -273,8 +273,8 @@ class TestSupervisorWebToolWording:
         return [chunk.strip() for chunk in self._SENTENCE_RE.findall("\n".join(lines))
                 if chunk.strip()]
 
-    def test_chat_supervisor_version_is_v6(self) -> None:
-        assert prompt_tool.load("chat_supervisor").version == 6
+    def test_chat_supervisor_version_is_v7(self) -> None:
+        assert prompt_tool.load("chat_supervisor").version == 7
 
     def test_prompt_mentions_web_tools_conditionally(self) -> None:
         assert "如果本轮工具清单里" in self._text()
@@ -290,6 +290,14 @@ class TestSupervisorWebToolWording:
         assert "清单里没有这类工具" in task
         assert "你想蹭哪条热点" in task           # 走 §03.5 的问句，而不是拒绝
         assert "不要答成" in task                 # 明确禁止落到"不在这套工具的能力范围内"
+
+    def test_prompt_restores_tool_selection_semantics(self) -> None:
+        """开网页后模型被完整分析吸走（真模型回退）：§02 必须写清"只问一件就只调那一个"。"""
+        task = prompt_tool.load("chat_supervisor").sections["task"]
+        assert "只调那一件" in task
+        assert "别顺手跑完整分析" in task
+        assert "不等于他要完整分析" in task
+        assert "检索素材" in task and "预览要素与" in task
 
     def test_fixed_refusal_phrase_carves_out_the_missing_optional_tool(self) -> None:
         """§03.1 固定话术的触发条件正是"清单里没有对应工具"——必须给关闭态留例外，否则反噬 §02。"""
