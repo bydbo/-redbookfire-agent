@@ -134,6 +134,10 @@ selection pass@3 由 93% 回到 100%（§3.1）。
    完全不同，不得当成 SearXNG 的通用能力。`publishedDate` 仍是「键存在、无值时为 null」。
 6. `chat-v2` 的 3 条网页用例依赖 `[web].enabled=true`；用 v2 在关闭态跑会看到 3 条必然红——
    那是用例与开关不匹配，不是回退。
+7. **按用例单独设 repeat 未实现**：计划 Task 13 写「天气那条重复 1 次」，脚本的 `--repeat`
+   是全局开关，实际 selection 14 条都跑了 3 次（天气那条 0 工具调用，重复成本可忽略）。
+8. **开启态只单跑了受开关影响的三节**（selection / multiturn / multistep）；boundary 与 revise
+   两节与 `[web]` 开关无关、用例与 chat-v1 逐字相同，由 A1 的关闭态 28/28 覆盖。
 
 ## 九、复现
 
