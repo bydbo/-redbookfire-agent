@@ -767,7 +767,8 @@ paths:
         - 对话
       summary: 新建对话会话
       description: |
-        建一个空会话（前端「新对话」）。标题留空，等**首条用户消息**落库时取前 20 字自动补上；
+        建一个空会话（前端「新会话」）。标题留空，等**首条用户消息**落库时取前 20 字自动补上；
+        之后可用 `PATCH /api/chat/sessions/{session_id}` 重命名。
         会话与消息只在本机数据库里，附件落在 `runs/_chat/<session_id>/`。
       operationId: createChatSession
       parameters:
@@ -882,6 +883,43 @@ paths:
           description: 已删除
         '404':
           $ref: '#/components/responses/NotFound'
+        '503':
+          $ref: '#/components/responses/DependencyUnavailable'
+
+    patch:
+      tags:
+        - 对话
+      summary: 重命名会话
+      description: |
+        只改 `chat_sessions.title`。请求体先 trim，空串 / 纯空白拒绝（422），
+        trim 后最长 100 个 Unicode 字符；**不修改 `updated_at`**（列表仍按最近活跃倒序，改名不置顶）。
+        首条用户消息的自动补名只在 `title` 为空时发生，重命名后的标题不会被覆盖。幂等。
+      operationId: renameChatSession
+      parameters:
+        - $ref: '#/components/parameters/RequestId'
+        - name: session_id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ChatSessionRename'
+      responses:
+        '200':
+          description: 已重命名
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ChatSession'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '422':
+          $ref: '#/components/responses/ValidationError'
         '503':
           $ref: '#/components/responses/DependencyUnavailable'
 
@@ -2282,6 +2320,16 @@ components:
         title:
           type: string
 
+    ChatSessionRename:
+      type: object
+      description: 重命名会话请求体；title 先 trim，空串 / 纯空白与超过 100 个 Unicode 字符都拒绝。
+      additionalProperties: false
+      required:
+        - title
+      properties:
+        title:
+          type: string
+
     ChatSession:
       type: object
       required:
@@ -2295,7 +2343,7 @@ components:
           format: uuid
         title:
           type: string
-          description: 取首条用户消息前 20 字；未发言时为「新对话」，不可编辑
+          description: 取首条用户消息前 20 字；未发言时为「新对话」；可由 PATCH 重命名（trim 后 ≤ 100 个 Unicode 字符）
         created_at:
           type: string
           format: date-time

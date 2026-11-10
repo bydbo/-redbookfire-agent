@@ -4,6 +4,7 @@ import { ApiRequestError, apiFetch, apiUrl, normalizeResponseError } from '@/api
 
 // 类型全部派生自 openapi-typescript 生成物（AGENTS.md：禁止手写并行类型定义）。
 export type ChatSession = components['schemas']['ChatSession']
+export type ChatSessionRename = components['schemas']['ChatSessionRename']
 export type ChatSessionSummary = components['schemas']['ChatSessionSummary']
 export type ChatSessionList = components['schemas']['ChatSessionList']
 export type ChatSessionDetail = components['schemas']['ChatSessionDetail']
@@ -36,6 +37,13 @@ export function listChatSessions(params: { limit: number; offset: number })
     offset: String(params.offset),
   })
   return apiFetch<ChatSessionList>(`/chat/sessions?${query.toString()}`)
+}
+
+// 重命名会话（S7.30）：只改展示名，不改 updated_at / 消息 / 上下文。
+export function renameChatSession(sessionId: string, title: string): Promise<ChatSession> {
+  const body: ChatSessionRename = { title }
+  return apiFetch<ChatSession>(`/chat/sessions/${encodeURIComponent(sessionId)}`,
+                               { method: 'PATCH', body })
 }
 
 // 会话详情（含消息，按时间升序）；limit 只取最近 N 条。

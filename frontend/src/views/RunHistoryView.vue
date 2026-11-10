@@ -75,7 +75,7 @@ function openRun(runId: string): void {
 </script>
 
 <template>
-  <main class="px-4 py-8">
+  <main class="px-4 py-5">
     <div class="mx-auto flex w-full max-w-4xl flex-col gap-6">
       <header class="flex items-start justify-between gap-4">
         <div>

@@ -450,6 +450,66 @@ class TestChatApi:
         assert client.get(f"/api/chat/sessions/{session_id}/attachments/"
                           f"{uuid.uuid4()}/0").status_code == 404
 
+    def test_rename_updates_title_without_reordering(self, client: TestClient) -> None:
+        """S7.30：改名后详情 / 列表都读到新标题，updated_at 不变、列表顺序不变。"""
+        first = new_session(client)
+        second = new_session(client)
+        before = client.get(f"/api/chat/sessions/{first}").json()
+        order_before = [item["session_id"]
+                        for item in client.get("/api/chat/sessions").json()["items"]]
+
+        response = client.patch(f"/api/chat/sessions/{first}", json={"title": "  改名后  "})
+        assert response.status_code == 200
+        assert response.json()["title"] == "改名后"
+        assert response.json()["updated_at"] == before["updated_at"]
+
+        detail = client.get(f"/api/chat/sessions/{first}").json()
+        assert detail["title"] == "改名后"
+        assert detail["updated_at"] == before["updated_at"]
+        listing = client.get("/api/chat/sessions").json()
+        titles = {item["session_id"]: item["title"] for item in listing["items"]}
+        assert titles[first] == "改名后"
+        assert [item["session_id"] for item in listing["items"]] == order_before
+        assert client.get(f"/api/chat/sessions/{second}").status_code == 200
+
+    @pytest.mark.parametrize("payload", [
+        {"title": ""},
+        {"title": "   "},
+        {"title": "字" * 101},
+        {"title": "ok", "extra": "not allowed"},
+        {},
+    ])
+    def test_rename_rejects_invalid_payloads(self, client: TestClient,
+                                             payload: dict[str, Any]) -> None:
+        session_id = new_session(client)
+        assert client.patch(f"/api/chat/sessions/{session_id}",
+                            json=payload).status_code == 422
+
+    def test_rename_accepts_100_unicode_chars(self, client: TestClient) -> None:
+        session_id = new_session(client)
+        title = "😀" * 100
+        response = client.patch(f"/api/chat/sessions/{session_id}", json={"title": title})
+        assert response.status_code == 200
+        assert response.json()["title"] == title
+
+    def test_rename_missing_or_non_uuid_returns_404(self, client: TestClient) -> None:
+        assert client.patch(f"/api/chat/sessions/{uuid.uuid4()}",
+                            json={"title": "x"}).status_code == 404
+        assert client.patch("/api/chat/sessions/not-a-uuid",
+                            json={"title": "x"}).status_code == 404
+
+    def test_rename_survives_first_message(self, client: TestClient,
+                                           provider: ScriptedProvider) -> None:
+        """先改名再发首条消息，自动补名不能覆盖用户改的标题。"""
+        provider.steps = [{"text": "收到"}]
+        session_id = new_session(client)
+        assert client.patch(f"/api/chat/sessions/{session_id}",
+                            json={"title": "用户改名"}).status_code == 200
+        response = client.post(f"/api/chat/sessions/{session_id}/messages",
+                               data={"text": "第一条用户消息"})
+        assert response.status_code == 200
+        assert client.get(f"/api/chat/sessions/{session_id}").json()["title"] == "用户改名"
+
 
 class TestMemoryAndUsage:
     """多轮记忆与轮级用量（S7.10）：跨会话不串味、跨轮图片回落、tokens 落库。"""

@@ -27,6 +27,8 @@ const props = withDefaults(defineProps<{
   maxTotalMb?: number
   /** 是否显示缩略图列表（分析台单图场景关掉，保持原有视觉） */
   thumbs?: boolean
+  /** panel = 虚线面板（分析台 / 旧版）；composer = 只留隐藏 file input，UI 交给 ChatView */
+  variant?: 'panel' | 'composer'
   disabled?: boolean
   /** 标题与提示文案（两处页面各自措辞不同） */
   title?: string
@@ -37,6 +39,7 @@ const props = withDefaults(defineProps<{
   maxSizeMb: 10,
   maxTotalMb: 30,
   thumbs: true,
+  variant: 'panel',
   disabled: false,
   title: '',
   hint: '',
@@ -88,13 +91,20 @@ function onFileChange(event: Event): void {
 
 function onDrop(event: DragEvent): void {
   dragging.value = false
+  if (props.disabled) return
   const dropped = Array.from(event.dataTransfer?.files ?? [])
   if (dropped.length === 0) return
   addFiles(dropped)
 }
 
-function onPaste(event: ClipboardEvent): void {
+function handlePaste(event: ClipboardEvent): void {
   const items = Array.from(event.clipboardData?.items ?? [])
+  const hasImage = items.some((item) => item.kind === 'file' && item.type.startsWith('image/'))
+  // 禁用态只拦图片，纯文本照常放行（不能吃掉用户正常粘贴文字）
+  if (props.disabled) {
+    if (hasImage) event.preventDefault()
+    return
+  }
   const pasted = items
     .filter((item) => item.kind === 'file' && item.type.startsWith('image/'))
     .map((item) => item.getAsFile())
@@ -105,6 +115,7 @@ function onPaste(event: ClipboardEvent): void {
 }
 
 function removeAt(index: number): void {
+  if (props.disabled) return
   emit('update:files', props.files.filter((_file, position) => position !== index))
 }
 
@@ -116,11 +127,15 @@ function namedForPaste(file: File, index: number): File {
 }
 
 function addFiles(incoming: File[], options: { pasted?: boolean } = {}): void {
-  const files = incoming.filter((file) => file && file.size > 0)
-  if (files.length === 0) {
-    emit('error', '没读到图片：这个文件是空的')
+  if (props.disabled) return
+  if (incoming.length === 0) return
+  // 任一非法文件即整批拒绝：不能先静默过滤空文件再收下同批其他文件。
+  const empty = incoming.findIndex((file) => !file || file.size === 0)
+  if (empty >= 0) {
+    emit('error', `第 ${empty + 1} 张是空文件，这一批没有加入`)
     return
   }
+  const files = incoming
   const badType = files.findIndex((file) => !MIME_SUFFIX[file.type])
   if (badType >= 0) {
     emit('error', `第 ${badType + 1} 张不是 jpg / png / webp 图片`)
@@ -148,10 +163,25 @@ function addFiles(incoming: File[], options: { pasted?: boolean } = {}): void {
   emit('error', '')                  // 通过校验：清掉上一次的提示
   emit('update:files', merged)
 }
+
+// composer 变体由 ChatView 驱动：校验 / 命名 / object URL 生命周期仍只在这一处。
+defineExpose({ pick, addFiles, handlePaste, previews })
 </script>
 
 <template>
-  <div class="flex flex-col gap-2">
+  <!-- composer 变体只保留隐藏的 file input，不渲染虚线面板（分析台仍走 panel，零改动） -->
+  <div v-if="variant === 'composer'" class="hidden">
+    <input
+      ref="input"
+      type="file"
+      :accept="ACCEPT"
+      :multiple="max > 1"
+      :disabled="disabled"
+      class="hidden"
+      @change="onFileChange"
+    >
+  </div>
+  <div v-else class="flex flex-col gap-2">
     <div
       class="flex flex-col items-center gap-2 rounded-lg border border-dashed px-4 py-6 text-center"
       :class="dragging ? 'border-brand bg-surface' : 'border-line bg-surface'"
@@ -163,7 +193,7 @@ function addFiles(incoming: File[], options: { pasted?: boolean } = {}): void {
       @dragover.prevent="dragging = true"
       @dragleave.prevent="dragging = false"
       @drop.prevent="onDrop"
-      @paste="onPaste"
+      @paste="handlePaste"
     >
       <p class="text-sm font-medium text-ink-strong">{{ titleText }}</p>
       <p v-if="hint" class="text-xs text-ink-muted">{{ hint }}</p>

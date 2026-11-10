@@ -9,9 +9,9 @@ import {
   NCollapse,
   NCollapseItem,
   NEmpty,
-  NInput,
   NSpin,
   NTag,
+  useMessage,
 } from 'naive-ui'
 import { computed, nextTick, onMounted, ref, watch } from 'vue'
 
@@ -22,11 +22,26 @@ import ImageIntake from '@/components/ImageIntake.vue'
 import { errorCategoryLabel, stageLabel, useChatStore } from '@/stores/chat'
 
 const store = useChatStore()
+const message = useMessage()
 
 const draft = ref('')
 const picked = ref<File[]>([])
-const intakeError = ref<string | null>(null)
 const messagesEl = ref<HTMLElement | null>(null)
+const dropActive = ref(false)
+
+/** composer 变体只暴露这几个方法给 ChatView；校验 / 命名 / object URL 仍在 ImageIntake 内。 */
+interface IntakeExpose {
+  pick: () => void
+  addFiles: (files: File[], options?: { pasted?: boolean }) => void
+  handlePaste: (event: ClipboardEvent) => void
+  previews: string[]
+}
+const intake = ref<IntakeExpose | null>(null)
+const previews = computed(() => intake.value?.previews ?? [])
+const canInteract = computed(() => !store.busy && !store.creatingSession)
+const canSend = computed(() =>
+  (draft.value.trim().length > 0 || picked.value.length > 0) && canInteract.value)
+const currentTitle = computed(() => store.currentSession?.title || '新对话')
 
 /** 贴底判据：距底 40px 以内算「用户还在底部」，此时新消息/流式增量才自动跟随。 */
 const STICK_THRESHOLD_PX = 40
@@ -81,29 +96,73 @@ watch(() => store.messages, (items) => {
   }
 }, { immediate: true })
 
-/** 图片入口的校验提示（白名单 / 单张 / 张数 / 合计，S7.17）；空串表示清掉 */
-function onIntakeError(message: string): void {
-  intakeError.value = message || null
-}
-
-async function onRemoveSession(): Promise<void> {
-  const id = store.currentId
-  const error = await store.removeSession()
-  if (store.currentId === id) contextActionError.value = error
+/** 校验失败只弹 toast；ImageIntake 成功时发出的空错误串必须忽略（不弹空 toast）。 */
+function onIntakeError(text: string): void {
+  if (text) message.warning(text, { duration: 4000 })
 }
 
 async function submit(): Promise<void> {
+  if (!canSend.value) return
   const id = store.currentId
   const text = draft.value
-  const file = picked.value
+  const files = picked.value
   draft.value = ''
   picked.value = []
-  const invalid = await store.send({ text, files: file })
-  if (store.currentId === id && invalid !== null) {
+  const result = await store.send({ text, files })
+  const switched = id !== null && store.currentId !== id
+  // 只有「确认未受理」与「前置校验未发出」恢复草稿；已受理后断流不恢复、不自动重发（D16）。
+  if (!switched && (result.outcome === 'rejected' || result.outcome === 'invalid')) {
     draft.value = text
-    picked.value = file
+    picked.value = files
   }
-  if (store.currentId === id) intakeError.value = null
+  if (!switched && result.outcome !== 'accepted' && result.message) {
+    message.warning(result.message, { duration: 4000 })
+  }
+}
+
+function onComposerKeydown(event: KeyboardEvent): void {
+  if (event.key !== 'Enter' || event.shiftKey || event.isComposing) return
+  event.preventDefault()
+  void submit()
+}
+
+/** 无边框 textarea 随内容长到 6 行（约 144px）为止，之后自己滚。 */
+const composerInput = ref<HTMLTextAreaElement | null>(null)
+function autoGrow(): void {
+  const el = composerInput.value
+  if (el === null) return
+  el.style.height = 'auto'
+  el.style.height = `${String(Math.min(el.scrollHeight, 144))}px`
+}
+watch(draft, () => { void nextTick(autoGrow) })
+
+function pickImages(): void {
+  intake.value?.pick()
+}
+
+function removeImage(index: number): void {
+  picked.value = picked.value.filter((_file, position) => position !== index)
+}
+
+function onComposerDragOver(event: DragEvent): void {
+  event.preventDefault()
+  dropActive.value = true
+}
+
+function onComposerDragLeave(event: DragEvent): void {
+  const next = event.relatedTarget as Node | null
+  if (next !== null && (event.currentTarget as HTMLElement).contains(next)) return
+  dropActive.value = false
+}
+
+function onComposerDrop(event: DragEvent): void {
+  event.preventDefault()
+  dropActive.value = false
+  intake.value?.addFiles(Array.from(event.dataTransfer?.files ?? []))
+}
+
+function onComposerPaste(event: ClipboardEvent): void {
+  intake.value?.handlePaste(event)
 }
 
 function messageText(message: ChatMessage): string {
@@ -140,10 +199,6 @@ function failureHint(message: ChatMessage): string {
     parts.push(errorCategoryLabel(String(snapshot.error_category)))
   }
   return `${base}（${parts.join(' · ')}）`
-}
-
-function sessionLabel(item: { title: string; session_id: string }): string {
-  return item.title || '新对话'
 }
 
 // ---- 上下文面板（S7.24）：生效 / 待确认、作用域、来源与恢复缺口 ----
@@ -260,28 +315,10 @@ function versionTag(call: { version_no?: number | null; base_version_no?: number
   <!-- 对话页自己锁高度：外壳给的是 min-h-0 flex-1，这里 h-full 撑满 → 全页只有消息区滚动 -->
   <main class="h-full min-h-0 px-4 py-6">
     <div class="mx-auto flex h-full min-h-0 w-full max-w-5xl flex-col gap-4">
-      <header class="flex shrink-0 flex-wrap items-end justify-between gap-3">
-        <div>
-          <h1 class="text-2xl font-bold text-ink-strong">
-            热点搭子
-          </h1>
-          <p class="mt-1 text-sm text-ink">
-            丢一张图或一句话过来，我帮你把热点拆开、找素材、写初稿（会自己决定要不要跑完整分析）。
-          </p>
-        </div>
-        <div class="flex gap-2">
-          <n-button size="small" :disabled="store.busy" @click="store.newSession()">
-            新对话
-          </n-button>
-          <n-button
-            v-if="store.currentId"
-            size="small"
-            :disabled="store.busy"
-            @click="onRemoveSession"
-          >
-            删除会话
-          </n-button>
-        </div>
+      <header class="flex shrink-0 items-center gap-3">
+        <h1 class="line-clamp-1 min-w-0 text-lg font-semibold text-ink-strong">
+          {{ currentTitle }}
+        </h1>
       </header>
 
       <n-alert v-if="store.error" class="shrink-0" type="error" :title="store.error" />
@@ -438,36 +475,7 @@ function versionTag(call: { version_no?: number | null; base_version_no?: number
         </n-collapse>
       </n-card>
 
-      <div class="flex min-h-0 flex-1 flex-col gap-4 md:flex-row md:gap-6">
-        <!-- 历史会话侧栏：消息区之外，自己滚；窄屏限高，别把消息区挤没 -->
-        <aside class="w-full shrink-0 md:w-56">
-          <n-card title="历史会话" size="small">
-            <div class="chat-sessions-scroll max-h-28 overflow-y-auto md:max-h-80">
-              <div v-if="store.sessionsLoading" class="text-sm text-ink-muted">
-                加载中…
-              </div>
-              <n-alert v-else-if="store.sessionsError" type="warning" :title="store.sessionsError" />
-              <n-empty v-else-if="store.sessions.length === 0" description="还没有会话" />
-              <ul v-else class="flex flex-col gap-1">
-                <li v-for="item in store.sessions" :key="item.session_id">
-                  <button
-                    type="button"
-                    class="chat-session-item w-full rounded-lg px-2 py-1 text-left text-sm"
-                    :class="{ 'is-active': item.session_id === store.currentId }"
-                    @click="store.openSession(item.session_id)"
-                  >
-                    <span class="line-clamp-1 font-medium">{{ sessionLabel(item) }}</span>
-                    <span class="mt-0.5 line-clamp-1 block text-xs text-ink-muted">
-                      {{ item.message_count }} 条 · {{ item.last_message_preview }}
-                    </span>
-                  </button>
-                </li>
-              </ul>
-            </div>
-          </n-card>
-        </aside>
-
-        <section class="flex min-h-0 min-w-0 flex-1 flex-col gap-3">
+      <section class="flex min-h-0 min-w-0 flex-1 flex-col gap-3">
           <!-- 唯一滚动容器：贴底判据与自动跟随都挂在它身上 -->
           <div
             ref="messagesEl"
@@ -602,50 +610,89 @@ function versionTag(call: { version_no?: number | null; base_version_no?: number
             </div>
           </div>
 
-          <!-- 输入区：一句话 +（可选）图（最多 9 张，S7.18） -->
-          <n-card size="small" class="shrink-0">
-            <div class="flex flex-col gap-3">
-              <n-input
-                v-model:value="draft"
-                type="textarea"
-                :autosize="{ minRows: 2, maxRows: 6 }"
-                placeholder="想蹭哪条热点？说一句话就行（也可以只丢图，最多 9 张）"
-                :disabled="store.busy"
-                @keydown.enter.exact.prevent="submit"
-              />
-              <!-- 选择 / 拖拽 / 粘贴（P0）都在这个组件里；最多 9 张，超限整批拒绝 -->
-              <ImageIntake
-                v-model:files="picked"
-                :max="9"
-                :disabled="store.busy"
-                title="丢几张图，合成一条热点"
-                hint="点这里选文件、把图片拖进来，或先点一下这里再 Ctrl/⌘+V 粘贴（jpg / png / webp，单张 ≤ 10 MB，最多 9 张、合计 ≤ 30 MB）"
-                label="选图片（最多 9 张）"
-                @error="onIntakeError"
-              />
-              <n-alert v-if="intakeError" type="warning" :title="intakeError" />
-              <div class="flex flex-wrap items-center gap-2">
-                <span class="text-xs text-ink-muted">
-                  已选 {{ picked.length }} / 9 张
-                </span>
-                <n-button
-                  class="ml-auto"
-                  size="small"
-                  type="primary"
-                  :loading="store.busy"
-                  :disabled="store.busy"
-                  @click="submit"
+          <!-- 整块 composer：缩略图 / 无边框输入 / ＋ · 张数 · 圆形发送 -->
+          <div
+            class="chat-composer shrink-0"
+            :class="{ 'is-dragging': dropActive }"
+            @dragover="onComposerDragOver"
+            @dragleave="onComposerDragLeave"
+            @drop="onComposerDrop"
+            @paste="onComposerPaste"
+          >
+            <div v-if="dropActive" class="composer-drop-mask">松手添加图片</div>
+
+            <div v-if="picked.length > 0" class="mb-2 flex flex-wrap gap-2">
+              <div v-for="(file, index) in picked" :key="`${file.name}-${index}`" class="composer-thumb">
+                <img
+                  v-if="previews[index]"
+                  :src="previews[index]"
+                  :alt="file.name"
+                  class="h-full w-full rounded-[10px] object-cover"
                 >
-                  发送
-                </n-button>
+                <button
+                  type="button"
+                  class="composer-thumb-remove"
+                  :aria-label="`移除 ${file.name}`"
+                  @click="removeImage(index)"
+                >
+                  ×
+                </button>
               </div>
-              <p class="text-xs text-ink-muted">
-                图片只用于这一次解析（不落盘到素材库）；离开页面这一轮也会跑完，回来看历史就行。
-              </p>
             </div>
-          </n-card>
-        </section>
-      </div>
+
+            <textarea
+              ref="composerInput"
+              v-model="draft"
+              class="composer-input"
+              rows="1"
+              placeholder="想蹭哪条热点？说一句话，或者直接丢图"
+              :disabled="store.busy"
+              @input="autoGrow"
+              @keydown="onComposerKeydown"
+            />
+
+            <div class="mt-2 flex items-center gap-2">
+              <button
+                type="button"
+                class="composer-add"
+                title="图片只用于本次解析、不落素材库"
+                aria-label="添加图片"
+                :disabled="!canInteract"
+                @click="pickImages"
+              >
+                ＋
+              </button>
+              <span class="text-xs text-ink-muted">最多 9 张</span>
+              <span class="text-xs text-ink-muted">已选 {{ picked.length }} / 9 张</span>
+              <button
+                type="button"
+                class="composer-send ml-auto"
+                :disabled="!canSend"
+                aria-label="发送"
+                @click="submit"
+              >
+                <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true">
+                  <path
+                    d="M12 19V5M5 12l7-7 7 7"
+                    fill="none" stroke="currentColor" stroke-width="2"
+                    stroke-linecap="round" stroke-linejoin="round"
+                  />
+                </svg>
+                <span class="sr-only">发送</span>
+              </button>
+            </div>
+
+            <!-- 选择 / 拖拽 / 粘贴的校验仍只在 ImageIntake 一处；这里只留隐藏 input -->
+            <ImageIntake
+              ref="intake"
+              v-model:files="picked"
+              variant="composer"
+              :max="9"
+              :disabled="!canInteract"
+              @error="onIntakeError"
+            />
+          </div>
+      </section>
     </div>
   </main>
 </template>

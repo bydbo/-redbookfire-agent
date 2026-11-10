@@ -1,7 +1,8 @@
 import { flushPromises, mount } from '@vue/test-utils'
+import { NMessageProvider } from 'naive-ui'
 import { createPinia, setActivePinia } from 'pinia'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { nextTick } from 'vue'
+import { h, nextTick } from 'vue'
 
 import type { RunDetail } from '@/api/analysis'
 import { getRun } from '@/api/analysis'
@@ -15,6 +16,11 @@ vi.mock('@/api/chat', () => ({
   listChatSessions: vi.fn(),
   getChatSession: vi.fn(),
   streamMessage: vi.fn(),
+  deleteChatSession: vi.fn(async () => undefined),
+  renameChatSession: vi.fn(async (id: string, title: string) => ({
+    session_id: id, title, created_at: '', updated_at: '',
+  })),
+  getChatContext: vi.fn(async () => null),
   chatAttachmentUrl: (session: string, message: string, index: number) =>
     `/api/chat/sessions/${session}/attachments/${message}/${index}`,
 }))
@@ -115,7 +121,10 @@ function runDetail(): RunDetail {
 }
 
 async function mountView() {
-  const wrapper = mount(ChatView)
+  // 隔离挂载必须给 useMessage() 一个 provider（App.vue 顶层在生产环境提供）
+  const wrapper = mount(NMessageProvider, {
+    slots: { default: () => h(ChatView) },
+  })
   await flushPromises()
   return wrapper
 }
@@ -153,18 +162,21 @@ describe('ChatView（S7.5 对话首页）', () => {
     vi.useRealTimers()
   })
 
-  it('空态给引导，历史会话列在旁边', async () => {
+  it('空态给引导，页头只有当前会话标题（历史会话已移到侧栏）', async () => {
     const wrapper = await mountView()
 
     expect(wrapper.text()).toContain('还没有消息')
-    expect(wrapper.text()).toContain('帮我蹭一下这个热点')
-    expect(wrapper.findAll('.chat-session-item')).toHaveLength(1)
+    expect(wrapper.find('h1').text()).toBe('帮我蹭一下这个热点')
     // 刷新恢复：最近一条会话自动打开（消息从库里读回来）
     expect(getChatSession).toHaveBeenCalledWith('s-1')
-    expect(wrapper.find('.chat-session-item').classes()).toContain('is-active')
+    // 页头 / 页内都不再有历史会话入口、新建与删除按钮
+    expect(wrapper.findAll('.chat-session-item')).toHaveLength(0)
+    expect(wrapper.text()).not.toContain('删除会话')
+    expect(wrapper.text()).not.toContain('新对话')
   })
 
-  it('新对话 + 发送一句话：先建会话，再流式，最后按库里消息渲染', async () => {
+  it('库里没有会话时发送一句话：先建会话，再流式，最后按库里消息渲染', async () => {
+    vi.mocked(listChatSessions).mockResolvedValue({ items: [], total: 0 })
     vi.mocked(createChatSession).mockResolvedValue({
       session_id: 's-9', title: '', created_at: '', updated_at: '',
     })
@@ -177,7 +189,6 @@ describe('ChatView（S7.5 对话首页）', () => {
     ]))
     const wrapper = await mountView()
 
-    await clickButton(wrapper, '新对话')
     await wrapper.find('textarea').setValue('帮我蹭一下这个热点')
     await clickButton(wrapper, '发送')
 
@@ -196,8 +207,6 @@ describe('ChatView（S7.5 对话首页）', () => {
     vi.mocked(getRun).mockResolvedValue(runDetail())
     const wrapper = await mountView()
 
-    await wrapper.find('.chat-session-item').trigger('click')   // 打开历史会话
-    await flushPromises()
     expect(getRun).toHaveBeenCalledWith('r-1')
     expect(wrapper.text()).toContain('爆点要素')
     expect(wrapper.text()).toContain('正文正文')
@@ -208,8 +217,6 @@ describe('ChatView（S7.5 对话首页）', () => {
     vi.mocked(getChatSession).mockRejectedValue(new Error('会话不存在'))
     const wrapper = await mountView()
 
-    await wrapper.find('.chat-session-item').trigger('click')
-    await flushPromises()
     expect(wrapper.text()).toContain('会话不存在')
     expect(wrapper.find('textarea').exists()).toBe(true)
   })
@@ -223,7 +230,7 @@ describe('ChatView（S7.5 对话首页）', () => {
     expect(messages.classes()).toContain('flex-1')
     // 输入卡片在滚动容器之外，且不压缩
     expect(messages.element.contains(wrapper.find('textarea').element)).toBe(false)
-    const composer = wrapper.find('textarea').element.closest('.n-card') as HTMLElement
+    const composer = wrapper.find('textarea').element.closest('.chat-composer') as HTMLElement
     expect(composer.className).toContain('shrink-0')
   })
 
@@ -333,7 +340,6 @@ describe('ChatView（S7.5 对话首页）', () => {
       session_id: 's-9', title: '', created_at: '', updated_at: '',
     })
     const wrapper = await mountView()
-    await clickButton(wrapper, '新对话')
 
     const input = wrapper.find('input[type="file"]')
     const files = [1, 2, 3].map((index) =>
@@ -342,9 +348,9 @@ describe('ChatView（S7.5 对话首页）', () => {
     await input.trigger('change')
     await flushPromises()
 
-    // 只数输入区卡片里的标签：页面上还有上下文面板（S7.24）的标签，不能混在一起数
-    const composer = wrapper.find('textarea').element.closest('.n-card') as HTMLElement
-    expect(composer.querySelectorAll('.n-tag')).toHaveLength(3)
+    // 只数 composer 里的缩略图：页面上还有上下文面板（S7.24）的标签，不能混在一起数
+    const composer = wrapper.find('textarea').element.closest('.chat-composer') as HTMLElement
+    expect(composer.querySelectorAll('.composer-thumb')).toHaveLength(3)
     expect(wrapper.text()).toContain('已选 3 / 9 张')
 
     await clickButton(wrapper, '发送')
@@ -358,7 +364,6 @@ describe('ChatView（S7.5 对话首页）', () => {
       session_id: 's-9', title: '', created_at: '', updated_at: '',
     })
     const wrapper = await mountView()
-    await clickButton(wrapper, '新对话')
 
     const event = new Event('paste', { bubbles: true, cancelable: true }) as ClipboardEvent
     const items = [1, 2].map((index) => ({
@@ -367,14 +372,72 @@ describe('ChatView（S7.5 对话首页）', () => {
       getAsFile: () => new File([new Uint8Array([index])], '', { type: 'image/png' }),
     }))
     Object.defineProperty(event, 'clipboardData', { value: { items } })
-    wrapper.find('[role="button"]').element.dispatchEvent(event)
+    wrapper.find('.chat-composer').element.dispatchEvent(event)
     await flushPromises()
 
     // 粘贴的图进选中区（截图没名字 → 生成可读名），且绝不自动发送
-    // 只数输入区卡片里的标签（上下文面板的标签不计入，S7.24）
-    const composer = wrapper.find('textarea').element.closest('.n-card') as HTMLElement
-    expect(composer.querySelectorAll('.n-tag')).toHaveLength(2)
-    expect(wrapper.text()).toContain('粘贴图片-1.png')
+    const composer = wrapper.find('textarea').element.closest('.chat-composer') as HTMLElement
+    expect(composer.querySelectorAll('.composer-thumb')).toHaveLength(2)
+    expect(composer.querySelector('.composer-thumb img')?.getAttribute('alt')).toBe('粘贴图片-1.png')
     expect(streamMessage).not.toHaveBeenCalled()
+  })
+
+  it('composer 是整块圆角卡：无虚线选图区、无底部说明段', async () => {
+    const wrapper = await mountView()
+    expect(wrapper.find('.chat-composer').exists()).toBe(true)
+    expect(wrapper.find('[role="button"]').exists()).toBe(false)
+    expect(wrapper.text()).not.toContain('图片只用于这一次解析')
+    expect(wrapper.text()).toContain('最多 9 张')
+    expect(wrapper.find('textarea').attributes('placeholder'))
+      .toBe('想蹭哪条热点？说一句话，或者直接丢图')
+  })
+
+  it('空输入时发送按钮禁用，有内容后可用', async () => {
+    const wrapper = await mountView()
+    expect(wrapper.find('.composer-send').attributes('disabled')).toBeDefined()
+    await wrapper.find('textarea').setValue('一句话')
+    expect(wrapper.find('.composer-send').attributes('disabled')).toBeUndefined()
+  })
+
+  it('Enter 发送；Shift+Enter 与 IME 组合中的 Enter 不发送', async () => {
+    vi.mocked(listChatSessions).mockResolvedValue({ items: [], total: 0 })
+    vi.mocked(createChatSession).mockResolvedValue({
+      session_id: 's-9', title: '', created_at: '', updated_at: '',
+    })
+    const wrapper = await mountView()
+    const area = wrapper.find('textarea')
+    await area.setValue('帮我蹭一下')
+
+    await area.trigger('keydown', { key: 'Enter', shiftKey: true, isComposing: false })
+    expect(streamMessage).not.toHaveBeenCalled()
+    await area.trigger('keydown', { key: 'Enter', shiftKey: false, isComposing: true })
+    expect(streamMessage).not.toHaveBeenCalled()
+    await area.trigger('keydown', { key: 'Enter', shiftKey: false, isComposing: false })
+    await flushPromises()
+    expect(streamMessage).toHaveBeenCalledTimes(1)
+  })
+
+  it('确认未受理的失败恢复草稿；SSE 已受理后断流不恢复、不自动重发', async () => {
+    const { ApiRequestError } = await import('@/api/client')
+    vi.mocked(streamMessage).mockRejectedValueOnce(
+      new ApiRequestError('服务不可用', undefined, 503),
+    )
+    const wrapper = await mountView()
+    const area = wrapper.find('textarea')
+    await area.setValue('第一条草稿')
+    await clickButton(wrapper, '发送')
+    expect((wrapper.find('textarea').element as HTMLTextAreaElement).value).toBe('第一条草稿')
+    expect(streamMessage).toHaveBeenCalledTimes(1)
+
+    // 流已开始后断流：不恢复草稿，避免重复提交已落库的消息
+    vi.mocked(streamMessage).mockImplementationOnce(async (...args) => {
+      const onEvent = args[2] as (event: { event: string; data: Record<string, unknown> }) => void
+      onEvent({ event: 'turn_started', data: {} })
+      throw new Error('stream broken')
+    })
+    await clickButton(wrapper, '发送')
+    await flushPromises()
+    expect((wrapper.find('textarea').element as HTMLTextAreaElement).value).toBe('')
+    expect(streamMessage).toHaveBeenCalledTimes(2)
   })
 })

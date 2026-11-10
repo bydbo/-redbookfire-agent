@@ -72,6 +72,11 @@ export async function apiFetch<T>(path: string, options: ApiFetchOptions = {}): 
 
   if (!response.ok) throw await normalizeResponseError(response)
 
+  // 204 / 显式空响应体：没有 JSON 可解析（DELETE 会话返回 204）。直接按成功返回，
+  // 否则 `response.json()` 会抛 SyntaxError，被上层误判成失败。
+  if (response.status === 204 || response.headers?.get('content-length') === '0') {
+    return undefined as T
+  }
   return (await response.json()) as T
 }
 

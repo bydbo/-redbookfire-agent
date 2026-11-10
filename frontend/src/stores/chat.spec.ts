@@ -11,10 +11,12 @@ import type {
 } from '@/api/chat'
 import {
   createChatSession,
+  deleteChatSession,
   getChatContext,
   getChatSession,
   listChatSessions,
   postChatContextAction,
+  renameChatSession,
   streamMessage,
 } from '@/api/chat'
 import { ApiRequestError } from '@/api/client'
@@ -27,6 +29,8 @@ vi.mock('@/api/chat', () => ({
   getChatContext: vi.fn(),
   postChatContextAction: vi.fn(),
   streamMessage: vi.fn(),
+  deleteChatSession: vi.fn(),
+  renameChatSession: vi.fn(),
 }))
 
 vi.mock('@/api/analysis', () => ({ getRun: vi.fn() }))
@@ -96,6 +100,12 @@ describe('useChatStore', () => {
     vi.mocked(getChatSession).mockReset()
     vi.mocked(streamMessage).mockReset()
     vi.mocked(getRun).mockReset()
+    vi.mocked(deleteChatSession).mockReset()
+    vi.mocked(renameChatSession).mockReset()
+    vi.mocked(deleteChatSession).mockResolvedValue(undefined)
+    vi.mocked(renameChatSession).mockImplementation(async (id: string, title: string) => ({
+      session_id: id, title, created_at: '', updated_at: '',
+    }))
   })
 
   afterEach(() => {
@@ -149,7 +159,9 @@ describe('useChatStore', () => {
 
   it('空消息被拦下，不发请求', async () => {
     const store = useChatStore()
-    await expect(store.send({ text: '   ' })).resolves.toBe('请先说点什么，或者丢图进来')
+    await expect(store.send({ text: '   ' })).resolves.toEqual({
+      outcome: 'invalid', message: '请先说点什么，或者丢图进来',
+    })
     expect(streamMessage).not.toHaveBeenCalled()
   })
 
@@ -164,7 +176,7 @@ describe('useChatStore', () => {
       new File([new Uint8Array([2])], '图2.png', { type: 'image/png' }),
     ]
 
-    await expect(store.send({ text: '', files })).resolves.toBeNull()
+    await expect(store.send({ text: '', files })).resolves.toMatchObject({ outcome: 'accepted' })
 
     expect(vi.mocked(streamMessage).mock.calls[0][1]).toMatchObject({ text: '', files })
   })
@@ -195,7 +207,8 @@ describe('useChatStore', () => {
     })
 
     const store = useChatStore()
-    await expect(store.send({ text: '帮我蹭一下这个热点' })).resolves.toBeNull()
+    await expect(store.send({ text: '帮我蹭一下这个热点' }))
+      .resolves.toMatchObject({ outcome: 'accepted' })
 
     expect(createChatSession).toHaveBeenCalledTimes(1)
     expect(observed.text).toBe('跑好了')
@@ -705,4 +718,75 @@ describe('chat store · 上下文状态（S7.24）', () => {
     expect(result).toContain('状态已变化')
     expect(store.context?.state_version).toBe(9)
   })
+
+  // ---- D15 / D16 / D12：创建防重、强制刷新、重命名与发送结果分类 ----
+  it('创建期间 creatingSession 阻止并发创建与发送，init 不自动打开旧会话', async () => {
+    vi.mocked(listChatSessions).mockResolvedValue(listing())
+    const deferred: { finish: () => void } = { finish: () => {} }
+    vi.mocked(createChatSession).mockImplementationOnce(() => new Promise((resolve) => {
+      deferred.finish = () => resolve({
+        session_id: 's-2', title: '', created_at: '', updated_at: '',
+      })
+    }))
+    const store = useChatStore()
+    const creating = store.newSession()
+    expect(store.creatingSession).toBe(true)
+
+    await store.init()
+    expect(getChatSession).not.toHaveBeenCalled()
+    expect(await store.send({ text: '创建中不该发送' })).toMatchObject({ outcome: 'invalid' })
+    expect(createChatSession).toHaveBeenCalledTimes(1)
+
+    deferred.finish()
+    await creating
+    expect(store.creatingSession).toBe(false)
+    expect(store.currentId).toBe('s-2')
+  })
+
+  it('重命名原地更新标题、不重排也不重新拉列表', async () => {
+    vi.mocked(listChatSessions).mockResolvedValue(listing())
+    const store = useChatStore()
+    await store.loadSessions()
+    expect(store.sessions[0].title).toBe('帮我蹭一下这个热点')
+
+    expect(await store.renameSession('s-1', '改名后')).toBeNull()
+    expect(store.sessions[0].title).toBe('改名后')
+    expect(store.sessions).toHaveLength(1)
+    expect(listChatSessions).toHaveBeenCalledTimes(1)
+  })
+
+  it('删除指定会话不动当前消息视图，并强制刷新列表', async () => {
+    vi.mocked(listChatSessions).mockResolvedValue(listing())
+    vi.mocked(getChatSession).mockResolvedValue(detail([message()]))
+    const store = useChatStore()
+    await store.openSession('s-1')
+    expect(store.messages).toHaveLength(1)
+    const before = vi.mocked(listChatSessions).mock.calls.length
+
+    expect(await store.removeSession('s-2')).toBeNull()
+    expect(deleteChatSession).toHaveBeenCalledWith('s-2')
+    expect(store.currentId).toBe('s-1')
+    expect(store.messages).toHaveLength(1)
+    expect(vi.mocked(listChatSessions).mock.calls.length).toBeGreaterThan(before)
+  })
+
+  it('发送结果分类：确认未受理 → rejected；SSE 已受理后断流 → disconnected', async () => {
+    vi.mocked(listChatSessions).mockResolvedValue(listing())
+    vi.mocked(getChatSession).mockResolvedValue(detail([]))
+    const store = useChatStore()
+    await store.openSession('s-1')
+
+    vi.mocked(streamMessage).mockRejectedValueOnce(
+      new ApiRequestError('服务不可用', undefined, 503),
+    )
+    expect(await store.send({ text: '第一条' })).toMatchObject({ outcome: 'rejected' })
+
+    vi.mocked(streamMessage).mockImplementationOnce(async (...args) => {
+      const onEvent = args[2] as (event: { event: string; data: Record<string, unknown> }) => void
+      onEvent({ event: 'turn_started', data: {} })
+      throw new Error('stream broken')
+    })
+    expect(await store.send({ text: '第二条' })).toMatchObject({ outcome: 'disconnected' })
+  })
+
 })

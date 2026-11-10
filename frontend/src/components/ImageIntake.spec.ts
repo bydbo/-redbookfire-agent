@@ -131,3 +131,50 @@ describe('ImageIntake（S7.17 共享图片入口）', () => {
     expect(lastError(wrapper)).toBe('')
   })
 })
+
+describe('ImageIntake composer 变体（S7.30）', () => {
+  it('不渲染虚线面板，只保留一个隐藏 file input', () => {
+    const { wrapper } = mountIntake({ variant: 'composer', max: 9 })
+    expect(wrapper.find('[role="button"]').exists()).toBe(false)
+    expect(wrapper.findAll('input[type="file"]')).toHaveLength(1)
+  })
+
+  it('addFiles 可用；禁用态选择 / 拖拽 / 粘贴都不改变已选图片', async () => {
+    const { wrapper } = mountIntake({ variant: 'composer', max: 9, disabled: true })
+    const exposed = wrapper.vm as unknown as {
+      addFiles: (files: File[]) => void
+      handlePaste: (event: ClipboardEvent) => void
+      pick: () => void
+    }
+    exposed.addFiles([makeFile('a.png')])
+    exposed.pick()
+    exposed.handlePaste(pasteEvent([makeFile('b.png')]))
+    await wrapper.vm.$nextTick()
+    expect(wrapper.emitted('update:files')).toBeUndefined()
+    await chooseFiles(wrapper, [makeFile('c.png')])
+    expect(wrapper.emitted('update:files')).toBeUndefined()
+  })
+
+  it('空文件与正常文件混合时整批拒绝', async () => {
+    const { wrapper } = mountIntake({ variant: 'composer', max: 9 })
+    await chooseFiles(wrapper, [
+      new File([], 'empty.png', { type: 'image/png' }),
+      makeFile('a.png'),
+    ])
+    expect(wrapper.emitted('update:files')).toBeUndefined()
+    expect(lastError(wrapper)).toContain('空文件')
+  })
+
+  it('一次 10 张整批拒绝，已选列表不变', async () => {
+    const { wrapper } = mountIntake({ variant: 'composer', files: [makeFile('旧.png')], max: 9 })
+    await chooseFiles(wrapper, Array.from({ length: 10 }, (_, i) => makeFile(`图${i}.png`)))
+    expect(wrapper.emitted('update:files')).toBeUndefined()
+    expect(lastError(wrapper)).toContain('最多选 9 张')
+  })
+
+  it('成功校验会发空错误串（调用方忽略空 toast）', async () => {
+    const { wrapper } = mountIntake({ variant: 'composer', max: 9 })
+    await chooseFiles(wrapper, [makeFile('a.png')])
+    expect(lastError(wrapper)).toBe('')
+  })
+})

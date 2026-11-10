@@ -137,7 +137,7 @@ function setElementWeight(index: number, value: number | null): void {
 </script>
 
 <template>
-  <main class="px-4 py-8">
+  <main class="px-4 py-5">
     <div class="mx-auto flex w-full max-w-2xl flex-col gap-6">
       <!-- 页面入口统一由顶栏导航提供（S5.7），此页不再放重复按钮 -->
       <header>

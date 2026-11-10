@@ -416,7 +416,8 @@ export interface paths {
         put?: never;
         /**
          * 新建对话会话
-         * @description 建一个空会话（前端「新对话」）。标题留空，等**首条用户消息**落库时取前 20 字自动补上；
+         * @description 建一个空会话（前端「新会话」）。标题留空，等**首条用户消息**落库时取前 20 字自动补上；
+         *     之后可用 `PATCH /api/chat/sessions/{session_id}` 重命名。
          *     会话与消息只在本机数据库里，附件落在 `runs/_chat/<session_id>/`。
          */
         post: operations["createChatSession"];
@@ -449,7 +450,13 @@ export interface paths {
         delete: operations["deleteChatSession"];
         options?: never;
         head?: never;
-        patch?: never;
+        /**
+         * 重命名会话
+         * @description 只改 `chat_sessions.title`。请求体先 trim，空串 / 纯空白拒绝（422），
+         *     trim 后最长 100 个 Unicode 字符；**不修改 `updated_at`**（列表仍按最近活跃倒序，改名不置顶）。
+         *     首条用户消息的自动补名只在 `title` 为空时发生，重命名后的标题不会被覆盖。幂等。
+         */
+        patch: operations["renameChatSession"];
         trace?: never;
     };
     "/api/chat/sessions/{session_id}/messages": {
@@ -1003,10 +1010,14 @@ export interface components {
         ChatSessionCreate: {
             title?: string;
         };
+        /** @description 重命名会话请求体；title 先 trim，空串 / 纯空白与超过 100 个 Unicode 字符都拒绝。 */
+        ChatSessionRename: {
+            title: string;
+        };
         ChatSession: {
             /** Format: uuid */
             session_id: string;
-            /** @description 取首条用户消息前 20 字；未发言时为「新对话」，不可编辑 */
+            /** @description 取首条用户消息前 20 字；未发言时为「新对话」；可由 PATCH 重命名（trim 后 ≤ 100 个 Unicode 字符） */
             title: string;
             /** Format: date-time */
             created_at: string;
@@ -2271,6 +2282,38 @@ export interface operations {
                 content?: never;
             };
             404: components["responses"]["NotFound"];
+            503: components["responses"]["DependencyUnavailable"];
+        };
+    };
+    renameChatSession: {
+        parameters: {
+            query?: never;
+            header?: {
+                /** @description 客户端生成的请求标识；未提供时由服务端生成。用于贯穿日志、调用追踪与数据库记录。 */
+                "X-Request-ID"?: components["parameters"]["RequestId"];
+            };
+            path: {
+                session_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ChatSessionRename"];
+            };
+        };
+        responses: {
+            /** @description 已重命名 */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ChatSession"];
+                };
+            };
+            404: components["responses"]["NotFound"];
+            422: components["responses"]["ValidationError"];
             503: components["responses"]["DependencyUnavailable"];
         };
     };

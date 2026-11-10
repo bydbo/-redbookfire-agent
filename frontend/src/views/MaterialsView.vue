@@ -181,7 +181,7 @@ const trashError = computed(() => store.actionError)
 </script>
 
 <template>
-  <main class="px-4 py-8">
+  <main class="px-4 py-5">
     <div class="mx-auto flex w-full max-w-5xl flex-col gap-6">
       <header class="flex flex-wrap items-end justify-between gap-3">
         <div>

@@ -52,6 +52,20 @@ describe('apiFetch', () => {
     })
   })
 
+  it('204 空响应按成功处理，不执行 JSON 解析（删除会话 S7.30）', async () => {
+    const jsonSpy = vi.fn(async () => { throw new SyntaxError('empty body') })
+    const noBody = {
+      ok: true,
+      status: 204,
+      json: jsonSpy,
+    } as unknown as Response
+    vi.stubGlobal('fetch', vi.fn(async () => noBody))
+
+    await expect(apiFetch<void>('/chat/sessions/abc', { method: 'DELETE' }))
+      .resolves.toBeUndefined()
+    expect(jsonSpy).not.toHaveBeenCalled()
+  })
+
   it('非 2xx 且是 ErrorResponse 时抛出带 code/message/detail/httpStatus 的错误', async () => {
     vi.stubGlobal('fetch', vi.fn(async () => response(
       { code: 'conflict', message: '运行尚未完成', detail: { run_id: 'abc' } }, 409,

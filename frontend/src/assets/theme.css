@@ -117,7 +117,193 @@ body {
   background: var(--xhs-page-glow);
 }
 
+/* v1.6 / D13：沿用 v1.4 决策（品牌强色文字 + 柔光背景），不再用整块品牌红。
+   font-weight 是必须的区分信号：:hover 已用同款配色，否则激活态与悬停态无法分辨。 */
 .app-nav-link.is-active {
+  color: var(--xhs-brand-strong);
+  background: var(--xhs-page-glow);
+  font-weight: 600;
+}
+
+/* ---------------- 左侧导航壳层（S7.30） ---------------- */
+.app-sidebar {
+  min-width: 0;
+  background: transparent;
+  border-right: 1px solid var(--xhs-line);
+}
+.app-sidebar-inner { min-height: 0; }
+.app-sidebar-mark { color: var(--xhs-brand-strong); font-size: 18px; }
+/* 只补充视觉，不写 display：显示/隐藏在模板里用 Tailwind 的 flex / md:hidden，
+   否则这里同特异性的 display:flex 会盖掉 md:hidden，桌面端也会露出移动端顶条。 */
+.app-mobilebar {
+  align-items: center;
+  gap: 8px;
+  flex-shrink: 0;
+  padding: 0 4px 8px;
+}
+@media (min-width: 768px) {
+  .app-content--chat { overflow: hidden; }
+}
+
+/* 侧栏历史会话行：标题按钮与两个图标按钮并列，禁止按钮嵌套 */
+.chat-session-item {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  min-width: 0;
+  padding: 4px 6px;
+  border-radius: 10px;
+  font-size: 13px;
+}
+.chat-session-item:hover,
+.chat-session-item.is-active { background: var(--xhs-page-glow); }
+.chat-session-item.is-active .session-main {
+  color: var(--xhs-brand-strong);
+  font-weight: 600;
+}
+.session-main {
+  flex: 1 1 auto;
+  min-width: 0;
+  padding: 2px 0;
+  border: 0;
+  background: none;
+  color: var(--xhs-ink);
+  text-align: left;
+  cursor: pointer;
+}
+.session-main:disabled { cursor: default; }
+.session-rename,
+.session-delete {
+  display: inline-flex;
+  flex: 0 0 auto;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 24px;
+  border: 0;
+  border-radius: 6px;
+  background: none;
+  color: var(--xhs-ink-muted);
+  opacity: 0.45;
+  font-size: 14px;
+  cursor: pointer;
+}
+.chat-session-item:hover .session-rename,
+.chat-session-item:hover .session-delete,
+.chat-session-item.is-active .session-rename,
+.chat-session-item.is-active .session-delete,
+.session-rename:focus-visible,
+.session-delete:focus-visible { opacity: 1; }
+.session-rename:hover,
+.session-delete:hover { background: var(--xhs-glass-hover); }
+.session-delete:disabled { opacity: 0.25; cursor: not-allowed; }
+.theme-toggle {
+  width: 100%;
+  padding: 6px 8px;
+  border: 0;
+  border-radius: 8px;
+  background: none;
+  color: var(--xhs-ink-muted);
+  font-size: 13px;
+  text-align: left;
+  cursor: pointer;
+}
+.theme-toggle:hover { background: var(--xhs-page-glow); color: var(--xhs-ink-strong); }
+
+/* ---------------- 整块 composer（S7.30 / D9） ---------------- */
+.chat-composer {
+  position: relative;
+  padding: 12px 14px;
+  border: 1px solid var(--xhs-line);
+  border-radius: 18px;
+  background: var(--xhs-surface);
+}
+.chat-composer:focus-within {
+  border-color: var(--xhs-brand-strong);
+  box-shadow: 0 0 0 3px var(--xhs-page-glow);
+}
+.chat-composer.is-dragging {
+  border-style: dashed;
+  border-color: var(--xhs-brand-strong);
+}
+.composer-drop-mask {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 18px;
+  background: var(--xhs-glass-bg);
+  color: var(--xhs-brand-strong);
+  font-size: 14px;
+  pointer-events: none;
+}
+.composer-input {
+  width: 100%;
+  min-height: 24px;
+  max-height: 144px;
+  resize: none;
+  border: 0;
+  outline: 0;
+  background: transparent;
+  color: var(--xhs-ink-strong);
+  font: inherit;
+  font-size: 14px;
+  line-height: 1.6;
+}
+.composer-input::placeholder { color: var(--xhs-ink-muted); }
+.composer-input:disabled { opacity: 0.6; }
+.composer-thumb {
+  position: relative;
+  flex: 0 0 auto;
+  width: 56px;
+  height: 56px;
+}
+.composer-thumb-remove {
+  position: absolute;
+  top: -6px;
+  right: -6px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 18px;
+  height: 18px;
+  border: 0;
+  border-radius: 50%;
+  background: var(--xhs-ink-strong);
+  color: var(--xhs-surface);
+  font-size: 12px;
+  line-height: 1;
+  cursor: pointer;
+}
+.composer-add {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 28px;
+  border: 0;
+  border-radius: 8px;
+  background: var(--xhs-page-glow);
+  color: var(--xhs-brand-strong);
+  font-size: 18px;
+  cursor: pointer;
+}
+.composer-add:disabled { opacity: 0.4; cursor: not-allowed; }
+.composer-send {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 36px;
+  height: 36px;
+  border: 0;
+  border-radius: 50%;
+  background: var(--xhs-brand);
   color: var(--xhs-on-brand);
-  background: rgba(216, 30, 60, 0.92);
+  cursor: pointer;
+}
+.composer-send:disabled {
+  background: var(--xhs-page-glow);
+  color: var(--xhs-disabled-ink);
+  cursor: not-allowed;
 }

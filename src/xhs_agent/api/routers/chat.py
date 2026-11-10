@@ -38,6 +38,7 @@ from ...services.chat import (
     load_message,
     load_session,
     mark_stale_turns,
+    rename_session,
     resolve_attachment,
     save_attachment,
 )
@@ -53,6 +54,7 @@ from ..models import (
     ChatSessionCreate,
     ChatSessionDetail,
     ChatSessionList,
+    ChatSessionRename,
     ClueSelectRequest,
     ClueVersionRequest,
     ContextActionRequest,
@@ -394,6 +396,20 @@ async def post_chat_context_action(session_id: UuidPath, payload: ContextActionR
         **applied,
         "context": context_state.context_view(cfg, stored),
     }
+
+
+@router.patch("/chat/sessions/{session_id}", response_model=ChatSession,
+               responses={404: error_response("资源不存在"),
+                          422: error_response("字段级校验失败"),
+                          503: error_response("依赖不可用（不做降级，直接返回错误）")})
+async def rename_chat_session(session_id: UuidPath, payload: ChatSessionRename,
+                              session: SessionDep) -> dict[str, Any]:
+    """重命名会话（S7.30）：只改 `title`，不改消息 / 上下文 / `updated_at`。"""
+    chat_id = _uuid(session_id, what="会话")
+    renamed = await rename_session(session, chat_id, payload.title)
+    if renamed is None:
+        raise NotFoundError(f"会话不存在：{session_id}", {"session_id": session_id})
+    return renamed
 
 
 @router.delete("/chat/sessions/{session_id}", status_code=204,

@@ -7,7 +7,7 @@
 
 口径：
 
-- 会话标题取**首条用户消息**去空白后的前 20 字（空则「新对话」），不可编辑；
+- 会话标题取**首条用户消息**去空白后的前 20 字（空则「新对话」），可由 PATCH 重命名（S7.30）；
 - 附件落 `<runs_dir>/_chat/<session_id>/<uuid>.<ext>`，消息里只存引用
   （`path` 相对工程根 + 正斜杠，与关键帧同一惯例）；magic bytes 与体积校验由接口层做
   （HTTP 语义留在 HTTP 层，与 `POST /api/hotspots/image-clue` 同一分工）；
@@ -585,6 +585,29 @@ async def mark_stale_turns(
         )
     await session.commit()
     return changed
+
+
+async def rename_session(
+    session: AsyncSession, session_id: uuid.UUID, title: str
+) -> dict[str, Any] | None:
+    """只改 `chat_sessions.title`，**不动 `updated_at`**（S7.30）；不存在返回 None。
+
+    请求体已由 `ChatSessionRename` trim / 校验过长度；这里只做一次查行 + 一次 UPDATE + commit，
+    不触碰消息、上下文、附件与 `context_state`。`updated_at` 列没有 `onupdate`，只写 `title`
+    不会让会话在「按最近活跃倒序」的列表里被顶到最前。
+
+    `_session_view` 刻意在 commit **之前**取值：默认 session factory 可能在 commit 后 expire
+    属性，那时再读会隐式多一次 SELECT，与「事务里不做额外读写」的口径冲突。
+    """
+    row = (
+        await session.execute(select(ChatSession).where(ChatSession.id == session_id))
+    ).scalar_one_or_none()
+    if row is None:
+        return None
+    row.title = title
+    view = _session_view(row)
+    await session.commit()
+    return view
 
 
 async def delete_session(

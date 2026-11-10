@@ -19,7 +19,7 @@ from __future__ import annotations
 from typing import Annotated, Any, Literal
 
 from fastapi import Path
-from pydantic import BaseModel, ConfigDict, Field, StringConstraints
+from pydantic import BaseModel, ConfigDict, Field, StringConstraints, field_validator
 
 # ---- 枚举（取值集合必须与 openapi.yaml 一致；改这里要同步契约与单测）----
 ElementType = Literal["ip", "topic", "scene", "visual", "emotion", "sound", "conflict",
@@ -363,6 +363,29 @@ class ChatSessionCreate(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     title: str = Field(default="", max_length=100)
+
+
+class ChatSessionRename(BaseModel):
+    """`PATCH /api/chat/sessions/{session_id}` 请求体：只改展示名（S7.30）。
+
+    契约 `additionalProperties: false` 对应 `extra="forbid"`。`min_length` 拦不住纯空白、
+    `max_length` 按 Python 的 Unicode 字符数（不是 UTF-8 字节），所以统一在 validator 里处理：
+    先 strip，再判非空与 ≤ 100。写入服务层的就是 trim 后的值。
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    title: str
+
+    @field_validator("title")
+    @classmethod
+    def _normalize(cls, raw: str) -> str:
+        title = raw.strip()
+        if not title:
+            raise ValueError("标题不能为空或纯空白")
+        if len(title) > 100:
+            raise ValueError("标题最多 100 个 Unicode 字符")
+        return title
 
 
 class ChatAttachment(_Response):

@@ -70,7 +70,7 @@ const reportUrl = computed(() => apiUrl(`/runs/${runId.value}/report?format=html
 </script>
 
 <template>
-  <main class="px-4 py-8">
+  <main class="px-4 py-5">
     <div class="mx-auto flex w-full max-w-3xl flex-col gap-6">
       <header class="flex items-center justify-between">
         <div>
@@ -88,7 +88,7 @@ const reportUrl = computed(() => apiUrl(`/runs/${runId.value}/report?format=html
 
       <n-alert v-if="failure" type="error" :title="failure" />
       <n-alert v-else-if="notFinished" type="warning" title="运行尚未完成">
-        结果写回后即可查看（409）。可稍后刷新，或回到分析台重新提交。
+        结果写回后即可查看（409）。可到运行历史查看，或稍后刷新重试。
       </n-alert>
 
       <n-card v-if="run" title="运行概况">

@@ -22,9 +22,17 @@ import {
   listChatSessions,
   listChatArtifacts,
   postChatContextAction,
+  renameChatSession,
   selectClueVersion,
   streamMessage,
 } from '@/api/chat'
+
+/** 发送结果（D16）：只有 `rejected`（响应前明确未受理）允许恢复草稿；
+ *  `disconnected` 是 SSE 已建立后的异常，恢复会造成重复用户消息。 */
+export interface SendResult {
+  outcome: 'accepted' | 'rejected' | 'disconnected' | 'invalid'
+  message: string
+}
 
 // 一次工具调用的进度步骤（S7.4 的 tool_started / tool_progress / tool_finished 归约而成）。
 export interface ToolStep {
@@ -140,6 +148,8 @@ export const useChatStore = defineStore('chat', () => {
   const messagesLoading = ref(false)
 
   const sending = ref(false)
+  // 创建会话在途（D15）：同时约束侧栏按钮、composer 与 init()，避免一次操作建多条会话。
+  const creatingSession = ref(false)
   const streamText = ref('')
   const toolSteps = ref<ToolStep[]>([])
   const error = ref<string | null>(null)
@@ -160,6 +170,11 @@ export const useChatStore = defineStore('chat', () => {
   const sourcePreview = ref<ChatMessage | null>(null)
   const sourceError = ref<string | null>(null)
   let sessionEpoch = 0
+  // 会话列表的 generation / 在途请求 / 脏标记（D15）：mutation 后强制刷新，
+  // 旧列表响应不得覆盖创建、删除或重命名后的状态。
+  let listGeneration = 0
+  let listInFlight: Promise<void> | null = null
+  let listDirty = false
   let contextRequest = 0
   let artifactRequest = 0
   let previewRequest = 0
@@ -602,10 +617,12 @@ export const useChatStore = defineStore('chat', () => {
     const base = artifactPreview.value
     const current = context.value
     if (base?.object_type !== 'clue' || current === null) return '请先选择图片线索'
-    return send({ text: '请重新解析这组图片，生成一份新的原始线索。', operationBinding: JSON.stringify({
-      operation: 'parse_clue_from_image', object_key: base.object_key,
-      force_reparse: true, expected_state_version: current.state_version,
-    }) })
+    const result = await send({ text: '请重新解析这组图片，生成一份新的原始线索。',
+      operationBinding: JSON.stringify({
+        operation: 'parse_clue_from_image', object_key: base.object_key,
+        force_reparse: true, expected_state_version: current.state_version,
+      }) })
+    return result.outcome === 'accepted' ? null : result.message
   }
 
   async function showSource(messageId: string): Promise<void> {
@@ -626,42 +643,100 @@ export const useChatStore = defineStore('chat', () => {
     }
   }
 
-  /** 删除当前会话并清空本地视图（v2 §3.3D）。 */
-  async function removeSession(): Promise<string | null> {
-    const sessionId = currentId.value
+  /** 删除指定会话（不传 = 删当前）。204 空响应由 `api/client.ts` 处理。
+   *  删当前会话清空消息视图；删别的会话保持当前会话；两者都强制刷新列表（D11 / D15）。 */
+  async function removeSession(targetId?: string): Promise<string | null> {
+    const id = targetId ?? currentId.value
+    if (id === null) return '没有可删除的会话'
+    const isCurrent = id === currentId.value
     const epoch = sessionEpoch
-    if (sessionId === null) return '没有可删除的会话'
     try {
-      await deleteChatSession(sessionId)
+      await deleteChatSession(id)
     } catch (err) {
       return describeError(err)
     }
-    if (sameSession(sessionId, epoch)) reset()
-    await loadSessions()
+    invalidateList()
+    if (isCurrent && sameSession(id, epoch)) reset()
+    await loadSessions(true)
     return null
   }
 
-  async function loadSessions(): Promise<void> {
-    sessionsLoading.value = true
-    sessionsError.value = null
+  /** 重命名成功后原地替换列表项标题：不重排、不重新拉列表（D12）。 */
+  async function renameSession(sessionId: string, title: string): Promise<string | null> {
+    try {
+      const updated = await renameChatSession(sessionId, title)
+      invalidateList()       // 作废在途列表请求，避免旧响应把新标题覆盖回去
+      sessions.value = sessions.value.map(
+        (item) => item.session_id === sessionId ? { ...item, title: updated.title } : item,
+      )
+      return null
+    } catch (err) {
+      return describeError(err)
+    }
+  }
+
+  /** 作废在途列表请求：旧 generation 的响应不再回写，同时收掉 loading。
+   *  否则它的 finally 因 generation 不匹配不会复位，"加载中…"会一直挂着。 */
+  function invalidateList(): void {
+    listGeneration += 1
+    sessionsLoading.value = false
+  }
+
+  async function fetchSessions(): Promise<void> {
+    const generation = ++listGeneration
     try {
       const listing = await listChatSessions({ limit: SESSION_PAGE_SIZE, offset: 0 })
-      sessions.value = listing.items
+      // 旧 generation 的响应直接丢弃：改名 / 删除 / 创建之后不能再写回旧快照。
+      if (generation === listGeneration) {
+        sessions.value = listing.items
+        sessionsError.value = null
+      }
     } catch (err) {
-      sessionsError.value = describeError(err)
+      if (generation === listGeneration) sessionsError.value = describeError(err)
     } finally {
-      sessionsLoading.value = false
+      if (generation === listGeneration) sessionsLoading.value = false
+    }
+  }
+
+  /** 普通加载共享在途请求；`force` 用于 mutation 后的强制刷新：
+   *  在途请求标脏，等它结束后至少再拉一次，绝不复用旧快照（D15）。 */
+  async function loadSessions(force = false): Promise<void> {
+    if (listInFlight !== null) {
+      if (force) listDirty = true
+      return listInFlight
+    }
+    sessionsLoading.value = true
+    sessionsError.value = null
+    listDirty = false
+    const task = (async () => {
+      await fetchSessions()
+      if (listDirty) {
+        listDirty = false
+        await fetchSessions()
+      }
+    })()
+    listInFlight = task
+    try {
+      await task
+    } finally {
+      listInFlight = null
     }
   }
 
   async function newSession(): Promise<string | null> {
+    if (creatingSession.value) return '正在创建会话，请稍候'
     stopPolling()
     clearSessionView()
     currentId.value = null
+    creatingSession.value = true
     const epoch = sessionEpoch
     try {
       const created = await createChatSession()
-      if (sessionEpoch !== epoch) return null
+      // 创建期间被切会话打断时不能静默报成功：调用方必须知道这一步没生效。
+      if (sessionEpoch !== epoch) {
+        error.value = '会话创建被打断，请重试'
+        return error.value
+      }
       currentId.value = created.session_id
       messages.value = []
       streamText.value = ''
@@ -670,12 +745,17 @@ export const useChatStore = defineStore('chat', () => {
       progressScope.value = { messageId: '', turnId: '' }
       error.value = null
       context.value = null
-      await loadSessions()
+      await loadSessions(true)
       return null
     } catch (err) {
-      if (sessionEpoch !== epoch) return null
+      if (sessionEpoch !== epoch) {
+        error.value = '会话创建被打断，请重试'
+        return error.value
+      }
       error.value = describeError(err)
       return error.value
+    } finally {
+      creatingSession.value = false
     }
   }
 
@@ -683,7 +763,7 @@ export const useChatStore = defineStore('chat', () => {
   async function init(): Promise<void> {
     await loadSessions()
     const latest = sessions.value[0]
-    if (currentId.value === null && latest !== undefined) {
+    if (currentId.value === null && !creatingSession.value && latest !== undefined) {
       await openSession(latest.session_id)
     }
   }
@@ -801,20 +881,26 @@ export const useChatStore = defineStore('chat', () => {
     }
   }
 
-  // 发一条消息（文字与图片至少给一个）。返回 null 表示已受理，否则是要给用户看的提示。
-  async function send(input: ChatStreamInput & { text: string }): Promise<string | null> {
+  /** 发一条消息，返回结构化结果（D16）。调用方只对 `rejected` 恢复草稿：
+   *  SSE 已建立后的断流不能引导重复提交，`invalid` 是前置校验失败、草稿原样保留。 */
+  async function send(input: ChatStreamInput & { text: string }): Promise<SendResult> {
     const text = input.text.trim()
     const files = input.files ?? []
-    if (text.length === 0 && files.length === 0) return '请先说点什么，或者丢图进来'
-    if (sending.value) return '上一轮还在跑，等它说完再发'
+    if (text.length === 0 && files.length === 0) {
+      return { outcome: 'invalid', message: '请先说点什么，或者丢图进来' }
+    }
+    if (sending.value) return { outcome: 'invalid', message: '上一轮还在跑，等它说完再发' }
+    if (creatingSession.value) return { outcome: 'invalid', message: '正在创建会话，请稍候' }
 
     if (currentId.value === null) {
       const invalid = await newSession()
-      if (invalid !== null) return invalid
+      if (invalid !== null) return { outcome: 'invalid', message: invalid }
     }
     const sessionId = currentId.value
     const epoch = sessionEpoch
-    if (sessionId === null) return '会话没能建起来，请重试'
+    if (sessionId === null) {
+      return { outcome: 'invalid', message: '会话没能建起来，请重试' }
+    }
 
     sending.value = true
     error.value = null
@@ -822,6 +908,7 @@ export const useChatStore = defineStore('chat', () => {
     toolSteps.value = []
     progress.value = null
     progressScope.value = { messageId: '', turnId: '' }
+    let accepted = false
     try {
       // v2 §3.3B：选择了基础版本时携带结构化绑定（服务端校验后随用户消息持久保存）
       const binding = input.operationBinding ?? (selectedBase.value && context.value !== null
@@ -835,26 +922,31 @@ export const useChatStore = defineStore('chat', () => {
       streamAbort = new AbortController()
       await streamMessage(sessionId, { text, files, operationBinding: binding },
                           (event) => {
+        accepted = true
         if (sameSession(sessionId, epoch)) onStreamEvent(event.event, event.data)
       }, streamAbort.signal)
-      if (!sameSession(sessionId, epoch)) return null
+      if (!sameSession(sessionId, epoch)) return { outcome: 'invalid', message: '' }
       selectedBase.value = null   // 绑定只作用于下一次明确操作
+      return { outcome: 'accepted', message: '' }
     } catch (err) {
-      if (!sameSession(sessionId, epoch)) return null
-      error.value = describeError(err)
+      if (!sameSession(sessionId, epoch)) return { outcome: 'invalid', message: '' }
+      const message = describeError(err)
+      error.value = message
+      // 只有「响应前、明确的 HTTP 失败」才算确认未受理；流已开始后的一切异常按断流处理。
+      const confirmedRejected = !accepted && err instanceof ApiRequestError
+      return { outcome: confirmedRejected ? 'rejected' : 'disconnected', message }
     } finally {
       if (sameSession(sessionId, epoch)) {
         sending.value = false
         streamText.value = ''
         await refreshMessages()
         if (sameSession(sessionId, epoch)) await loadContext()
-        if (sameSession(sessionId, epoch)) await loadSessions()
+        if (sameSession(sessionId, epoch)) await loadSessions(true)
         const latest = sameSession(sessionId, epoch)
           ? [...messages.value].reverse().find((item) => item.run_id) : undefined
         if (latest?.run_id) void ensureRun(latest.run_id)
       }
     }
-    return null
   }
 
   // 取一次结果卡片的数据并缓存；409（还没写回）折成 null，不重复请求。
@@ -889,14 +981,14 @@ export const useChatStore = defineStore('chat', () => {
   return {
     sessions, sessionsLoading, sessionsError,
     currentId, currentSession, messages, messagesLoading,
-    sending, busy, streamText, toolSteps, error, runs,
+    sending, busy, creatingSession, streamText, toolSteps, error, runs,
     progress, stageElapsedMs, stageLongRunning,
     context, contextLoading, contextError, selectedBase,
     artifactVersions, artifactPreview, artifactObjectKey, artifactsLoading, artifactsError,
     sourcePreview, sourceError,
     loadArtifacts, previewArtifact, chooseClue, saveClue, reparseClue, showSource,
     loadSessions, loadContext, actOnContext, startRecovery, completeRecovery,
-    removeSession,
+    removeSession, renameSession,
     init, newSession, openSession, refreshMessages, send, ensureRun, reset,
     stopPolling, toolLabel,
   }
