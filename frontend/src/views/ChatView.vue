@@ -92,9 +92,21 @@ onMounted(async () => {
 // 消息里带 run_id 的结果卡片：拿到 id 就把 run 取回来（store 里缓存，失败只记 null）
 watch(() => store.messages, (items) => {
   for (const item of items) {
-    if (item.run_id) void store.ensureRun(item.run_id)
+    const runId = cardRunId(item)
+    if (runId) void store.ensureRun(runId)
   }
 }, { immediate: true })
+
+/** 结果卡片只属于**产出**这次运行的那一轮。
+ *
+ * `read_run` / `revise_draft` 的返回里也带 `run_id`，后端会把它落到这条助手消息上（那是"本轮
+ * 引用了哪次运行"，用于上下文与版本追溯）。若照 `run_id` 直接渲染卡片，用户每追问一句都会把
+ * 同一份热点与候选清单再贴一遍——所以这里只认本轮真的调过 `run_hotspot_analysis` 的消息。
+ */
+function cardRunId(item: ChatMessage): string {
+  const produced = (item.tool_calls ?? []).some((call) => call.tool === 'run_hotspot_analysis')
+  return produced ? item.run_id ?? '' : ''
+}
 
 /** 校验失败只弹 toast；ImageIntake 成功时发出的空错误串必须忽略（不弹空 toast）。 */
 function onIntakeError(text: string): void {
@@ -573,9 +585,9 @@ function versionTag(call: { version_no?: number | null; base_version_no?: number
               </a>
 
               <!-- 结果卡片：和结果页共用 `HotspotResult` -->
-              <template v-if="message.run_id && store.runs[message.run_id]">
+              <template v-if="cardRunId(message) && store.runs[cardRunId(message)]">
                 <n-card
-                  v-for="(hotspot, index) in store.runs[message.run_id]?.hotspots ?? []"
+                  v-for="(hotspot, index) in store.runs[cardRunId(message)]?.hotspots ?? []"
                   :key="hotspot.hotspot_id"
                   :title="`热点 ${index + 1}`"
                   size="small"
@@ -584,28 +596,28 @@ function versionTag(call: { version_no?: number | null; base_version_no?: number
                     {{ hotspot.hotspot_raw }}
                   </p>
                   <HotspotResult :hotspot="hotspot" compact
-                                 :run-id="message.run_id" :position="hotspot.position" />
+                                 :run-id="cardRunId(message)" :position="hotspot.position" />
                 </n-card>
                 <n-alert
-                  v-if="(store.runs[message.run_id]?.hotspots.length ?? 0) === 0"
-                  :type="store.runs[message.run_id]?.status === 'failed' ? 'error' : 'info'"
-                  :title="store.runs[message.run_id]?.status === 'failed'
+                  v-if="(store.runs[cardRunId(message)]?.hotspots.length ?? 0) === 0"
+                  :type="store.runs[cardRunId(message)]?.status === 'failed' ? 'error' : 'info'"
+                  :title="store.runs[cardRunId(message)]?.status === 'failed'
                     ? '这次运行没有产出结果' : '这次运行没有热点结果'"
                 >
-                  {{ store.runs[message.run_id]?.hotspots[0]?.error || '可到运行历史查看详情。' }}
+                  {{ store.runs[cardRunId(message)]?.hotspots[0]?.error || '可到运行历史查看详情。' }}
                 </n-alert>
               </template>
               <div
-                v-else-if="message.run_id && message.run_id in store.runs"
+                v-else-if="cardRunId(message) && cardRunId(message) in store.runs"
                 class="mr-auto text-xs text-ink-muted"
               >
-                结果暂不可用（run_id：{{ message.run_id }}），可稍后刷新
+                结果暂不可用（run_id：{{ cardRunId(message) }}），可稍后刷新
               </div>
               <div
-                v-else-if="message.run_id"
+                v-else-if="cardRunId(message)"
                 class="mr-auto text-xs text-ink-muted"
               >
-                结果卡片加载中（run_id：{{ message.run_id }}）
+                结果卡片加载中（run_id：{{ cardRunId(message) }}）
               </div>
             </div>
           </div>

@@ -202,7 +202,10 @@ describe('ChatView（S7.5 对话首页）', () => {
   it('assistant 带 run_id 时把结果卡片渲染出来（与结果页共用同一套）', async () => {
     vi.mocked(getChatSession).mockResolvedValue(detail([
       message({ message_id: 'm-u', role: 'user', content: '帮我蹭一下这个热点' }),
-      message({ message_id: 'm-a', content: '跑完了。', run_id: 'r-1' }),
+      message({
+        message_id: 'm-a', content: '跑完了。', run_id: 'r-1',
+        tool_calls: [{ tool: 'run_hotspot_analysis', status: 'succeeded', args: {}, run_id: null }],
+      }),
     ]))
     vi.mocked(getRun).mockResolvedValue(runDetail())
     const wrapper = await mountView()
@@ -211,6 +214,27 @@ describe('ChatView（S7.5 对话首页）', () => {
     expect(wrapper.text()).toContain('爆点要素')
     expect(wrapper.text()).toContain('正文正文')
     expect(wrapper.text()).toContain('文案初稿')
+  })
+
+  it('只引用了旧运行的消息不重复贴卡片（read_run / revise_draft 也会带 run_id）', async () => {
+    vi.mocked(getChatSession).mockResolvedValue(detail([
+      message({
+        message_id: 'm-a', content: '跑完了。', run_id: 'r-1',
+        tool_calls: [{ tool: 'run_hotspot_analysis', status: 'succeeded', args: {}, run_id: null }],
+      }),
+      message({ message_id: 'm-u2', role: 'user', content: '第 4 条是哪个素材？' }),
+      message({
+        message_id: 'm-a2', content: '第 4 条是《浅蓝羽绒服挂树上》。', run_id: 'r-1',
+        tool_calls: [{ tool: 'read_run', status: 'succeeded', args: {}, run_id: 'r-1' }],
+      }),
+    ]))
+    vi.mocked(getRun).mockResolvedValue(runDetail())
+    const wrapper = await mountView()
+    await flushPromises()
+
+    // 产出那次运行的一轮有卡片，引用它的一轮没有：整页只出现一次候选清单
+    expect((wrapper.text().match(/热点 1/g) ?? []).length).toBe(1)
+    expect(wrapper.text()).toContain('第 4 条是《浅蓝羽绒服挂树上》。')
   })
 
   it('会话打不开时给错误提示，不阻塞输入框', async () => {
