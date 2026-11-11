@@ -63,7 +63,15 @@ uv run python scripts/eval_chat_tools.py --cases evals/chat/cases-v3.json \
 2. **多步「搜热点→跑分析」2/3**：三次里有一次模型调用直接 `LLMError`（`failed`，成本 0.0259 元），
    另外两次都正常走完 3 步并命中依据词。属环境抖动，不是规则问题。
 
-## 四、关闭态为什么不单独跑
+## 四、已知限制（本次未处理）
+
+`read_run` / `run_hotspot_analysis` 的候选清单最多回 8 条（`CANDIDATE_PREVIEW_LIMIT`），`count` 仍是
+总数。`topk` 默认 5，所以日常不会触发；但用户明确要「多看几条」（`topk` 可到 20）时，序号大于 8 的
+候选就查不到画面描述——此时模型能看到的信号只有「清单最多 8 条」这句 description 与 `count` 的差值，
+规则要求它说清"共几条、这一条不在返回范围里"，而不是断言"没有这条"。要不要给 `read_run` 加分页或
+按序号取单条，留到真的出现这种反馈再做。
+
+## 五、关闭态为什么不单独跑
 
 `chat-v3` 是 `chat-v2` 的超集（14/10/7/3/3），而 v8 没有触碰网页工具的条件式——`search_hotspots` /
 `fetch_url` 仍由 `[web].enabled` 决定是否下发。关闭态的 28 条对照见 `chat-tools-2026-11-09.md`
