@@ -76,3 +76,19 @@ uv run python scripts/eval_chat_tools.py --cases evals/chat/cases-v3.json \
 `chat-v3` 是 `chat-v2` 的超集（14/10/7/3/3），而 v8 没有触碰网页工具的条件式——`search_hotspots` /
 `fetch_url` 仍由 `[web].enabled` 决定是否下发。关闭态的 28 条对照见 `chat-tools-2026-11-09.md`
 （v7 全量 28/28）；本次改动只涉及 `read_run` 的返回形状与序号口径，与网页开关无交集。
+
+## 六、真机复验（2026-11-11，compose 全栈）
+
+`docker compose build api` + `up -d --no-deps api worker` 后，先确认容器里跑的是新代码
+（`prompt.load("chat_supervisor").version == 8`、`_candidate_briefs` 可用），再用
+`runs/_smoke_rank_check.py` 走一遍不 mock 的真链路：建会话 → 真跑一次分析（Celery + 真模型）→
+追问「第 4 条是哪个素材」。
+
+| 步骤 | 观测 |
+| --- | --- |
+| 第一轮 | `run_hotspot_analysis`，`chat_supervisor: 8`，0.1142 元，落 run `f8fb6565…`，候选 5 条 |
+| 运行详情 | rank 1 夜间户外露营喝热饮 / 2–3 湖上桨板运动 / **4 浅蓝羽绒服挂树上** / 5 白色外套挂松树枝 |
+| 第二轮 | `read_run`，0.0273 元，正文：「第 4 条是《浅蓝羽绒服挂树上》。分数 0.166……画面是这样的：树上挂着一件浅蓝羽绒服」 |
+| 判定 | 标题命中、禁词（记错 / 没有第 4 条 / 不存在第 4）零命中 —— 按那次运行的 rank 4 对齐，未质疑用户 |
+
+这条复验同时证明了 P0-1 的现场价值：第二轮并没有重新检索，只是把那次运行读回来。
