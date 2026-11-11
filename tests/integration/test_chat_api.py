@@ -35,9 +35,14 @@ from xhs_agent.services import chat_tools, chat_turns
 from xhs_agent.services.chat_tools import TOOL_RUN_ANALYSIS, ToolOutcome
 from xhs_agent.services.chat_turns import TurnEvents, start_turn
 from xhs_agent.tools import llm
+from xhs_agent.tools import prompt as prompt_tool
 from xhs_agent.tools.llm import LLMResult
 
 pytestmark = pytest.mark.integration
+
+# 版本号只在 `tests/unit/test_prompts_assets.py` 的 `EXPECTED_VERSIONS` 里钉死；这里跟着资产走，
+# 免得每升一版都要回来改一遍（升 v7 时漏改，这条断言一直红着）
+SUPERVISOR_VERSION = prompt_tool.load("chat_supervisor").version
 
 PNG = b"\x89PNG\r\n\x1a\n" + b"\x00" * 64        # 校验只看 magic bytes，内容不必是真图片
 RUN_ID = str(uuid.uuid4())
@@ -183,7 +188,7 @@ def provider(monkeypatch: pytest.MonkeyPatch) -> ScriptedProvider:
 def tools(monkeypatch: pytest.MonkeyPatch) -> FakeToolRunner:
     runner = FakeToolRunner(ToolOutcome(
         status="succeeded",
-        payload={"run_id": RUN_ID, "status": "succeeded", "candidates": 5,
+        payload={"run_id": RUN_ID, "status": "succeeded", "count": 5,
                  "top1_title": "球场热身", "cost_cny": 0.05, "latency_ms": 1200},
         steps=[{"stage": "完成", "done": 100, "total": 100}]))
     monkeypatch.setattr(chat_turns, "build_tool_runner", lambda *_args, **_kwargs: runner)
@@ -270,7 +275,7 @@ class TestChatApi:
         assert assistant["content"] == "跑了完整分析，命中 5 条。"
         assert assistant["run_id"] == RUN_ID
         assert assistant["cost_cny"] == pytest.approx(0.054)
-        assert assistant["prompt_versions"] == {"chat_supervisor": 6}
+        assert assistant["prompt_versions"] == {"chat_supervisor": SUPERVISOR_VERSION}
         # S7.21：轮次标识 / 阶段快照 / trace 关联都落库（刷新后据此恢复阶段）
         assert assistant["turn_id"] and assistant["turn_id"] == finished["turn_id"]
         snapshot = assistant["progress"]

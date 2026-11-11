@@ -608,8 +608,52 @@ REFUSAL_PAYLOAD: dict[str, Any] = {
 }
 
 
+FIRST_MATERIAL_ID = "11111111-1111-1111-1111-111111111111"
+# 候选标题按 rank 排开：用户说「第 4 条」时的对齐口径就是 rank，标题必须互不相同才验得出来
+CANDIDATE_TITLES = ("夜里的球鞋", "路灯下的鞋带", "跑鞋特写", "清晨的跑道")
+
+
+def candidate_row(rank: int, title: str) -> dict[str, Any]:
+    """`_matches_by_run_hotspot` 形状的候选替身（rank / score / usage 都要能被模型看到）。"""
+    material_id = (
+        FIRST_MATERIAL_ID if rank == 1 else f"{rank:08x}-2222-2222-2222-222222222222"
+    )
+    return {
+        "rank": rank,
+        "material_id": material_id,
+        "score": round(0.95 - 0.1 * (rank - 1), 3),
+        "usage": f"第 {rank} 条的用途摘述",
+        "material": {
+            "id": material_id,
+            "path": f"D:/m/{title}.mp4",
+            "type": "video",
+            "title": title,
+            "description": "夜里跑步",
+            "tags": ["夜跑"],
+            "elements": [],
+            "duration_s": 12.0,
+            "width": 1080,
+            "height": 1920,
+            "has_audio": True,
+            "size_bytes": 10,
+            "mtime": None,
+            "source": "sidecar",
+            "keyframes": [],
+            "indexed_at": None,
+            "fingerprint": "fp",
+            "embedding_model": None,
+        },
+        "current_material": {"exists": True},
+        "evidence": {"candidate": {"origin": "runtime"}},
+    }
+
+
 def run_detail(
-    *, status: str = "succeeded", with_draft: bool = True, hotspots: int = 1
+    *,
+    status: str = "succeeded",
+    with_draft: bool = True,
+    hotspots: int = 1,
+    candidates: int = len(CANDIDATE_TITLES),
 ) -> dict[str, Any]:
     """`load_run` 形状的替身（只带工具真会读的字段）。"""
     items: list[dict[str, Any]] = []
@@ -642,35 +686,12 @@ def run_detail(
                 "gap_advice": {"items": []},
                 "evidence": {"clue": {"origin": "runtime"}},
                 "candidates": [
-                    {
-                        "material_id": "11111111-1111-1111-1111-111111111111",
-                        "material": {
-                            "id": "11111111-1111-1111-1111-111111111111",
-                            "path": "D:/m/夜跑.mp4",
-                            "type": "video",
-                            "title": "夜里的球鞋",
-                            "description": "夜里跑步",
-                            "tags": ["夜跑"],
-                            "elements": [],
-                            "duration_s": 12.0,
-                            "width": 1080,
-                            "height": 1920,
-                            "has_audio": True,
-                            "size_bytes": 10,
-                            "mtime": None,
-                            "source": "sidecar",
-                            "keyframes": [],
-                            "indexed_at": None,
-                            "fingerprint": "fp",
-                            "embedding_model": None,
-                        },
-                        "current_material": {"exists": True},
-                        "evidence": {"candidate": {"origin": "runtime"}},
-                    }
+                    candidate_row(rank, title)
+                    for rank, title in enumerate(CANDIDATE_TITLES[:candidates], start=1)
                 ],
                 "draft": (
                     {
-                        "material_id": "11111111-1111-1111-1111-111111111111",
+                        "material_id": FIRST_MATERIAL_ID,
                         "hotspot_key": raw,
                         "titles": [{"text": "原标题", "style": "直给"}],
                         "body": "原始正文",
@@ -688,10 +709,10 @@ def run_detail(
     for item in items:
         item["evidence"]["clue"] = evidence_meta(
             origin="runtime", source_ref="unit:clue", completeness="complete", payload=item["clue"])
-        candidate = item["candidates"][0]
-        candidate["evidence"]["candidate"] = evidence_meta(
-            origin="runtime", source_ref="unit:material", completeness="complete",
-            payload=candidate["material"])
+        for candidate in item["candidates"]:
+            candidate["evidence"]["candidate"] = evidence_meta(
+                origin="runtime", source_ref="unit:material", completeness="complete",
+                payload=candidate["material"])
     return {
         "run_id": RUN_UUID,
         "status": status,
@@ -903,6 +924,96 @@ class TestRunIdFallback:
         )
 
         assert outcome.status == "failed" and "还没跑过分析" in outcome.error
+
+
+class TestReadRunCandidateList:
+    """P0-1：`read_run` 要整份带回候选清单。
+
+    用户指「第 4 条」时，那次运行的 `rank` 是唯一对齐口径；只回「条数 + 首选」，模型就只能重新
+    检索，拿到的是另一份排序，再拿新排序去否定用户——「把对的说成错的」就是这么来的。
+    """
+
+    @pytest.mark.asyncio
+    async def test_list_keeps_the_run_order(
+        self, tmp_path: Path, patched_run: Any
+    ) -> None:
+        outcome = await read_run(context(tmp_path), {"run_id": RUN_UUID})
+
+        assert outcome.status == "succeeded", outcome.error
+        hotspot = cast(dict[str, Any], outcome.payload)["hotspots"][0]
+        assert hotspot["count"] == len(CANDIDATE_TITLES)
+        assert [item["rank"] for item in hotspot["candidates"]] == [1, 2, 3, 4]
+        assert [item["title"] for item in hotspot["candidates"]] == list(
+            CANDIDATE_TITLES
+        )
+        # 首选与清单第一行必须同一份数据：两处说法不一致等于自造矛盾
+        assert hotspot["top1_title"] == hotspot["candidates"][0]["title"]
+
+    @pytest.mark.asyncio
+    async def test_the_fourth_row_is_answerable(
+        self, tmp_path: Path, patched_run: Any
+    ) -> None:
+        outcome = await read_run(context(tmp_path), {"run_id": RUN_UUID})
+
+        fourth = cast(dict[str, Any], outcome.payload)["hotspots"][0]["candidates"][3]
+        assert fourth["rank"] == 4
+        assert fourth["title"] == "清晨的跑道"
+        # usage 是「标题没说、但用户会用来指认」的那句话，必须透出
+        assert fourth["usage"] == "第 4 条的用途摘述"
+        assert fourth["material_id"] == "00000004-2222-2222-2222-222222222222"
+        assert fourth["score"] == 0.65
+
+    @pytest.mark.asyncio
+    async def test_long_list_is_capped_while_count_keeps_the_total(
+        self, tmp_path: Path, patched_run: Any
+    ) -> None:
+        detail = run_detail(candidates=0)
+        detail["hotspots"][0]["candidates"] = [
+            candidate_row(rank, f"候选 {rank}") for rank in range(1, 12)
+        ]
+        patched_run["detail"] = detail
+
+        outcome = await read_run(context(tmp_path), {"run_id": RUN_UUID})
+
+        hotspot = cast(dict[str, Any], outcome.payload)["hotspots"][0]
+        assert hotspot["count"] == 11
+        assert len(hotspot["candidates"]) == chat_tools.CANDIDATE_PREVIEW_LIMIT
+
+    @pytest.mark.asyncio
+    async def test_empty_title_falls_back_to_the_file_name(
+        self, tmp_path: Path, patched_run: Any
+    ) -> None:
+        detail = run_detail(candidates=0)
+        row = candidate_row(1, "夜里的球鞋")
+        row["material"]["title"] = ""
+        row["material"]["path"] = "D:/m/无名素材.mp4"
+        detail["hotspots"][0]["candidates"] = [row]
+        patched_run["detail"] = detail
+
+        outcome = await read_run(context(tmp_path), {"run_id": RUN_UUID})
+
+        hotspot = cast(dict[str, Any], outcome.payload)["hotspots"][0]
+        assert hotspot["candidates"][0]["title"] == "无名素材.mp4"
+
+
+class TestRunAnalysisSummary:
+    """同一条清单也要出现在 `run_hotspot_analysis` 的返回里：刚跑完就问「第 N 条」同样常见。"""
+
+    @pytest.mark.asyncio
+    async def test_summary_uses_the_same_shape(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        async def fake_load_run(_session: Any, _run_id: Any) -> Any:
+            return run_detail()
+
+        monkeypatch.setattr(chat_tools, "load_run", fake_load_run)
+
+        summary = await chat_tools._summarise(context(tmp_path), RUN_UUID, "夜跑球鞋")
+
+        assert summary["count"] == len(CANDIDATE_TITLES)
+        assert [item["rank"] for item in summary["candidates"]] == [1, 2, 3, 4]
+        assert summary["candidates"][0]["title"] == CANDIDATE_TITLES[0]
+        assert summary["top1_title"] == CANDIDATE_TITLES[0]
 
 
 class FakePollSession:

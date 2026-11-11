@@ -83,7 +83,7 @@ class FakeTools:
             status="succeeded",
             payload={
                 "run_id": "r-1",
-                "candidates": 5,
+                "count": 5,
                 "cost_cny": 0.05,
                 "top1_title": "球拍与手部特写",
             },
@@ -204,7 +204,7 @@ class TestTurn:
                 status="succeeded",
                 payload={
                     "run_id": "r-1",
-                    "candidates": 5,
+                    "count": 5,
                     "cost_cny": 0.05,
                     "prompt_tokens": 700,
                     "completion_tokens": 300,
@@ -415,7 +415,7 @@ class TestTurn:
 FAKE_TOOL = "fake_probe"
 FAKE_TASK = "fake_probe_task"
 # `chat_supervisor` 当前的 prompt 版本：prompt 升版时这条要跟着改（prompt 契约 §六 要求升版必跑回归）
-SUPERVISOR_VERSION = 7
+SUPERVISOR_VERSION = 8
 
 
 def register_fake_tool(monkeypatch: pytest.MonkeyPatch) -> list[dict[str, Any]]:
@@ -821,7 +821,7 @@ class TestFailureLedgerAndUsage:
                 status="succeeded",
                 payload={
                     "run_id": "r-1",
-                    "candidates": 5,
+                    "count": 5,
                     "cost_cny": 0.05,
                     "prompt_tokens": 700,
                     "completion_tokens": 300,
@@ -886,7 +886,7 @@ class TestFailureLedgerAndUsage:
                 status="succeeded",
                 payload={
                     "run_id": "r-1",
-                    "candidates": 5,
+                    "count": 5,
                     "cost_cny": 0.05,
                     "prompt_tokens": 700,
                     "completion_tokens": 300,

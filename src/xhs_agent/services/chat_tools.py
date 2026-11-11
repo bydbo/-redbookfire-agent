@@ -366,8 +366,10 @@ TOOLS: list[dict[str, Any]] = [
             "name": TOOL_READ_RUN,
             "description": (
                 "读回一次**已完成**的运行结果（按 run_id）：每条热点的爆点要素、要素覆盖率、"
-                "候选素材条数、首选素材与初稿标题。它不重新分析、不检索、不花钱；用户追问"
-                "「刚才那次」「上次那批」的结果细节时用它。**run_id 可以不传**——不传就用"
+                "候选素材的**完整清单**（rank / 标题 / 分数 / 用途摘述，最多 8 条）、素材总数与"
+                "初稿标题。它不重新分析、不检索、不花钱；用户追问「刚才那次」「上次那批」的结果"
+                "细节，或用「第 4 条」这样指代候选素材时用它——**序号就是这里返回的 rank**，"
+                "别处拿不到同一份编号。**run_id 可以不传**——不传就用"
                 "这个会话里最近一次运行的结果（用户说「上次那批」时正是这种情况）。"
             ),
             "parameters": {
@@ -717,6 +719,33 @@ def _candidate_view(candidate: Any) -> dict[str, Any]:
         "usage": candidate.usage,
     }
     return result
+
+
+def _candidate_brief(candidate: dict[str, Any]) -> dict[str, Any]:
+    """`load_run` 的候选字典 → 给模型看的**一行**（P0：让「第 N 条」有据可依）。
+
+    与 `_candidate_view` 同一套键名，只是不带 tags / hits 这类重字段：`read_run` 一次要给
+    每条热点的整份候选清单，逐条塞完整形状会把上下文预算吃光。`rank` 必须原样透出——用户说
+    「第 4 条」时的对齐口径只有它，模型不能自己按分数重排。
+    """
+    material = candidate.get("material") or {}
+    title = str(material.get("title") or "")
+    if not title:
+        title = Path(str(material.get("path") or "")).name
+    return {
+        "rank": int(candidate.get("rank") or 0),
+        "title": title,
+        "score": round(float(candidate.get("score") or 0), 3),
+        "usage": str(candidate.get("usage") or ""),
+        "material_id": str(candidate.get("material_id") or ""),
+    }
+
+
+def _candidate_briefs(candidates: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """候选清单 → 精简列表（上限同 `search_materials`，总数另由 `count` 给出）。"""
+    return [
+        _candidate_brief(item) for item in candidates[:CANDIDATE_PREVIEW_LIMIT]
+    ]
 
 
 def _check_hotspot(args: dict[str, Any]) -> tuple[str, str]:
@@ -2580,7 +2609,9 @@ async def _summarise(ctx: ToolContext, run_id: str, hotspot: str) -> dict[str, A
         "run_id": str(run_id),
         "hotspot": hotspot[:100],
         "status": detail.get("status") or "succeeded",
-        "candidates": len(candidates),
+        # 键名与 `search_materials` / `read_run` 统一：`count` 是总数，`candidates` 是清单
+        "count": len(candidates),
+        "candidates": _candidate_briefs(candidates),
         "top1_title": (top.get("material") or {}).get("title") or "",
         "top1_score": round(float(top.get("score") or 0), 3),
         "coverage_ratio": round(
@@ -2596,7 +2627,12 @@ async def _summarise(ctx: ToolContext, run_id: str, hotspot: str) -> dict[str, A
 
 
 def _run_summary(detail: dict[str, Any]) -> dict[str, Any]:
-    """整份 run 详情的精简形状（`read_run` 用）：每个热点只留能回话的字段。"""
+    """整份 run 详情的精简形状（`read_run` 用）：每个热点只留能回话的字段。
+
+    候选清单必须整份带出来（P0-1）：用户回头看「第 4 条」时，只有这里能给出与那次运行一致
+    的 rank / 标题 / usage。少给这一层，模型就只能重新检索，于是拿到一份新排序，再拿新排序
+    去否定用户——这正是「助手把对的说成错的」的成因。
+    """
     totals = detail.get("totals") or {}
     hotspots: list[dict[str, Any]] = []
     for index, item in enumerate(detail.get("hotspots") or [], start=1):
@@ -2612,6 +2648,7 @@ def _run_summary(detail: dict[str, Any]) -> dict[str, Any]:
                     float((item.get("coverage") or {}).get("ratio") or 0), 3
                 ),
                 "count": len(candidates),
+                "candidates": _candidate_briefs(candidates),
                 "top1_title": (top.get("material") or {}).get("title") or "",
                 "draft_titles": [
                     entry.get("text") for entry in (draft.get("titles") or [])

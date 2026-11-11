@@ -45,12 +45,16 @@ from xhs_agent.services.chat_turns import build_tool_runner
 from xhs_agent.services.run_snapshots import evidence_meta, material_snapshot
 from xhs_agent.services.runs import submit_analysis
 from xhs_agent.tools import llm
+from xhs_agent.tools import prompt as prompt_tool
 from xhs_agent.tools.llm import LLMResult, StructuredCaller
 from xhs_agent.workflows.chat import run_turn
 
 pytestmark = [pytest.mark.integration, pytest.mark.asyncio]
 
 EMBED_KEY_ENV = "SMOKE_ONLY_EMBED_KEY"          # 故意不设：用来证明"没碰 embedding"
+# 版本号只在 `tests/unit/test_prompts_assets.py` 的 `EXPECTED_VERSIONS` 里钉死；这里跟着资产走，
+# 免得每升一版都要回来改一遍（升 v7 时漏改，三处断言一直红着）
+SUPERVISOR_VERSION = prompt_tool.load("chat_supervisor").version
 
 # 线索里只有「羽毛球」能被示例素材的字面命中，另外两个要素必然落进缺口。
 # 全局关键词只参与召回，命中与覆盖必须分别来自各要素的直接证据或同类型词典。
@@ -591,7 +595,7 @@ class TestTurnPromptVersions:
         assert [item["tool"] for item in turn.tool_calls] == ["search_materials"]
         assert turn.tool_calls[0]["status"] == "succeeded"
         # supervisor 的版本（v2）+ 工具内部拆解的版本，都记进这一轮
-        assert turn.prompt_versions == {"chat_supervisor": 6, "hotspot_clue": 2}
+        assert turn.prompt_versions == {"chat_supervisor": SUPERVISOR_VERSION, "hotspot_clue": 2}
         assert provider.tasks == ["hotspot_clue"]
         assert turn.run_id == ""                      # 只读工具不产生 run
         assert turn.cost_cny > 0
@@ -613,5 +617,5 @@ class TestTurnPromptVersions:
 
         assert turn.status == "succeeded", turn.error
         assert turn.tool_calls[0]["tool"] == "revise_draft"
-        assert turn.prompt_versions == {"chat_supervisor": 6, "copy_revise": 3}
+        assert turn.prompt_versions == {"chat_supervisor": SUPERVISOR_VERSION, "copy_revise": 3}
         assert provider.tasks == ["copy_revise"]

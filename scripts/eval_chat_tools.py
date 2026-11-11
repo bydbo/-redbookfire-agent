@@ -103,9 +103,24 @@ A2_PASS_TARGET = 0.50
 SUITES: tuple[str, ...] = ("selection", "boundary", "multiturn", "revise", "multistep")
 # 假工具的固定产出（评测不碰库、不起 Celery）；`球拍特写` / `抓地` 是多轮断言用的关键词
 FAKE_RUN_ID = "0f4d6f1e-6f2f-4b1a-9c3e-0d1a2b3c4d5e"
+# 候选清单：多轮用例要用「第 4 条」指代第 4 行，rank / 标题 / usage 三者都得能对上
+FAKE_CANDIDATES: list[dict[str, Any]] = [
+    {"rank": 1, "title": "球拍特写", "score": 0.94,
+     "usage": "羽毛球拍与手部的中景特写", "material_id": "00000001-0000-4000-8000-000000000001"},
+    {"rank": 2, "title": "夜里的球鞋", "score": 0.88,
+     "usage": "夜里路边系鞋带的近景", "material_id": "00000002-0000-4000-8000-000000000002"},
+    {"rank": 3, "title": "帐篷旁的咖啡", "score": 0.81,
+     "usage": "手冲咖啡倒进杯子的特写", "material_id": "00000003-0000-4000-8000-000000000003"},
+    {"rank": 4, "title": "湖边露营举手欢呼", "score": 0.73,
+     "usage": "女性在草地帐篷旁欢呼的中景",
+     "material_id": "00000004-0000-4000-8000-000000000004"},
+    {"rank": 5, "title": "抓地鞋底", "score": 0.66,
+     "usage": "鞋底踩过柏油路面的特写", "material_id": "00000005-0000-4000-8000-000000000005"},
+]
 FAKE_PAYLOADS: dict[str, dict[str, Any]] = {
     TOOL_RUN_ANALYSIS: {
-        "run_id": FAKE_RUN_ID, "status": "succeeded", "candidates": 5,
+        "run_id": FAKE_RUN_ID, "status": "succeeded",
+        "count": len(FAKE_CANDIDATES), "candidates": FAKE_CANDIDATES,
         "top1_title": "球拍特写", "top1_score": 0.94, "coverage_ratio": 0.75,
         "draft_titles": ["夜跑两公里"], "has_draft": True,
         "cost_cny": 0.09, "prompt_tokens": 8000, "completion_tokens": 4000,
@@ -117,16 +132,18 @@ FAKE_PAYLOADS: dict[str, dict[str, Any]] = {
         "cost_cny": 0.01, "prompt_tokens": 2000, "completion_tokens": 500,
     },
     TOOL_SEARCH_MATERIALS: {
-        "hotspot": "夜跑球鞋开箱", "count": 5, "coverage_ratio": 0.75,
+        "hotspot": "夜跑球鞋开箱", "count": len(FAKE_CANDIDATES), "coverage_ratio": 0.75,
         "elements": [{"type": "topic", "label": "话题", "value": "夜跑球鞋开箱"}],
-        "candidates": [{"rank": 1, "score": 0.94, "title": "球拍特写"}],
+        # 故意与 run 的排序**不同**：模型若拿新检索的排序去回答「第 4 条」，结论就会不一样
+        "candidates": [FAKE_CANDIDATES[1], FAKE_CANDIDATES[0]],
         "cost_cny": 0.003, "prompt_tokens": 2000, "completion_tokens": 300,
     },
     TOOL_READ_RUN: {
         "run_id": FAKE_RUN_ID, "status": "succeeded",
         "totals": {"llm_calls": 3, "cost_cny": 0.09, "prompt_tokens": 8000,
                    "completion_tokens": 4000, "latency_ms": 9000},
-        "hotspots": [{"index": 1, "hotspot": "夜跑球鞋开箱", "count": 5,
+        "hotspots": [{"index": 1, "hotspot": "夜跑球鞋开箱",
+                      "count": len(FAKE_CANDIDATES), "candidates": FAKE_CANDIDATES,
                       "top1_title": "球拍特写", "coverage_ratio": 0.75,
                       "draft_titles": ["夜跑两公里"]}],
     },
@@ -201,12 +218,14 @@ class BoundaryCase:
 
 @dataclass(frozen=True)
 class MultiTurnCase:
-    """一条多轮用例：逐轮的工具白名单 + 终轮要点 +（可选）历史预算断言。"""
+    """一条多轮用例：逐轮的工具白名单 + 终轮要点/禁词 +（可选）历史预算断言。"""
 
     name: str
     turns: tuple[str, ...]
     expect_tools: tuple[frozenset[str], ...]
     must_contain_last: tuple[str, ...] = ()
+    # 终轮不许出现的词：只写「必须说到什么」抓不住「把用户说的对的说成错的」这类回归
+    must_not_contain_last: tuple[str, ...] = ()
     seed_history: int = 0
     assert_budget: bool = False
     notes: str = ""
@@ -305,6 +324,8 @@ def load_cases(path: Path = CASES_PATH) -> ChatCases:
             expect_tools=tuple(frozenset(str(x) for x in group)
                                for group in item.get("expect_tools") or []),
             must_contain_last=tuple(str(x) for x in item.get("must_contain_last") or []),
+            must_not_contain_last=tuple(str(x)
+                                        for x in item.get("must_not_contain_last") or []),
             seed_history=int(item.get("seed_history") or 0),
             assert_budget=bool(item.get("assert_budget")),
             notes=str(item.get("notes") or ""))
@@ -470,6 +491,7 @@ async def run_multiturn_case(cfg: AppConfig, provider: Any,
 
     last_reply = turns[-1]["reply"]
     missing = [word for word in case.must_contain_last if word not in last_reply]
+    forbidden = [word for word in case.must_not_contain_last if word and word in last_reply]
     budget: dict[str, Any] | None = None
     if case.assert_budget:
         assembled, dropped = assemble_history(
@@ -479,13 +501,16 @@ async def run_multiturn_case(cfg: AppConfig, provider: Any,
         budget = {"used": used, "limit": cfg.chat.history_token_budget, "dropped": dropped,
                   "ok": used <= cfg.chat.history_token_budget and dropped > 0}
     over_cost = [item["index"] for item in turns if item["cost_cny"] > COST_LIMIT_CNY]
-    ok = (all(item["ok"] for item in turns) and not missing
+    ok = (all(item["ok"] for item in turns) and not missing and not forbidden
           and (budget is None or bool(budget["ok"])) and not over_cost)
-    result = {"name": case.name, "turns": turns, "missing": missing, "budget": budget,
-              "over_cost": over_cost, "ok": ok, "notes": case.notes}
+    result = {"name": case.name, "turns": turns, "missing": missing,
+              "must_not_contain_last": list(case.must_not_contain_last),
+              "forbidden": forbidden, "budget": budget, "over_cost": over_cost,
+              "ok": ok, "notes": case.notes}
     picks = " → ".join(", ".join(item["picked"]) or "(不调工具)" for item in turns)
     print(f"{'PASS' if ok else 'FAIL'} | {case.name} | {picks} | 缺要点 {missing} | "
-          f"预算 {budget} | 成本 {[item['cost_cny'] for item in turns]}", flush=True)
+          f"命中禁词 {forbidden} | 预算 {budget} | "
+          f"成本 {[item['cost_cny'] for item in turns]}", flush=True)
     return result
 
 

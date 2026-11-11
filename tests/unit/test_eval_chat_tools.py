@@ -28,6 +28,7 @@ SCRIPT_PATH = Path(__file__).resolve().parents[2] / "scripts" / "eval_chat_tools
 EVALS_CHAT_DIR = Path(__file__).resolve().parents[2] / "evals" / "chat"
 CASES_V1_PATH = EVALS_CHAT_DIR / "cases.json"
 CASES_V2_PATH = EVALS_CHAT_DIR / "cases-v2.json"
+CASES_V3_PATH = EVALS_CHAT_DIR / "cases-v3.json"
 EVALS_REPORTS_DIR = Path(__file__).resolve().parents[2] / "evals" / "reports"
 SECTIONS = ("selection", "boundary", "multiturn", "revise")
 # v2 新增的网页用例：selection 4 条（message → 可接受的首跳工具）+ multiturn 1 条
@@ -38,6 +39,7 @@ NEW_SELECTION_CASES: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("明天上海天气怎么样", ()),
 )
 NEW_MULTITURN_NAME = "网页：多轮承接（搜→分析）"
+NEW_RANK_CASE_NAME = "多轮：按那次运行的 rank 认候选"
 NEW_MULTISTEP_NAMES = ("多步：搜热点→跑分析", "多步：搜热点→读正文", "多步：读链接→跑分析")
 
 
@@ -545,6 +547,43 @@ class TestCasesV2:
 
         assert [len(cases.selection), len(cases.boundary), len(cases.multiturn),
                 len(cases.revise), len(cases.multistep)] == [14, 10, 6, 3, 3]
+
+
+class TestCasesV3:
+    """v3：v2 的 36 条逐字保留 + 1 条「按那次运行的 rank 认候选」（P0-2 的回归点）。"""
+
+    def test_cases_v3_version_string(self, ev: Any) -> None:
+        assert ev.load_cases(CASES_V3_PATH).version == "chat-v3"
+
+    def test_cases_v3_keeps_v2_verbatim(self) -> None:
+        v2, v3 = read_json(CASES_V2_PATH), read_json(CASES_V3_PATH)
+
+        for section in ("selection", "boundary", "multiturn", "revise", "multistep"):
+            assert v3[section][:len(v2[section])] == v2[section], section
+
+    def test_cases_v3_adds_one_rank_case(self) -> None:
+        v2, v3 = read_json(CASES_V2_PATH), read_json(CASES_V3_PATH)
+        added = v3["multiturn"][len(v2["multiturn"]):]
+
+        assert [item["name"] for item in added] == [NEW_RANK_CASE_NAME]
+        case = added[0]
+        assert len(case["turns"]) == len(case["expect_tools"]) == 2
+        # 判据必须双向：既要说对第 4 条，也不许反过来否定用户
+        assert case["must_contain_last"] and case["must_not_contain_last"]
+        assert "read_run" in case["expect_tools"][1]
+        assert case["notes"].strip()
+
+    def test_rank_case_anchor_matches_the_fake_payload(self, ev: Any) -> None:
+        """断言的第 4 条标题必须真在假 payload 的第 4 行，否则用例永远判不过。"""
+        case = read_json(CASES_V3_PATH)["multiturn"][-1]
+        candidates = ev.FAKE_PAYLOADS[chat_tools.TOOL_READ_RUN]["hotspots"][0]["candidates"]
+
+        fourth = candidates[3]
+        assert fourth["rank"] == 4
+        assert all(word in fourth["title"] for word in case["must_contain_last"])
+        # search_materials 的假返回故意换过顺序：拿它顶替一定对不上那条 rank
+        searched = ev.FAKE_PAYLOADS[chat_tools.TOOL_SEARCH_MATERIALS]["candidates"]
+        assert [item["rank"] for item in searched] != [1, 2, 3, 4]
 
 
 class TestCasesFlag:
