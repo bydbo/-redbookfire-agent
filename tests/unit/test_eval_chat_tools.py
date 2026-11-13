@@ -29,6 +29,7 @@ EVALS_CHAT_DIR = Path(__file__).resolve().parents[2] / "evals" / "chat"
 CASES_V1_PATH = EVALS_CHAT_DIR / "cases.json"
 CASES_V2_PATH = EVALS_CHAT_DIR / "cases-v2.json"
 CASES_V3_PATH = EVALS_CHAT_DIR / "cases-v3.json"
+CASES_V4_PATH = EVALS_CHAT_DIR / "cases-v4.json"
 EVALS_REPORTS_DIR = Path(__file__).resolve().parents[2] / "evals" / "reports"
 SECTIONS = ("selection", "boundary", "multiturn", "revise")
 # v2 新增的网页用例：selection 4 条（message → 可接受的首跳工具）+ multiturn 1 条
@@ -40,6 +41,9 @@ NEW_SELECTION_CASES: tuple[tuple[str, tuple[str, ...]], ...] = (
 )
 NEW_MULTITURN_NAME = "网页：多轮承接（搜→分析）"
 NEW_RANK_CASE_NAME = "多轮：按那次运行的 rank 认候选"
+# v4 新增：点名某条候选要文案（selection 1 条 + 多轮 1 条）
+NEW_CANDIDATE_SELECTION_NAME = "点名某条候选要文案"
+NEW_CANDIDATE_MULTITURN_NAME = "多轮：换素材写稿不走改稿"
 NEW_MULTISTEP_NAMES = ("多步：搜热点→跑分析", "多步：搜热点→读正文", "多步：读链接→跑分析")
 
 
@@ -584,6 +588,78 @@ class TestCasesV3:
         # search_materials 的假返回故意换过顺序：拿它顶替一定对不上那条 rank
         searched = ev.FAKE_PAYLOADS[chat_tools.TOOL_SEARCH_MATERIALS]["candidates"]
         assert [item["rank"] for item in searched] != [1, 2, 3, 4]
+
+
+class TestForbiddenHits:
+    """禁词判定要能区分「在犯这个错」与「在纠正这个说法」。"""
+
+    def test_plain_claim_is_a_hit(self, ev: Any) -> None:
+        assert ev.forbidden_hits("素材库里没有这张图", ["素材库里没有"]) == ["素材库里没有"]
+
+    def test_negated_claim_is_not_a_hit(self, ev: Any) -> None:
+        for text in ("这不等于素材库里没有", "不是素材库里没有，而是这一条没有",
+                     "并非素材库里没有"):
+            assert ev.forbidden_hits(text, ["素材库里没有"]) == []
+
+    def test_hit_after_a_negated_mention_still_counts(self, ev: Any) -> None:
+        text = "不是素材库里没有；但另一次我说素材库里没有，那是错的"
+        assert ev.forbidden_hits(text, ["素材库里没有"]) == ["素材库里没有"]
+
+    def test_empty_inputs(self, ev: Any) -> None:
+        assert ev.forbidden_hits("", ["素材库里没有"]) == []
+        assert ev.forbidden_hits("随便一句话", []) == []
+
+
+class TestCasesV4:
+    """v4：v3 的 37 条逐字保留 + 2 条「点名候选要文案」（S7.32）。"""
+
+    def test_cases_v4_version_string(self, ev: Any) -> None:
+        assert ev.load_cases(CASES_V4_PATH).version == "chat-v4"
+
+    def test_cases_v4_keeps_v3_verbatim(self) -> None:
+        v3, v4 = read_json(CASES_V3_PATH), read_json(CASES_V4_PATH)
+
+        for section in ("selection", "boundary", "multiturn", "revise", "multistep"):
+            assert v4[section][:len(v3[section])] == v3[section], section
+
+    def test_cases_v4_adds_the_candidate_cases(self) -> None:
+        v3, v4 = read_json(CASES_V3_PATH), read_json(CASES_V4_PATH)
+        new_selection = v4["selection"][len(v3["selection"]):]
+        new_multiturn = v4["multiturn"][len(v3["multiturn"]):]
+
+        assert [item["name"] for item in new_selection] == [NEW_CANDIDATE_SELECTION_NAME]
+        # 不许只放「按候选写稿」：先 read_run 核对序号也算对
+        assert sorted(new_selection[0]["expect"]) == [
+            "read_run", "write_draft_on_candidate"]
+        assert new_selection[0]["why"].strip()
+
+        assert [item["name"] for item in new_multiturn] == [NEW_CANDIDATE_MULTITURN_NAME]
+        case = new_multiturn[0]
+        assert len(case["turns"]) == len(case["expect_tools"]) == 2
+        assert "write_draft_on_candidate" in case["expect_tools"][1]
+        assert "revise_draft" not in case["expect_tools"][1]      # 换素材不是改稿
+        assert case["must_contain_last"] and case["must_not_contain_last"]
+        assert case["notes"].strip()
+
+    def test_candidate_case_anchor_matches_the_fake_payload(self, ev: Any) -> None:
+        case = read_json(CASES_V4_PATH)["multiturn"][-1]
+        payload = ev.FAKE_PAYLOADS[chat_tools.TOOL_WRITE_DRAFT_ON_CANDIDATE]
+
+        assert payload["material_rank"] == 4
+        assert all(word in payload["draft"]["body"] for word in case["must_contain_last"])
+        # 假 payload 自己不许出现禁词，否则这一条永远判不过
+        assert not any(word in payload["draft"]["body"]
+                       for word in case["must_not_contain_last"])
+
+    def test_cases_v4_expectations_only_reference_registered_tools(self) -> None:
+        known = chat_tools.tool_names(make_cfg(enabled=True))
+        payload = read_json(CASES_V4_PATH)
+
+        for item in payload["selection"]:
+            assert set(item["expect"]) <= known, item["name"]
+        for item in payload["multiturn"]:
+            for group in item["expect_tools"]:
+                assert set(group) <= known, item["name"]
 
 
 class TestCasesFlag:

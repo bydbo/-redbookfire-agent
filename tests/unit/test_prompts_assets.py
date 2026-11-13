@@ -17,7 +17,7 @@ ALL_TASKS = (*AGENT_TASKS, "material_tagging", "image_hotspot_clue",
 PLACEHOLDER_MARKERS = ("待 S3.1 填写", "待填写")
 # 版本号只随内容变更递增（prompt 契约 §三 / §六）——钉住当前值，顺手改正文却忘了升版本会被挡下
 EXPECTED_VERSIONS = {"hotspot_clue": 2, "material_select": 2, "copy_draft": 3,
-                     "chat_supervisor": 8, "copy_revise": 3,
+                     "chat_supervisor": 9, "copy_revise": 3,
                      "image_hotspot_clue_multi": 4, "image_hotspot_clue": 5,
                      "material_tagging": 2, "context_extract": 2, "context_recover": 3}
 CONTRACT_PATH = (Path(__file__).resolve().parents[2]
@@ -273,8 +273,8 @@ class TestSupervisorWebToolWording:
         return [chunk.strip() for chunk in self._SENTENCE_RE.findall("\n".join(lines))
                 if chunk.strip()]
 
-    def test_chat_supervisor_version_is_v8(self) -> None:
-        assert prompt_tool.load("chat_supervisor").version == 8
+    def test_chat_supervisor_version_is_v9(self) -> None:
+        assert prompt_tool.load("chat_supervisor").version == 9
 
     def test_prompt_mentions_web_tools_conditionally(self) -> None:
         assert "如果本轮工具清单里" in self._text()

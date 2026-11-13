@@ -77,6 +77,7 @@ from xhs_agent.services.chat_tools import (
     TOOL_RUN_ANALYSIS,
     TOOL_SEARCH_HOTSPOTS,
     TOOL_SEARCH_MATERIALS,
+    TOOL_WRITE_DRAFT_ON_CANDIDATE,
     ToolOutcome,
 )
 from xhs_agent.tools import prompt as prompt_tool
@@ -160,6 +161,26 @@ FAKE_PAYLOADS: dict[str, dict[str, Any]] = {
                     "tags": ["#夜跑"], "cover_text": "夜跑两公里",
                     "first_3s": "鞋底特写", "shot_list": [], "compliance_notes": []},
         "cost_cny": 0.02, "prompt_tokens": 1500, "completion_tokens": 400,
+    },
+    # S7.32：按候选写稿。正文里带 rank 4 的锚点词（湖边露营），
+    # 多轮用例靠它判断"回答是照着被点名那条写的"，而不是拿别的候选糊过去
+    TOOL_WRITE_DRAFT_ON_CANDIDATE: {
+        "run_id": FAKE_RUN_ID, "hotspot_index": 1, "material_rank": 4,
+        "material": {"material_id": FAKE_CANDIDATES[3]["material_id"],
+                     "title": FAKE_CANDIDATES[3]["title"],
+                     "usage": FAKE_CANDIDATES[3]["usage"], "current_exists": True},
+        "draft": {"material_id": FAKE_CANDIDATES[3]["material_id"],
+                  "hotspot_key": "夜跑球鞋开箱",
+                  "titles": [{"text": "湖边露营这一版", "style": "直给"}],
+                  "body": "这版按第 4 条写：湖边露营举手欢呼的那张，草地和帐篷都在画面里。",
+                  "tags": ["#露营"], "cover_text": "湖边露营",
+                  "first_3s": "举手的瞬间", "shot_list": ["先拍欢呼"],
+                  "compliance_notes": []},
+        "evidence_notice": "基于历史文字依据生成",
+        "object_key": f"draft:{FAKE_RUN_ID}:1",
+        "version_id": None, "version_no": None, "replayed": False,
+        "cost_cny": 0.04, "prompt_tokens": 3000, "completion_tokens": 1200,
+        "usage_status": "actual",
     },
     # 网页两件的假返回（Task 13 的 multistep 节用）：形状对齐真实 payload，
     # 里面的标题/正文是**判定用的锚点**——回复里必须能对上它们，才算"关键事实有依据"
@@ -405,6 +426,41 @@ def read_baseline_prompt(ref: str) -> str:
     return text
 
 
+# 上游抖动重试：只对 `LLMError`（网络 / 5xx / 空响应）生效，用于把"网络问题"与"行为不对"
+# 分开计——2026-11-13 的 v4 首跑里 3 张不同用例各挂了一次 LLMError，pass^3 被噪声压到 62%。
+# 不重试业务性失败（工具选错、拒绝判定）——那些正是要测的东西。
+LLM_RETRIES = 1
+LLM_RETRY_SLEEP_S = 1.5
+
+
+async def supervise_with_retry(provider: Any, messages: list[dict[str, Any]], *,
+                               tools: list[dict[str, Any]], stream: bool = False) -> Any:
+    """单轮决策（selection / boundary）：`LLMError` 重试一次。"""
+    for attempt in range(LLM_RETRIES + 1):
+        try:
+            return await supervise(provider, messages, tools=tools, stream=stream)
+        except LLMError as exc:
+            if attempt >= LLM_RETRIES:
+                raise
+            print(f"[重试] LLMError：{exc}（第 {attempt + 1} 次重试）", file=sys.stderr, flush=True)
+            await asyncio.sleep(LLM_RETRY_SLEEP_S)
+    raise AssertionError("unreachable")  # pragma: no cover
+
+
+async def run_turn_with_retry(cfg: AppConfig, **kwargs: Any) -> Any:
+    """完整一轮（多轮 / 多步）：`run_turn` 不抛错，失败态里带 LLMError 时重试一次。"""
+    turn: Any = None
+    for attempt in range(LLM_RETRIES + 1):
+        turn = await run_turn(cfg, **kwargs)
+        if (turn.status != "failed" or "LLMError" not in str(turn.error or "")
+                or attempt >= LLM_RETRIES):
+            return turn
+        print(f"[重试] 本轮 LLMError：{turn.error}（第 {attempt + 1} 次重试）",
+              file=sys.stderr, flush=True)
+        await asyncio.sleep(LLM_RETRY_SLEEP_S)
+    return turn
+
+
 async def run_selection_case(cfg: AppConfig | None, provider: Any,
                              case: SelectionCase) -> dict[str, Any]:
     """跑一条选择用例：把消息喂给 supervisor，只看第一跳点了哪个工具。
@@ -416,7 +472,8 @@ async def run_selection_case(cfg: AppConfig | None, provider: Any,
     picked: list[str] = []
     error = ""
     try:
-        turn = await supervise(provider, messages, tools=chat_tools.tools_for(cfg), stream=False)
+        turn = await supervise_with_retry(
+            provider, messages, tools=chat_tools.tools_for(cfg), stream=False)
         picked = [str(call["name"]) for call in turn.tool_calls]
     except LLMError as exc:                    # 上游抖动：记下来当失败，不中断整轮评测
         error = str(exc)
@@ -439,7 +496,8 @@ async def run_boundary_case(cfg: AppConfig | None, provider: Any,
     reply = ""
     error = ""
     try:
-        turn = await supervise(provider, messages, tools=chat_tools.tools_for(cfg), stream=False)
+        turn = await supervise_with_retry(
+            provider, messages, tools=chat_tools.tools_for(cfg), stream=False)
         picked = [str(call["name"]) for call in turn.tool_calls]
         reply = turn.text
     except LLMError as exc:
@@ -470,6 +528,32 @@ def seed_history(turns: int) -> list[dict[str, Any]]:
     return history
 
 
+# 否定前缀：命中的禁词若紧跟在"不等于 / 不是 / 并非"这类否定之后，说明模型是在**纠正**
+# 这个说法而不是在犯它（2026-11-13 实测：「这条没有的不等于素材库里没有」被判成命中）。
+# 只认紧邻 8 个字以内的否定词——不做语言学分析，够用且可预期。
+NEGATION_MARKERS = ("不等于", "不是", "并非", "不能说", "不表示", "不代表")
+NEGATION_WINDOW = 8
+
+
+def forbidden_hits(reply: str, words: Sequence[str]) -> list[str]:
+    """禁词命中（带否定前缀豁免）：返回真正需要判失败的那些词。"""
+    hits: list[str] = []
+    for word in words:
+        if not word:
+            continue
+        start = 0
+        while True:
+            index = reply.find(word, start)
+            if index < 0:
+                break
+            prefix = reply[max(0, index - NEGATION_WINDOW):index]
+            if not any(marker in prefix for marker in NEGATION_MARKERS):
+                hits.append(word)
+                break
+            start = index + len(word)
+    return hits
+
+
 async def run_multiturn_case(cfg: AppConfig, provider: Any,
                              case: MultiTurnCase) -> dict[str, Any]:
     """跑一条多轮用例：真模型 + 假工具，逐轮记工具选择，最后断言要点与预算。"""
@@ -477,13 +561,15 @@ async def run_multiturn_case(cfg: AppConfig, provider: Any,
     tools = FakeTools()
     turns: list[dict[str, Any]] = []
     for index, text in enumerate(case.turns):
-        turn = await run_turn(cfg, provider=provider, history=history, user_text=text,
-                              run_tool=tools, stream=False)
+        turn = await run_turn_with_retry(
+            cfg, provider=provider, history=history, user_text=text,
+            run_tool=tools, stream=False)
         picked = [str(call["tool"]) for call in turn.tool_calls]
         allowed = set(case.expect_tools[index]) if index < len(case.expect_tools) else set()
         ok = turn.status == "succeeded" and set(picked) <= allowed
         turns.append({"index": index + 1, "text": text, "picked": picked,
                       "expect": sorted(allowed), "reply": turn.reply,
+                      "status": turn.status, "error": turn.error,
                       "cost_cny": turn.cost_cny, "latency_ms": turn.latency_ms, "ok": ok})
         history.append({"role": "user", "content": text})
         history.append({"role": "assistant", "content": turn.reply,
@@ -491,7 +577,7 @@ async def run_multiturn_case(cfg: AppConfig, provider: Any,
 
     last_reply = turns[-1]["reply"]
     missing = [word for word in case.must_contain_last if word not in last_reply]
-    forbidden = [word for word in case.must_not_contain_last if word and word in last_reply]
+    forbidden = forbidden_hits(last_reply, case.must_not_contain_last)
     budget: dict[str, Any] | None = None
     if case.assert_budget:
         assembled, dropped = assemble_history(
@@ -523,8 +609,9 @@ async def run_multistep_case(cfg: AppConfig, provider: Any,
     成功——"调了工具但结论没依据"与"没调"一样不合格。
     """
     tools = FakeTools()
-    turn = await run_turn(cfg, provider=provider, history=[], user_text=case.message,
-                          run_tool=tools, stream=False)
+    turn = await run_turn_with_retry(
+        cfg, provider=provider, history=[], user_text=case.message,
+        run_tool=tools, stream=False)
     picked = [str(call["tool"]) for call in turn.tool_calls]
     steps_ok = len(picked) >= case.min_steps
     first_ok = not case.first_tool or bool(picked and picked[0] in case.first_tool)

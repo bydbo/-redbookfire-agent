@@ -244,12 +244,26 @@ user   消息 = 具名 02 Task（渲染后，仅当前任务与数据）
   `candidates[].rank` 为准，**不得用 `search_materials` 的新排序顶替这份编号**，绝不质疑用户；
   `title` 与 `usage` 措辞不一致时以 `usage` 为准、两栏一起讲清楚；那次运行的候选确实不足该序号时，
   说明实际有几条，并问一句是不是另一次运行的结果。同一次变更把工具返回形状补到能支撑这条规则
-  （§二 工具表已记）：`read_run` / `run_hotspot_analysis` 统一为 `count`（总数）+ `candidates`
+  （§一 对话工具清单已记）：`read_run` / `run_hotspot_analysis` 统一为 `count`（总数）+ `candidates`
   （≤8 条，每条 `rank` / `title` / `score` / `usage` / `material_id`）。评测按 §六 的对话口径，用例集
   升到 `chat-v3`（`chat-v2` 的 36 条逐字保留 + 1 条多轮用例，并给多轮判定加了
   `must_not_contain_last` 禁词），`--repeat 3`、基线 `HEAD`（v7）对照工作区 v8：工具选择 14/14×3
   两臂一致、越界 10/10×3、多轮 6/7×3（新增用例 3/3）、改写 3/3×3、多步 2/3×3（一次 `LLMError`），
   报告 `evals/reports/chat-tools-2026-11-11-rank.md`。
+- **2026-11-13 换素材写稿与改稿分工（`chat_supervisor` v8 → v9）**：真机反馈「用户说
+  『基于第 4 条素材重新写一版』，助手答不上来还判用户记错」的第二种形态——`revise_draft` 的证据链
+  把素材钉死在初稿那条，模型只能把「用第 4 条」塞进 `request`，改写模型按「素材没拍到的事不写」
+  拒绝，随后把「这条素材里没有」说成「素材库里没有」。v9 只动两处：§02 第 (1) 步拆出「用户点名
+  要某一条候选的文案」这一支（走新增的 `write_draft_on_candidate`，`material_rank` 即候选序号）；
+  §03 新增第 11 条——`revise_draft` 只改这一版初稿、素材不变，换素材写稿用新工具，且
+  **工具说「这条素材里没有 X」时不许说成「素材库里没有 X」**。同一次变更落地了第 7 个工具（以
+  指定候选的冻结快照跑 `copy_draft`，登记成 `draft:<run>:<pos>` 的新版本，
+  `source.actor=candidate_switch`，见 §一 工具表与数据契约）。评测按 §六 的对话口径，用例集升到
+  `chat-v4`（`chat-v3` 的 37 条逐字保留 + 2 条），`--repeat 3`、基线 `HEAD`（v8）对照工作区 v9：
+  工具选择两臂 15/15、越界 9/10、多轮 7/8（新增用例 3/3，跨四轮复跑 12/12 选对工具）、改写 3/3、
+  多步 2/3；三条非全过分别是判定假阳性与 `LLMError` 抖动，报告
+  `evals/reports/chat-tools-2026-11-13-candidate-draft.md`。同批还修了评测口径两处：
+  `LLMError` 重试一次、禁词判定加否定前缀豁免（详见该报告 §四）。
 - 落地路径：列与迁移在 S3.9 完成；**仓储层写入（S3.4a）与 worker 接线（S3.4b）**分别承接——S3.1 已在 state / `RunResult` 里产出该字段，落库由 S3.4a 完成。
 
 ## 六、变更流程与准入门槛
