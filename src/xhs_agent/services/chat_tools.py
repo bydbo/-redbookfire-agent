@@ -1,8 +1,9 @@
-"""对话可调用的工具（S7.3 起；S7.7 加只读三件，S7.7b 加拆解预览，S7.8 加改写；PR2 加网页两件）。
+"""对话可调用的工具（S7.3 起；S7.7 加只读三件，S7.7b 加拆解预览，S7.8 加改写；PR2 加网页两件；
+S7.32 加按候选写稿）。
 
 用途：把「对话层能做的事」写成工具——跑完整分析（第一批）、解析图片 / 查素材库 / 读历史运行
-      （S7.7 只读三件）、预览爆点要素与缺口（S7.7b）、改写文案（S7.8）、搜热点 / 读网页
-      （PR2 的 `search_hotspots` / `fetch_url`，默认不下发）。
+      （S7.7 只读三件）、预览爆点要素与缺口（S7.7b）、改写文案（S7.8）、按候选素材写稿（S7.32）、
+      搜热点 / 读网页（PR2 的 `search_hotspots` / `fetch_url`，默认不下发）。
 输入：`ToolContext`（配置 / 会话 / 投递器 / 文本模型 caller / 可注入的连接池与 sleep）+ 工具参数 dict。
 输出：`ToolOutcome`（status / payload / steps / error / prompt_versions / 用量）——payload 既喂回
       给模型，也落进 `chat_messages.tool_calls`。
@@ -23,8 +24,10 @@
   `search_materials`（只检索）、`read_run`（只读、不花钱）、`preview_element_coverage`
   （不调 embedding、不写稿、不落 runs）、`search_hotspots`（只发一次搜索请求，不花钱、
   不写库）、`fetch_url`（只读一个公网页，受 SSRF 校验与 robots 约束，不落盘）。
-  有副作用的只有 `run_hotspot_analysis`（投 job）与 `revise_draft`（花一次模型钱，
-  但**不写库**——run 的初稿快照不动）；
+  有副作用的只有 `run_hotspot_analysis`（投 job）、`revise_draft`（花一次模型钱，
+  但**不写库**——run 的初稿快照不动）与 `write_draft_on_candidate`（花一次模型钱；
+  run 的快照同样不动，只在会话版本里追加一版——换素材等于换输入，必须是**新版本**，
+  不能当成"改稿"，否则证据链不成立）；
 - **一轮内不重复付费**：`ToolContext.cache` 按「热点原文」缓存拆解结果、按「附件路径」缓存
   图片解析结果，所以「先预览再检索」「先解析图片再跑分析」都只付一次模型钱；
 - **`run_id` 可省**（`read_run` / `revise_draft`）：不传就落到本会话**最近一次**运行产出的
@@ -71,6 +74,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..agents.clue import TASK_ID as CLUE_TASK
 from ..agents.clue import extract_clue
+from ..agents.draft import TASK_ID as DRAFT_TASK
+from ..agents.draft import write_draft
 from ..agents.revise import TASK_ID as REVISE_TASK
 from ..agents.revise import ReviseOutcome
 from ..agents.revise import revise_draft as revise_agent
@@ -81,7 +86,7 @@ from ..core.errors import ApiError, BadRequestError, ConflictError, public_error
 from ..core.observations import record as record_observation
 from ..core.tracing import LEVEL_ERROR, get_tracer
 from ..db.models import ChatArtifactVersion, ChatMessage
-from ..schemas import TYPE_LABELS, Element, HotspotClue, SchemaError
+from ..schemas import TYPE_LABELS, Draft, Element, HotspotClue, SchemaError
 from ..services import artifact_versions, context_state, image_cache
 from ..services.chat import latest_run_id, resolve_attachment
 from ..services.image_clue import (
@@ -243,6 +248,8 @@ TOOL_SEARCH_MATERIALS = "search_materials"
 TOOL_READ_RUN = "read_run"
 TOOL_PREVIEW_COVERAGE = "preview_element_coverage"
 TOOL_REVISE_DRAFT = "revise_draft"
+# S7.32：以某次运行里指定的那条候选素材为基准写一版新稿（换素材出稿）
+TOOL_WRITE_DRAFT_ON_CANDIDATE = "write_draft_on_candidate"
 # 网页两件（PR2）：schema 在 `TOOLS` 之外，由 `tools_for` 按 `[web]` 开关追加
 TOOL_SEARCH_HOTSPOTS = "search_hotspots"
 TOOL_FETCH_URL = "fetch_url"
@@ -446,6 +453,43 @@ TOOLS: list[dict[str, Any]] = [
                 },
                 },
                 "required": ["request"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": TOOL_WRITE_DRAFT_ON_CANDIDATE,
+            "description": (
+                "以**某次运行里指定的那一条候选素材**为基准，写一版新的文案初稿：不重新分析、"
+                "不检索、不覆盖原来的初稿——写好的文案出现在这次回复里，同时成为这条热点文案的"
+                "新版本（后续还能继续在它上面改）。用户点名候选清单里的某一条要文案时用它"
+                "（「就用第 4 条给我写一版」「按那张树上挂外套的写」）。"
+                "**只是在这版初稿上改口吻 / 结构，请用 revise_draft**。`material_rank` 就是候选"
+                "清单里的序号（与 read_run 返回的 rank 同一口径，从 1 开始）。"
+                "**run_id 可以不传**：不传就用这个会话里最近一次运行。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "run_id": {
+                        "type": "string",
+                        "description": "取哪次运行的候选素材（uuid）。取自之前分析的返回值；"
+                        "用户说的是「刚才那批」时留空即可，不要自己编。",
+                },
+                    "hotspot_index": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "description": "用第几条热点的候选，默认 1。",
+                },
+                    "material_rank": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "description": "用第几条候选素材（从 1 开始，与 read_run 返回的 rank 一致）。"
+                        "用户说「第 4 条」就填 4。",
+                },
+                },
+                "required": ["material_rank"],
             },
         },
     },
@@ -2453,6 +2497,344 @@ async def revise_draft(
 
 
 
+async def write_draft_on_candidate(
+    ctx: ToolContext,
+    args: dict[str, Any],
+    *,
+    attachments: list[dict[str, Any]] | None = None,
+    on_progress: ProgressFn | None = None,
+) -> ToolOutcome:
+    """「按候选写稿」工具（S7.32）：以 run 里指定的那条候选素材为基准写一版新稿。
+
+    与 `revise_draft` 的分工是硬约束而不是偏好：改稿的证据链要求「这版稿的输入可证」
+    （`_historical_evidence` 的 `draft_material_provenance`），所以改稿只能在初稿那条素材上
+    改；用户点名**另一条候选**要文案时走这里。新稿登记成 `draft:<run>:<pos>` 的新版本，
+    后续还能在这版上继续改——`revise_draft` 以它为 base 时会读版本自带的证据，
+    不会退回初稿那条素材。
+    """
+    steps: list[dict[str, Any]] = []
+
+    async def progress(stage: str, done: int = 0, total: int = 0) -> None:
+        _step(steps, stage, done, total)
+        if on_progress is not None:
+            await on_progress(stage, done, total)
+
+    raw_run, invalid_run = await _resolve_run_id(ctx, str(args.get("run_id") or ""))
+    if invalid_run:
+        return ToolOutcome(status="failed", steps=steps, error=invalid_run)
+    # A04：直接工具入口同样验证归属——UUID 合法不等于属于本会话
+    if not await _run_belongs_to_session(ctx, raw_run):
+        return ToolOutcome(
+            status="failed",
+            steps=steps,
+            payload={"reason": "run_not_in_session", "run_id": raw_run},
+            error="这次运行不属于当前会话，不能读取",
+        )
+
+    raw_index = args.get("hotspot_index")
+    if raw_index is None or raw_index == "":
+        index = 1
+    else:
+        try:
+            index = int(raw_index)
+        except (TypeError, ValueError):
+            return ToolOutcome(
+                status="failed",
+                steps=steps,
+                error="hotspot_index 必须是 ≥1 的整数（第几条热点）",
+            )
+    if index < 1:
+        return ToolOutcome(
+            status="failed",
+            steps=steps,
+            error="hotspot_index 必须是 ≥1 的整数（第几条热点）",
+        )
+
+    raw_rank = args.get("material_rank")
+    if raw_rank is None or raw_rank == "":
+        return ToolOutcome(
+            status="failed",
+            steps=steps,
+            error="缺少 material_rank：要用户说清是第几条候选素材"
+            "（与 read_run 返回的 rank 同一口径，从 1 开始）",
+        )
+    try:
+        rank = int(raw_rank)
+    except (TypeError, ValueError):
+        return ToolOutcome(
+            status="failed",
+            steps=steps,
+            error=f"material_rank 必须是 ≥1 的整数（第几条候选素材），收到 {raw_rank!r}",
+        )
+    if rank < 1:
+        return ToolOutcome(
+            status="failed",
+            steps=steps,
+            error=f"material_rank 必须是 ≥1 的整数（第几条候选素材），收到 {rank}",
+        )
+
+    _step(steps, "读运行")
+    detail = await load_run(ctx.session, uuid.UUID(raw_run))
+    if detail is None:
+        return ToolOutcome(
+            status="failed",
+            steps=steps,
+            error=f"找不到这次运行（run_id：{raw_run}），请确认 id 是否正确",
+        )
+    if str(detail.get("status")) != "succeeded":
+        return ToolOutcome(
+            status="failed",
+            steps=steps,
+            error="这次运行还没跑完（或失败了），暂时写不了；稍后可以在运行历史里回看",
+        )
+    hotspots = list(detail.get("hotspots") or [])
+    if index > len(hotspots):
+        return ToolOutcome(
+            status="failed",
+            steps=steps,
+            payload={"reason": "hotspot_index_out_of_range", "hotspot_count": len(hotspots)},
+            error=f"这次运行只有 {len(hotspots)} 条热点，没有第 {index} 条",
+        )
+    item = hotspots[index - 1]
+
+    candidates = list(item.get("candidates") or [])
+    matches = [row for row in candidates if int(row.get("rank") or 0) == rank]
+    if not matches:
+        # 越界时把**实际有哪些**回给模型：它要么自己纠正，要么如实告诉用户，不许靠猜
+        preview = [
+            {
+                "rank": int(row.get("rank") or 0),
+                "title": str((row.get("material") or {}).get("title") or ""),
+            }
+            for row in candidates[:CANDIDATE_PREVIEW_LIMIT]
+        ]
+        listed = "、".join(f"{row['rank']}《{row['title']}》" for row in preview)
+        tail = f"；候选里现有的是：{listed}" if preview else "；这条热点这次没有候选素材"
+        return ToolOutcome(
+            status="failed",
+            steps=steps,
+            payload={
+                "reason": "material_rank_out_of_range",
+                "count": len(candidates),
+                "candidates": preview,
+            },
+            error=(
+                f"这次运行的第 {index} 条热点只有 {len(candidates)} 条候选，没有第 {rank} 条"
+                f"{tail}"
+            ),
+        )
+    candidate = matches[0]
+    material = dict(candidate.get("material") or {})
+    material_id = str(candidate.get("material_id") or material.get("id") or "")
+    if not material or not material_id:
+        return ToolOutcome(
+            status="failed",
+            steps=steps,
+            payload={"reason": "material_snapshot_missing", "material_rank": rank},
+            error="这条候选缺少冻结素材快照（旧运行），没法据此写稿；可以重新跑一次分析",
+        )
+    clue = item.get("clue")
+    if not isinstance(clue, dict) or not clue:
+        return ToolOutcome(
+            status="failed",
+            steps=steps,
+            payload={"reason": "clue_missing", "material_rank": rank},
+            error="这次运行没有爆点线索，写不了",
+        )
+    if ctx.caller is None:  # pragma: no cover - 运行器总会注入
+        return ToolOutcome(
+            status="failed", steps=steps, error="写稿失败：对话工具缺少文本模型 caller"
+        )
+
+    # 证据以**这条候选**为准（不是初稿那条）：先做一次结构校验再花钱，失败即止
+    draft_now = item.get("draft") if isinstance(item.get("draft"), dict) else None
+    provisional = (
+        dict(draft_now) if draft_now
+        else Draft(hotspot_key=str(clue.get("hotspot_raw") or "")).to_dict()
+    )
+    provisional["material_id"] = material_id
+    key = artifact_versions.object_key("draft", raw_run, index)
+    evidence, missing = await _bound_historical_evidence(
+        ctx.session, item=item, base_draft=provisional, run_id=raw_run, position=index
+    )
+    if evidence is None:
+        return ToolOutcome(
+            status="failed",
+            steps=steps,
+            payload={
+                "reason": "historical_evidence_incomplete",
+                "object_key": key,
+                "missing_fields": missing,
+            },
+            error="这条候选的历史依据不完整（缺线索或素材快照），没法据此写稿；"
+            "可以重新跑一次分析",
+        )
+
+    constraints = await _constraints_for(ctx, object_key=key)
+    await progress("写稿")
+    before = len(ctx.caller.records)
+    try:
+        outcome = await write_draft(
+            HotspotClue.from_dict(evidence["clue"]),
+            dict(evidence["material"]),
+            ctx.caller,
+            constraints=constraints,
+        )
+    except (ApiError, LLMError, SchemaError) as exc:
+        return ToolOutcome(
+            status="failed",
+            steps=steps,
+            payload={"object_key": key, "usage_status": "unknown"},
+            error=f"写稿失败：{_reason(exc)}；这一轮没产出文案，可以直接重试",
+        )
+    result = outcome.value
+    if result is None:
+        return ToolOutcome(
+            status="failed",
+            steps=steps,
+            payload={"object_key": key},
+            error="写稿失败：这条候选没有可用的素材内容",
+        )
+
+    cost = _records_cost(ctx.caller, before)
+    prompt_tokens, completion_tokens = _records_tokens(ctx.caller, before)
+    usage_status = _records_usage_status(ctx.caller, before) or "estimated"
+    new_draft = result.to_dict()
+    versions = {DRAFT_TASK: int(outcome.version or 1)}
+    # 证据的 `base_draft` 必须是**这一版新稿**：后续 revise 以它为 base 时会重算 digest
+    final_evidence, _final_missing = await _bound_historical_evidence(
+        ctx.session, item=item, base_draft=dict(new_draft), run_id=raw_run, position=index
+    )
+    evidence_notice = "基于历史文字依据生成"
+    if (final_evidence or {}).get("current_material", {}).get("exists") is False:
+        evidence_notice += "，原素材当前不可用"
+    origins = ((final_evidence or {}).get("sources") or {})
+    if any(
+        "cutover_capture" in str((origins.get(key_name) or {}).get("origin") or "")
+        for key_name in ("clue", "material")
+    ):
+        evidence_notice += "；部分依据来自切换时采集"
+
+    version_payload: dict[str, Any] = {
+        "object_key": key,
+        "base_version_id": None,
+        "base_version_no": None,
+        "version_id": None,
+        "version_no": None,
+        "replayed": False,
+    }
+    versioning = (
+        ctx.session is not None
+        and ctx.session_id is not None
+        and (ctx.policy is None or ctx.policy.commits_versions)
+    )
+    if versioning and final_evidence is not None:
+        assert ctx.session is not None and ctx.session_id is not None  # versioning 已保证
+        if draft_now:
+            initial_base = await _canonical_base_material(ctx.session, dict(draft_now))
+            initial_evidence, _ = await _bound_historical_evidence(
+                ctx.session, item=item, base_draft=initial_base,
+                run_id=raw_run, position=index,
+            )
+            # 初稿本身没有完整证据时不硬凑：跳过登记，让这一版成为对象首版
+            if initial_evidence is not None:
+                try:
+                    await artifact_versions.ensure_initial(
+                        ctx.session,
+                        session_id=ctx.session_id,
+                        object_key_value=key,
+                        object_type="draft",
+                        run_id=raw_run,
+                        position=index,
+                        content=dict(draft_now),
+                        source={"actor": "run_initial"},
+                        prompt_versions={
+                            str(k): int(v)
+                            for k, v in (detail.get("prompt_versions") or {}).items()
+                        },
+                        evidence_snapshot=initial_evidence,
+                    )
+                except ApiError as exc:
+                    return ToolOutcome(
+                        status="failed", steps=steps, error=_reason(exc)
+                    )
+        request_key = artifact_versions.request_key(
+            ctx.session_id,
+            key,
+            turn_id=ctx.turn_id or "",
+            call_id=ctx.checkpoint_scope or "",
+            request=f"candidate:{rank}",
+        )
+        existing = (
+            await ctx.session.execute(
+                select(ChatArtifactVersion).where(
+                    ChatArtifactVersion.session_id == ctx.session_id,
+                    ChatArtifactVersion.request_key == request_key,
+                )
+            )
+        ).scalar_one_or_none()
+        row = await artifact_versions.register_version(
+            ctx.session,
+            session_id=ctx.session_id,
+            object_key_value=key,
+            object_type="draft",
+            content=dict(new_draft),
+            source={
+                "actor": "candidate_switch",
+                "material_rank": rank,
+                "turn_id": ctx.turn_id or "",
+                "tool_call_id": ctx.checkpoint_scope or "",
+            },
+            prompt_versions=versions,
+            run_id=raw_run,
+            position=index,
+            request_key_value=request_key,
+            evidence_snapshot=dict(final_evidence),
+        )
+        base_no = None
+        if row.base_version_id is not None:
+            parent = await ctx.session.get(ChatArtifactVersion, row.base_version_id)
+            base_no = int(parent.version_no or 0) if parent is not None else None
+        version_payload.update(
+            {
+                "base_version_id": str(row.base_version_id) if row.base_version_id else None,
+                "base_version_no": base_no,
+                "version_id": str(row.id),
+                "version_no": int(row.version_no or 0),
+                "replayed": existing is not None,
+            }
+        )
+    elif versioning:
+        evidence_notice += "；本次未登记版本（历史依据不完整）"
+
+    await progress("完成", 100, 100)
+    return ToolOutcome(
+        status="succeeded",
+        steps=steps,
+        payload={
+            "run_id": raw_run,
+            "hotspot_index": index,
+            "material_rank": rank,
+            "material": {
+                "material_id": str(candidate.get("material_id") or material.get("id") or ""),
+                "title": str(material.get("title") or Path(str(material.get("path") or "")).name),
+                "usage": str(candidate.get("usage") or ""),
+                "current_exists": bool(
+                    (candidate.get("current_material") or {}).get("exists", True)
+                ),
+            },
+            "draft": new_draft,
+            "evidence_notice": evidence_notice,
+            **version_payload,
+            "cost_cny": cost,
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "usage_status": usage_status,
+        },
+        prompt_versions=versions,
+    )
+
+
 async def _read_image(
     ctx: ToolContext, attachment: dict[str, Any]
 ) -> tuple[bytes, str]:
@@ -2938,6 +3320,7 @@ HANDLERS: dict[str, ToolHandler] = {
     TOOL_READ_RUN: read_run,
     TOOL_PREVIEW_COVERAGE: preview_element_coverage,
     TOOL_REVISE_DRAFT: revise_draft,
+    TOOL_WRITE_DRAFT_ON_CANDIDATE: write_draft_on_candidate,
     TOOL_SEARCH_HOTSPOTS: search_hotspots,
     TOOL_FETCH_URL: fetch_url,
 }

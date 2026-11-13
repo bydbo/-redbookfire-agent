@@ -15,6 +15,7 @@ import json
 import uuid
 from decimal import Decimal
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -25,6 +26,7 @@ from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
 from xhs_agent.config import AppConfig, load_config
 from xhs_agent.db import Base
 from xhs_agent.db.models import (
+    ChatArtifactVersion,
     Hotspot,
     Material,
     MaterialIdAlias,
@@ -40,6 +42,7 @@ from xhs_agent.services.chat_tools import (
     preview_element_coverage,
     revise_draft,
     search_materials,
+    write_draft_on_candidate,
 )
 from xhs_agent.services.chat_turns import build_tool_runner
 from xhs_agent.services.run_snapshots import evidence_meta, material_snapshot
@@ -619,3 +622,122 @@ class TestTurnPromptVersions:
         assert turn.tool_calls[0]["tool"] == "revise_draft"
         assert turn.prompt_versions == {"chat_supervisor": SUPERVISOR_VERSION, "copy_revise": 3}
         assert provider.tasks == ["copy_revise"]
+
+
+# ---------- 按候选写稿（S7.32） ----------
+
+CANDIDATE_DRAFT: dict[str, Any] = {
+    "titles": [{"text": "按第三条写", "style": "直给"}],
+    "cover_text": "第三条",
+    "first_3s": "候选 3 的画面",
+    "body": "这版按第 3 条候选素材写。",
+    "tags": ["#夜跑"],
+    "shot_list": ["先拍候选 3"],
+    "compliance_notes": [],
+}
+
+
+async def add_candidates(session: AsyncSession, run_id: str, *, count: int = 2) -> list[str]:
+    """给已播种的运行补候选（rank 从 2 起递增），返回新增素材 id（按 rank 顺序）。"""
+    run_hotspot = (await session.execute(
+        select(RunHotspot).where(RunHotspot.run_id == uuid.UUID(run_id))
+        .order_by(RunHotspot.position))).scalars().first()
+    assert run_hotspot is not None
+    added: list[str] = []
+    for offset in range(count):
+        rank = 2 + offset
+        material = Material(path=f"候选-{rank}.mp4", type="video",
+                            title=f"候选素材 {rank}",
+                            description=f"第 {rank} 条候选的画面描述",
+                            tags=["夜跑"], elements=[], source="sidecar",
+                            width=1080, height=1920, size_bytes=2048)
+        session.add(material)
+        await session.flush()
+        snapshot = material_snapshot(material)
+        session.add(RunMatch(
+            run_hotspot_id=run_hotspot.id, material_id=material.id, rank=rank,
+            score=Decimal("0.7000"), recall_sources=["literal"], hits=[], missing=[],
+            reasons=[f"补充候选 {rank}"], usage=f"第 {rank} 条的用途",
+            material_snapshot=snapshot,
+            evidence_meta={"candidate": evidence_meta(
+                origin="runtime", source_ref=f"candidate-{rank}",
+                completeness="complete", payload=snapshot)}))
+        added.append(str(material.id))
+    await session.commit()
+    return added
+
+
+def candidate_context(db_session: AsyncSession, cfg: AppConfig, *,
+                      session_id: uuid.UUID, turn: str, payload: dict[str, Any]) -> ToolContext:
+    """带会话上下文的工具上下文：版本登记只在这种形态下生效（与对话运行器一致）。"""
+    return ToolContext(
+        cfg=cfg, session=db_session,
+        caller=StructuredCaller(provider=CountingProvider(payload)),
+        session_id=session_id,
+        policy=SimpleNamespace(commits_versions=True, enforce=True),
+        turn_id=turn, checkpoint_scope=f"{turn}-call",
+    )
+
+
+class TestWriteDraftOnCandidate:
+    """换素材写稿：新稿绑到指定候选，并登记成该热点文案的新版本。"""
+
+    async def test_switches_material_and_registers_a_new_version(
+            self, db_session: AsyncSession, cfg: AppConfig) -> None:
+        run_id, _draft = await seed_finished_run(db_session)
+        added = await add_candidates(db_session, run_id, count=2)   # rank 2 / 3
+        chat = await create_session(db_session, title="候选写稿")
+        ctx = candidate_context(db_session, cfg,
+                                session_id=uuid.UUID(str(chat["session_id"])),
+                                turn="turn-1", payload=CANDIDATE_DRAFT)
+
+        outcome = await write_draft_on_candidate(
+            ctx, {"run_id": run_id, "material_rank": 3})
+
+        assert outcome.status == "succeeded", outcome.error
+        assert outcome.payload["material"]["material_id"] == added[1]
+        assert outcome.payload["draft"]["material_id"] == added[1]
+        assert outcome.payload["version_no"] == 2
+        assert outcome.payload["base_version_no"] == 1
+        rows = (await db_session.execute(
+            select(ChatArtifactVersion)
+            .where(ChatArtifactVersion.object_key == outcome.payload["object_key"])
+            .order_by(ChatArtifactVersion.version_no))).scalars().all()
+        assert [row.version_no for row in rows] == [1, 2]
+        # 换素材必须换证据：canonical 是第 3 条，不是初稿那条
+        assert rows[1].content["material_id"] == added[1]
+        assert rows[1].evidence_snapshot["canonical_material_id"] == added[1]
+        assert rows[1].source["actor"] == "candidate_switch"
+        assert rows[1].source["material_rank"] == 3
+        assert rows[1].base_version_id == rows[0].id
+
+    async def test_revise_continues_on_the_new_material(
+            self, db_session: AsyncSession, cfg: AppConfig) -> None:
+        """关键回归：换素材出稿后，再改稿不能退回运行初稿那条素材。"""
+        run_id, _draft = await seed_finished_run(db_session)
+        added = await add_candidates(db_session, run_id, count=2)
+        chat = await create_session(db_session, title="候选写稿续改")
+        session_id = uuid.UUID(str(chat["session_id"]))
+        first = await write_draft_on_candidate(
+            candidate_context(db_session, cfg, session_id=session_id,
+                              turn="turn-1", payload=CANDIDATE_DRAFT),
+            {"run_id": run_id, "material_rank": 3})
+        assert first.status == "succeeded", first.error
+
+        revised = await revise_draft(
+            candidate_context(db_session, cfg, session_id=session_id,
+                              turn="turn-2", payload=REVISED_PAYLOAD),
+            {"run_id": run_id, "request": "再口语一点"})
+
+        assert revised.status == "succeeded", revised.error
+        assert revised.payload["base_version_id"] == first.payload["version_id"]
+        assert revised.payload["base_version_no"] == 2
+        assert revised.payload["version_no"] == 3
+        # 改稿用的素材仍是被点名的那条
+        assert revised.payload["current_material"] is not None
+        rows = (await db_session.execute(
+            select(ChatArtifactVersion)
+            .where(ChatArtifactVersion.object_key == first.payload["object_key"])
+            .order_by(ChatArtifactVersion.version_no))).scalars().all()
+        assert [row.version_no for row in rows] == [1, 2, 3]
+        assert rows[2].evidence_snapshot["canonical_material_id"] == added[1]

@@ -261,12 +261,16 @@ async def register_version(
     run_id: str | None = None,
     position: int | None = None,
     request_key_value: str | None = None,
+    evidence_snapshot: dict[str, Any] | None = None,
 ) -> ChatArtifactVersion:
     """显式重解析：在锁内基于**当前 head** 建立一个新成功版本（A08）。
 
     与 `ensure_initial` 的区别：后者幂等，已有版本时直接返回，无法表达"用户显式重解析"；
     这里每次都分配新的 `version_no`，新版本成为对象 head，但**不修改已选定的
     `object_refs`**——普通后续任务仍消费用户显式选定的编辑版，直到用户再次显式切换。
+
+    `evidence_snapshot`（S7.32）：换素材写稿这类"输入变了"的新版本必须自带证据，
+    否则后续以它为 base 改稿时会回落到运行初稿那条素材。不传时保持旧行为（空快照）。
     """
     chat = await _lock_session(session, session_id)
     if request_key_value:
@@ -291,6 +295,7 @@ async def register_version(
         content=dict(content),
         source={"actor": "explicit_reparse", **dict(source or {})},
         prompt_versions=dict(prompt_versions or {}),
+        evidence_snapshot=dict(evidence_snapshot or {}),
         usage={},
     )
     session.add(row)

@@ -256,6 +256,7 @@ describe('useChatStore', () => {
     expect(toolLabel('read_run')).toBe('读历史运行')
     expect(toolLabel('preview_element_coverage')).toBe('预览爆点要素')
     expect(toolLabel('revise_draft')).toBe('改写文案')
+    expect(toolLabel('write_draft_on_candidate')).toBe('按候选写稿')
     expect(toolLabel('brand_new_tool')).toBe('brand_new_tool')
   })
 

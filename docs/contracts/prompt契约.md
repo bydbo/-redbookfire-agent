@@ -39,7 +39,7 @@ proposal_id，供后续页显式撤回 / 替换；服务端保持候选待确认
 **对话工具清单（S7.7 起）**：对话层能调的工具**只有**下表这些。**参数 schema 与返回结构的
 单一来源仍是 `services/chat_tools.py` 的 `TOOLS` 与各 handler 的 payload**——本表只登记
 "有什么、有没有副作用、用不用 prompt、返回要点"，不复制 schema（复制就会漂移；
-`tests/unit/test_prompts_assets.py` 有一条用例钉住"本表的工具名集合 == `TOOLS` 的名字集合"）。
+`tests/unit/test_prompts_assets.py` 有一条用例钉住"每个注册的工具都必须出现在本表里"）。
 
 | 工具 | 用途 | 副作用 | 带 prompt 版本 | 返回要点 |
 | --- | --- | --- | --- | --- |
@@ -49,6 +49,7 @@ proposal_id，供后续页显式撤回 / 替换；服务端保持候选待确认
 | `read_run` | 读回一次已完成运行的结果（`run_id` 可省：默认本会话最近一次运行） | 无（只读库、不调模型、不花钱） | 无 | 每条热点的要素 / 覆盖率 / 候选清单（`rank` / 标题 / 分数 / 用途，≤8 条）/ 候选总数 / 首选 / 初稿标题 |
 | `preview_element_coverage` | 要素拆解 + 字面通道覆盖估算与补拍建议 | 无（只读库、不调 embedding、不落 `runs`） | `hotspot_clue` | 要素、覆盖率、缺口与补拍建议 |
 | `revise_draft` | 按用户要求改写某次运行已产出的初稿（`run_id` 可省：默认本会话最近一次运行） | **有**：花一次模型钱；**不写库**（run 的初稿快照不动） | `copy_revise` | `refused` + 理由，或改后初稿 |
+| `write_draft_on_candidate` | 以某次运行里**指定的那条候选素材**为基准写一版新稿（`material_rank` 必填，`run_id` 可省） | **有**：花一次模型钱；**不改 run**（初稿快照不动），把新稿登记成该热点文案的新版本（`source.actor=candidate_switch`；`[context].mode=off` 时不登记） | `copy_draft` | 用了哪条候选（`rank` / 标题 / 用途）、完整 Draft、版本号与父版本、成本 |
 
 **网页工具的条件式口径（`chat_supervisor` v6 起）**：`search_hotspots` / `fetch_url` 是否随本轮
 `tools` 下发由开关 `[web].enabled` 决定（**默认关闭**），而 prompt 只有一份。所以这两条规则同时成立：

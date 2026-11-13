@@ -53,6 +53,7 @@ export const TOOL_LABELS: Record<string, string> = {
   read_run: '读历史运行',
   preview_element_coverage: '预览爆点要素',
   revise_draft: '改写文案',
+  write_draft_on_candidate: '按候选写稿',
   search_hotspots: '搜索热点',
   fetch_url: '读取网页',
 }

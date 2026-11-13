@@ -25,6 +25,7 @@ from xhs_agent.services.chat_tools import (
     TOOL_REVISE_DRAFT,
     TOOL_RUN_ANALYSIS,
     TOOL_SEARCH_MATERIALS,
+    TOOL_WRITE_DRAFT_ON_CANDIDATE,
     TOOLS,
     ToolContext,
     ToolOutcome,
@@ -36,6 +37,7 @@ from xhs_agent.services.chat_tools import (
     run_hotspot_analysis,
     search_materials,
     tool_names,
+    write_draft_on_candidate,
 )
 from xhs_agent.services.image_clue import ImageClueParse
 from xhs_agent.services.retrieval import RetrievalOutcome
@@ -122,6 +124,7 @@ class TestToolSchema:
             TOOL_READ_RUN,
             TOOL_PREVIEW_COVERAGE,
             TOOL_REVISE_DRAFT,
+            TOOL_WRITE_DRAFT_ON_CANDIDATE,
         }
         # PR2：网页两件的 schema 在 TOOLS 外面（按 [web] 开关追加），但 handler 常驻分发表，
         # 所以「一一对上」的等号右边取**开启态**清单；关闭态下发的仍是 TOOLS 本身。
@@ -852,6 +855,193 @@ class TestRevisePaths:
             context(tmp_path), {"run_id": RUN_UUID, "request": "改短点"}
         )
         assert outcome.status == "failed" and "caller" in outcome.error
+
+
+# ---------- 按候选写稿（S7.32） ----------
+
+DRAFT_ON_CANDIDATE_PAYLOAD: dict[str, Any] = {
+    "titles": [{"text": "树上挂着的外套", "style": "直给"}],
+    "cover_text": "树上外套",
+    "first_3s": "树上挂着的浅蓝羽绒服",
+    "body": "这版按第 4 条写：树上挂着浅蓝羽绒服。",
+    "tags": ["#夜跑"],
+    "shot_list": ["先拍树上的外套"],
+    "compliance_notes": ["别带品牌 logo"],
+}
+
+
+class _CountResult:
+    def __init__(self, value: int) -> None:
+        self._value = value
+
+    def scalar_one(self) -> int:
+        return self._value
+
+
+class _CountSession:
+    """只满足 `_run_belongs_to_session` 的会话替身（一条 count 查询）。"""
+
+    def __init__(self, value: int) -> None:
+        self._value = value
+
+    async def execute(self, *_args: Any, **_kwargs: Any) -> _CountResult:
+        return _CountResult(self._value)
+
+
+class TestWriteDraftOnCandidate:
+    """以某条候选素材为基准写新稿：序号越界、证据缺失、归属、不改库。"""
+
+    def test_schema_requires_material_rank(self) -> None:
+        schema = next(
+            item["function"] for item in TOOLS
+            if item["function"]["name"] == TOOL_WRITE_DRAFT_ON_CANDIDATE
+        )
+        assert schema["parameters"]["required"] == ["material_rank"]
+        assert TOOL_WRITE_DRAFT_ON_CANDIDATE in HANDLERS
+
+    @pytest.mark.asyncio
+    async def test_writes_a_draft_bound_to_the_named_candidate(
+        self, tmp_path: Path, patched_run: Any
+    ) -> None:
+        provider = CountingProvider(DRAFT_ON_CANDIDATE_PAYLOAD)
+        ctx = context(tmp_path, caller=StructuredCaller(provider=provider))
+
+        outcome = await write_draft_on_candidate(
+            ctx, {"run_id": RUN_UUID, "material_rank": 4}
+        )
+
+        assert outcome.status == "succeeded", outcome.error
+        assert outcome.payload["material_rank"] == 4
+        assert outcome.payload["material"]["material_id"] == (
+            "00000004-2222-2222-2222-222222222222"
+        )
+        assert outcome.payload["material"]["title"] == "清晨的跑道"
+        # 新稿必须绑在第 4 条上：绑错等于换素材白做
+        assert outcome.payload["draft"]["material_id"] == (
+            "00000004-2222-2222-2222-222222222222"
+        )
+        assert outcome.payload["draft"]["body"] == "这版按第 4 条写：树上挂着浅蓝羽绒服。"
+        assert outcome.prompt_versions == {"copy_draft": 3}
+        # 无会话上下文 → 不登记版本（与 revise_draft 的 off 分支同口径）
+        assert outcome.payload["version_id"] is None
+        assert provider.calls == 1
+
+    @pytest.mark.asyncio
+    async def test_rank_out_of_range_lists_what_exists(
+        self, tmp_path: Path, patched_run: Any
+    ) -> None:
+        provider = CountingProvider(DRAFT_ON_CANDIDATE_PAYLOAD)
+        ctx = context(tmp_path, caller=StructuredCaller(provider=provider))
+
+        outcome = await write_draft_on_candidate(
+            ctx, {"run_id": RUN_UUID, "material_rank": 9}
+        )
+
+        assert outcome.status == "failed"
+        assert outcome.payload["reason"] == "material_rank_out_of_range"
+        assert outcome.payload["count"] == len(CANDIDATE_TITLES)
+        assert [row["rank"] for row in outcome.payload["candidates"]] == [1, 2, 3, 4]
+        assert "没有第 9 条" in outcome.error
+        assert provider.calls == 0  # 校验不过不许花钱
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("rank", [0, -1, "abc"])
+    async def test_bad_material_rank_is_rejected(
+        self, tmp_path: Path, patched_run: Any, rank: Any
+    ) -> None:
+        outcome = await write_draft_on_candidate(
+            context(tmp_path), {"run_id": RUN_UUID, "material_rank": rank}
+        )
+        assert outcome.status == "failed" and "material_rank" in outcome.error
+
+    @pytest.mark.asyncio
+    async def test_missing_material_rank_is_rejected(
+        self, tmp_path: Path, patched_run: Any
+    ) -> None:
+        outcome = await write_draft_on_candidate(context(tmp_path), {"run_id": RUN_UUID})
+        assert outcome.status == "failed" and "缺少 material_rank" in outcome.error
+
+    @pytest.mark.asyncio
+    async def test_unfinished_run_is_reported(
+        self, tmp_path: Path, patched_run: Any
+    ) -> None:
+        patched_run["detail"] = run_detail(status="running")
+        outcome = await write_draft_on_candidate(
+            context(tmp_path), {"run_id": RUN_UUID, "material_rank": 1}
+        )
+        assert outcome.status == "failed" and "还没跑完" in outcome.error
+
+    @pytest.mark.asyncio
+    async def test_candidate_without_snapshot_is_reported(
+        self, tmp_path: Path, patched_run: Any
+    ) -> None:
+        detail = run_detail()
+        detail["hotspots"][0]["candidates"][3]["material"] = None
+        patched_run["detail"] = detail
+        provider = CountingProvider(DRAFT_ON_CANDIDATE_PAYLOAD)
+        ctx = context(tmp_path, caller=StructuredCaller(provider=provider))
+
+        outcome = await write_draft_on_candidate(
+            ctx, {"run_id": RUN_UUID, "material_rank": 4}
+        )
+
+        assert outcome.status == "failed"
+        assert outcome.payload["reason"] == "material_snapshot_missing"
+        assert provider.calls == 0
+
+    @pytest.mark.asyncio
+    async def test_missing_clue_is_reported(
+        self, tmp_path: Path, patched_run: Any
+    ) -> None:
+        detail = run_detail()
+        detail["hotspots"][0]["clue"] = None
+        patched_run["detail"] = detail
+
+        outcome = await write_draft_on_candidate(
+            context(tmp_path), {"run_id": RUN_UUID, "material_rank": 1}
+        )
+        assert outcome.status == "failed" and "没有爆点线索" in outcome.error
+
+    @pytest.mark.asyncio
+    async def test_without_caller_fails_politely(
+        self, tmp_path: Path, patched_run: Any
+    ) -> None:
+        outcome = await write_draft_on_candidate(
+            context(tmp_path), {"run_id": RUN_UUID, "material_rank": 1}
+        )
+        assert outcome.status == "failed" and "caller" in outcome.error
+
+    @pytest.mark.asyncio
+    async def test_run_outside_the_session_is_refused(
+        self, tmp_path: Path, patched_run: Any
+    ) -> None:
+        ctx = ToolContext(
+            cfg=write_config(tmp_path),
+            session=cast(Any, _CountSession(0)),
+            session_id=uuid.uuid4(),
+        )
+
+        outcome = await write_draft_on_candidate(
+            ctx, {"run_id": RUN_UUID, "material_rank": 1}
+        )
+
+        assert outcome.status == "failed"
+        assert outcome.payload["reason"] == "run_not_in_session"
+
+    @pytest.mark.asyncio
+    async def test_run_snapshot_is_not_mutated(
+        self, tmp_path: Path, patched_run: Any
+    ) -> None:
+        before = json.loads(json.dumps(patched_run["detail"], ensure_ascii=False, default=str))
+        provider = CountingProvider(DRAFT_ON_CANDIDATE_PAYLOAD)
+
+        await write_draft_on_candidate(
+            context(tmp_path, caller=StructuredCaller(provider=provider)),
+            {"run_id": RUN_UUID, "material_rank": 3},
+        )
+
+        after = json.loads(json.dumps(patched_run["detail"], ensure_ascii=False, default=str))
+        assert after == before  # run 是冻结快照，写稿不许回写
 
 
 class TestRunIdFallback:
