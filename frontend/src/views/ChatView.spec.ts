@@ -525,5 +525,41 @@ describe('ChatView（S7.5 对话首页）', () => {
       expect(wrapper.text()).toContain('搜索热点')
       expect(wrapper.text()).not.toContain('详情')
     })
+
+    it('阶段快照已结束时不当摘要主语，退回当前工具名', async () => {
+      // 真实场景：supervisor 阶段已 succeeded，工具（改写文案）还在跑且没有阶段键
+      vi.mocked(getChatSession).mockResolvedValue(detail([
+        message({
+          message_id: 'm-r', status: 'running',
+          progress: {
+            stage: 'supervisor', label: '理解与决策', status: 'succeeded', attempt: 1,
+            started_at: '2026-11-14T08:00:00+00:00', updated_at: '2026-11-14T08:00:01+00:00',
+          },
+        }),
+      ]))
+      const wrapper = await mountView()
+      useChatStore().activeTool = { label: '改写文案', startedAt: Date.now() }
+      await nextTick()
+
+      expect(wrapper.text()).toContain('改写文案')
+      expect(wrapper.text()).not.toContain('理解与决策')
+    })
+
+    it('点开详情后跟随滚到底，用户不会以为没展开', async () => {
+      vi.mocked(getChatSession).mockResolvedValue(detail([runningMessage()]))
+      const wrapper = await mountView()
+      seedSteps()
+      await nextTick()
+
+      const messages = wrapper.find('.chat-messages').element as HTMLElement
+      fakeScrollable(messages)
+      messages.scrollTop = 700          // 1000 - 700 - 300 = 0：用户在底部
+      messages.dispatchEvent(new Event('scroll'))
+      await nextTick()
+
+      await clickButton(wrapper, '详情')
+
+      expect(messages.scrollTop).toBe(1000)
+    })
   })
 })

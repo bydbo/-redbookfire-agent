@@ -40,10 +40,10 @@ export interface ToolStep {
   stage: string
   done: number
   total: number
-  status: 'running' | 'succeeded' | 'failed'
+  status: 'running' | 'succeeded' | 'failed' | 'skipped'
   /** 该阶段第一次出现的时刻（ms）；与 `endedAt` 之差就是这一步的耗时。 */
   startedAt: number
-  /** 被下一个阶段顶掉 / 工具结束时写入；`null` 表示还在跑。 */
+  /** 被下一个阶段顶掉 / 阶段自己上报终态 / 工具结束时写入；`null` 表示还在跑。 */
   endedAt: number | null
 }
 
@@ -163,27 +163,79 @@ export const useChatStore = defineStore('chat', () => {
   // 只在还没有阶段快照时给摘要行一个主语。
   const activeTool = ref<{ label: string; startedAt: number } | null>(null)
 
+  /** 后端阶段终态 → 展示用的四态；`skipped` / `interrupted` 都不冒充成功。 */
+  function stepStatusOf(raw: string): ToolStep['status'] {
+    if (raw === '' || raw === 'running') return 'running'
+    if (raw === 'skipped') return 'skipped'
+    if (raw === 'failed' || raw === 'interrupted') return 'failed'
+    return 'succeeded'
+  }
+
   /** 同一阶段只保留一行：与最后一行同名就地更新，换阶段才收掉上一行再追加。
    *
-   *  口径与后端账本一致（`chat.py` 的 `steps[-1]` 比较）——轮询会把同一个「分析中」
-   *  每秒上报一次，逐条 push 会让一次运行在界面上变成十几行。
+   *  口径与后端账本一致（`chat.py` 的 `steps[-1]` 比较）。两条额外规则都来自真实事件序列：
+   *  - **没有阶段键的临时文案是心跳**：`_wait_for_run` 在快照没变化时每轮 poll 发一次
+   *    「分析中」（`stage_key` 为空串），它不能顶掉正在跑的阶段，否则时间线会谎报"已完成"；
+   *  - **进度事件可以自带终态**：`status` 为 succeeded / failed 时当场收尾，失败不被打勾。
    */
-  function pushStep(next: { stage: string; done: number; total: number }): void {
+  function pushStep(next: {
+    stage: string
+    done: number
+    total: number
+    stageKey: string
+    status: string
+  }): void {
     if (next.stage === '') return
     const now = Date.now()
+    const status = stepStatusOf(next.status)
     const steps = toolSteps.value
     const last = steps[steps.length - 1]
+
+    if (next.stageKey === '') {
+      // 心跳 / 无阶段键的临时文案：只更新当前阶段，不另起一行
+      if (last === undefined || last.endedAt !== null) {
+        steps.push({
+          stage: next.stage,
+          done: next.done,
+          total: next.total,
+          status,
+          startedAt: now,
+          endedAt: status === 'running' ? null : now,
+        })
+        return
+      }
+      last.done = next.done
+      last.total = next.total
+      if (status !== 'running') {
+        last.status = status
+        last.endedAt = now
+      }
+      return
+    }
+
     if (last !== undefined && last.stage === next.stage) {
       last.done = next.done
       last.total = next.total
-      last.status = 'running'
+      if (status !== 'running') {
+        last.status = status
+        last.endedAt = now
+      } else if (last.endedAt === null) {
+        last.status = 'running'
+      }
       return
     }
     if (last !== undefined && last.endedAt === null) {
       last.status = 'succeeded'
       last.endedAt = now
     }
-    steps.push({ ...next, status: 'running', startedAt: now, endedAt: null })
+    steps.push({
+      stage: next.stage,
+      done: next.done,
+      total: next.total,
+      status,
+      startedAt: now,
+      endedAt: status === 'running' ? null : now,
+    })
   }
   const error = ref<string | null>(null)
 
@@ -272,6 +324,12 @@ export const useChatStore = defineStore('chat', () => {
   const stageLongRunning = computed(
     () => progress.value?.status === 'running' && stageElapsedMs.value >= LONG_STAGE_MS,
   )
+  /** 当前工具已经跑了多久：没有阶段快照的轮次（改稿 / 读历史）靠它给摘要一个秒数。 */
+  const activeToolElapsedMs = computed(() => {
+    const item = activeTool.value
+    if (item === null) return 0
+    return Math.max(0, clock.value - item.startedAt)
+  })
 
   // run_id → RunDetail（结果卡片）；null 表示「取不到」（还没写回 / 已被清理）
   const runs = ref<Record<string, RunDetail | null>>({})
@@ -870,6 +928,7 @@ export const useChatStore = defineStore('chat', () => {
           label: toolLabel(String(data.tool ?? '')),
           startedAt: Date.now(),
         }
+        startClock()   // 摘要行要在没有阶段快照时也能报「已 X 秒」
         break
       case 'tool_progress':
         // 工具过程（done/total 与中文阶段）只喂步骤列表，按阶段合并，不再一行一条
@@ -877,6 +936,8 @@ export const useChatStore = defineStore('chat', () => {
           stage: String(data.stage ?? ''),
           done: Number(data.done ?? 0),
           total: Number(data.total ?? 0),
+          stageKey: String(data.stage_key ?? ''),
+          status: String(data.status ?? 'running'),
         })
         if (snapshot !== null && String(data.stage_key ?? '') !== '') {
           applySnapshot(snapshot, scope)
@@ -906,6 +967,8 @@ export const useChatStore = defineStore('chat', () => {
           }
         }
         activeTool.value = null
+        // 没有在跑的阶段时可以把秒表停掉；阶段还在跑就继续让它走
+        if (progress.value?.status !== 'running') stopClock()
         // 需要更新阶段的收尾事件同样带快照（结构化 worker 阶段 / 旧式标签阶段）
         if (snapshot !== null) applySnapshot(snapshot, scope)
         break
@@ -1028,7 +1091,7 @@ export const useChatStore = defineStore('chat', () => {
     sessions, sessionsLoading, sessionsError,
     currentId, currentSession, messages, messagesLoading,
     sending, busy, creatingSession, streamText, toolSteps, activeTool, error, runs,
-    progress, stageElapsedMs, stageLongRunning,
+    progress, stageElapsedMs, stageLongRunning, activeToolElapsedMs,
     context, contextLoading, contextError, selectedBase,
     artifactVersions, artifactPreview, artifactObjectKey, artifactsLoading, artifactsError,
     sourcePreview, sourceError,

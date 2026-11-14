@@ -30,18 +30,21 @@ onUnmounted(() => {
 
 function rowClass(step: ToolStep): string {
   if (step.status === 'succeeded') return 'is-done'
+  if (step.status === 'skipped') return 'is-skipped'
   if (step.status === 'failed') return 'is-failed'
   return 'is-active'
 }
 
 function iconOf(step: ToolStep): string {
   if (step.status === 'succeeded') return '✓'
+  if (step.status === 'skipped') return '–'
   if (step.status === 'failed') return '✕'
   return '●'
 }
 
 function metaOf(step: ToolStep): string {
   if (step.status === 'running') return `进行中 · ${formatElapsed(now.value - step.startedAt)}`
+  if (step.status === 'skipped') return '已跳过'
   if (step.status === 'failed') return '未完成'
   return formatElapsed((step.endedAt ?? now.value) - step.startedAt)
 }
@@ -114,4 +117,8 @@ function metaOf(step: ToolStep): string {
 .is-failed .step-icon,
 .is-failed .step-meta { color: var(--xhs-brand-strong); }
 .is-failed .step-name { color: var(--xhs-ink-strong); font-weight: 600; }
+
+.is-skipped .step-icon,
+.is-skipped .step-name,
+.is-skipped .step-meta { color: var(--xhs-ink-muted); }
 </style>

@@ -205,12 +205,16 @@ function statusLabel(message: ChatMessage): string | null {
 /** 运行中的一行摘要：当前阶段（没有阶段时退回工具名、「正在回复…」）+ 已用时。
  *
  *  只给「在动」的信号，不给百分比——排队这类阶段的百分比本来就不存在。
+ *  阶段快照只在 `running` 时才算数：`改写文案` / `写稿` 这类工具没有阶段键，
+ *  progress 会停在已经 succeeded 的 supervisor 阶段，照抄它等于告诉用户"还在决策"。
  */
 function runningSummary(message: ChatMessage): string {
-  const label = store.progress?.label || store.activeTool?.label || statusLabel(message) || ''
+  const stage = store.progress?.status === 'running' ? store.progress : null
+  const label = stage?.label || store.activeTool?.label || statusLabel(message) || ''
+  const elapsed = stage !== null ? store.stageElapsedMs : store.activeToolElapsedMs
   const parts: string[] = []
   if (label !== '') parts.push(label)
-  if (store.stageElapsedMs > 0) parts.push(`已 ${formatElapsed(store.stageElapsedMs)}`)
+  if (elapsed > 0) parts.push(`已 ${formatElapsed(elapsed)}`)
   return parts.join(' · ')
 }
 
@@ -218,6 +222,10 @@ function runningSummary(message: ChatMessage): string {
 const stepsExpanded = ref(false)
 watch(() => store.sending, (on) => {
   if (on) stepsExpanded.value = false
+})
+// 展开后跟着滚到底：运行中的气泡就在列表末尾，不跟的话用户只看到按钮变了字
+watch(stepsExpanded, () => {
+  void scrollToLatest()
 })
 
 /** 失败提示：有阶段快照时补「失败于哪个阶段 + 安全错误类别」（S7.21）。 */

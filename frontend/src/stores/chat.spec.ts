@@ -263,9 +263,15 @@ describe('useChatStore', () => {
     vi.mocked(streamMessage).mockImplementation(async (_id, _input, onEvent) => {
       onEvent({ event: 'turn_started', data: {} })
       onEvent({ event: 'tool_started', data: { tool: 'run_hotspot_analysis' } })
-      onEvent({ event: 'tool_progress', data: { stage: '排队等待', done: 0, total: 100 } })
+      onEvent({
+        event: 'tool_progress',
+        data: { stage: '排队等待', done: 0, total: 100, stage_key: 'queue_wait' },
+      })
       vi.advanceTimersByTime(8000)
-      onEvent({ event: 'tool_progress', data: { stage: '检索', done: 20, total: 100 } })
+      onEvent({
+        event: 'tool_progress',
+        data: { stage: '检索', done: 20, total: 100, stage_key: 'retrieve' },
+      })
     })
     const store = useChatStore()
     await store.send({ text: '帮我蹭一下这个热点' })
@@ -289,13 +295,104 @@ describe('useChatStore', () => {
   it('tool_finished 清空当前工具，并把最后一行收成终态', async () => {
     const store = await sendEvents([
       { event: 'tool_started', data: { tool: 'run_hotspot_analysis' } },
-      { event: 'tool_progress', data: { stage: '检索', done: 60, total: 100 } },
+      { event: 'tool_progress', data: { stage: '检索', done: 60, total: 100, stage_key: 'retrieve' } },
       { event: 'tool_finished', data: { status: 'succeeded' } },
     ])
 
     expect(store.activeTool).toBeNull()
     expect(store.toolSteps).toHaveLength(1)
     expect(store.toolSteps[0].status).toBe('succeeded')
+  })
+
+  it('轮询心跳「分析中」只更新进度，不顶掉正在跑的阶段', async () => {
+    // 真实序列（test_chat_tools.py::test_reports_new_stages_once）：
+    // 排队等待 → 素材同步 → 分析中(心跳) → 拆解 → 报告
+    let mid: ToolStep[] = []
+    primeSession()
+    vi.mocked(streamMessage).mockImplementation(async (_id, _input, onEvent) => {
+      const store = useChatStore()
+      onEvent({ event: 'turn_started', data: {} })
+      onEvent({ event: 'tool_started', data: { tool: 'run_hotspot_analysis' } })
+      onEvent({
+        event: 'tool_progress',
+        data: { stage: '素材同步', done: 5, total: 100, stage_key: 'material_sync' },
+      })
+      onEvent({
+        event: 'tool_progress',
+        data: { stage: '分析中', done: 5, total: 100, stage_key: '' },
+      })
+      mid = store.toolSteps.map((step) => ({ ...step }))
+      onEvent({ event: 'tool_progress', data: { stage: '拆解', done: 40, total: 100, stage_key: 'clue' } })
+    })
+    const store = useChatStore()
+    await store.send({ text: '帮我蹭一下这个热点' })
+
+    // 心跳到来时：仍然只有素材同步一行，且它还在跑（不谎报 completed）
+    expect(mid.map((step) => step.stage)).toEqual(['素材同步'])
+    expect(mid[0].status).toBe('running')
+    expect(mid[0].endedAt).toBeNull()
+    // 下一个真实阶段才收掉它；心跳本身不占一行
+    expect(store.toolSteps.map((step) => step.stage)).toEqual(['素材同步', '拆解'])
+    expect(store.toolSteps[0].status).toBe('succeeded')
+    expect(store.toolSteps[0].endedAt).not.toBeNull()
+    expect(store.toolSteps[1].status).toBe('running')
+  })
+
+  it('空阶段名的进度事件不造空行', async () => {
+    const store = await sendEvents([
+      { event: 'tool_started', data: { tool: 'run_hotspot_analysis' } },
+      { event: 'tool_progress', data: { stage: '', done: 0, total: 100 } },
+    ])
+
+    expect(store.toolSteps).toEqual([])
+  })
+
+  it('新工具开始时清掉上一个工具的阶段行', async () => {
+    const store = await sendEvents([
+      { event: 'tool_started', data: { tool: 'run_hotspot_analysis' } },
+      { event: 'tool_progress', data: { stage: '检索', done: 10, total: 100, stage_key: 'retrieve' } },
+      { event: 'tool_finished', data: { status: 'succeeded' } },
+      { event: 'tool_started', data: { tool: 'search_materials' } },
+    ])
+
+    expect(store.toolSteps).toEqual([])
+    expect(store.activeTool?.label).toBe('查素材库')
+  })
+
+  it('进度事件自带终态时直接收尾，失败不被打勾', async () => {
+    const store = await sendEvents([
+      { event: 'tool_started', data: { tool: 'run_hotspot_analysis' } },
+      {
+        event: 'tool_progress',
+        data: { stage: '素材同步', done: 100, total: 100, stage_key: 'material_sync', status: 'succeeded' },
+      },
+      {
+        event: 'tool_progress',
+        data: { stage: '检索', done: 0, total: 100, stage_key: 'retrieve', status: 'failed' },
+      },
+    ])
+
+    expect(store.toolSteps.map((step) => step.stage)).toEqual(['素材同步', '检索'])
+    expect(store.toolSteps[0].status).toBe('succeeded')
+    expect(store.toolSteps[0].endedAt).not.toBeNull()
+    expect(store.toolSteps[1].status).toBe('failed')
+    expect(store.toolSteps[1].endedAt).not.toBeNull()
+  })
+
+  it('工具失败时最后一行收成 failed，并记下结束时刻', async () => {
+    primeSession()
+    vi.mocked(streamMessage).mockImplementation(async (_id, _input, onEvent) => {
+      onEvent({ event: 'turn_started', data: {} })
+      onEvent({ event: 'tool_started', data: { tool: 'run_hotspot_analysis' } })
+      onEvent({ event: 'tool_progress', data: { stage: '检索', done: 60, total: 100, stage_key: 'retrieve' } })
+      vi.advanceTimersByTime(1500)
+      onEvent({ event: 'tool_finished', data: { status: 'failed' } })
+    })
+    const store = useChatStore()
+    await store.send({ text: '帮我蹭一下这个热点' })
+
+    expect(store.toolSteps[0].status).toBe('failed')
+    expect((store.toolSteps[0].endedAt ?? 0) - store.toolSteps[0].startedAt).toBe(1500)
   })
 
   it('流式请求报错时记错误，但消息仍以库里的为准', async () => {
