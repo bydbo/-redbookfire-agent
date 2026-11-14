@@ -34,11 +34,17 @@ export interface SendResult {
   message: string
 }
 
-// 一次工具调用的进度步骤（S7.4 的 tool_started / tool_progress / tool_finished 归约而成）。
+// 一次工具调用中的阶段（S7.4 的 tool_started / tool_progress / tool_finished 归约而成）。
+// 同一阶段只占一行：重复上报就地更新 `done / total`，换阶段才追加并给上一行收尾。
 export interface ToolStep {
   stage: string
   done: number
   total: number
+  status: 'running' | 'succeeded' | 'failed'
+  /** 该阶段第一次出现的时刻（ms）；与 `endedAt` 之差就是这一步的耗时。 */
+  startedAt: number
+  /** 被下一个阶段顶掉 / 工具结束时写入；`null` 表示还在跑。 */
+  endedAt: number | null
 }
 
 const POLL_INTERVAL_MS = 2000
@@ -153,6 +159,32 @@ export const useChatStore = defineStore('chat', () => {
   const creatingSession = ref(false)
   const streamText = ref('')
   const toolSteps = ref<ToolStep[]>([])
+  // 当前在跑的工具（tool_started 起、tool_finished 止）。工具本身不占阶段行，
+  // 只在还没有阶段快照时给摘要行一个主语。
+  const activeTool = ref<{ label: string; startedAt: number } | null>(null)
+
+  /** 同一阶段只保留一行：与最后一行同名就地更新，换阶段才收掉上一行再追加。
+   *
+   *  口径与后端账本一致（`chat.py` 的 `steps[-1]` 比较）——轮询会把同一个「分析中」
+   *  每秒上报一次，逐条 push 会让一次运行在界面上变成十几行。
+   */
+  function pushStep(next: { stage: string; done: number; total: number }): void {
+    if (next.stage === '') return
+    const now = Date.now()
+    const steps = toolSteps.value
+    const last = steps[steps.length - 1]
+    if (last !== undefined && last.stage === next.stage) {
+      last.done = next.done
+      last.total = next.total
+      last.status = 'running'
+      return
+    }
+    if (last !== undefined && last.endedAt === null) {
+      last.status = 'succeeded'
+      last.endedAt = now
+    }
+    steps.push({ ...next, status: 'running', startedAt: now, endedAt: null })
+  }
   const error = ref<string | null>(null)
 
   // 上下文状态（S7.24）：生效 / 待确认事实与版本；刷新和每轮结束后都从服务端取回
@@ -742,6 +774,7 @@ export const useChatStore = defineStore('chat', () => {
       messages.value = []
       streamText.value = ''
       toolSteps.value = []
+      activeTool.value = null
       progress.value = null
       progressScope.value = { messageId: '', turnId: '' }
       error.value = null
@@ -778,6 +811,7 @@ export const useChatStore = defineStore('chat', () => {
     error.value = null
     streamText.value = ''
     toolSteps.value = []
+    activeTool.value = null
     progress.value = null
     progressScope.value = { messageId: '', turnId: '' }
     try {
@@ -830,11 +864,16 @@ export const useChatStore = defineStore('chat', () => {
         else mergeLegacyStage(data, scope)
         break
       case 'tool_started':
-        toolSteps.value.push({ stage: `开始：${toolLabel(String(data.tool ?? ''))}`, done: 0, total: 0 })
+        // 工具本身不再占一行（原来会 push「开始：xxx」，那是前端造的伪阶段）
+        toolSteps.value = []
+        activeTool.value = {
+          label: toolLabel(String(data.tool ?? '')),
+          startedAt: Date.now(),
+        }
         break
       case 'tool_progress':
-        // 工具过程（done/total 与中文阶段）只喂步骤列表，不再独立改写当前阶段
-        toolSteps.value.push({
+        // 工具过程（done/total 与中文阶段）只喂步骤列表，按阶段合并，不再一行一条
+        pushStep({
           stage: String(data.stage ?? ''),
           done: Number(data.done ?? 0),
           total: Number(data.total ?? 0),
@@ -858,11 +897,15 @@ export const useChatStore = defineStore('chat', () => {
         }
         break
       case 'tool_finished':
-        toolSteps.value.push({
-          stage: data.status === 'succeeded' ? '工具完成' : `工具失败：${String(data.error ?? '')}`,
-          done: 0,
-          total: 0,
-        })
+        // 收尾只更新最后一行，不再追加「工具完成」伪阶段
+        {
+          const last = toolSteps.value[toolSteps.value.length - 1]
+          if (last !== undefined && last.endedAt === null) {
+            last.status = data.status === 'succeeded' ? 'succeeded' : 'failed'
+            last.endedAt = Date.now()
+          }
+        }
+        activeTool.value = null
         // 需要更新阶段的收尾事件同样带快照（结构化 worker 阶段 / 旧式标签阶段）
         if (snapshot !== null) applySnapshot(snapshot, scope)
         break
@@ -907,6 +950,7 @@ export const useChatStore = defineStore('chat', () => {
     error.value = null
     streamText.value = ''
     toolSteps.value = []
+    activeTool.value = null
     progress.value = null
     progressScope.value = { messageId: '', turnId: '' }
     let accepted = false
@@ -974,6 +1018,7 @@ export const useChatStore = defineStore('chat', () => {
     messages.value = []
     streamText.value = ''
     toolSteps.value = []
+    activeTool.value = null
     progress.value = null
     progressScope.value = { messageId: '', turnId: '' }
     error.value = null
@@ -982,7 +1027,7 @@ export const useChatStore = defineStore('chat', () => {
   return {
     sessions, sessionsLoading, sessionsError,
     currentId, currentSession, messages, messagesLoading,
-    sending, busy, creatingSession, streamText, toolSteps, error, runs,
+    sending, busy, creatingSession, streamText, toolSteps, activeTool, error, runs,
     progress, stageElapsedMs, stageLongRunning,
     context, contextLoading, contextError, selectedBase,
     artifactVersions, artifactPreview, artifactObjectKey, artifactsLoading, artifactsError,

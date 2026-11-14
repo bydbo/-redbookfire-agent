@@ -20,6 +20,7 @@ import {
   streamMessage,
 } from '@/api/chat'
 import { ApiRequestError } from '@/api/client'
+import type { ToolStep } from '@/stores/chat'
 import { TOOL_LABELS, errorCategoryLabel, stageLabel, toolLabel, useChatStore } from '@/stores/chat'
 
 vi.mock('@/api/chat', () => ({
@@ -112,6 +113,29 @@ describe('useChatStore', () => {
     vi.useRealTimers()
   })
 
+  /** 一次发送的前置：建会话、列表、回读都就绪（流事件由各用例自己 mock）。 */
+  function primeSession(): void {
+    vi.mocked(createChatSession).mockResolvedValue({
+      session_id: 's-9', title: '', created_at: '', updated_at: '',
+    })
+    vi.mocked(listChatSessions).mockResolvedValue(listing())
+    vi.mocked(getChatSession).mockResolvedValue(detail([]))
+  }
+
+  /** 按顺序回放一串事件后返回 store；断言统一在发送结束之后做。 */
+  async function sendEvents(
+    events: Array<{ event: string; data: Record<string, unknown> }>,
+  ): Promise<ReturnType<typeof useChatStore>> {
+    primeSession()
+    vi.mocked(streamMessage).mockImplementation(async (_id, _input, onEvent) => {
+      onEvent({ event: 'turn_started', data: {} })
+      for (const event of events) onEvent(event)
+    })
+    const store = useChatStore()
+    await store.send({ text: '帮我蹭一下这个热点' })
+    return store
+  }
+
   it('会话列表与「新对话」', async () => {
     vi.mocked(listChatSessions).mockResolvedValue(listing())
     vi.mocked(createChatSession).mockResolvedValue({
@@ -187,7 +211,7 @@ describe('useChatStore', () => {
     })
     vi.mocked(listChatSessions).mockResolvedValue(listing())
     vi.mocked(getRun).mockResolvedValue(runDetail())
-    const observed: { text: string; steps: string[] } = { text: '', steps: [] }
+    const observed: { text: string; steps: ToolStep[] } = { text: '', steps: [] }
     const answered = [
       message({ message_id: 'm-u', role: 'user', content: '帮我蹭一下这个热点' }),
       message({ message_id: 'm-a', run_id: 'r-1', content: '跑了完整分析，命中 5 条。' }),
@@ -202,7 +226,7 @@ describe('useChatStore', () => {
       onEvent({ event: 'text_delta', data: { text: '好了' } })
       const store = useChatStore()
       observed.text = store.streamText
-      observed.steps = store.toolSteps.map((step) => step.stage)
+      observed.steps = store.toolSteps.map((step) => ({ ...step }))
       onEvent({ event: 'turn_finished', data: { status: 'succeeded' } })
     })
 
@@ -212,10 +236,66 @@ describe('useChatStore', () => {
 
     expect(createChatSession).toHaveBeenCalledTimes(1)
     expect(observed.text).toBe('跑好了')
-    expect(observed.steps).toEqual(['开始：跑完整分析', '分析中', '工具完成'])
+    // 「开始：xxx」伪阶段行已取消：工具本身不再占一行，只有真实阶段
+    expect(observed.steps.map((step) => step.stage)).toEqual(['分析中'])
+    expect(observed.steps[0].status).toBe('succeeded')
     expect(store.messages.map((item) => item.message_id)).toEqual(['m-u', 'm-a'])
     expect(store.streamText).toBe('')                 // 终态后清掉增量，显示落库正文
     expect(getRun).toHaveBeenCalledWith('r-1')        // 顺手取结果卡片
+  })
+
+  it('同一阶段的重复上报只保留一行，只更新进度', async () => {
+    const store = await sendEvents([
+      { event: 'tool_started', data: { tool: 'run_hotspot_analysis' } },
+      { event: 'tool_progress', data: { stage: '分析中', done: 0, total: 100 } },
+      { event: 'tool_progress', data: { stage: '分析中', done: 40, total: 100 } },
+      { event: 'tool_progress', data: { stage: '分析中', done: 90, total: 100 } },
+    ])
+
+    expect(store.toolSteps).toHaveLength(1)
+    expect(store.toolSteps[0]).toMatchObject({
+      stage: '分析中', done: 90, total: 100, status: 'running',
+    })
+  })
+
+  it('阶段切换追加新行，并把上一行收成 succeeded 且记下耗时', async () => {
+    primeSession()
+    vi.mocked(streamMessage).mockImplementation(async (_id, _input, onEvent) => {
+      onEvent({ event: 'turn_started', data: {} })
+      onEvent({ event: 'tool_started', data: { tool: 'run_hotspot_analysis' } })
+      onEvent({ event: 'tool_progress', data: { stage: '排队等待', done: 0, total: 100 } })
+      vi.advanceTimersByTime(8000)
+      onEvent({ event: 'tool_progress', data: { stage: '检索', done: 20, total: 100 } })
+    })
+    const store = useChatStore()
+    await store.send({ text: '帮我蹭一下这个热点' })
+
+    expect(store.toolSteps.map((step) => step.stage)).toEqual(['排队等待', '检索'])
+    expect(store.toolSteps[0].status).toBe('succeeded')
+    expect((store.toolSteps[0].endedAt ?? 0) - store.toolSteps[0].startedAt).toBe(8000)
+    expect(store.toolSteps[1].status).toBe('running')
+    expect(store.toolSteps[1].endedAt).toBeNull()
+  })
+
+  it('tool_started 只记当前工具，不再新增「开始：」伪阶段行', async () => {
+    const store = await sendEvents([
+      { event: 'tool_started', data: { tool: 'run_hotspot_analysis' } },
+    ])
+
+    expect(store.toolSteps).toEqual([])
+    expect(store.activeTool?.label).toBe('跑完整分析')
+  })
+
+  it('tool_finished 清空当前工具，并把最后一行收成终态', async () => {
+    const store = await sendEvents([
+      { event: 'tool_started', data: { tool: 'run_hotspot_analysis' } },
+      { event: 'tool_progress', data: { stage: '检索', done: 60, total: 100 } },
+      { event: 'tool_finished', data: { status: 'succeeded' } },
+    ])
+
+    expect(store.activeTool).toBeNull()
+    expect(store.toolSteps).toHaveLength(1)
+    expect(store.toolSteps[0].status).toBe('succeeded')
   })
 
   it('流式请求报错时记错误，但消息仍以库里的为准', async () => {
