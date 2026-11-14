@@ -464,4 +464,66 @@ describe('ChatView（S7.5 对话首页）', () => {
     expect((wrapper.find('textarea').element as HTMLTextAreaElement).value).toBe('')
     expect(streamMessage).toHaveBeenCalledTimes(2)
   })
+
+  describe('工具进度折叠', () => {
+    function runningMessage(): ChatMessage {
+      return message({
+        message_id: 'm-r', status: 'running',
+        progress: {
+          stage: 'retrieve', label: '检索', status: 'running', attempt: 1,
+          started_at: '2026-11-14T08:00:00+00:00', updated_at: '2026-11-14T08:00:10+00:00',
+        },
+      })
+    }
+
+    function seedSteps(): void {
+      const store = useChatStore()
+      store.toolSteps.push(
+        { stage: '排队等待', done: 0, total: 100, status: 'succeeded', startedAt: 0, endedAt: 8400 },
+        { stage: '检索', done: 0, total: 100, status: 'running', startedAt: 8400, endedAt: null },
+      )
+    }
+
+    it('运行中默认只显示摘要行，不渲染阶段流水、不出现假进度', async () => {
+      vi.mocked(getChatSession).mockResolvedValue(detail([runningMessage()]))
+      const wrapper = await mountView()
+      // 打开会话会重置上一轮的流水，所以在 init 之后再塞本轮步骤
+      seedSteps()
+      await nextTick()
+
+      expect(wrapper.text()).toContain('检索')
+      expect(wrapper.text()).toContain('详情')
+      expect(wrapper.text()).not.toContain('0/100')
+      expect(wrapper.findAll('.step-row')).toHaveLength(0)
+    })
+
+    it('点开详情才渲染时间线，再点收起回到摘要行', async () => {
+      vi.mocked(getChatSession).mockResolvedValue(detail([runningMessage()]))
+      const wrapper = await mountView()
+      seedSteps()
+      await nextTick()
+
+      await clickButton(wrapper, '详情')
+
+      expect(wrapper.findAll('.step-row')).toHaveLength(2)
+      expect(wrapper.text()).toContain('排队等待')
+      expect(wrapper.text()).toContain('8 秒')
+      expect(wrapper.find('button[aria-expanded]').attributes('aria-expanded')).toBe('true')
+
+      await clickButton(wrapper, '收起')
+      expect(wrapper.findAll('.step-row')).toHaveLength(0)
+    })
+
+    it('没有阶段事件时不显示详情按钮，摘要行退回工具名', async () => {
+      vi.mocked(getChatSession).mockResolvedValue(detail([
+        message({ message_id: 'm-r', status: 'running' }),
+      ]))
+      const wrapper = await mountView()
+      useChatStore().activeTool = { label: '搜索热点', startedAt: Date.now() }
+      await nextTick()
+
+      expect(wrapper.text()).toContain('搜索热点')
+      expect(wrapper.text()).not.toContain('详情')
+    })
+  })
 })

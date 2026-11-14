@@ -19,7 +19,9 @@ import type { ChatMessage, ContextFact, ContextProposal } from '@/api/chat'
 import HotspotResult from '@/components/HotspotResult.vue'
 import ChatArtifactPanel from '@/components/ChatArtifactPanel.vue'
 import ImageIntake from '@/components/ImageIntake.vue'
+import StepTimeline from '@/components/StepTimeline.vue'
 import { errorCategoryLabel, stageLabel, useChatStore } from '@/stores/chat'
+import { formatElapsed } from '@/utils/format'
 
 const store = useChatStore()
 const message = useMessage()
@@ -66,9 +68,14 @@ async function scrollToLatest(force = false): Promise<void> {
   stickToBottom.value = true
 }
 
-// 新消息 / 流式增量 / 工具步骤变化：只有贴底时才跟随——用户上翻读历史时不要拽回去
+// 新消息 / 流式增量 / 工具步骤变化：只有贴底时才跟随——用户上翻读历史时不要拽回去。
+// 工具步骤现在按阶段就地更新（长度不变），所以用「最后一行内容」而不是 length 当触发源。
 watch(
-  [() => store.messages.length, () => store.streamText, () => store.toolSteps.length],
+  [
+    () => store.messages.length,
+    () => store.streamText,
+    () => store.toolSteps.map((step) => `${step.stage}:${step.done}:${step.status}`).join('|'),
+  ],
   () => {
     void scrollToLatest()
   },
@@ -195,11 +202,23 @@ function statusLabel(message: ChatMessage): string | null {
   }
 }
 
-function formatElapsed(ms: number): string {
-  const seconds = Math.max(0, Math.round(ms / 1000))
-  if (seconds < 60) return `${seconds} 秒`
-  return `${Math.floor(seconds / 60)} 分 ${seconds % 60} 秒`
+/** 运行中的一行摘要：当前阶段（没有阶段时退回工具名、「正在回复…」）+ 已用时。
+ *
+ *  只给「在动」的信号，不给百分比——排队这类阶段的百分比本来就不存在。
+ */
+function runningSummary(message: ChatMessage): string {
+  const label = store.progress?.label || store.activeTool?.label || statusLabel(message) || ''
+  const parts: string[] = []
+  if (label !== '') parts.push(label)
+  if (store.stageElapsedMs > 0) parts.push(`已 ${formatElapsed(store.stageElapsedMs)}`)
+  return parts.join(' · ')
 }
+
+// 阶段流水默认收起；换一轮（sending 由 false → true）时复位
+const stepsExpanded = ref(false)
+watch(() => store.sending, (on) => {
+  if (on) stepsExpanded.value = false
+})
 
 /** 失败提示：有阶段快照时补「失败于哪个阶段 + 安全错误类别」（S7.21）。 */
 function failureHint(message: ChatMessage): string {
@@ -526,30 +545,25 @@ function versionTag(call: { version_no?: number | null; base_version_no?: number
                   >
                 </div>
 
-                <!-- 工具过程：本轮流式中的粗粒度进度 -->
-                <div
-                  v-if="message.status === 'running' && store.toolSteps.length > 0"
-                  class="mt-2 flex flex-col gap-1 border-t border-line pt-2 text-xs text-ink-muted"
-                >
-                  <span v-for="(step, index) in store.toolSteps" :key="`${index}-${step.stage}`">
-                    · {{ step.stage }}<template v-if="step.total > 0">（{{ step.done }}/{{ step.total }}）</template>
-                  </span>
-                </div>
-
+                <!-- 工具过程：一行摘要 + 需要时才展开的阶段时间线（默认收起） -->
                 <div v-if="message.status === 'running'" class="mt-2 flex flex-col gap-1 text-xs text-ink-muted">
-                  <div class="flex flex-wrap items-center gap-2">
+                  <div class="flex flex-wrap items-center gap-2 border-t border-line pt-2">
                     <n-spin size="small" />
-                    <span>{{ statusLabel(message) }}</span>
-                    <template v-if="store.progress">
-                      <span>
-                        · {{ store.progress.label }}
-                        <template v-if="store.progress.attempt > 1">
-                          （第 {{ store.progress.attempt }} 次尝试）
-                        </template>
-                      </span>
-                      <span v-if="store.stageElapsedMs > 0">· 已 {{ formatElapsed(store.stageElapsedMs) }}</span>
-                    </template>
+                    <span>{{ runningSummary(message) }}</span>
+                    <span v-if="(store.progress?.attempt ?? 1) > 1">
+                      第 {{ store.progress?.attempt }} 次尝试
+                    </span>
+                    <button
+                      v-if="store.toolSteps.length > 0"
+                      type="button"
+                      class="ml-auto underline underline-offset-2"
+                      :aria-expanded="stepsExpanded"
+                      @click="stepsExpanded = !stepsExpanded"
+                    >
+                      {{ stepsExpanded ? '收起' : '详情' }}
+                    </button>
                   </div>
+                  <StepTimeline v-if="stepsExpanded" :steps="store.toolSteps" />
                   <span v-if="store.stageLongRunning">
                     耗时较长：可能还在排队或素材同步，稍等即可，不必刷新页面。
                   </span>
