@@ -932,3 +932,91 @@ GET /api/runs/{run_id}/report → 返回完整 HTML 报告
 | 高可用、微服务、Kubernetes | 负载实测或部署需求证明单机不足 | 用负载与恢复目标论证，单独预算，不作求职展示前置 |
 | 更多 Agent / 工具、热榜、reranker / 新模型 | 试用和失败集证明现有能力不足 | 具体任务、对照基线和验收指标，独立评审，不按功能数量判断成熟度 |
 | 自托管推理与应用自行管理 KV / 前缀缓存 | 已决定自托管且实测重复 prefill 成为瓶颈 | 评审推理引擎、显存 / 隔离、失效规则及成本，对照延迟和吞吐；独立 Story 与估算，不作本批前置 |
+
+---
+
+## 八、已落地能力清单（2026-11-20 自 README 迁移）
+
+> 迁移原因：README 面向初次访问者，80 行长表会淹没项目定位；逐项落地状态归本文件。
+> 内容原样迁移，未重排、未更新数字；分项 Story 的状态以第三节为准。
+
+| 部分 | 状态 |
+| --- | --- |
+| 数据契约（要素／线索／素材／匹配／文案） | ✅ 已完成（S1.1 起为 Pydantic v2 模型） |
+| 配置加载与启动前置检查（pydantic-settings，分级必填 + 退出码 2） | ✅ 已完成（S1.2） |
+| `tools/` 首批单测（词典 / 打分 / 报告 / 素材 / 媒体 / 模型 / 追踪 / 视觉） | ✅ 已完成（S1.4） |
+| 覆盖率统计（pytest-cov，语句 + 分支，不设门槛） | ✅ 已完成（S1.5） |
+| 爆点要素词典（`tools/lexicon.py`） | ✅ 已完成 |
+| 模型调用层（兼容接口 + 结构化输出自修重试） | ✅ 已完成 |
+| 素材扫描与索引（旁车文件／文件名／视觉打标，增量更新） | ✅ 已完成 |
+| 相关性打分与覆盖度计算 | ✅ 已完成 |
+| 报告渲染（HTML + Markdown）与运行追踪 | ✅ 已完成 |
+| `agents/` 与 `workflows/` 编排层 | ✅ 已完成（S3.1） |
+| 本地依赖编排（PostgreSQL 16 + pgvector、Redis，Docker Compose） | ✅ 已完成（S2.1） |
+| 集成测试基座（testcontainers + pytest-asyncio） | ✅ 已完成（S2.9） |
+| 数据库 ORM 与会话（七张表、14+ 条索引、向量列） | ✅ 已完成（S2.2；对话两表随 S7.2 追加） |
+| 素材索引入库 + 增量判断（`materials` 表 + 指纹增量 + 消失即删） | ✅ 已完成（S2.4） |
+| 向量回填（embedding 客户端 + `materials.embedding` / `embedding_model`） | ✅ 已完成（S2.5） |
+| 双通道召回 + RRF + 要素加权（素材检索服务） | ✅ 已完成（S2.6） |
+| 检索层基线对比评测（纯字面基线 vs 混合召回，报告落 `evals/reports/`） | ✅ 已完成（S2.8） |
+| LangGraph 五节点状态图（拆解 → 检索 → 缺口 → 撰稿 → 报告）与三条 agent prompt 正文 | ✅ 已完成（S3.1） |
+| FastAPI 应用骨架（`/api` 路由树、统一错误响应、`X-Request-ID`） | ✅ 已完成（S3.2） |
+| 接口实现（`/api` 前缀：health / analyze / jobs / runs / runs/{id} / report / material-frames；S5.6 起七个） | ✅ 已完成（S3.3；S5.4 / S5.6 各加一个） |
+| 分析结果写回（`run_matches` / 统计 / `prompt_versions` 落库，RunStore 退化为产物目录） | ✅ 已完成（S3.4a） |
+| 分析主链路 HTTP 异步化（文本模型与向量共用 httpx 连接池，去掉 `asyncio.to_thread`） | ✅ 已完成（S3.5） |
+| Celery worker 接线（`POST /api/analyze` 真投递 → 消费 → 索引新鲜度 → 分析 → 写回） | ✅ 已完成（S3.4b） |
+| Walking Skeleton 端到端联调（一键脚本：起进程 → 投热点 → 验候选与报告 → 落样例报告） | ✅ 已完成（S3.6） |
+| 完整启动前置检查（配置契约 §四 的 7 步 + 接入 lifespan + `python -m xhs_agent.serve`） | ✅ 已完成（S3.8） |
+| Prompt 变更回归报告（两臂对照 + prompt 契约 §六 七维度门槛，落 `evals/reports/prompt-*.md`） | ✅ 已完成（S3.10） |
+| 结构化日志（structlog，`console` / `json` 一键切换）与 run_id 全链路贯穿 | ✅ 已完成（S4.1） |
+| 陈旧 run 对账（worker 启动时把卡住的 `running` 标成 `failed`） | ✅ 已完成（S4.1） |
+| Langfuse 调用追踪（运行 / 热点 / 模型调用三级，看得到 token·成本·延迟；缺键只告警不阻断） | ✅ 已完成（S4.2） |
+| OpenTelemetry 追踪（API 请求 → 数据库 → worker 模型调用连成一条 trace） | ✅ 已完成（S4.3） |
+| 多阶段 Docker 镜像 + 全栈 compose（`docker compose up` 一条命令起 api / worker / postgres / redis，含一次性迁移服务） | ✅ 已完成（S4.4） |
+| GitHub Actions CI（lint / typecheck / test + 镜像构建 + 前端；覆盖率门槛 78%） | ✅ 已完成（S4.5；frontend job 随 S5.9 加入） |
+| 契约一致性校验（`scripts/check_openapi.py`：FastAPI 导出的 OpenAPI 必须覆盖 `docs/contracts/openapi.yaml`，跑在 CI 的 test job 里） | ✅ 已完成（S4.6） |
+| Alembic 数据库迁移（唯一建表路径） | ✅ 已完成（S2.3） |
+| 评测集 v1 与示例素材包（七维度口径、版本冻结） | ✅ 已完成（S2.0） |
+| 服务入口（FastAPI 二十四个接口 + LangGraph 编排，S3.1–S3.3；S5.4 / S5.6 / S6.1–S6.6 / S7.4 扩充） | ✅ 已完成 |
+| 前端工程脚手架（Vue 3 + Vite + TS + Router + Pinia + Naive UI + Tailwind，S5.1：别名 / 环境变量 / 代理 / 构建配置） | ✅ 已完成（S5.1） |
+| 接口类型生成（S5.2：`openapi-typescript` 从 `docs/contracts/openapi.yaml` 生成 `frontend/src/api/schema.d.ts` 入库；`pnpm run check:api` + CI `frontend` job 防漂移） | ✅ 已完成（S5.2） |
+| 分析台页面（S5.3：多热点输入 → 提交 → 2 秒轮询进度 → 自动跳转结果占位页；`/` 为分析台、`/runs/:runId` 为结果页） | ✅ 已完成（S5.3） |
+| 结果详情页（S5.4：爆点要素 / 候选素材含关键帧缩略图 / 覆盖缺口 / 文案初稿四块齐全，文案一键复制；新增关键帧取帧接口 `GET /api/materials/{id}/keyframes/{n}`） | ✅ 已完成（S5.4） |
+| 数据可视化（S5.5：结果详情页新增「数据可视化」卡片——要素覆盖度含 60% 目标线 / 候选得分分布五档 / 成本与耗时含按热点预算线，数据全部来自 RunDetail，无新增接口） | ✅ 已完成（S5.5） |
+| 运行历史（S5.6：契约新增 `GET /api/runs`（RunSummary / RunList，limit 1–100 + offset 分页）；前端 `/runs` 页倒序列表 / 回看结果 / 下载 HTML·MD 报告，分析台加入口） | ✅ 已完成（S5.6） |
+| 视觉打磨（S5.7：小红书风格主题 token（品牌红取自官网 `#ff2442`，加深版供白字按钮达标）+ 明/暗双主题 + 按钮·顶栏·卡片毛玻璃 + 统一顶栏导航；路由分包 + 响应 gzip，移动端 Lighthouse 58→97、总传输 166 KiB） | ✅ 已完成（S5.7） |
+| 前端测试（S5.8：Vitest + jsdom 48 条覆盖工具函数 / store / 关键组件；覆盖率只报告不设门槛；`pnpm build` 产物经 FastAPI 托管实测 14 条断言全过） | ✅ 已完成（S5.8） |
+| 前端进 CI 与镜像（S5.9：CI 的 frontend job 加 lint + 测试 + 构建；镜像多一个 node 构建阶段，dist 进 runtime，容器默认 `serve=true` 托管单页应用，镜像 413MB） | ✅ 已完成（S5.9） |
+| 图片热点解析接口（S6.6：契约先行新增 `POST /api/hotspots/image-clue`（multipart 单图，jpg/png/webp、≤ 10 MB，按 magic bytes 认类型）；异步多模态客户端 + 新 prompt 资产 `image_hotspot_clue`；图片只在内存里转模型输入，**不落盘不入库**） | ✅ 已完成（S6.6） |
+| 预置线索通道（S6.7：`POST /api/analyze` 增加可选 `clues`（与 `hotspots` 等长、单项可 null）——用户确认/编辑过的线索直接落库并**短路拆解节点**，不重复付费；不传时行为与以前逐字节一致） | ✅ 已完成（S6.7） |
+| 分析台图片入口（S6.8：上传 / 拖拽 / 粘贴一张图 → 可编辑的描述与要素卡（类型·取值·权重）→ 与其他热点一起批量提交，或「用这条热点分析」只跑这一条；带 clue 的热点显示「来自图片」） | ✅ 已完成（S6.8） |
+| 图片链路测试与真机冒烟（S6.9：真容器集成用例证明「解析 → 带 clues 提交 → 结果页线索与提交值逐字段一致、拆解节点未被再次调用」；Playwright 驱动本机 Edge 走通真实链路，14/14 断言，run 成本 0.0530 元） | ✅ 已完成（S6.9） |
+| 素材库查询接口（S6.1：`GET /api/materials` 分页 + 关键词 / 类型 / 打标来源 / 主题目录筛选（含 `dirs` 计数）；`GET /api/materials/{id}` 详情含爆点要素；契约先行、`check_openapi` 零 diff） | ✅ 已完成（S6.1） |
+| 素材元数据编辑（S6.2：`PATCH /api/materials/{id}` 白名单三字段，**写库 + 写同名 `.txt` 旁车**——磁盘是唯一来源，重扫描后人工说明仍在；标签去重去空、上限 14 个） | ✅ 已完成（S6.2） |
+| 删除与回收站（S6.3：移入 `_trash/`（连同旁车）并删索引行、列出回收站、恢复 = 重新入库（新 uuid）、单条 / 一键真删；新增 `xhs_agent.index_materials` 任务与 **Celery 结果后端**（ADR 0014，分析任务显式 `ignore_result`）） | ✅ 已完成（S6.3） |
+| 扫描与上传导入（S6.4：`POST /api/materials/scan` 触发「增量同步 + 向量回填」；`POST /api/materials/uploads` **流式**落到 `<素材根>/<YYYY-MM>/`（同名加序号、超 `[upload].max_size_gb` 退 413）；`GET /api/materials/tasks/{id}` 查阶段 / 计数 / 失败原因；镜像装 ffmpeg） | ✅ 已完成（S6.4） |
+| 素材库页（S6.5：第 4 页 `/materials`——搜索 / 类型 / 来源 / 主题 chips、网格↔列表、拖拽上传带进度、编辑弹窗、多选批量删除、回收站抽屉；真机冒烟 20/20：导入 3 条 → 自动打标 → 改标签（库 + 旁车）→ 删入回收站 → 恢复（新 uuid）→ 清空。**详情弹窗补齐**：点卡片 / 缩略图走 `GET /api/materials/{id}`，看全部关键帧与爆点要素——此前这条接口前端一直没人调，点卡片毫无反应） | ✅ 已完成（S6.5 + 详情补齐） |
+| 原生工具调用与真 token 流式（S7.1：`LLMCall` 增 `tools` / `stream`，`LLMResult` 增 `tool_calls`；流式已回吐正文后不重试；记账口径与普通调用一致。DoR 已实测 `deepseek-flash` 支持 `tools` / `tool_calls`，结论见 ADR 0015） | ✅ 已完成（S7.1） |
+| 对话会话与消息存储（S7.2：数据契约 §3.6 / §3.7 + 迁移 **0004** + `services/chat.py`；附件落 `runs/_chat/<session_id>/` 且只存引用；过期 `running` 行按 `[chat].turn_stale_seconds` 兜底标 `interrupted`） | ✅ 已完成（S7.2） |
+| 对话编排图（S7.3：LangGraph `supervisor ⇄ tools`，轮次上限 `[chat].max_tool_rounds`；第一批只挂「跑完整分析」，有图片先走 S6.6 解析再按 S6.7 预置线索提交，**拆解节点短路**；新增 prompt 资产 `chat_supervisor`） | ✅ 已完成（S7.3） |
+| 对话 SSE 接口（S7.4：`POST /api/chat/sessions/{id}/messages` 返回 `text/event-stream`，事件 `turn_started` / `tool_started` / `tool_progress` / `tool_finished` / `text_delta` / `turn_finished` / `error`；Redis pub/sub 传事件，**轮次跑在 detached 任务里**——断开只停转发，不再算这一轮） | ✅ 已完成（S7.4） |
+| 对话首页（S7.5：`/` 改成对话、分析台挪到 `/analyze`（**路由名仍是 `analysis`**）；消息列表 + 输入框（文字 + 可选一张图）+ 工具过程 + 流式增量 + 结果卡片（与结果页共用 `HotspotResult.vue`）+ 历史会话侧栏；刷新后自动打开最近一条会话） | ✅ 已完成（S7.5） |
+| 对话闭环测试与真机冒烟（S7.6：单测 + 真容器集成（发消息 → 触达工具 → 落库 → 读回 → 附件取回）+ Playwright 真机 19/19 断言：传图 + 一句话 → 工具过程 → 流式正文 → 结果卡片 5 条候选 → 刷新仍在，截图落 `runs/_smoke_s76/`） | ✅ 已完成（S7.6） |
+| 工具分发去硬编码（S7.7a：`services/chat_tools.py` 同时持有 `TOOLS` 与 `HANDLERS`，`workflows/chat.py` 里不再出现任何具体工具名——"加一个工具只改一处"从口号变成有源码扫描用例钉住的事实；工具内部的 prompt 版本也汇总进 `chat_messages`） | ✅ 已完成（S7.7a） |
+| 只读工具三件（S7.7：`parse_image_clue` 解析图片 / `search_materials` 查素材库 / `read_run` 读历史运行；都无副作用、可被模型选，参数与返回值登记进 prompt 契约的对话工具清单；一轮内按热点文本与附件路径缓存，同一件事不重复付费） | ✅ 已完成（S7.7） |
+| 拆解预览工具（S7.7b：`preview_element_coverage` 只做要素拆解 + **字面通道**覆盖估算，不调 embedding、不写稿、不落 `runs`；返回缺口与补拍建议，说明里写明"这一步不产出候选素材"） | ✅ 已完成（S7.7b） |
+| 改写文案工具（S7.8：新 prompt 资产 `copy_revise`（§03 逐字复用 `copy_draft` 的 12 条边界 + 越界必须拒绝）+ 工具 `revise_draft`；改后文案只回对话、**不覆盖 run 的初稿快照**） | ✅ 已完成（S7.8） |
+| 工具集测试与真机冒烟（S7.9：新增 `scripts/eval_chat_tools.py` 真模型工具选择评测（两臂对照，报告落 `evals/reports/chat-tools-*.md`）；`chat_supervisor` v1 → v2（能力边界改为以工具清单为准）并按 prompt 契约 §六 的对话类口径回归；真机 19/19：传图 + 问素材 → 完整分析 → 改写 → 刷新仍在，截图落 `runs/_smoke_s79/`） | ✅ 已完成（S7.9） |
+| 多轮记忆与上下文预算（S7.10：历史按 token 预算装配——最近 `[chat].history_max_messages` 条保留原文、更早的降级成摘要、超 `[chat].history_token_budget` 再裁剪并说明；工具摘要行带 `run_id`；跨轮图片回落 `latest_attachment`；`chat_messages` 加 `prompt_tokens` / `completion_tokens` + 迁移 **0005**；图片解析成本计入轮级成本） | ✅ 已完成（S7.10） |
+| 越界处理（S7.11：机读能力清单 `prompts/chat_capabilities.json` —— 能力内 / 边界外可引导 / 合规红线三类 + 固定话术，红线不给绕过写法；`chat_supervisor` §02 用 `{{ capabilities }}` 注入、prompt v3；新增 ADR 0016） | ✅ 已完成（S7.11） |
+| 越界与多轮评测 + 成本口径（S7.12：用例集 `evals/chat/cases.json`（工具选择 10 / 越界 10 / 多轮 5 / 改写 3），`scripts/eval_chat_tools.py` 扩成四节、判定全为确定性规则；轮级成本门槛 ≤ 0.25 元/轮（含一次分析），同步产品方案与 prompt 契约 §六） | ✅ 已完成（S7.12） |
+| 第三批文档收口（S7.13：产品方案补对话式入口与可复现边界、项目结构补对话模块与能力清单、技术栈路线图与各契约同步） | ✅ 已完成（S7.13） |
+| 多图上传与契约（S7.14：messages 的 `file` → `files`（1–9 个 binary）；新增 `[chat].attachment_max_count = 9` 与 `attachment_total_max_mb = 30`；逐张校验、400 文案指明第几张、超限整批拒绝） | ✅ 已完成（S7.14） |
+| 多图合并解析（S7.15：新 prompt 资产 `image_hotspot_clue_multi` + `AsyncImageClient.complete_many` + `parse_image_clue_multi`；一次调用一份线索，要素 3–8 个且必须带 `evidence`（指图）；单图路径零改动） | ✅ 已完成（S7.15） |
+| 工具与跨轮回落改造（S7.16：图片工具从 `attachments[0]` 改为整组、缓存键按整组路径、`ToolContext.recent_attachments` 与 `latest_attachments` 按整组回落、成本只记那一次调用） | ✅ 已完成（S7.16） |
+| 共享图片入口组件（S7.17：`ImageIntake.vue` 收口选择 / 拖拽 / 粘贴 + 缩略图 + 逐张删除 + 上限校验；分析台 `max=1`、`thumbs=false`，行为与视觉与现状一致） | ✅ 已完成（S7.17） |
+| 对话页接入多图 + 测试与冒烟（S7.18：对话页 `max=9`；真机冒烟「粘贴 9 张 → 一份标签 → 跑一次分析 → 结果卡片」15/15，含 9 图 vs 单图对照，截图落 `runs/_smoke_s718/`） | ✅ 已完成（S7.18） |
+| 观测契约与追踪门面（S7.19：冻结阶段生命周期 / 事件 payload / 当前阶段快照 / 关联标识与用量口径；`core/progress.py` 统一合并语义与安全错误类别白名单；`Tracer` 扩 `turn` / `tool` / `node` / `finish_turn` / `trace_id`，`TracingProvider` 补 `complete_with_tools` 且流式增量原样透传） | ✅ 已完成（S7.19） |
+| 节点状态与跨进程接线（S7.20：`chat.turn` → `tool.*` → worker 节点三层 span；SSE 增 `stage` 事件；五节点 / 素材同步 / 向量回填 / 查询 embedding 各有状态与耗时；traceparent 取自投递时刻的当前 span（工具 span 子树内），`turn_id` 走独立业务头并绑日志；任务详情 `current_step` 不再恒为 `None`；迁移 0006） | ✅ 已完成（S7.20） |
+| 当前状态持久化与消息回看（S7.21：`chat_messages` 加 `turn_id` / `trace_id` / `progress`（迁移 0007）+ `runs.stage` 快照；刷新后按消息恢复阶段 / 耗时 / 失败类别 / 调用链入口；前端显示「第 N 阶段 · 已 x 秒」「耗时较长」提示与「查看调用链」链接；追踪关闭时状态仍可见、链接如实不显示） | ✅ 已完成（S7.21） |
+| 分层验收与真云回放（S7.22：单测补白名单 / 取消超时 / 日志上下文复位等分支；集成钉住 detached 轮次继续、Celery 父子 span（worker 挂投递时工具 span）、重试、两会话并发不串线、追踪初始化失败不阻断；新增 `scripts/check_trace_chain.py` 按消息 trace 读回并核对层级 / 用量 / 耗时；`docs/可观测.md` 收口字段字典与排查手册；真机 + 真云证据落 `runs/_smoke_s722/`） | ✅ 已完成（S7.22） |

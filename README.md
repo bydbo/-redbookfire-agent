@@ -1,509 +1,124 @@
 # 小红书热点搭子
 
 [![CI](https://github.com/bydbo/-redbookfire-agent/actions/workflows/ci.yml/badge.svg)](https://github.com/bydbo/-redbookfire-agent/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 
-> Hotspot-to-Material Relevance Agent
-> 输入一个热点，在**你自己的素材库**里找出能蹭上它的镜头，并说清为什么能蹭。
+> **给我一个热点，在你的素材库里找出能蹭上的镜头，并说清为什么能蹭。**
 
----
-
-## 这个项目解决什么问题
-
-热点的窗口期只有 24–48 小时，而创作者花在"翻素材"上的时间常常比拍素材还长：素材库几百上千条、命名靠手写、检索只能靠记忆。
-
-热点搭子做三件事：
-
-1. 把热点拆成**可迁移的爆点要素**（主题、场景、画面、情绪、形式、人群……）与**不可直用的要素**（明星姓名、肖像、代言暗示）；
-2. 在你自己的素材库里做**确定性相关性检索**，输出候选镜头、命中的要素、建议怎么用，以及"缺什么素材"；
-3. 给出一版**文案初稿**（标题备选、封面字、开头 3 秒、正文、话题、剪辑顺序）。
-
-设计主线是：**文案是副产品，素材相关性才是真问题。** 大模型只负责判断（拆解、解释、撰稿），排序交给确定性算法——所以结果可复现、可解释、可评测，成本也不随素材量增长。
-
-完整产品设计见 `docs/产品方案.md`。
-
-结果卡片分别显示“素材标签”和“命中热点要素”，每个命中都有具体依据。分析结果是当次运行的快照，修改素材后不会自动重算旧分数；需要使用新数据时重新发起分析。对话正文会先在服务端完成安全检查再显示，阶段进度照常更新。内部提示词不通过页面或公开接口提供，模型失败只返回安全错误说明。防护与本次验证边界见 [2026-10-28 修复验证报告](evals/reports/prompt-security-boundary-2026-10-28.md)。
-
-结果卡片分别显示“素材标签”和“命中热点要素”，每个命中都有具体依据。分析结果是当次运行的快照，修改素材后不会自动重算旧分数；需要使用新数据时重新发起分析。对话正文会先在服务端完成安全检查再显示，阶段进度照常更新。内部提示词不通过页面或公开接口提供，模型失败只返回安全错误说明。防护与本次验证边界见 [2026-10-28 修复验证报告](evals/reports/prompt-security-boundary-2026-10-28.md)。
+把热点拆成可迁移的**爆点要素**，在你的私有素材库里做**确定性相关性检索**，输出候选镜头、覆盖缺口
+和一版文案初稿。文案是副产品，**素材相关性才是真问题**。
 
 ---
 
-## 当前进度（如实标注）
+## 它解决什么问题
 
-| 部分 | 状态 |
+热点窗口只有 24–48 小时，创作者的时间却大半花在翻素材上：库里几百上千条、命名靠手写、检索只能靠记忆。
+
+项目做三件事：
+
+1. **拆解**：把热点拆成可迁移的要素（主题 / 场景 / 画面 / 情绪 / 形式 / 人群……）与**不可直用**的要素（明星姓名、肖像、代言暗示）；
+2. **检索**：在你的素材库里做双通道召回，输出候选镜头、命中了哪些要素、建议怎么用，以及"缺什么素材"；
+3. **撰稿**：给一版初稿（标题备选、封面字、开头 3 秒、正文、话题、剪辑顺序）。
+
+## 一条设计主线：排序不交给大模型
+
+| 谁来做 | 做什么 |
 | --- | --- |
-| 数据契约（要素／线索／素材／匹配／文案） | ✅ 已完成（S1.1 起为 Pydantic v2 模型） |
-| 配置加载与启动前置检查（pydantic-settings，分级必填 + 退出码 2） | ✅ 已完成（S1.2） |
-| `tools/` 首批单测（词典 / 打分 / 报告 / 素材 / 媒体 / 模型 / 追踪 / 视觉） | ✅ 已完成（S1.4） |
-| 覆盖率统计（pytest-cov，语句 + 分支，不设门槛） | ✅ 已完成（S1.5） |
-| 爆点要素词典（`tools/lexicon.py`） | ✅ 已完成 |
-| 模型调用层（兼容接口 + 结构化输出自修重试） | ✅ 已完成 |
-| 素材扫描与索引（旁车文件／文件名／视觉打标，增量更新） | ✅ 已完成 |
-| 相关性打分与覆盖度计算 | ✅ 已完成 |
-| 报告渲染（HTML + Markdown）与运行追踪 | ✅ 已完成 |
-| `agents/` 与 `workflows/` 编排层 | ✅ 已完成（S3.1） |
-| 本地依赖编排（PostgreSQL 16 + pgvector、Redis，Docker Compose） | ✅ 已完成（S2.1） |
-| 集成测试基座（testcontainers + pytest-asyncio） | ✅ 已完成（S2.9） |
-| 数据库 ORM 与会话（七张表、14+ 条索引、向量列） | ✅ 已完成（S2.2；对话两表随 S7.2 追加） |
-| 素材索引入库 + 增量判断（`materials` 表 + 指纹增量 + 消失即删） | ✅ 已完成（S2.4） |
-| 向量回填（embedding 客户端 + `materials.embedding` / `embedding_model`） | ✅ 已完成（S2.5） |
-| 双通道召回 + RRF + 要素加权（素材检索服务） | ✅ 已完成（S2.6） |
-| 检索层基线对比评测（纯字面基线 vs 混合召回，报告落 `evals/reports/`） | ✅ 已完成（S2.8） |
-| LangGraph 五节点状态图（拆解 → 检索 → 缺口 → 撰稿 → 报告）与三条 agent prompt 正文 | ✅ 已完成（S3.1） |
-| FastAPI 应用骨架（`/api` 路由树、统一错误响应、`X-Request-ID`） | ✅ 已完成（S3.2） |
-| 接口实现（`/api` 前缀：health / analyze / jobs / runs / runs/{id} / report / material-frames；S5.6 起七个） | ✅ 已完成（S3.3；S5.4 / S5.6 各加一个） |
-| 分析结果写回（`run_matches` / 统计 / `prompt_versions` 落库，RunStore 退化为产物目录） | ✅ 已完成（S3.4a） |
-| 分析主链路 HTTP 异步化（文本模型与向量共用 httpx 连接池，去掉 `asyncio.to_thread`） | ✅ 已完成（S3.5） |
-| Celery worker 接线（`POST /api/analyze` 真投递 → 消费 → 索引新鲜度 → 分析 → 写回） | ✅ 已完成（S3.4b） |
-| Walking Skeleton 端到端联调（一键脚本：起进程 → 投热点 → 验候选与报告 → 落样例报告） | ✅ 已完成（S3.6） |
-| 完整启动前置检查（配置契约 §四 的 7 步 + 接入 lifespan + `python -m xhs_agent.serve`） | ✅ 已完成（S3.8） |
-| Prompt 变更回归报告（两臂对照 + prompt 契约 §六 七维度门槛，落 `evals/reports/prompt-*.md`） | ✅ 已完成（S3.10） |
-| 结构化日志（structlog，`console` / `json` 一键切换）与 run_id 全链路贯穿 | ✅ 已完成（S4.1） |
-| 陈旧 run 对账（worker 启动时把卡住的 `running` 标成 `failed`） | ✅ 已完成（S4.1） |
-| Langfuse 调用追踪（运行 / 热点 / 模型调用三级，看得到 token·成本·延迟；缺键只告警不阻断） | ✅ 已完成（S4.2） |
-| OpenTelemetry 追踪（API 请求 → 数据库 → worker 模型调用连成一条 trace） | ✅ 已完成（S4.3） |
-| 多阶段 Docker 镜像 + 全栈 compose（`docker compose up` 一条命令起 api / worker / postgres / redis，含一次性迁移服务） | ✅ 已完成（S4.4） |
-| GitHub Actions CI（lint / typecheck / test + 镜像构建 + 前端；覆盖率门槛 78%） | ✅ 已完成（S4.5；frontend job 随 S5.9 加入） |
-| 契约一致性校验（`scripts/check_openapi.py`：FastAPI 导出的 OpenAPI 必须覆盖 `docs/contracts/openapi.yaml`，跑在 CI 的 test job 里） | ✅ 已完成（S4.6） |
-| Alembic 数据库迁移（唯一建表路径） | ✅ 已完成（S2.3） |
-| 评测集 v1 与示例素材包（七维度口径、版本冻结） | ✅ 已完成（S2.0） |
-| 服务入口（FastAPI 二十四个接口 + LangGraph 编排，S3.1–S3.3；S5.4 / S5.6 / S6.1–S6.6 / S7.4 扩充） | ✅ 已完成 |
-| 前端工程脚手架（Vue 3 + Vite + TS + Router + Pinia + Naive UI + Tailwind，S5.1：别名 / 环境变量 / 代理 / 构建配置） | ✅ 已完成（S5.1） |
-| 接口类型生成（S5.2：`openapi-typescript` 从 `docs/contracts/openapi.yaml` 生成 `frontend/src/api/schema.d.ts` 入库；`pnpm run check:api` + CI `frontend` job 防漂移） | ✅ 已完成（S5.2） |
-| 分析台页面（S5.3：多热点输入 → 提交 → 2 秒轮询进度 → 自动跳转结果占位页；`/` 为分析台、`/runs/:runId` 为结果页） | ✅ 已完成（S5.3） |
-| 结果详情页（S5.4：爆点要素 / 候选素材含关键帧缩略图 / 覆盖缺口 / 文案初稿四块齐全，文案一键复制；新增关键帧取帧接口 `GET /api/materials/{id}/keyframes/{n}`） | ✅ 已完成（S5.4） |
-| 数据可视化（S5.5：结果详情页新增「数据可视化」卡片——要素覆盖度含 60% 目标线 / 候选得分分布五档 / 成本与耗时含按热点预算线，数据全部来自 RunDetail，无新增接口） | ✅ 已完成（S5.5） |
-| 运行历史（S5.6：契约新增 `GET /api/runs`（RunSummary / RunList，limit 1–100 + offset 分页）；前端 `/runs` 页倒序列表 / 回看结果 / 下载 HTML·MD 报告，分析台加入口） | ✅ 已完成（S5.6） |
-| 视觉打磨（S5.7：小红书风格主题 token（品牌红取自官网 `#ff2442`，加深版供白字按钮达标）+ 明/暗双主题 + 按钮·顶栏·卡片毛玻璃 + 统一顶栏导航；路由分包 + 响应 gzip，移动端 Lighthouse 58→97、总传输 166 KiB） | ✅ 已完成（S5.7） |
-| 前端测试（S5.8：Vitest + jsdom 48 条覆盖工具函数 / store / 关键组件；覆盖率只报告不设门槛；`pnpm build` 产物经 FastAPI 托管实测 14 条断言全过） | ✅ 已完成（S5.8） |
-| 前端进 CI 与镜像（S5.9：CI 的 frontend job 加 lint + 测试 + 构建；镜像多一个 node 构建阶段，dist 进 runtime，容器默认 `serve=true` 托管单页应用，镜像 413MB） | ✅ 已完成（S5.9） |
-| 图片热点解析接口（S6.6：契约先行新增 `POST /api/hotspots/image-clue`（multipart 单图，jpg/png/webp、≤ 10 MB，按 magic bytes 认类型）；异步多模态客户端 + 新 prompt 资产 `image_hotspot_clue`；图片只在内存里转模型输入，**不落盘不入库**） | ✅ 已完成（S6.6） |
-| 预置线索通道（S6.7：`POST /api/analyze` 增加可选 `clues`（与 `hotspots` 等长、单项可 null）——用户确认/编辑过的线索直接落库并**短路拆解节点**，不重复付费；不传时行为与以前逐字节一致） | ✅ 已完成（S6.7） |
-| 分析台图片入口（S6.8：上传 / 拖拽 / 粘贴一张图 → 可编辑的描述与要素卡（类型·取值·权重）→ 与其他热点一起批量提交，或「用这条热点分析」只跑这一条；带 clue 的热点显示「来自图片」） | ✅ 已完成（S6.8） |
-| 图片链路测试与真机冒烟（S6.9：真容器集成用例证明「解析 → 带 clues 提交 → 结果页线索与提交值逐字段一致、拆解节点未被再次调用」；Playwright 驱动本机 Edge 走通真实链路，14/14 断言，run 成本 0.0530 元） | ✅ 已完成（S6.9） |
-| 素材库查询接口（S6.1：`GET /api/materials` 分页 + 关键词 / 类型 / 打标来源 / 主题目录筛选（含 `dirs` 计数）；`GET /api/materials/{id}` 详情含爆点要素；契约先行、`check_openapi` 零 diff） | ✅ 已完成（S6.1） |
-| 素材元数据编辑（S6.2：`PATCH /api/materials/{id}` 白名单三字段，**写库 + 写同名 `.txt` 旁车**——磁盘是唯一来源，重扫描后人工说明仍在；标签去重去空、上限 14 个） | ✅ 已完成（S6.2） |
-| 删除与回收站（S6.3：移入 `_trash/`（连同旁车）并删索引行、列出回收站、恢复 = 重新入库（新 uuid）、单条 / 一键真删；新增 `xhs_agent.index_materials` 任务与 **Celery 结果后端**（ADR 0014，分析任务显式 `ignore_result`）） | ✅ 已完成（S6.3） |
-| 扫描与上传导入（S6.4：`POST /api/materials/scan` 触发「增量同步 + 向量回填」；`POST /api/materials/uploads` **流式**落到 `<素材根>/<YYYY-MM>/`（同名加序号、超 `[upload].max_size_gb` 退 413）；`GET /api/materials/tasks/{id}` 查阶段 / 计数 / 失败原因；镜像装 ffmpeg） | ✅ 已完成（S6.4） |
-| 素材库页（S6.5：第 4 页 `/materials`——搜索 / 类型 / 来源 / 主题 chips、网格↔列表、拖拽上传带进度、编辑弹窗、多选批量删除、回收站抽屉；真机冒烟 20/20：导入 3 条 → 自动打标 → 改标签（库 + 旁车）→ 删入回收站 → 恢复（新 uuid）→ 清空。**详情弹窗补齐**：点卡片 / 缩略图走 `GET /api/materials/{id}`，看全部关键帧与爆点要素——此前这条接口前端一直没人调，点卡片毫无反应） | ✅ 已完成（S6.5 + 详情补齐） |
-| 原生工具调用与真 token 流式（S7.1：`LLMCall` 增 `tools` / `stream`，`LLMResult` 增 `tool_calls`；流式已回吐正文后不重试；记账口径与普通调用一致。DoR 已实测 `deepseek-flash` 支持 `tools` / `tool_calls`，结论见 ADR 0015） | ✅ 已完成（S7.1） |
-| 对话会话与消息存储（S7.2：数据契约 §3.6 / §3.7 + 迁移 **0004** + `services/chat.py`；附件落 `runs/_chat/<session_id>/` 且只存引用；过期 `running` 行按 `[chat].turn_stale_seconds` 兜底标 `interrupted`） | ✅ 已完成（S7.2） |
-| 对话编排图（S7.3：LangGraph `supervisor ⇄ tools`，轮次上限 `[chat].max_tool_rounds`；第一批只挂「跑完整分析」，有图片先走 S6.6 解析再按 S6.7 预置线索提交，**拆解节点短路**；新增 prompt 资产 `chat_supervisor`） | ✅ 已完成（S7.3） |
-| 对话 SSE 接口（S7.4：`POST /api/chat/sessions/{id}/messages` 返回 `text/event-stream`，事件 `turn_started` / `tool_started` / `tool_progress` / `tool_finished` / `text_delta` / `turn_finished` / `error`；Redis pub/sub 传事件，**轮次跑在 detached 任务里**——断开只停转发，不再算这一轮） | ✅ 已完成（S7.4） |
-| 对话首页（S7.5：`/` 改成对话、分析台挪到 `/analyze`（**路由名仍是 `analysis`**）；消息列表 + 输入框（文字 + 可选一张图）+ 工具过程 + 流式增量 + 结果卡片（与结果页共用 `HotspotResult.vue`）+ 历史会话侧栏；刷新后自动打开最近一条会话） | ✅ 已完成（S7.5） |
-| 对话闭环测试与真机冒烟（S7.6：单测 + 真容器集成（发消息 → 触达工具 → 落库 → 读回 → 附件取回）+ Playwright 真机 19/19 断言：传图 + 一句话 → 工具过程 → 流式正文 → 结果卡片 5 条候选 → 刷新仍在，截图落 `runs/_smoke_s76/`） | ✅ 已完成（S7.6） |
-| 工具分发去硬编码（S7.7a：`services/chat_tools.py` 同时持有 `TOOLS` 与 `HANDLERS`，`workflows/chat.py` 里不再出现任何具体工具名——"加一个工具只改一处"从口号变成有源码扫描用例钉住的事实；工具内部的 prompt 版本也汇总进 `chat_messages`） | ✅ 已完成（S7.7a） |
-| 只读工具三件（S7.7：`parse_image_clue` 解析图片 / `search_materials` 查素材库 / `read_run` 读历史运行；都无副作用、可被模型选，参数与返回值登记进 prompt 契约的对话工具清单；一轮内按热点文本与附件路径缓存，同一件事不重复付费） | ✅ 已完成（S7.7） |
-| 拆解预览工具（S7.7b：`preview_element_coverage` 只做要素拆解 + **字面通道**覆盖估算，不调 embedding、不写稿、不落 `runs`；返回缺口与补拍建议，说明里写明"这一步不产出候选素材"） | ✅ 已完成（S7.7b） |
-| 改写文案工具（S7.8：新 prompt 资产 `copy_revise`（§03 逐字复用 `copy_draft` 的 12 条边界 + 越界必须拒绝）+ 工具 `revise_draft`；改后文案只回对话、**不覆盖 run 的初稿快照**） | ✅ 已完成（S7.8） |
-| 工具集测试与真机冒烟（S7.9：新增 `scripts/eval_chat_tools.py` 真模型工具选择评测（两臂对照，报告落 `evals/reports/chat-tools-*.md`）；`chat_supervisor` v1 → v2（能力边界改为以工具清单为准）并按 prompt 契约 §六 的对话类口径回归；真机 19/19：传图 + 问素材 → 完整分析 → 改写 → 刷新仍在，截图落 `runs/_smoke_s79/`） | ✅ 已完成（S7.9） |
-| 多轮记忆与上下文预算（S7.10：历史按 token 预算装配——最近 `[chat].history_max_messages` 条保留原文、更早的降级成摘要、超 `[chat].history_token_budget` 再裁剪并说明；工具摘要行带 `run_id`；跨轮图片回落 `latest_attachment`；`chat_messages` 加 `prompt_tokens` / `completion_tokens` + 迁移 **0005**；图片解析成本计入轮级成本） | ✅ 已完成（S7.10） |
-| 越界处理（S7.11：机读能力清单 `prompts/chat_capabilities.json` —— 能力内 / 边界外可引导 / 合规红线三类 + 固定话术，红线不给绕过写法；`chat_supervisor` §02 用 `{{ capabilities }}` 注入、prompt v3；新增 ADR 0016） | ✅ 已完成（S7.11） |
-| 越界与多轮评测 + 成本口径（S7.12：用例集 `evals/chat/cases.json`（工具选择 10 / 越界 10 / 多轮 5 / 改写 3），`scripts/eval_chat_tools.py` 扩成四节、判定全为确定性规则；轮级成本门槛 ≤ 0.25 元/轮（含一次分析），同步产品方案与 prompt 契约 §六） | ✅ 已完成（S7.12） |
-| 第三批文档收口（S7.13：产品方案补对话式入口与可复现边界、项目结构补对话模块与能力清单、技术栈路线图与各契约同步） | ✅ 已完成（S7.13） |
-| 多图上传与契约（S7.14：messages 的 `file` → `files`（1–9 个 binary）；新增 `[chat].attachment_max_count = 9` 与 `attachment_total_max_mb = 30`；逐张校验、400 文案指明第几张、超限整批拒绝） | ✅ 已完成（S7.14） |
-| 多图合并解析（S7.15：新 prompt 资产 `image_hotspot_clue_multi` + `AsyncImageClient.complete_many` + `parse_image_clue_multi`；一次调用一份线索，要素 3–8 个且必须带 `evidence`（指图）；单图路径零改动） | ✅ 已完成（S7.15） |
-| 工具与跨轮回落改造（S7.16：图片工具从 `attachments[0]` 改为整组、缓存键按整组路径、`ToolContext.recent_attachments` 与 `latest_attachments` 按整组回落、成本只记那一次调用） | ✅ 已完成（S7.16） |
-| 共享图片入口组件（S7.17：`ImageIntake.vue` 收口选择 / 拖拽 / 粘贴 + 缩略图 + 逐张删除 + 上限校验；分析台 `max=1`、`thumbs=false`，行为与视觉与现状一致） | ✅ 已完成（S7.17） |
-| 对话页接入多图 + 测试与冒烟（S7.18：对话页 `max=9`；真机冒烟「粘贴 9 张 → 一份标签 → 跑一次分析 → 结果卡片」15/15，含 9 图 vs 单图对照，截图落 `runs/_smoke_s718/`） | ✅ 已完成（S7.18） |
-| 观测契约与追踪门面（S7.19：冻结阶段生命周期 / 事件 payload / 当前阶段快照 / 关联标识与用量口径；`core/progress.py` 统一合并语义与安全错误类别白名单；`Tracer` 扩 `turn` / `tool` / `node` / `finish_turn` / `trace_id`，`TracingProvider` 补 `complete_with_tools` 且流式增量原样透传） | ✅ 已完成（S7.19） |
-| 节点状态与跨进程接线（S7.20：`chat.turn` → `tool.*` → worker 节点三层 span；SSE 增 `stage` 事件；五节点 / 素材同步 / 向量回填 / 查询 embedding 各有状态与耗时；traceparent 取自投递时刻的当前 span（工具 span 子树内），`turn_id` 走独立业务头并绑日志；任务详情 `current_step` 不再恒为 `None`；迁移 0006） | ✅ 已完成（S7.20） |
-| 当前状态持久化与消息回看（S7.21：`chat_messages` 加 `turn_id` / `trace_id` / `progress`（迁移 0007）+ `runs.stage` 快照；刷新后按消息恢复阶段 / 耗时 / 失败类别 / 调用链入口；前端显示「第 N 阶段 · 已 x 秒」「耗时较长」提示与「查看调用链」链接；追踪关闭时状态仍可见、链接如实不显示） | ✅ 已完成（S7.21） |
-| 分层验收与真云回放（S7.22：单测补白名单 / 取消超时 / 日志上下文复位等分支；集成钉住 detached 轮次继续、Celery 父子 span（worker 挂投递时工具 span）、重试、两会话并发不串线、追踪初始化失败不阻断；新增 `scripts/check_trace_chain.py` 按消息 trace 读回并核对层级 / 用量 / 耗时；`docs/可观测.md` 收口字段字典与排查手册；真机 + 真云证据落 `runs/_smoke_s722/`） | ✅ 已完成（S7.22） |
+| 大模型 | **判断与解释**：拆解要素、解释为什么能蹭、写文案初稿 |
+| 确定性算法 | **排序与打分**：双通道召回 → RRF 融合 → 要素类型加权 → Top-K，同分按 id 升序 |
 
-业务链路**已端到端跑通**：`docker compose up -d --wait` 起依赖 → `uv run celery -A xhs_agent.tasks.worker:app worker` 起 worker → `uv run python -m xhs_agent.serve` 起接口（先跑 7 步启动前置检查）→ `POST /api/analyze` 投递 → worker 自动消费（索引新鲜度 → 五节点分析 → 逐热点写回）→ `/api/jobs/{job_id}` 轮询 → `/api/runs/{run_id}` 取结构化结果、`/report` 取报告。另可运行 `uv run python -m xhs_agent.probe`、`uv run python scripts/index_materials.py`、`uv run python scripts/backfill_embeddings.py`、`uv run python scripts/eval_retrieval.py`、`uv run python scripts/smoke_skeleton.py`。路线图见文末。
+结果可复现、可解释、可评测，成本不随素材量增长。这是整条链路最核心的取舍。
 
----
+## 已实现的能力
 
-E7 第六批已完成上下文、版本、图片复用和观测的工程修复（2026-10-19）；完整真实模型对照、独立人工评分与 M18 签收仍待完成。当前证据和 E8 前置顺序见 [本次交付报告](evals/reports/context-repair-2026-10-19.md)。`[context].mode` 默认仍为 `off`。
+- **对话式入口**：LangGraph `supervisor ⇄ tools` + 原生 Function Calling，7 个工具（跑完整分析 / 解析图片 / 查素材库 / 读历史运行 / 预览爆点要素 / 改写文案 / 按候选写稿），多轮记忆与越界话术；
+- **五节点分析状态图**：拆解 → 检索 → 缺口 → 撰稿 → 报告，每步可重试、可上报进度；
+- **真流式**：`text/event-stream` + Redis pub/sub，轮次跑在 detached 任务里，关掉页面不打断这一轮；
+- **素材库**：上传 / 增量扫描 / 向量回填 / 编辑（库 + 旁车双写）/ 回收站 / 关键帧预览；
+- **可观测**：structlog 结构化日志 + Langfuse 调用追踪 + OpenTelemetry（API → DB → worker 一条 trace），阶段快照与调用链可在界面上回看；
+- **评测**：20 组人工标注集、检索基线对照、prompt 回归七维度、成本与延迟门槛。
 
-## 技术栈
+## 架构
 
-已落地的选型（完整清单、依据与规划中的演进见 `docs/技术栈.md`）：
-
-| 层面 | 选型 |
-| --- | --- |
-| 语言 | Python ≥ 3.11 |
-| 包管理与构建 | uv + `pyproject.toml`（hatchling 后端，src 布局） |
-| 运行时依赖 | pydantic v2、pydantic-settings、python-dotenv、SQLAlchemy 2.0 async + asyncpg、pgvector、alembic、langgraph、fastapi + uvicorn、redis、httpx、celery、structlog、langfuse、opentelemetry-api + instrumentation-fastapi |
-| 开发依赖 | pytest、pytest-cov、pytest-asyncio、testcontainers、ruff、mypy、pre-commit |
-| 文本模型接入 | OpenAI 兼容 `/chat/completions` 协议（默认 DeepSeek），标准库 `urllib` 直连，JSON mode 结构化输出 + 解析失败自修 |
-| 多模态接入 | 通义千问 VL（`qwen-vl-max`），关键帧 base64 内联 |
-| 音视频处理 | ffmpeg / ffprobe（用于探测与抽帧；缺失时跳过抽帧，属能力裁剪） |
-| 检索算法 | 双通道召回（pg_trgm 字面 + pgvector 余弦）→ RRF 融合 → 要素类型加权终分 → Top-K 截断；同分按 material_id 升序 |
-| 配置 | pydantic-settings + TOML：环境变量 > `.env` > config.toml > 代码默认值；启动前置检查见 `uv run python -m xhs_agent.probe` |
-| 数据落地 | PostgreSQL `materials` 表（素材索引，增量同步）+ JSONL 轨迹 + Markdown 与单文件 HTML 报告；JSON 索引已在 S2.10 退役 |
-| 测试 | pytest |
-
-### 最终技术栈（企业级，已确定待落地）
-
-| 层面 | 选型 |
-| --- | --- |
-| Web 服务 | FastAPI + Uvicorn |
-| HTTP 客户端 | httpx（异步 + 连接池；文本模型与向量的统一传输，S3.5） |
-| Agent 编排 | LangGraph（状态图 + 检查点 + 失败重试） |
-| 数据库与缓存 | PostgreSQL 16 + pgvector 0.8.6、Redis 7.4.11（本地 `docker compose` 起，tag 固定） |
-| 数据访问 | SQLAlchemy 2.0 async ORM + asyncpg + pgvector（模型见 `src/xhs_agent/db/`）；Alembic 迁移已落地（S2.3，五个版本 `0001`–`0005`） |
-| 检索 | 混合召回：pg_trgm 字面 + pgvector 语义，RRF 融合后套要素加权 |
-| Embedding | 默认通义 text-embedding-v3（API）；本地小模型为可选实现 |
-| 队列与缓存 | Redis + Celery |
-| 可观测 | structlog（`console` / `json`）+ run_id 贯穿全链路 + Langfuse Cloud 调用追踪 + OpenTelemetry（ASGI 服务端 span、`xhs_agent.db` DB span、W3C 跨进程传播；默认只上报元数据，`LANGFUSE_CAPTURE_CONTENT=true` 才连提示词与正文） |
-| 容器化 / CI | Docker Compose（postgres / redis / migrate / api / worker 五服务）；GitHub Actions 五个 job（lint / typecheck / test / image / frontend） |
-| 代码质量 / 测试 | ruff + mypy + pre-commit + pytest-cov + pytest-asyncio + testcontainers（均已落地） |
-| 前端 | Vue 3 + Vite + TypeScript + Pinia + Vue Router（S5.1 已落地） |
-| UI 与可视化 | Naive UI + Tailwind CSS（S5.1 已落地；S5.7 起统一语义 token + 明/暗主题 + 毛玻璃，边界见 ADR 0013）+ ECharts 6.1（S5.5 已落地：覆盖度 / 得分分布 / 成本耗时三张图，S5.7 起跟随主题） |
-| 接口类型 | `openapi-typescript` 从契约生成 TS 类型（S5.2 已落地：生成物入库 + CI 防漂移） |
-
-以上组件**均已落地**，后续路线见 `docs/技术栈.md` 第四节。**简历只写已经落地的技术栈。**
-
-> **运行时降级已取消**：缺密钥、连不上数据库或队列时启动直接失败并明确报错，不再提供“无密钥也能跑”的离线模式。
+```text
+浏览器（Vue 3 + Vite + TS）
+      │  REST / SSE
+      ▼
+FastAPI（28 条接口，契约先行）── Celery 投递 ──▶ Celery worker
+      │                                            │
+      │                                     LangGraph 五节点
+      ├──────────────┬─────────────────────────────┤
+      ▼              ▼                             ▼
+PostgreSQL 16    Redis 7                  LLM（DeepSeek 兼容接口）
++ pgvector      队列 + pub/sub            + 通义 VL / text-embedding-v3
++ pg_trgm
+```
 
 ## 快速开始
 
-前置条件：Python ≥ 3.11、`uv`、`ffmpeg` / `ffprobe`（用于抽帧）。前端开发另需 Node 25.3.0 + pnpm 11.25.0（见步骤 15）。
-
-> **注意**：两种跑法都支持——（A）**一条命令起全栈**：`docker compose up -d --wait`（下面第一段）；（B）本地开发：`docker compose up -d --wait postgres redis` 只起依赖，API 与 worker 用 `uv run` 直接跑（第二段起）。
+前置：Docker Desktop、Python ≥ 3.11、[uv](https://docs.astral.sh/uv/)、ffmpeg。
 
 ```powershell
-# ============ CI 跑什么（S4.5）：推 main 自动跑，本地可逐条复现 ============
-#   lint        uv run ruff check .
-#   typecheck   uv run mypy
-#   test        uv run python scripts/check_coverage.py   # 单测 + 集成联合覆盖率 >=78%
-#               # 联合入口已包含真实容器集成测试（runner 自带 Docker）
-#   image       docker compose config --quiet && docker build -t xhs-agent:ci .
-# test job 里还包含契约一致性校验（tests/unit/test_openapi_contract.py →
-#   scripts/check_openapi.py），本地可单独跑：uv run python scripts/check_openapi.py
-# Python 3.12 / uv 0.12.7 / UV_FROZEN=1；不依赖任何密钥。
-
-# ============ （A）容器一条命令起全栈（S4.4）============
-# 前置：Docker Desktop 已启动、config/.env 已填好密钥（DEEPSEEK_API_KEY / DASHSCOPE_API_KEY）
-docker compose up -d --wait      # 首次构建镜像约 2–5 分钟；之后秒起
-docker compose ps                # 期望：api / worker / postgres / redis healthy，migrate 为 exited(0)
-
-# 健康检查（db / redis / llm 三项都 ok 才是 200）
-curl -i http://127.0.0.1:8000/api/health
-
-# 投一个热点并轮询（完整链路：队列 → worker → 索引新鲜度 → 五节点分析 → 落库）
-curl -s -X POST http://127.0.0.1:8000/api/analyze -H "Content-Type: application/json" `
-  -d '{"hotspots": ["某明星打羽毛球被拍"], "topk": 5}'
-# 用返回的 job_id 轮询 /api/jobs/{job_id}；succeeded 后用 run_id 取 /api/runs/{run_id}
-
-ls runs/                # 报告 / trace.jsonl 直接落在宿主（bind mount），容器里外同一份
-docker compose logs -f api      # JSON 结构化日志（XHS_LOG_FORMAT=json）
-docker compose down             # 停全栈（保留 pgdata / redisdata 卷）
-# 迁移由一次性 migrate 服务自动跑；需要手动补跑时：docker compose run --rm migrate
-
-# 容器口径：DATABASE_URL / REDIS_URL 指向 compose 服务名；前端 dist 已在镜像里（S5.9），
-# api 按契约默认 serve=true 一并托管单页应用（只想跑 API 时用 XHS_FRONTEND_SERVE=false 覆盖），
-# 镜像以非 root（uid 1000）运行，
-# ./data/materials 与 ./runs 是 bind mount——Linux 宿主上若 uid 不同，需要先 chown。
-
-# ============ （B）本地开发：只起依赖，代码用 uv 跑 ============
-# 1. 安装环境（首次需要网络）
-uv sync
-
-# 2. 起本地依赖（PostgreSQL 16 + pgvector、Redis；镜像 tag 固定在 docker-compose.yml）
-docker compose up -d --wait postgres redis
-
-# 3. 准备配置（必须填必填项：项目不做无密钥降级）
-Copy-Item config/.env.example config/.env
-#    编辑 config/.env 填 DEEPSEEK_API_KEY（P1 必填）、DASHSCOPE_API_KEY（向量召回默认
-#    启用，故默认必填）、DATABASE_URL（P2 必填，本地默认
-#    postgresql+asyncpg://xhs:xhs@localhost:5432/xhs）与 REDIS_URL（P3 必填，S3.4b 起
-#    需要队列；**建议写 127.0.0.1 而不是 localhost**——compose 只绑 IPv4，Windows 上
-#    localhost 常先解析到 ::1，会让 Redis 连接超时）
-REDIS_URL=redis://127.0.0.1:6379/0
-
-# 4. 建表（Alembic 迁移；改模型后必须同时提交迁移脚本）
-uv run alembic upgrade head
-#    回滚与一致性自查：uv run alembic downgrade base / uv run alembic check
-
-# 5. 素材索引入库（可选，首次使用素材库时跑一次全量；之后每次分析前自动增量）
-#    把素材放进 data/materials/ 后执行；--max-vision-items 控制视觉打标的成本上限
-uv run python scripts/index_materials.py
-
-# 6. 向量回填（首次建库后 / 素材内容变更后 / 更换 embedding 模型后各跑一次）
-#    逐批提交、失败即停、重跑幂等；--batch-size 控制每批条数、--limit 限制本次条数
-uv run python scripts/backfill_embeddings.py
-
-# 7. 验证安装与本地依赖（两个服务应是 healthy）
-uv run python -c "import xhs_agent; print(xhs_agent.__version__)"
-docker compose ps
-
-# 8. 验证配置读取（输出不应包含任何密钥）
-uv run python -c "from xhs_agent.config import load_config; print(load_config().describe())"
-
-# 9. 跑启动前置检查（《配置契约》§四 的 7 步：配置 → DB → 扩展 → 迁移 → Redis → 前端 dist）
-#    退出码：0 = 通过；2 = 配置错误；3 = 依赖不可用（每一步都打印能照做的修复提示）
-uv run python -m xhs_agent.probe
-
-# 10. （可选）跑检索层基线对比评测：临时库只装 demo_pack，真实回填向量后两臂对照
-#     结果落 evals/reports/retrieval-v1-<日期>.md；需要 Docker 与真实 DASHSCOPE_API_KEY
-uv run python scripts/eval_retrieval.py
-
-# 10b. E9 真实效果评测（当前数据是 draft，不能 live）：
-#      先校验数据包、离线估算 10 元预算；正式实验还受 S8.3 切换 / S7.29 签收 / 人工标注约束。
-uv run python scripts/eval_e9.py validate --experiment evals/e9-v1 --allow-draft
-uv run python scripts/e9_labels.py export --experiment evals/e9-v1 --out labels.csv
-uv run python scripts/eval_e9.py estimate --experiment evals/e9-v1
-#      协议见 docs/E9评测协议.md；live 失败会返回 3/4，不伪造结果。
-
-# 11. 起 Celery worker（S3.4b：消费 POST /api/analyze 投递的 job）
-#     （走容器全栈时跳过这一步——compose 的 worker 服务已经在跑）
-uv run celery -A xhs_agent.tasks.worker:app worker --loglevel=info
-#    Windows 本地开发建议加 --pool=solo（prefork 在 Windows 上不稳；软超时只在
-#    Linux 的 prefork worker 上生效）
-
-# 12. 起 HTTP 服务（另开一个终端）
-#    推荐用带前置检查的入口（先查 7 步、失败按契约退 2/3，再交给 uvicorn）：
-uv run python -m xhs_agent.serve --host 127.0.0.1 --port 8000
-#    等价写法：uv run uvicorn xhs_agent.api.main:app --port 8000（lifespan 也会查，
-#    但那条路径启动失败时 uvicorn 固定退 3）
-#    文档页：http://127.0.0.1:8000/api/docs（挂在 /api 下，非 /api 路径留给前端单页应用）
-
-# 13. 投一个热点并轮询（完整链路：队列 → worker → 索引新鲜度 → 五节点分析 → 落库）
-curl -s -X POST http://127.0.0.1:8000/api/analyze -H "Content-Type: application/json" `
-  -d '{"hotspots": ["某明星打羽毛球场被拍，反差感拉满"], "topk": 5}'
-#    拿返回的 job_id 轮询 /api/jobs/{job_id}，succeeded 后用 run_id 取 /api/runs/{run_id}
-#    与 /api/runs/{run_id}/report?format=html
-
-# 13.1 结构化日志（S4.1）：默认 console 可读；容器 / CI 与日志检索用 json
-#      json 时一行一个 JSON 对象，每条都带 request_id 与 run_id（不在上下文里为空串）：
-XHS_LOG_FORMAT=json uv run python -m xhs_agent.serve --port 8000
-#      worker 同理：XHS_LOG_FORMAT=json uv run celery -A xhs_agent.tasks.worker:app worker
-#      检索示例（只挑某次运行的日志）：… | jq -c 'select(.run_id=="<run_id>")'
-
-# 13.2 陈旧 run 对账（S4.1）：worker 启动时会自动跑一次；也可手动补跑
-#      把 running 且 started_at 超过 [queue].task_time_limit_s × 2（默认 1800 秒）的行标成 failed
-uv run python -m xhs_agent.tasks.reconcile
-
-# 13.3 调用追踪（S4.2）：把 LANGFUSE_PUBLIC_KEY / LANGFUSE_SECRET_KEY / LANGFUSE_HOST
-#      三行写进 config/.env 即启用（缺任一：只打一条 warning 并关闭追踪，分析照常跑）；
-#      LANGFUSE_HOST 也接受官方 SDK 的别名 LANGFUSE_BASE_URL；EU 区用 cloud.langfuse.com、
-#      US 区用 us.cloud.langfuse.com。每次运行结束日志里会有一条带 trace 链接的
-#      “调用追踪：run … 的 trace …”，按 run_id 就能回放。
-#      默认只上报元数据（模型名 / task / run_id / token / 成本 / 延迟 / 错误），
-#      需要连提示词与产出正文一起上报时再加 LANGFUSE_CAPTURE_CONTENT=true（ADR 0005 口径）。
-
-# 13.4 一条请求一条 trace（S4.3）：POST /api/analyze 的服务端 span 会经 Celery 消息头
-#      （W3C traceparent）接到 worker 的分析链路上，所以 Langfuse 里同一条 trace 里能依次看到
-#      POST /api/analyze → db.submit_analysis → analyze → hotspot-1 → 3 个模型 generation。
-#      DB span 只有操作与表名（不上报 SQL 语句）；/api/health 与文档页不产生 span。
-
-# 13.5 对话首页（S7.1–S7.9）：浏览器打开 http://127.0.0.1:8000/ 就是对话页
-#      （只跑 API 时 http://localhost:5173/ 走 Vite，同样落在这条路由上）。
-#      传一张图 + 一句话 → 模型自己决定调哪个工具（跑完整分析 / 解析图片 / 查素材库 /
-#      读历史运行 / 预览爆点要素 / 改写文案）→ 工具过程与正文流式可见 → 结果卡片回到对话里；
-#      刷新后自动打开最近一条会话，消息与结果都还在。
-#      接口面：POST/GET /api/chat/sessions、GET /api/chat/sessions/{id}、
-#      PATCH /api/chat/sessions/{id}（重命名会话标题，trim 后 ≤100 个 Unicode 字符）、
-#      POST /api/chat/sessions/{id}/messages（multipart → text/event-stream）、
-#      GET /api/chat/sessions/{id}/attachments/{message_id}/{index}。
-#      两条口径：① 轮次跑在 API 进程的 detached 任务里，关掉页面/断流**不打断**这一轮，
-#      回来看到的是终态消息；② 图片只用于这一次解析（不落素材库），附件落 runs/_chat/。
-#
-# 13.6 对话层的工具选择评测（S7.9）：改 `chat_supervisor` 的正文后跑这一条（prompt 契约 §六 的
-#      对话类口径，不是分析链路的七维度）：真模型跑一组固定消息，判定"该调的调、不该调的不调"，
-#      外加改写路径的越界拒绝。报告落 evals/reports/chat-tools-<日期>.md；约 0.1 元、不需要容器。
-uv run python scripts/eval_chat_tools.py --baseline HEAD~1 --note "这次为什么改"
-#      只跑前 3 条冒烟：--limit 3
-
-# 14. 一键跑通 Walking Skeleton（推荐先用它验证环境）
-#     自己起 uvicorn + Celery worker、素材库为空时种入示例素材包、投 case-01 的热点、
-#     轮询到终态、核对"至少 1 条候选且带命中要素与理由"与完整 HTML 报告，跑完回收进程。
-#     **真实调用模型**（一个热点约 3 次调用，成本几分钱）；样例报告落
-#     evals/reports/skeleton-<日期>.html|md，这次运行会留在库里可回看。
-uv run python scripts/smoke_skeleton.py
-#     只驱动已起的服务：--api-url http://127.0.0.1:8000；不种素材：--no-seed
-
-# 15. 前端开发与构建（S5.1 起；工程在 frontend/，Node 25.3.0 + pnpm 11.25.0，
-#     版本固定在 package.json 的 engines / packageManager 与 .node-version）
-cd frontend
-pnpm install          # 首次；pnpm-lock.yaml 入库，node_modules 不入库
-pnpm dev              # 开发服务器 http://localhost:5173，/api 代理到 127.0.0.1:8000（配置契约 §五）
-pnpm run type-check   # vue-tsc 零错误才算过
-pnpm build            # 类型检查 + 构建，产物落 frontend/dist（由 FastAPI 挂载，ADR 0009）
-pnpm run gen:api      # 契约变了才跑：从 ../docs/contracts/openapi.yaml 重新生成 src/api/schema.d.ts
-pnpm run check:api    # 防漂移自检：重新生成 + git diff，有差异即非零（CI 的 frontend job 跑这条）
-pnpm run lint         # ESLint 9（只做正确性规则，不查格式）
-pnpm test             # Vitest 单测（123 条，jsdom，含主题对比度、图表 option、分析台/素材库/对话状态机、
-                      # SSE 解析与对话独立滚动行为）
-pnpm run test:cov     # 单测 + 覆盖率报告（只报告不设门槛）
+Copy-Item config/.env.example config/.env      # 填 DEEPSEEK_API_KEY / DASHSCOPE_API_KEY
+docker compose up -d --wait                    # api / worker / postgres / redis + 一次性迁移
+curl -i http://127.0.0.1:8000/api/health       # db / redis / llm 三项都 ok 才是 200
 ```
 
-`pnpm dev` 与 `uv run python -m xhs_agent.serve --port 8000`（或 `XHS_FRONTEND_SERVE=false` 的等价入口）同时运行，即可在 http://localhost:5173 全栈调试：页面走 Vite，接口经代理进本地 API。
+打开 <http://127.0.0.1:8000/> 就是对话页：丢一张图 + 一句话，模型自己决定调哪个工具。
 
-> **分析台有两种输入方式（S6.6–S6.9）**：直接写热点文本，或「从图片拆热点」——选文件 / 拖拽 / 把一个图片**粘贴**进卡片（jpg / png / webp，单张 ≤ 10 MB）即可让多模态模型拆出热点描述与爆点要素；描述与要素卡（类型 / 取值 / 权重）都能改，改完点「用这条热点分析」只跑这一条，「加入热点列表」则与手输的热点混在同一次批量提交里。图片只在内存里转成模型输入，**不落盘、不入库**（解析成本按契约不进 `runs` 统计）；提交带线索的热点会**短路拆解节点**，不重复付费。`[vision].enabled` 打开且密钥就位才可用，默认关闭时接口会明确返回 503。
-
-> **`[frontend]` 段怎么起作用**：`serve = true`（默认）且 `frontend/dist` 存在且非空时，FastAPI 会把 dist 挂在根路径，并把 `/api` 之外的未命中路径（无扩展名的）回落成 `index.html`——前端 history 路由刷新不会 404；带扩展名的未命中仍返回 404，API 的 404 也照旧是 `not_found` 的 JSON。
-
-> **素材库页（S6.1–S6.5）**：左侧导航「素材库」→ `/materials`。支持拖拽 / 选择文件上传（视频与图片，
-> 单个默认 ≤ 2 GB，落点 `<素材根>/YYYY-MM/`，同名自动加序号）、按主题目录 / 类型 / 打标来源 /
-> 关键词筛选、网格↔列表切换、编辑标题 / 描述 / 标签（**同时写数据库与同名 `.txt` 旁车**，
-> 重扫描后人工说明仍在）、多选批量删除、回收站抽屉（恢复 / 单条真删 / 一键清空）。
-> **点卡片（缩略图 / 标题 / 「详情」按钮）打开详情弹窗**：大图预览 + 视频全部关键帧可切换、
-> 完整元信息（目录 / 尺寸 / 时长 / 大小 / 入库时间 / 磁盘路径）、描述与标签，以及**这条素材的爆点要素**
-> （类型 / 取值 / 权重 / 置信 / 依据）——爆点要素与多张关键帧只有单条详情接口给，列表接口没有。
-> 「扫描」按钮触发一次「增量同步 + 向量回填」，进度与失败原因用 `GET /api/materials/tasks/{task_id}` 查。
-
-> **对话首页（S7.1–S7.9）**：打开 `/`（左侧导航第一项「对话」）就是对话框。传一张图 + 一句话，
-> 模型自己决定要不要调工具、调哪个：有图片就先解析成热点线索，再把「热点 + 线索」作为**一次完整分析**
-> 投给 worker（拆解节点被预置线索短路，不重复付费），工具过程（解析图片 → 提交分析 → 分析中）与模型
-> 正文都通过 SSE 流式显示，跑完把结果卡片（爆点要素 / 候选素材 / 覆盖缺口 / 文案初稿）直接贴在对话里。
-> 工具集一共七个：跑完整分析、解析图片、查素材库、读历史运行、预览爆点要素、改写文案、按候选写稿
-> （后六个都是**不新建分析运行**的，只有「跑完整分析」会产生运行记录；改写保留运行初稿快照，换素材
-> 写稿会另存一版会话文案版本，图片解析也会保存可复用线索）。用户在初稿上提修改意见时，`read_run` /
-> `revise_draft` 的 `run_id` **可以不传**——默认落到本会话最近一次运行，所以「把刚才那版改得更口语一点」
-> 这种话直接说得通（`run_id` 只出现在工具返回值里，装配给模型的历史只有消息正文——这条是 S7.9 冒烟
-> 暴露并当场修的）。
-> 同样，「第 4 条素材是哪个」「上面第 3 个是什么画面」这类用序号指代候选的话也走得通：`read_run` 会把那次运行的
-> 候选清单**整份**带回来（每条带 `rank` / 标题 / 分数 / 用途），模型按那次运行的编号作答，不拿新一次检索的
-> 排序顶替、更不会反过来质疑用户（S7.31）。
-> 左侧导航栏常驻「对话 / 素材库 / 运行历史」三项与历史会话列表，刷新后自动打开最近一条。
-> 两条边界：**关掉页面不会打断这一轮**（轮次跑在 API 进程的
-> detached 任务里，回来看到终态消息）；**不做「停止生成」**——要停就去运行历史看结果。分析台入口已下线，
-> 路由 `/analyze` 保留（隐藏页，直链可开），对话里的分析结果与它共用同一套渲染。对话页是三段落布局：页头只显示当前会话标题，
-> **只有消息区滚动**（贴底时新消息与流式增量自动跟随，手动上翻看历史时不会被打断），整块输入卡常驻底部；
-> 历史会话列表在左侧栏、占满剩余高度并独立滚动；窄屏（<768px）侧栏折叠成汉堡 + 抽屉。
+> **不做运行时降级**：缺密钥、连不上数据库或队列时**启动直接失败**并说明原因，不提供"无密钥也能跑"
+> 的离线模式——降级产出会被当成正常结果使用，反而损害可信度。
 >
-> **还没有前端产物时**：`serve = true` + 缺 dist 属于配置错误，启动前置检查会**拒绝启动**（退出码 2）。本地纯后端开发用环境变量覆盖即可只跑 API：`XHS_FRONTEND_SERVE=false`（等价于把 `[frontend].serve` 设为 `false`）——`scripts/smoke_skeleton.py` 已经默认这么做了。前端工程已落地（S5.1–S5.9），本地 `cd frontend && pnpm build` 产 dist；**镜像里也已内含 dist**，`docker compose up -d --wait` 后 http://127.0.0.1:8000/ 直接就是单页应用。
+> 本地开发（只起依赖、代码用 `uv run` 跑）、素材索引、向量回填、前端调试与全部命令见
+> **[开发指南](docs/开发指南.md)**。
 
-网络受限时：`uv sync --no-dev` 只装运行时环境（pydantic / pydantic-settings / python-dotenv / SQLAlchemy async + asyncpg / pgvector / alembic）；不过 `import xhs_agent` 仍然需要安装或设置 `PYTHONPATH=src`（src 布局）。
+## 工程指标（截至 2026-11）
 
-### 对话中的限制、版本与恢复
+| 指标 | 数值 | 怎么复核 |
+| --- | --- | --- |
+| Python 源码 | 约 2.9 万行（`src/`） | — |
+| 测试 | 2264 条（默认跑 1851 条；413 条真容器集成需 `-m integration`）+ 前端 226 条 | `uv run pytest` / `pnpm test` |
+| 覆盖率 | 单测与集成**联合**覆盖率 ≥ 78%，CI 强制 | `uv run python scripts/check_coverage.py` |
+| 接口 | 28 条 REST 路径，OpenAPI YAML 是唯一事实源，CI 校验零 diff | `docs/contracts/openapi.yaml` |
+| 数据 | 15 个 Alembic 版本，迁移是唯一建表路径 | `uv run alembic history` |
+| 交付 | `docker compose up -d --wait` 一条命令起全栈；GitHub Actions 五个 job | `.github/workflows/ci.yml` |
+| 真机成本 | 单个热点约 **0.05–0.11 元**、**40–60 秒**（随图片数与模型版本变化） | `evals/reports/` |
 
-`[context].mode` 默认 `off`。试用前按 [配置契约](docs/contracts/配置契约.md) 核实模型窗口和会话范围；界面「当前目标与限制」会显示实际生效模式，窗口未核实时 `enforce` 会降为 `shadow`。
+## 目录
 
-- **目标与限制**：展开面板查看有效要求和来源；待确认项可确认或拒绝。新要求先保存，仍有适用冲突时暂停改稿 / 分析。明确「换话题」会归档旧话题约束和对象选择，会话级限制继续保留。
-- **文案版本**：在「版本历史与线索」中查看历史正文，选定基础版本再发送改稿要求。默认承接目标对象最近成功版本，也可以从旧版另起分支；失败不推进版本，运行初稿保持不变。
-- **图片线索**：打开版本后可修改热点描述、要素与依据并另存。重解析生成新的原始线索，已选定的编辑版继续保留；要改用新解析，须显式选择该版。附件缺失 / 内容变化会阻止复用，不能用旧缓存掩盖缺图。
-- **恢复旧会话**：按「开始 / 继续恢复」逐页扫描，再核对候选并完成恢复；有缺口时需要明确确认。恢复被中断后显示重试入口，重复点击同一动作不重复执行。
-- **冲突与超限**：状态或版本发生变化时先刷新再选择；上下文与输出预留无法装入时停止发送，缩小任务范围或调整已核实的预算后再试。切会话会清理旧编辑器和版本选择，迟到响应不会写到另一会话。
-
-这些能力的持久化、模式与计费边界见 [数据契约](docs/contracts/数据契约.md)。单测、固定模型与真实模型效果分别验收，M18 状态见 [backlog](docs/backlog.md)。
-
-### prompt 变更怎么走（prompt 契约 §六）
-
-1. **一次只改一层**：单个提交只改五段中的一段（`src/xhs_agent/prompts/<task>.md`），版本号随内容递增；
-2. **跑回归**：把被改那个 prompt 的新旧两版各跑一遍同一批 20 组用例——旧正文用 `git show` 取，
-   不写文件、不改工作区：
-
-   ```powershell
-   uv run python scripts/eval_prompts.py --task hotspot_clue --note "本次改动的原因"
-   # 冒烟（真容器 + 真模型，只跑前 2 组用例，约 0.4 元）：
-   uv run python scripts/eval_prompts.py --task hotspot_clue --limit 2 --out <临时目录>
-   ```
-
-3. **看门槛**：脚本按契约 §六 判七维度（幻觉=0、事实准确率≥90% 且不降、输出结构 100%、
-   Tool 选择 100%、任务完成率 Top-5≥80%/首选≥50% 且不降、成本≤0.15 元/热点（ADR 0012）、速度≤60 秒/热点），
-   **任一不达标即输出"回退"**（脚本本身仍退 0——回退是给人看的结论）；
-4. **归档**：报告落 `evals/reports/prompt-<task_id>-v<N>-<日期>.md` + 同名 `.json`，
-   里面逐用例列维度变化、附改动 diff，并留一列人工 1–5 分「文案可用率」（**只记录、不进门槛**）。
-
-> 代价参考：全量两臂 = 20 组 × 2 臂 × 3 次模型调用 ≈ 3–4 元、30–40 分钟；只跑被改任务的单步属后续优化。
-
----
-
-## 目录结构
-
-```
+```text
 project/
-├─ AGENTS.md              AI 开发规范（唯一权威版本，先读它）
-├─ README.md              本文件
-├─ pyproject.toml         依赖与工程元数据
-├─ .gitignore            忽略规则（密钥、素材、运行产物）
-├─ config/
-│   ├─ config.toml        默认配置（可入库，零密钥）
-│   ├─ .env.example       密钥模板（可入库）
-│   └─ .env               真实密钥（本地文件，永不入库）
-├─ data/materials/        本地素材库（不入库）
-├─ frontend/              Vue 3 单页应用（源码与构建配置）
-├─ docs/                  全部文档
-├─ evals/                 评测用例与脱敏示例素材包
-├─ runs/                  运行产物（不入库）
-├─ src/xhs_agent/         源码
-└─ tests/                 测试
+├─ src/xhs_agent/   Python 包：api / services / workflows / agents / tools / db / core
+├─ tests/           单测（离线）与集成（testcontainers 真容器）
+├─ frontend/        Vue 3 单页应用
+├─ docs/            产品方案、五份契约、ADR、可观测手册、backlog
+├─ evals/           评测集、标注与评测报告
+├─ config/          config.toml（可公开）+ .env.example（密钥模板）
+└─ alembic/         数据库迁移
 ```
 
-每个目录的职责边界见 `docs/项目结构.md`。
+每个目录的职责边界见 [项目结构](docs/项目结构.md)。
 
----
+## 文档
 
-## 配置说明
-
-配置分三层，**密钥与源码彻底分离**：
-
-- `config/config.toml`：可公开的默认值，按段组织（`llm` / `vision` / `embedding` / `retrieval` / `match` / `paths` / `database` / `queue` / `frontend`）；
-- `config/.env`：只放密钥，被 `.gitignore` 忽略，永不提交；
-- 环境变量：优先级最高，用于密钥与部署差异。
-
-**完整的环境变量清单、`config.toml` 段结构、启动前置检查与退出码，见 `docs/contracts/配置契约.md`** —— 本文件不再重复维护那张表，避免两处不一致。
-
-**运行时不降级**：缺密钥、连不上数据库或队列时直接启动失败并给出明确报错。这是刻意取舍——降级模式产出质量差一个档次，被当成正常模式使用反而会损害结果可信度。
-
----
-
-## 测试与开发规范
-
-```powershell
-# 质量门：lint + 类型检查（mypy 严格模式覆盖 core / db / services / tools / api / tasks 等 55 个文件）
-uv run ruff check .
-uv run mypy
-
-# 全量单元测试
-uv run pytest
-
-# 联合覆盖率（需 Docker；单测与集成均通过后执行 78% 门槛）
-# 分项与联合报告：runs/_coverage/{unit,integration,combined}.json
-uv run python scripts/check_coverage.py
-
-# 提交前钩子：装一次即可，之后每次 commit 自动跑上面三条
-uv run pre-commit install
-uv run pre-commit run --all-files
-```
-
-当前 `tests/unit/` 覆盖数据契约、配置加载、启动前置检查、素材索引同步与向量回填，以及 `tools/` 下九个可离线测的模块
-（词典 / 匹配 / 检索 / 报告 / 素材 / 媒体 / 模型调用 / 追踪 / 视觉），`uv run pytest` 应全绿。
-
-依赖真实 Postgres / Redis 的集成用例在 `tests/integration/`：默认**不跑**，需要显式触发——
-
-```powershell
-uv run pytest -m integration   # 用 testcontainers 起真实容器；需要可用的 Docker
-```
-
-Docker 不可用时会直接报错并说明原因（不静默跳过）。
-
-开发前请先读 `AGENTS.md`（AI 开发规范，含目录约定、文件边界、测试要求、依赖策略、提交检查清单）：
-
-- `AGENTS.md` —— 权威规范，动手前必读
-- `docs/开发规范.md` —— 同一套规则的详细解释版
-- `docs/可观测.md` —— 可观测使用手册：三层职责、阶段口径、日志字段字典、排查手册
-- `docs/项目结构.md` —— 目录与文件职责
-- `docs/AI开发说明.md` —— 怎么和 AI 协作开发这个项目
-- `docs/产品方案.md` —— 产品定位、流程、指标与技术架构
-- `docs/简历与面试.md` —— 面向求职的项目描述与面试要点
-- `docs/contracts/` —— 五份契约（API / 数据 / 检索 / 配置 / Prompt），唯一事实源
-- `docs/adr/` —— 架构决策记录：当初为什么这么选
-- `docs/backlog.md` —— 任务分解、里程碑与风险
-
----
-
-## 路线图
-
-| 阶段 | 内容 |
+| 想了解 | 看这里 |
 | --- | --- |
-| P1 工程骨架 | 契约重构、配置加载、质量门与首批单测 |
-| P2 数据与检索 | Postgres + pgvector、混合召回、评测集 |
-| P3 编排与服务 | LangGraph、FastAPI 接口（/api 前缀）、Celery |
-| P4 可观测与交付 | 结构化日志与调用追踪、容器化、CI |
-| P5 前端工程 | Vue 3 单页应用：对话首页、分析台、结果详情、运行历史、素材库 + ECharts 可视化 |
-| P6 素材与图片 | 素材库页（查询 / 编辑 / 回收站 / 导入）+ 图片热点解析链路 |
-| P7 对话式入口 | 对话首页：原生 function calling + 会话存储 + SSE 流式 + 结果卡片 + **工具集**（第一、二批 S7.1–S7.9：跑完整分析 / 解析图片 / 查素材库 / 读历史运行 / 预览爆点要素 / 改写文案；第三批 S7.10–S7.13：多轮记忆、越界话术与评测；第四批 S7.14–S7.18：多图上传与合并解析；**第五批 S7.19–S7.22：对话全链路可观测——阶段 / 耗时 / 失败类别 / 调用链回看**） |
-| v1.1 及以后 | 多热点横向对比、历史回看、自动抓热榜、效果回流 |
+| 产品定位、流程与指标 | [产品方案](docs/产品方案.md) |
+| 怎么跑、怎么配、怎么改 | [开发指南](docs/开发指南.md) |
+| API / 数据 / 检索 / 配置 / prompt | [契约目录](docs/contracts/) |
+| 为什么这么选 | [ADR](docs/adr/README.md) |
+| 可观测：三层职责、字段字典、排查手册 | [可观测](docs/可观测.md) |
+| 任务分解、里程碑与风险 | [backlog](docs/backlog.md) |
+| 面向求职的项目描述与面试要点 | [简历与面试](docs/简历与面试.md) |
 
-**完整的任务分解、依赖关系、验收标准与工作量估算见 `docs/backlog.md`** —— 本文件只列阶段，不重复维护任务清单。
+## 边界与已知限制（如实）
 
----
+- **本地单机部署**：不提供公网多租户、身份授权与限流；相关能力在 backlog 里登记为未开始；
+- **评测规模有限**：20 组人工标注、单轮为主；真实多轮上下文效果（M18）尚未签收，不宣称已达到；
+- **提示词不外露**：不通过页面或公开接口提供，模型失败只返回安全错误说明；
+- **图片只用于这一次解析**：不落盘、不入素材库，附件落 `runs/_chat/`；
+- **旧结果不自动重算**：分析结果是当次运行的快照，改素材不会回写历史分数。
 
 ## 许可
 
-暂未选定开源许可，默认保留全部权利。如需开源，请在 `pyproject.toml` 与本节同步补充许可证信息。
+[MIT](LICENSE) © 2026 王正
