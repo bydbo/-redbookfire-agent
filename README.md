@@ -76,7 +76,7 @@ curl -i http://127.0.0.1:8000/api/health       # db / redis / llm 三项都 ok �
 
 | 指标 | 数值 | 怎么复核 |
 | --- | --- | --- |
-| Python 源码 | 约 2.9 万行（`src/`） | — |
+| Python 源码 | 约 2.9 万行有效代码（`src/`，不含空行与注释） | — |
 | 测试 | 2264 条（默认跑 1851 条；413 条真容器集成需 `-m integration`）+ 前端 226 条 | `uv run pytest` / `pnpm test` |
 | 覆盖率 | 单测与集成**联合**覆盖率 ≥ 78%，CI 强制 | `uv run python scripts/check_coverage.py` |
 | 接口 | 28 条 REST 路径，OpenAPI YAML 是唯一事实源，CI 校验零 diff | `docs/contracts/openapi.yaml` |
