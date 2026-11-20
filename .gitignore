@@ -44,3 +44,16 @@ frontend/node_modules/
 frontend/dist/
 frontend/.vite/
 frontend/*.tsbuildinfo
+
+# 内部过程归档：批次问题清单 / 修复报告 / 交接 / 审批包
+# 保留在本机做面试底稿，不进公开仓库；产品与契约类文档不受影响（E9评测协议.md 仍入库）
+docs/E6*.md
+docs/E7*.md
+docs/E8*.md
+docs/E9真实效果*.md
+
+# 不属于本项目的杂物：第三方书籍 PDF、散落的 node_modules、临时产物
+/docs/AI-Agents-in-Depth-zh-CN.pdf
+node_modules/
+*tmp_pytest_acceptance*/
+.workbuddy/

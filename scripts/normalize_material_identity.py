@@ -1,7 +1,7 @@
 """E6 管理入口：plan 默认只读，apply 要求指定已审查计划，verify 核验批次。
 
 运行产物含本地路径，默认保存 runs/_material_identity/；不打印密钥、不调用模型。
-必须在停写窗口对真实库 apply，完整操作说明见 docs/E6素材身份归一化执行与验收.md。
+必须在停写窗口对真实库 apply；操作说明《E6 素材身份归一化执行与验收》属内部归档，不在本仓库。
 """
 
 from __future__ import annotations
